@@ -1,0 +1,15 @@
+build/
+screenshots/
+.superpowers/
+.agents/
+.claude
+.codex/
+.codehamr/
+tools/*
+!tools/ci-proofs.sh
+CLAUDE.md
+AGENTS.md
+docs/
+tmp.txt
+__pycache__
+trailer
