@@ -83,7 +83,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>       // update check timestamps ("GEPRUEFT VOR n MIN")
+#include <time.h>       // update check timestamps ("CHECKED n MIN AGO")
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -599,16 +599,16 @@ static const wpn_def_t WPN_DEF[WPN_COUNT] = {
 // restating the fractions in both is how the A/V contract on the mechanic's
 // defining moment drifts.
 //
-// PER WEAPON, because the two beats are not the same two events on the two guns.
-// The AR seats a magazine and drops a bolt. A five-round bolt gun has no
-// magazine to seat, and its own sound already says what its beats are: bolt
-// FORWARD at 0.860 and bolt DOWN AND LOCKED at 0.970, the two loudest events in
-// SFX_RELOAD_SR (amp 0.96 and 1.46). Both weapons were being punched at the AR's
-// 0.560 and 0.960, so on the sniper the first punch landed on the FOURTH OF FIVE
-// identical round presses (0.555) — i.e. on nothing — and the second loudest
-// event in the whole buffer got no beat at all. Filmed at 13 stations, 22-29% of
-// the frame is in motion from prog 0.24 to 0.48 with nothing happening at the
-// action, which is what "the rifle waves about" looks like.
+// PER WEAPON, because the two beats are not the same two events on the two guns:
+// the AR seats a magazine and drops a bolt, the sniper seats a magazine and then
+// WORKS ITS ACTION. Both were once punched at the AR's 0.560/0.960 while the
+// sniper was a five-round stripper load, so its first punch landed on the fourth
+// of five identical round presses — i.e. on nothing — and its loudest event got
+// no beat at all. Filmed at 13 stations, 22-29% of the frame was in motion from
+// prog 0.24 to 0.48 with nothing happening at the action, which is what "the
+// rifle waves about" looks like. The rows below are the events the buffers
+// actually have; they must be re-read from the SFX_RELOAD_* builders whenever
+// those move, or the beat lands in silence again.
 static const float RELOAD_BEAT[WPN_COUNT][2] = {
   {0.560f, 0.960f},   // AR: the magazine SEATS, then the bolt goes home
   // The sniper changes a MAGAZINE now, and its beats moved with it: the box
@@ -660,12 +660,38 @@ static const param_def_t VOL_DEF = {"volume", "VOLUME", 0.7f, 0.0f, 1.0f, 0.05f}
 #define MAX_BOTS   20
 #define MAX_HUMANS 8
 #define MAX_ENTS   (MAX_BOTS + MAX_HUMANS)
+// g_rng_gun is declared above this point (the RNG section precedes the roster
+// constants) and must be sized MAX_HUMANS — it is indexed by human slot. The
+// comment there says so; this is what makes raising MAX_HUMANS a compile error
+// instead of an out-of-bounds write nobody sees.
+static_assert(sizeof g_rng_gun / sizeof g_rng_gun[0] == MAX_HUMANS,
+              "g_rng_gun is PER HUMAN: size it MAX_HUMANS");
 
 // Dedicated-server mode (design §2/§3). DECLARED ABOVE THE PLATFORM SPLIT —
 // g_headless sits inside #ifndef _WIN32 and copying that idiom here breaks
 // the MinGW build exactly in app_start's gate. Runtime flag, set only by
 // --server in main(); the Windows target never sets it but must compile it.
 static int g_server;
+// THE port, for every role: server listen, directory listen, the port a server
+// heartbeats to, and the client's mp_port. ONE number, because the three used
+// to be two (--port defaulted to 27015, mp_port to 27000) and a `--directory`
+// started without --port therefore listened where no client ever dialled.
+//
+// 31415 was chosen against four criteria, in this order:
+//   - BELOW 32768. /proc/sys/net/ipv4/ip_local_port_range is 32768-60999 on
+//     both this container and the VPS: a listener inside that window can lose
+//     the bind to an outbound socket the kernel handed the same port first.
+//     That is the only one of the four that is a correctness argument.
+//   - Not IANA-assigned and not any game's default. 27015 is Valve's (Source,
+//     CS, TF2) and is swept continuously by Shodan/Censys and by A2S_INFO
+//     reflection scanners — a public 27015 collects hostile UDP from day one
+//     for no reason other than the number. This is noise reduction, NOT a
+//     security measure: the protection is NET_CONNECT_MIN, the cookie and the
+//     input budget below, all of which hold on any port.
+//   - Not in Steam's 27000-27100 block, which a player's own Steam client
+//     uses and which some routers special-case.
+//   - Memorable (pi), because a human types it into mp_port.
+#define NET_PORT_DEF 31415
 // Server parameters COME FROM ARGV, not from the config (§8.3): argv is the
 // interface systemd needs anyway, and it deletes the config-trap quartet
 // (parser switch, emit list, unknown-key deletion, live slider for a
@@ -679,7 +705,7 @@ static int g_server;
   const char *dir_host;  // --dir-host: heartbeat here so Quick Join finds us
   int  dir_port;
   int  directory;      // --directory: run as the instance directory instead
-} g_srv = {27015, 8, 6, 10, 1, 12, 0, NULL, 27000, 0};
+} g_srv = {NET_PORT_DEF, 8, 6, 10, 1, 12, 0, NULL, NET_PORT_DEF, 0};
 
 // WHICH entity is "me" — the one identity that is allowed to differ per
 // process (design §4.2): 0 in singleplayer, the own id on a networked client,
@@ -716,7 +742,11 @@ static int ent_next(int e) {
     if (g_humans_on[h]) return MAX_BOTS + h;
   return -1;
 }
-#define ENT_FOREACH(e) for (int e = 0; e >= 0; e = ent_next(e))
+// Seeded from ent_next(-1), not from a literal 0: on a dedicated server human
+// slot 0 is empty, and starting at 0 anyway put a phantom ALIVE entity into
+// every snapshot, hitscan sweep and spawn-point test. In singleplayer
+// g_humans_on[0] is 1, so the first id is still 0 and the walk is unchanged.
+#define ENT_FOREACH(e) for (int e = ent_next(-1); e >= 0; e = ent_next(e))
 
 // The two match sliders, ONE definition each. Their ranges used to be written
 // out three times — config parse, MATCH tab, and the harness's `bots`/`fraglimit`
@@ -860,7 +890,7 @@ typedef struct {
   int   fps_cap;             // frame limiter, 0 = off
   int   show_fps;
   int   msaa;                // MSAA samples: 0 (off), 2, 4 or 8
-  // Read by audio_mix on the WASAPI thread while the GAME tab's slider writes it
+  // Read by audio_mix on the audio thread while the GAME tab's slider writes it
   // on the main thread — the one object crossing that boundary that was not yet
   // atomic (g_trig_w/g_trig_r and g_audio_run are). Making the member itself
   // atomic beats mirroring it into a second global: a mirror would be a
@@ -933,11 +963,21 @@ static config_t config_defaults(void) {
                 // against 12 m/s strafes without it is a handicap, not a
                 // difficulty choice.
                 .pad_curve = 1, .pad_assist = 1,
-                // Compiled-in defaults so a FRESH config is immediately
-                // functional; both are meant to be overridden by config once
-                // the real VPS exists (§8.4: the address must outlive the
-                // developer's ability to touch installed copies).
-                .mp_host = "mp.example.de", .mp_port = 27000,
+                // The master server, compiled in so a FRESH install is
+                // immediately playable, and overridable by config.cfg because
+                // §8.4 requires the address to outlive the developer's ability
+                // to touch installed copies. TWO LIMITS OF THAT ESCAPE HATCH,
+                // both load-bearing if this address ever has to move:
+                //   - config_load_or_create WRITES the whole file on first
+                //     start, so an installed client has this literal value
+                //     frozen in its config.cfg. Changing it here reaches FRESH
+                //     installs only; everyone else keeps dialling the old one.
+                //   - which is why net_resolve takes a NAME as happily as a
+                //     dotted quad (getaddrinfo, see the Linux/Winsock halves):
+                //     a DNS record is the only form of this default that can
+                //     be repointed after the fact. The raw IP is the choice
+                //     that trades that away for having no dependency.
+                .mp_host = "178.104.216.82", .mp_port = NET_PORT_DEF,
                 .update_url = "https://github.com/codehamr/skill-issue",
                 .update_check = 1};
   for (int i = 0; i < MV_COUNT; i++) c.mv[i] = MV_DEF[i].def;
@@ -1321,8 +1361,11 @@ static int exe_path(char *out, size_t n) {
   DWORD len = GetModuleFileNameA(NULL, out, (DWORD)n);
   return len > 0 && len < (DWORD)n;
 #else
+  // readlink neither NUL-terminates nor reports truncation: a full buffer is
+  // indistinguishable from a path that happens to fit, so a too-long path
+  // would be silently shortened and the updater would swap the wrong file.
   ssize_t len = readlink("/proc/self/exe", out, n - 1);
-  if (len <= 0) { out[0] = '\0'; return 0; }
+  if (len <= 0 || (size_t)len >= n - 1) { out[0] = '\0'; return 0; }
   out[len] = '\0';
   return 1;
 #endif
@@ -1380,10 +1423,10 @@ static void sha256_update(sha256_t *s, const void *data, size_t len) {
   }
 }
 static void sha256_hex(sha256_t *s, char out[65]) {
-  uint64_t bits = s->n * 8;
+  uint64_t bits = s->n * 8;   // captured BEFORE padding, so padding may grow n
   uint8_t pad = 0x80;
   sha256_update(s, &pad, 1);
-  while (s->fill != 56) { uint8_t z = 0; sha256_update(s, &z, 1); s->n--; }
+  while (s->fill != 56) { uint8_t z = 0; sha256_update(s, &z, 1); }
   uint8_t lenb[8];
   for (int i = 0; i < 8; i++) lenb[i] = (uint8_t)(bits >> (56 - i * 8));
   sha256_update(s, lenb, 8);
@@ -1462,7 +1505,9 @@ static upd_verdict_t upd_compare(const char *buf, size_t len,
   remote_date[0] = remote_sha[0] = '\0';
   if (len == 0 || len > 4096) { *why = "SIZE"; return UPDV_MALFORMED; }
   // rule 2: first line is exactly "# version YYYY-MM-DD"
-  if (len < 20 || memcmp(buf, "# version ", 10) != 0 || !upd_date_ok(buf + 10) ||
+  // len < 21, not 20: buf[20] is the line terminator, and the buffer need not
+  // be NUL-terminated, so a 20-byte body would be read one past its end.
+  if (len < 21 || memcmp(buf, "# version ", 10) != 0 || !upd_date_ok(buf + 10) ||
       (buf[20] != '\n' && buf[20] != '\r')) { *why = "HEADER"; return UPDV_MALFORMED; }
   memcpy(remote_date, buf + 10, 10);
   remote_date[10] = '\0';
@@ -1544,7 +1589,16 @@ static void upd_check_finish(int fetch_ok, const char *buf, size_t len) {
   }
   char own[64], own_sha[65], rdate[11], rsha[65];
   const char *why;
-  update_asset_name(own, sizeof own);
+  // No asset for this platform means there is nothing this build could ever
+  // install, so the comparison must not run at all: the "none" sentinel is a
+  // MATCHABLE name, and a SHA256SUMS carrying a line called "none" would
+  // otherwise be read as an offer. The start path already gates on this
+  // (UPD_UNSUPPORTED); honouring the return keeps every other caller safe.
+  if (!update_asset_name(own, sizeof own)) {
+    atomic_store(&g_upd_checked_at, (long)time(NULL));
+    atomic_store(&g_upd_state, UPD_UNSUPPORTED);
+    return;
+  }
   if (!upd_own_sha(own_sha)) own_sha[0] = '\0';
   upd_verdict_t v = upd_compare(buf, len, own, own_sha, BUILD_VERSION,
                                 rdate, rsha, &why);
@@ -1837,8 +1891,9 @@ static void map_generate(uint32_t seed) {
 // ---------------------------------------------------------------------------
 // Events — the sim's one-way channel to presentation. player_tick/bot_tick
 // push; consumers pull: the harness prints a line per event at push time (the
-// scripted-test contract), VFX spawn at push time (pure data), the Windows
-// frame loop drains the buffer once per frame for audio, then clears it.
+// scripted-test contract), VFX spawn at push time (pure data), the shared
+// `audio_frame_drain` empties the buffer once per frame for audio on every
+// platform (the dedicated server drains it per TICK instead), then clears it.
 // Events must survive all ticks of one frame, hence the frame-scope buffer.
 // ---------------------------------------------------------------------------
 
@@ -2148,10 +2203,10 @@ static float pen_keep(float used, float budget) {
 
 // ---------------------------------------------------------------------------
 // Procedural audio — every sound is synthesized at startup into a 48 kHz
-// mono float buffer (layered noise/sine partials through one-pole filters
-// and exponential envelopes; seeded, so the WAV dump is reproducible).
-// Playback is Windows-only (WASAPI, see the backend); the headless build
-// dumps WAVs + level stats via the `sfx DIR` script command instead.
+// interleaved STEREO float buffer (layered noise/sine partials through one-pole
+// filters and exponential envelopes; seeded, so the WAV dump is reproducible).
+// Both native backends play it (WASAPI on Windows, ALSA on Linux); the headless
+// harness dumps WAVs + level stats via the `sfx DIR` script command instead.
 // ---------------------------------------------------------------------------
 
 [[maybe_unused]] static const char *SFX_NAME[SFX_COUNT] = {  // harness WAV dump
@@ -2472,6 +2527,11 @@ static void sfx_finish(int id, float peak, float target_rms, float win_s) {
     float a = b[i] < 0 ? -b[i] : b[i];
     if (a > mx) mx = a;
   }
+  // `peak` only bites BELOW 0.9346 — that is where the soft knee above
+  // asymptotes (0.55 + 1/2.6), so nothing leaving that loop can exceed it and
+  // a peak argument at or over 0.94 is a knob with nothing on the other end.
+  // Six call sites deliberately sit there (they want only the knee); the rest
+  // pass 0.62-0.93 and are really asking for headroom.
   if (mx > peak) { float k = peak / mx; for (int i = 0; i < n; i++) b[i] *= k; }
 }
 
@@ -2584,7 +2644,9 @@ static void sfx_verb(int id, int upto, float predelay, float size_s,
 }
 
 // A short percussive "clack" — the mechanical building block. Kept as a
-// helper because bolts, mag wells and dry fire all want the same thing.
+// helper because the gunshots' bolt detail and dry fire all want the same
+// thing. The reload's magazine events do NOT come through here: they are
+// `sfx_mech` below, which is this plus the mass a clack has none of.
 static void sfx_clack(int id, int at, float tone_hz, float amp) {
   int n = sfx_burst(0.055f, tone_hz, 1.1f, 0.00004f, 0.0075f, 1.3f, amp);
   sfx_lay(id, n, at, 0.0f, 0);
@@ -2606,8 +2668,9 @@ static void sfx_clack(int id, int at, float tone_hz, float amp) {
 // every other sound sits inside. A magazine going into a receiver is 300 g of
 // steel arriving in an aluminium housing; it has a bottom end.
 //
-//   knack     the transient. Sub-millisecond and high — this is the "knackig",
-//             and it must stay the loudest SAMPLE of the event.
+//   knack     the transient. Sub-millisecond and high — this is the CRISPNESS
+//             the brief asks for, and it must stay the loudest SAMPLE of the
+//             event.
 //   metal     the band that says what the part is made of (`tone_hz`)
 //   spring    magazine spring, detent, gear rattle. The connective tissue that
 //             makes it a mechanism rather than four isolated clicks.
@@ -2667,7 +2730,7 @@ static void sfx_mech(int id, int at, float tone_hz, float mass_hz, float amp,
   // as the meat burst below already is. Measured per event with an 85 ms window
   // on each authored offset, the AR magazine SEAT delivered 45.5 dB at
   // 20-120 Hz against the gunshot's 55.6, the kill confirmation's 58.9 and a
-  // FOOTSTEP's 43.5 — the moment the brief calls "schoenes Einrasten" was two
+  // FOOTSTEP's 43.5 — the moment the brief calls a satisfying SEAT was two
   // decibels above a boot. The 200-800 Hz meat landed (55.5 dB, above the AR
   // report's own 50.6), so the file's "fat lives at 200-800" rule worked; what
   // was missing is the bottom that says MASS. This file's own note four blocks
@@ -2838,6 +2901,18 @@ static void sfx_hit_attack(int id, float g) {
   sfx_lay(id, n, 0, 0.0f, 1);                          // impact snap
 }
 
+// THE ROOM IS PART OF THE CONSEQUENCE AXIS, so it is authored once per
+// consequence and applied to both precision variants. It used to be two literal
+// parameter quintuples written out twice each, i.e. the "identical within the
+// pair" contract held only as long as four call sites were edited together —
+// exactly the drift the two-axis design above exists to make impossible.
+static void sfx_room_hit(int id) {   // 8 ms of decay, so the ring is not a beep
+  sfx_verb(id, (int)(0.09f * SFX_HZ), 0.005f, 0.013f, 0.13f, 3400.0f, 0.20f);
+}
+static void sfx_room_kill(int id) {  // a real room: a kill has size a hit lacks
+  sfx_verb(id, (int)(0.30f * SFX_HZ), 0.011f, 0.030f, 0.42f, 2200.0f, 0.30f);
+}
+
 static void sfx_hit_base(int id, float g) {
   int n;
   sfx_hit_attack(id, g);
@@ -2969,9 +3044,9 @@ static void sfx_build_all(void) {
   sfx_finish(SFX_FIRE_AR, 0.97f, 0.1748f, 0.30f);
 
   // ---- Sniper: a pressure wave, and then the whole arena answering --------
-  // "Mächtiger" and "hallender" are two different jobs solved in two different
-  // places, and the old shot did neither: it was a slightly lower AR with a
-  // longer noise tail bolted on.
+  // "Mightier" and "more reverberant" are two different jobs solved in two
+  // different places, and the old shot did neither: it was a slightly lower AR
+  // with a longer noise tail bolted on.
   //   POWER is the first 60 ms. A big rifle is a pressure STEP, not a louder
   //   crack, so the transient is longer and its high-pass corner drops from
   //   1200 to 850 Hz (a click filtered at 1.2 kHz has no chest in it), the
@@ -3197,12 +3272,9 @@ static void sfx_build_all(void) {
   // hit < headshot < kill < headshot kill with every rung ABOVE the gun that
   // caused it. `sfx` prints all four back; they must stay monotone.
 
-  // A tiny room on the hits. Not for size — for the 8 ms of decay that stops a
-  // 3 kHz ring from reading as a synthesised beep.
   sfx_alloc(SFX_HIT, 0.30f);
   sfx_hit_base(SFX_HIT, 1.00f);
-  sfx_verb(SFX_HIT, (int)(0.09f * SFX_HZ), 0.005f, 0.013f, 0.13f, 3400.0f,
-           0.20f);
+  sfx_room_hit(SFX_HIT);
   sfx_finish(SFX_HIT, 0.94f, 0.4200f, 0.30f);
 
   // The two signature gains differ, and the reason is not taste. `g` scales the
@@ -3217,15 +3289,12 @@ static void sfx_build_all(void) {
   sfx_alloc(SFX_HIT_HEAD, 0.30f);
   sfx_hit_base(SFX_HIT_HEAD, SFX_HEAD_DUCK);
   sfx_head_sig(SFX_HIT_HEAD, 0.80f);
-  sfx_verb(SFX_HIT_HEAD, (int)(0.09f * SFX_HZ), 0.005f, 0.013f, 0.13f, 3400.0f,
-           0.20f);
+  sfx_room_hit(SFX_HIT_HEAD);
   sfx_finish(SFX_HIT_HEAD, 0.95f, 0.2620f, 0.30f);
 
-  // A real room on the kills, so a kill has the size a hit does not.
   sfx_alloc(SFX_KILL, 0.72f);
   sfx_kill_base(SFX_KILL, 1.00f);
-  sfx_verb(SFX_KILL, (int)(0.30f * SFX_HZ), 0.011f, 0.030f, 0.42f, 2200.0f,
-           0.30f);
+  sfx_room_kill(SFX_KILL);
   // 0.3750, not 0.3470: sharing the hit's transient made the kill's own onset
   // brighter and its gain stage therefore quieter, and measured the 300 ms
   // ladder step from hit_head to kill had thinned to 0.22 dB. Re-derived rather
@@ -3237,8 +3306,7 @@ static void sfx_build_all(void) {
   sfx_alloc(SFX_KILL_HEAD, 0.72f);
   sfx_kill_base(SFX_KILL_HEAD, SFX_HEAD_DUCK);
   sfx_head_sig(SFX_KILL_HEAD, 1.45f);
-  sfx_verb(SFX_KILL_HEAD, (int)(0.30f * SFX_HZ), 0.011f, 0.030f, 0.42f, 2200.0f,
-           0.30f);
+  sfx_room_kill(SFX_KILL_HEAD);
   sfx_finish(SFX_KILL_HEAD, 0.96f, 0.3120f, 0.30f);
 
   // ---- Taking a round ----------------------------------------------------
@@ -3451,7 +3519,7 @@ static void sfx_build_all(void) {
     // The seat is where the WEIGHT is (118 Hz, the lowest mass in either
     // reload) and the bolt is where the KNACK is (2100 Hz tone, least mass, and
     // the loudest of the five). That split is deliberate and it is the whole
-    // "satter UND knackiger": they are different questions and they belong to
+    // "fatter AND crisper": they are different questions and they belong to
     // different events. The bolt staying loudest also keeps `eng` — the energy
     // peak — on the event that ANNOUNCES A LIVE WEAPON, which is the one thing
     // in this sound the player acts on.
@@ -3612,12 +3680,12 @@ static void sfx_build_all(void) {
 // ---------------------------------------------------------------------------
 // Audio routing. WHICH sound a game event becomes, how loud, how far to the
 // side and how late, is ordinary presentation logic and lives outside the
-// platform guard: the Windows build feeds it to a WASAPI mixer, and the
-// headless harness feeds it to `sfxlog` and, through the mixer below, to
+// platform guard: both native builds feed it to the mixer below, and the
+// headless harness feeds it to `sfxlog` and, through that same mixer, to
 // `mixdown` — which is the only way any of this gets tested at all, since there
 // is no way to listen in the container the game is developed in. The mixer is
-// no longer behind the platform guard either; only the WASAPI thread that
-// drives it is Windows-only.
+// no longer behind the platform guard either; only the audio THREAD that drives
+// it is backend-specific (WASAPI on Windows, ALSA on Linux).
 
 // A voice carries its own L/R gains and a start DELAY. Both matter:
 // panning is how a shot from behind-left becomes information rather than
@@ -3631,7 +3699,7 @@ static void sfx_build_all(void) {
 // own shot" was a claim about the BUS, and the bus is where voice stealing,
 // the scheduled delays and the master limiter's ducking all happen. The
 // harness now renders it (`mixdown`), so those numbers are checked. Only the
-// WASAPI thread that feeds this stays Windows-only.
+// thread that feeds this is backend-specific (WASAPI on Windows, ALSA on Linux).
 typedef struct {
   int active; const float *buf; int len;
   float pos, rate, gl, gr; int delay;
@@ -3999,7 +4067,13 @@ static void audio_on_event(const event_t *e) {
                e->src == g_local_ent ? 0.0f : pan, dist / 343.0f);
     break;
   }
-  case EV_DRYFIRE:  audio_play(SFX_DRY, 1.0f, 1.0f, 0.0f, 0.0f); break;
+  // The dry click is a hands-on cue: it says YOUR magazine is empty, so it is
+  // the local shooter's only. Ungated it played centred and full gain for any
+  // entity — the "literal == 0 means me" class, one identity late. The event
+  // printer already reads g_local_ent here.
+  case EV_DRYFIRE:
+    if (e->src == g_local_ent) audio_play(SFX_DRY, 1.0f, 1.0f, 0.0f, 0.0f);
+    break;
   case EV_RELOAD:
     // The player's own reload is in his hands: centred, close, undistanced. A
     // bot's is an event at a point in the arena and is routed like one.
@@ -4059,7 +4133,9 @@ static void audio_on_event(const event_t *e) {
     // answer the player's own death already uses (rate 0.72; SFX_HURT routes
     // as KEEP — riding the lead bus unducked without ducking anything), so it
     // neither ducks the arena nor congratulates anybody.
-    if (e->k == 0)
+    // g_local_ent, not a literal 0: EV_END.k is the WINNER's entity id, and on
+    // a client that id is the own slot, never 0.
+    if (e->k == g_local_ent)
       audio_play(SFX_KILL_HEAD, SFX_LEAD_GAIN, 0.85f, 0.0f,
                  WPN_DEF[g_last_wpn].sfx_hit_t + 0.38f);
     else
@@ -4190,9 +4266,9 @@ static void audio_shot_world(const event_t *e) {
 
 static void audio_event(const event_t *e) { audio_on_event(e); audio_shot_world(e); }
 
-// 64-voice mixer, fed through a lock-free SPSC ring: the game thread posts
-// triggers, the WASAPI thread (or, headless, the `mixdown` command) starts
-// voices and mixes.
+// MAX_VOICES mixer, fed through a lock-free SPSC ring: the game thread posts
+// triggers, the audio thread (WASAPI or ALSA — or, headless, the `mixdown`
+// command) starts voices and mixes.
 static float g_lim_g = 1.0f;   // master limiter gain state
 // Two measurement hooks, one compare each. They exist because the two ways
 // this mixer can quietly ruin a sound are both invisible in the output WAV
@@ -4417,7 +4493,7 @@ static void audio_mix(float *out, uint32_t frames, int channels) {
     if (duck < g_duck_min) g_duck_min = duck;
     // Master limiter, not a hard clamp. Clamping a mix of six overlapping
     // shots is distortion on every peak; a limiter with a fast attack and a
-    // ~120 ms release ducks the whole bus for a moment instead, which is what
+    // ~170 ms release ducks the whole bus for a moment instead, which is what
     // makes a firefight loud AND clean. The gain state is per-buffer and
     // smoothed, so it can never introduce a click of its own.
     float mag = fabsf(sl) > fabsf(sr) ? fabsf(sl) : fabsf(sr);
@@ -4724,11 +4800,26 @@ typedef struct {
 
 // PROTO is byte 0-1 of EVERY packet (§7.2), hand-bumped on any wire change.
 // An old client must fail LOUDLY (REJECT), never misinterpret a changed schema.
-#define NET_PROTO 1
+// 2: CONNECT and QUERY carry a length floor, the snapshot header carries the
+// map seed, NP_LEAVE exists, and the entity record's weapon field is rejected
+// rather than masked. A version-1 peer trips the PROTO check on byte 0 and is
+// told so, which is the whole reason this number is hand-maintained.
+#define NET_PROTO 2
+// Floors on UNVERIFIED requests, so the answer to one is always smaller than
+// the request was (§7.1) and neither responder can be pointed at a forged
+// source address. 16 against the 7-byte COOKIE; 704 against the INSTANCES
+// reply, whose own cap is 40 records x 17 bytes + 4 = 684.
+#define NET_CONNECT_MIN 16
+#define NET_QUERY_MIN   736   // >= 4 + 40 records x 18 bytes = 724
+// Human slots one source address may hold (net_srv_admit). A cookie proves an
+// address is reachable, never that it is a different person; NAT legitimately
+// puts a few players behind one address, a slot-squatter takes all of them.
+#define NET_JOIN_PER_HOST 4
 
 typedef enum {
-  NP_CONNECT = 1,   // client->server, unverified: PROTO + name; answered by a
-                    // COOKIE strictly SMALLER than the request (§7.1)
+  NP_CONNECT = 1,   // client->server, unverified: PROTO + name, zero-padded to
+                    // NET_CONNECT_MIN so the COOKIE answer is strictly SMALLER
+                    // than the request and the port cannot be reflected (§7.1)
   NP_COOKIE,        // server->client: 8-byte stateless cookie
   NP_JOIN,          // client->server: CONNECT again WITH the cookie
   NP_ACCEPT,        // server->client: your id, map seed, solids hash
@@ -4738,10 +4829,16 @@ typedef enum {
   NP_HEARTBEAT,     // server->directory: port + occupancy + code (§6, Phase 6)
   NP_QUERY,         // client->directory: give me the instance list
   NP_INSTANCES,     // directory->client: aggregate + per-instance occupancy
+  NP_LEAVE,         // client->server: I am going. Frees the slot NOW instead
+                    // of at the 10 s idle timeout — without it a quit-and-
+                    // rejoin arrives from a fresh ephemeral port, finds its
+                    // old conn still holding a human slot, and can be refused
+                    // an arena that is half empty.
 } np_type_t;
 
 typedef enum {
   NR_PROTO = 1, NR_FULL, NR_BADCOOKIE, NR_BADNAME,
+  NR_WORLD,   // client-side only: the server's arena hash is not ours
 } np_reject_t;
 
 // Client input for one tick (§6.2): the wish vector is post-deadzone/curve
@@ -4840,13 +4937,17 @@ static void net_ent_encode(np_wr *w, const net_ent_t *e) {
 static int net_ent_decode(np_rd *r, net_ent_t *e) {
   e->id = np_r8(r); e->flags = np_r8(r);
   e->hp = np_r8(r);
-  e->weapon = np_r8(r) & 3;                     // 2 bits: never index past WPN
+  e->weapon = np_r8(r);
   e->reload = np_r8(r); e->spawn_seq = np_r8(r);
   e->x = (int16_t)np_r16(r); e->y = (int16_t)np_r16(r); e->z = (int16_t)np_r16(r);
   e->vx = (int16_t)np_r16(r); e->vy = (int16_t)np_r16(r); e->vz = (int16_t)np_r16(r);
   e->yaw = (int16_t)np_r16(r); e->pitch = (int16_t)np_r16(r);
   e->lean = (int16_t)np_r16(r);
-  return !r->bad && e->id < MAX_ENTS;           // id clamp: index guard
+  // Both fields are used as ARRAY INDICES by the caller (g_players/g_bots and
+  // WPN_DEF/g_cfg.wp), so both are rejection criteria rather than masks: the
+  // old `& 3` let a hostile server hand out weapon 2 and 3 against a
+  // WPN_COUNT of 2, i.e. an out-of-bounds read per snapshot record.
+  return !r->bad && e->id < MAX_ENTS && e->weapon < WPN_COUNT;
 }
 
 // FNV-1a over the generated solids (§6.4): map_generate has NO transcendental
@@ -4876,9 +4977,9 @@ static uint32_t net_world_hash(void) {
   if (!isfinite(*yaw) || !isfinite(*pitch)) { *yaw = prev_yaw; *pitch = 0.0f; return; }
   *pitch = f_clamp(*pitch, -PITCH_MAX, PITCH_MAX);
   float dy = wrap_pi(*yaw - prev_yaw);
-  if (dy >  NET_MAX_TURN_PER_TICK) *yaw = wrap_pi(prev_yaw + NET_MAX_TURN_PER_TICK);
-  if (dy < -NET_MAX_TURN_PER_TICK) *yaw = wrap_pi(prev_yaw - NET_MAX_TURN_PER_TICK);
-  else *yaw = wrap_pi(*yaw);
+  if      (dy >  NET_MAX_TURN_PER_TICK) *yaw = wrap_pi(prev_yaw + NET_MAX_TURN_PER_TICK);
+  else if (dy < -NET_MAX_TURN_PER_TICK) *yaw = wrap_pi(prev_yaw - NET_MAX_TURN_PER_TICK);
+  else                                  *yaw = wrap_pi(*yaw);
 }
 
 // Stateless cookie (§7.1): hash(secret, ip, port, time/30). No per-attempt
@@ -4897,11 +4998,6 @@ static uint32_t net_cookie(uint32_t ip, uint16_t port, uint32_t epoch) {
   return got == net_cookie(ip, port, now_epoch) ||
          got == net_cookie(ip, port, now_epoch - 1);   // one epoch of slack
 }
-
-// The event channel record (§6.5): every event carries its sim tick and a
-// monotone id; the client acks the highest seen and drops any id <= its high-
-// water mark, so a resent EV_KILL never plays the confirmation twice.
-typedef struct { uint32_t id; uint32_t tick; uint8_t type, src, dst, k; } net_ev_t;
 
 // Input budget (§6.7): the lag-switch aimbot is a client that stalls, then
 // dumps 60 backdated inputs in one frame, each shot rewound to a different
@@ -5185,9 +5281,16 @@ static void mv_air(v3 *vel, float wx, float wz, float wlen, float sp2d) {
 #define ANIM_ANKLE_Y  0.075f  // ankle joint height with the sole on the floor
 #define ANIM_THIGH    0.435f
 #define ANIM_SHIN     0.425f
+// USABLE leg reach, hip joint to ankle. A leg never locks straight, so every
+// reach bound in the solver is the full leg times this fraction — the plant
+// budget, the stance sink and the IK clamp all have to agree or a foot that
+// one pass calls reachable the next pass drags off its plant.
+#define ANIM_LEG      (ANIM_THIGH + ANIM_SHIN)
+#define ANIM_REACH_K  0.965f
 #define ANIM_HIP_HALF 0.095f  // half distance between the hip joints
-// Hip joint height at MID-STANCE: ~96% of thigh+shin, so the support knee comes
-// within ~15 degrees of straight as the body passes over the foot. The hip then
+// Hip joint height at MID-STANCE: ~93% of thigh+shin measured above the ankle,
+// so the support knee passes over the foot at ~136 deg — visibly flexed rather
+// than locked straight (0.872 - ANIM_ANKLE_Y over ANIM_LEG). The hip then
 // drops ANIM_HIP_BOB*2 toward the stride extremes, which is both what a real
 // pelvis does and what buys the horizontal leg reach a long stride needs — the
 // two are the same mechanism. A hip held at one height either locks the knees
@@ -5596,8 +5699,8 @@ static float anim_hz(const anim_t *a) {
   // controller; now it IS the step rate — but only since `anim_duty` stopped
   // capping the backward duty AFTER the reach bound. Until then this was the
   // CLOCK's ratio and not the feet's: at 4 m/s the clock read 1.22x forward
-  // while the boots measured 4.80 against 2.40 steps/s, i.e. 2.00x. It is
-  // 1.25x now. Measure a cadence claim by counting PLANTS, never by reading
+  // while the boots measured 4.80 against 2.40 steps/s, i.e. 2.00x. Measure a
+  // cadence claim by counting PLANTS, never by reading
   // this function. 0.34 measured a flat 1.31x the
   // forward rate at every speed — too busy to read as a walk. 0.22 lands at
   // 1.17-1.19x through the 0.8-6 m/s band a player actually backs off at,
@@ -5619,7 +5722,7 @@ static float anim_hmax(const anim_t *a) {
   float hipy = ANIM_HIP_Y + (ANIM_HIP_CR - ANIM_HIP_Y) * a->crouch_s -
                0.06f * runT * (1.0f - 0.65f * a->bwd) * (1.0f - a->crouch_s) -
                ANIM_HIP_BOB * 0.5f;
-  float mxr = (ANIM_THIGH + ANIM_SHIN) * 0.965f;
+  float mxr = ANIM_LEG * ANIM_REACH_K;
   float drop = hipy - ANIM_ANKLE_Y;
   return sqrtf(fmaxf(0.04f, mxr * mxr - drop * drop));
 }
@@ -5836,7 +5939,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // behind the hip — a real body drops its hip and stays on the ground. Capped
   // so it can never collapse, and eased so a re-step cannot pop it.
   {
-    float mx = (ANIM_THIGH + ANIM_SHIN) * 0.965f, want = 0.0f;
+    float mx = ANIM_LEG * ANIM_REACH_K, want = 0.0f;
     for (int i = 0; i < 2; i++) {
       if (a->foot[i].t < 1.0f) continue;  // stance legs only
       float s = i ? 1.0f : -1.0f;
@@ -6003,7 +6106,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
     float preflex = (a->foot[i].t >= 1.0f)
                         ? 0.045f * (1.0f - a->stance[i]) * runT * ground
                         : 0.0f;
-    float dl = v3_len(dd), mx = (ANIM_THIGH + ANIM_SHIN) * (0.965f - preflex);
+    float dl = v3_len(dd), mx = ANIM_LEG * (ANIM_REACH_K - preflex);
     if (dl > mx) ank = v3_add(hip, v3_scale(dd, mx / dl));
     float fy = a->foot[i].yaw;
     v3 footF = {{sinf(fy), 0, -cosf(fy)}};
@@ -6026,7 +6129,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
         st *= f_clamp((a->foot[i].pos.y - base.y - ANIM_ANKLE_Y) / 0.045f, 0.0f, 1.0f);
       want = st * 0.55f * (0.45f + 0.55f * runT);
       // Backpedalling the foot stays pointed through the whole swing so it
-      // arrives forefoot-first — that plant is the whole "tippeln" read.
+      // arrives forefoot-first — that plant is the whole mincing-steps read.
       want = want * (1.0f - a->bwd) - 0.26f * a->bwd;
     } else if (a->air_s > 0.5f) {
       // Airborne: plantarflexed off the push (toe down), DORSIflexed on the
@@ -6654,9 +6757,8 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
       f->t = 1.0f;
       f->yaw = a->leg_yaw + (i ? 1.0f : -1.0f) * ANIM_TOE_OUT;
     }
-    a->fall = 0;
   }
-  if (grounded) a->fall = 0;
+  if (grounded) a->fall = 0;   // covers the landing edge above too
   a->was_grounded = grounded;
 
   // Hip heading. Hips do NOT simply face the aim: a human running sideways turns
@@ -7089,9 +7191,13 @@ static void anim_reset(anim_t *a, v3 pos, float yaw) {
     a->foot[i].t = 1.0f;
   }
   skel_solve(a, pos, yaw, 0.0f);
-  // Prime the compliance filter's history, or the first tick differentiates a
-  // pelvis against zero and hands the trunk a 116 m/s step.
+  // Prime BOTH histories that get differentiated, or the first tick after a
+  // spawn measures a step out of nothing: the pelvis against zero (a 116 m/s
+  // trunk step) and the aim yaw against zero — a body spawning at yaw = pi
+  // registered ~377 rad/s of turn rate, i.e. the shoulders led a turn nobody
+  // made, once per respawn.
   a->spc_py = a->pose.pelvis.y;
+  a->yaw_prev = yaw;
   a->prev_pose = a->pose;
 }
 
@@ -7297,7 +7403,7 @@ static float ent_flash01(int flash, int head) {
 #define DEATH_WALL_E     0.42f    // horizontal restitution off it: a body that
                                   // STOPS at cover is a body that fell over
                                   // near it. Being thrown back off it is the
-                                  // whole "gegen die Wand knallen" read.
+                                  // whole "slammed into the wall" read.
 #define DEATH_WALL_SPIN  0.55f    // rad/s of tumble per m/s the wall took
 #define DEATH_SLAM_SPIN  0.30f    // ...of the old rotation that survives it
 #define DEATH_REST_VAR   0.30f    // rad of per-kill variation in HOW FAR SHORT
@@ -7671,6 +7777,11 @@ typedef struct {
   int  over, winner, last_killer, restart_req;
 } match_t;
 
+// How long a dedicated server holds the final scoreboard before regenerating
+// the arena. 8 s at 120 Hz: long enough to read a 20-name board, short enough
+// that a public instance is never parked.
+#define MATCH_OVER_TICKS 960
+
 static match_t g_match;
 static int g_match_nbots_fwd(void) { return g_match.nbots; }  // for ent_next
 
@@ -7808,6 +7919,13 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
   np_w32(&w, (uint32_t)g_tick);
   np_w32(&w, last_input_tick);
   np_w32(&w, net_world_hash());
+  // THE ARENA CAN CHANGE UNDER A LIVE CLIENT. A server regenerates the map on
+  // every rematch, and the seed was handed out exactly once, in ACCEPT — so
+  // after the first match end the server simulated one world and streamed it
+  // to clients still colliding against another. That does not present as a
+  // version error, it presents as rubber-banding through walls. 4 bytes at
+  // 60 Hz is 240 B/s per client; the alternative is a re-handshake.
+  np_w32(&w, g_map_seed);
   size_t cnt_at = w.at;
   np_w8(&w, 0);                            // count placeholder
   int cnt = 0;
@@ -7828,11 +7946,12 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
 // on a malformed header (wrong proto / type).
 [[maybe_unused]] static int net_snapshot_read(const unsigned char *buf, size_t len, uint32_t *server_tick,
                              uint32_t *last_input_tick, uint32_t *world,
-                             net_ent_t *out, int out_cap) {
+                             uint32_t *seed,
+                             net_ent_t *out, int out_cap, int *complete) {
   np_rd r = {buf, len, 0, 0};
   if (np_r16(&r) != NET_PROTO) return -1;
   if (np_r8(&r) != NP_SNAPSHOT) return -1;
-  uint32_t st = np_r32(&r), li = np_r32(&r), wh = np_r32(&r);
+  uint32_t st = np_r32(&r), li = np_r32(&r), wh = np_r32(&r), sd = np_r32(&r);
   int cnt = np_r8(&r);
   if (r.bad) return -1;
   if (cnt > out_cap) cnt = out_cap;        // never write past the caller array
@@ -7842,9 +7961,15 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
     if (!net_ent_decode(&r, &ne)) break;   // truncated: stop, keep what parsed
     out[got++] = ne;
   }
+  // A PARTIAL LIST IS NOT A SHORTER ROSTER. Records go out in ENT_FOREACH
+  // order, so humans are LAST — a single unparseable record therefore looks
+  // exactly like "everyone after this left", and a caller that reads absence
+  // as departure would retire them, up to and including the local player.
+  if (complete) *complete = (got == cnt);
   if (server_tick) *server_tick = st;
   if (last_input_tick) *last_input_tick = li;
   if (world) *world = wh;
+  if (seed) *seed = sd;
   return got;
 }
 
@@ -7991,6 +8116,12 @@ static void net_hist_record(void) {
 [[maybe_unused]] static float net_hist_trace(int e, long t, float frac, v3 o, v3 d, int *part) {
   if (g_hist_tick < 0) return -1.0f;
   long newest = g_hist_tick, oldest = newest - (NET_HIST - 1);
+  // A session younger than the ring has no history before tick 0, and without
+  // this the window's floor goes NEGATIVE: the clamp below then passes a
+  // negative t straight through, and C's % keeps the sign, so the lookup
+  // indexes before the array. Only reachable in the first NET_HIST-1 ticks —
+  // which is exactly when a client joins.
+  if (oldest < 0) oldest = 0;
   if (t < oldest) { t = oldest; frac = 0.0f; }
   if (t >= newest) { t = newest; frac = 0.0f; }
   const hist_t *a = &g_hist[e][t % NET_HIST];
@@ -8077,6 +8208,15 @@ static v3 ent_aimpoint(int e) {  // upper chest
 // out-of-arena lengths no current caller produces.
 static int los_blocked(v3 o, v3 d, float lim) {
   if (lim > GUN_RANGE) return 1;
+  // This loop is where the 20-bot sim spends most of its time (gprof: 11.9 of
+  // 12.1 million ray_aabb calls arrive from here, ~23% of sim self-time), so
+  // it looks like the obvious place to optimize. A segment-AABB pre-reject was
+  // tried and REMOVED: it is exactly equivalent and it measured 417 ms against
+  // 409 ms unmodified over ten interleaved 24000-tick runs, i.e. no win and
+  // possibly a small loss. With ~30 solids, ray_aabb is already cheap enough
+  // that six extra compares per solid cost more than the rejects save. If this
+  // is ever revisited, the lever is the SOLID COUNT (a grid or a BVH), not the
+  // per-solid test — and measure it interleaved, on an idle machine.
   for (int i = 0; i < g_num_solids; i++) {
     v3 n;
     float t = ray_aabb(o, d, g_solids[i].min, g_solids[i].max, &n);
@@ -8829,10 +8969,13 @@ static gunanim_t gun_anim(const weapon_t *w, float alpha) {
         // slowly and then slams the last centimetre, and a symmetric ease spends
         // its speed in the middle where nothing happens. Cubed, 70% of the travel
         // is in the last third and it lands exactly on the seat. CLAMPED because
-        // the branch bound is per-weapon while the ramp's window is not: the
-        // sniper's seat leaves 0.30 of progress in which an unclamped ramp climbs
-        // to 2.875, and a cube of (1 - 2.875) is -6.58, i.e. a magazine six
-        // metres under the arena.
+        // the branch bound (`seat`) and the ramp's window are two separate
+        // numbers: they coincide today — GUN_MAG_U's 0.40+0.16 ends on
+        // RELOAD_BEAT[*][0] = 0.560 and GUN_MAG_U_TAC's window ends on
+        // RELOAD_SEAT_TAC — and the clamp is what keeps a beat MOVED without its
+        // window from running u past 1. The sniper's old 0.860 seat against the
+        // 0.16 window reached u = 2.875, where 1 - u^3 is -22.7: a magazine
+        // twenty metres under the arena.
         //
         // IT HAS TO BE 1 - u^3, NOT (1 - u)^3, and the two are mirror images.
         // The shipped expression was the second: it put 34.7 mm of travel in the
@@ -8860,7 +9003,7 @@ static gunanim_t gun_anim(const weapon_t *w, float alpha) {
   // ...and it does not happen at all on a TACTICAL reload of the AR: the bolt
   // never locked back, so there is nothing to release. The sniper works its
   // action either way, which is why it is exempt.
-  g.bolt = (w->reload_tac && cur != WPN_SR)
+  g.bolt = tac_ar
          ? 0.0f
          : f_clamp((prog - 0.660f) / (0.330f - 1.0f / ticks), 0.0f, 1.0f);
   if (cur == WPN_SR) {
@@ -9197,8 +9340,19 @@ static void bot_tick(int bi) {
       float cdx = b->cov_p.x - b->pos.x, cdz = b->cov_p.z - b->pos.z;
       float cl = sqrtf(cdx * cdx + cdz * cdz);
       if (cl < 0.9f) {
-        b->cov_valid = 0;  // arrived: hold here, the line is already broken
+        // Arrived: hold here, the line is already broken, and hand the bot to
+        // the pre-aim/peek branch below.
+        b->cov_valid = 0;
         b->in_cover = 0;
+        // ...but do not re-arm the probe on the very NEXT tick. Clearing
+        // cov_valid alone put a bot standing in its own cover through
+        // bot_cover_spot (a couple of dozen ray casts) every tick for the
+        // whole reload. Holding cov_valid instead was worse in the other
+        // direction — measured, it took cover_pct from 8.0 to 1.0 at seed
+        // 1337, i.e. the tactic nearly stopped firing. The cooldown the
+        // FAILED-probe path already uses is the right lever: same behaviour,
+        // one probe every 10 ticks instead of 120 per second.
+        b->cov_retry = 10;
       } else {
         wx = cdx / cl;
         wz = cdz / cl;
@@ -9490,6 +9644,20 @@ static void match_tick(void) {
   }
   while (g_match.nbots > want) g_bots[--g_match.nbots].active = 0;
 
+  // A DEDICATED SERVER OWNS ITS OWN REMATCH. Everywhere else the rematch is a
+  // fire press from g_local_ent, and a server has no local entity (-1), so
+  // nothing could ever clear g_match.over there: bots stop ticking, respawns
+  // stop, the trigger is gated off, and the instance sits frozen on its final
+  // scoreboard until somebody restarts the process. Clients get the scoreboard
+  // for MATCH_OVER_TICKS and then a fresh arena, which is what a public server
+  // has to do. Kept OUT of match_t: that struct is memset by match_restart and
+  // its tail layout is load-bearing (see the counter arrays above).
+  static int over_t;
+  if (g_server) {
+    if (!g_match.over) over_t = 0;
+    else if (++over_t >= MATCH_OVER_TICKS) { over_t = 0; g_match.restart_req = 1; }
+  }
+
   if (g_match.restart_req) {
     g_match.restart_req = 0;
     match_restart();
@@ -9555,7 +9723,6 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
     if (w->reload_t > 0)
       // .src: a designated-initializer push with the field left out is
       // SILENTLY entity 0 (zero-init) — every identity field is explicit now.
-      // 0 = this player's entity id; Phase 1 threads the real one.
       ev_push((event_t){.type = EV_RELOAD_CANCEL, .src = ent, .a = p->pos,
                         .wpn = w->cur});
     w->cur = want;
@@ -10038,7 +10205,6 @@ typedef struct {
   int      human;                 // human slot (1..MAX_HUMANS-1); 0 while unjoined
   uint32_t last_recv_ms;          // idle-timeout clock
   uint32_t last_input_tick;       // tag the snapshot with the last input applied
-  uint32_t last_ev_ack;           // highest event id the client confirmed
 } net_conn_t;
 static net_conn_t g_conns[MAX_HUMANS];
 static int g_srv_fd = -1;
@@ -10066,6 +10232,15 @@ static void net_srv_rebalance(void) {
 static int net_srv_admit(uint32_t ip, uint16_t port, const char *name) {
   int humans = 0;
   for (int h = 0; h < MAX_HUMANS; h++) if (g_humans_on[h]) humans++;
+  // ONE HOST MAY NOT BE THE WHOLE ARENA. Nothing above bounds joins per source
+  // address, so a single machine could take every human slot with one packet
+  // each and lock a public instance out — the cookie proves the address is
+  // reachable, not that it is a different person. NAT legitimately puts a few
+  // players behind one address, which is what the allowance is for.
+  int same = 0;
+  for (int i = 0; i < MAX_HUMANS; i++)
+    if (g_conns[i].used && g_conns[i].ip == ip) same++;
+  if (same >= NET_JOIN_PER_HOST) return -1;
   net_fill_t act = net_fill_decision(humans, g_match.nbots, /*is_code*/0,
                                      g_srv.fighters, g_srv.cap_public, g_srv.cap_hard);
   if (act == NF_REJECT) return -1;
@@ -10121,7 +10296,13 @@ static void net_srv_packet(const unsigned char *b, int n, uint32_t ip, uint16_t 
   }
   int type = np_r8(&r);
   if (type == NP_CONNECT) {
-    // Stateless cookie, reply STRICTLY SMALLER than the request (§7.1).
+    // THE REPLY MUST BE SMALLER THAN THE REQUEST, and that only holds if the
+    // request has a floor. A bare CONNECT is 3 bytes (proto + type, empty
+    // name) against a 7-byte COOKIE — a 2.3x amplifier pointed at whatever
+    // source address the attacker forged. The client pads to
+    // NET_CONNECT_MIN; anything shorter is not a client of ours and is
+    // dropped in silence, which costs a spoofer the whole reflection.
+    if (n < NET_CONNECT_MIN) return;
     unsigned char out[8]; np_wr w = {out, sizeof out, 0, 0};
     np_w16(&w, NET_PROTO); np_w8(&w, NP_COOKIE);
     np_w32(&w, net_cookie(ip, port, epoch));
@@ -10146,13 +10327,16 @@ static void net_srv_packet(const unsigned char *b, int n, uint32_t ip, uint16_t 
     np_w32(&w, g_map_seed);
     np_w32(&w, net_world_hash());
     net_udp_send(g_srv_fd, ip, port, out, (int)w.at);
+  } else if (type == NP_LEAVE) {
+    int conn = net_conn_find(ip, port);
+    if (conn >= 0) net_srv_drop(conn);      // same teardown as the idle timeout
   } else if (type == NP_INPUT) {
     int conn = net_conn_find(ip, port);
     if (conn < 0) return;                   // unknown source: ignore
     g_conns[conn].last_recv_ms = net_now_ms();
     int h = g_conns[conn].human;
-    uint32_t ack = np_r32(&r);              // highest event id the client has
-    g_conns[conn].last_ev_ack = ack;
+    np_r32(&r);   // event-ack slot (§6.5): reserved, always 0 — read to
+                  // advance the cursor, stored nowhere until a reader exists
     int cnt = np_r8(&r);
     if (cnt > NET_IN_MAX) cnt = NET_IN_MAX;
     // Input budget (§6.7): drop the excess oldest-first, count it.
@@ -10221,6 +10405,7 @@ static int net_srv_client_count(void) {
 // the FULLEST arena with room rather than scattering them. Instances heartbeat
 // every 2 s and expire after 10 s of silence, so a dead one drops out. No sim.
 #define NET_DIR_MAX 64
+#define NET_DIR_PER_HOST 8   // rows one source IP may hold (see net_dir_heartbeat)
 typedef struct {
   uint32_t ip; uint16_t port;
   uint8_t humans, bots, cap_public, cap_hard;
@@ -10241,11 +10426,19 @@ static net_inst_t g_dir[NET_DIR_MAX];
   for (int i = 0; i < 6; i++) code[i] = (char)np_r8(&r);
   if (r.bad) return;
   (void)sport;
-  int slot = -1, free = -1;
+  // ONE HOST, A FEW ROWS. The row key includes the ADVERTISED port, which the
+  // sender chooses, so a single unauthenticated host could otherwise walk that
+  // field and fill the whole table in NET_DIR_MAX packets — every real
+  // instance expired out of Quick Join by one machine. The source IP is the
+  // part an attacker cannot pick freely (the heartbeat is never answered, so
+  // spoofing it buys nothing), and a real host runs a handful of instances.
+  int slot = -1, free = -1, mine = 0;
   for (int i = 0; i < NET_DIR_MAX; i++) {
+    if (g_dir[i].last_ms && g_dir[i].ip == ip) mine++;
     if (g_dir[i].last_ms && g_dir[i].ip == ip && g_dir[i].port == port) { slot = i; break; }
     if (!g_dir[i].last_ms && free < 0) free = i;
   }
+  if (slot < 0 && mine >= NET_DIR_PER_HOST) return;
   if (slot < 0) slot = free;
   if (slot < 0) return;             // table full
   g_dir[slot] = (net_inst_t){ip, port, humans, bots, cp, ch, proto, {0}, now};
@@ -10261,7 +10454,12 @@ static net_inst_t g_dir[NET_DIR_MAX];
   np_w16(&w, NET_PROTO); np_w8(&w, NP_INSTANCES);
   size_t cnt_at = w.at; np_w8(&w, 0);
   int cnt = 0, total = 0;
-  for (int i = 0; i < NET_DIR_MAX && cnt < 40; i++) {
+  // Bounded by the BUFFER, not by a hand-counted record cap: a record is 18
+  // bytes (ip4 port2 humans1 bots1 cap2 proto2 code6), so 40 of them plus the
+  // 4-byte header is 724 — past a 704-byte buffer, and np_wr's overflow flag
+  // then made net_dir_reply return 0, i.e. the directory answered NOTHING at
+  // 39 live instances and Quick Join simply stopped working.
+  for (int i = 0; i < NET_DIR_MAX && cnt < 40 && w.at + 18 <= w.n; i++) {
     if (!g_dir[i].last_ms) continue;
     np_w32(&w, g_dir[i].ip); np_w16(&w, g_dir[i].port);
     np_w8(&w, g_dir[i].humans); np_w8(&w, g_dir[i].bots);
@@ -10289,17 +10487,15 @@ typedef struct {
   uint32_t   server_tick;            // newest snapshot's server tick
   uint32_t   ack_input_tick;         // last input the server had applied (reconcile anchor)
   uint32_t   world;                  // server's world hash (arena check)
-  uint32_t   ev_high;                // highest event id seen (dedup + ack)
+  // Event-ack field of the input packet (§6.5). RESERVED: the event channel it
+  // would acknowledge does not exist yet, so this is always 0 — it is kept
+  // because it is part of the wire layout, not because anything reads it.
+  uint32_t   ev_high;
   char       name[12];
   int        reject;                 // last REJECT reason, 0 = none
   int        synced;                 // first authoritative fix received?
   uint32_t   seq;                    // our own input counter (prediction anchor)
-  // our recent inputs, keyed by seq — replayed after a snapshot to re-predict
-  struct { uint16_t buttons; float yaw, pitch, wx, wy; } inring[NET_HIST];
-  v3         predpos[NET_HIST];       // predicted pos AFTER each seq's move
-  // a small ring of recent snapshots for foreign-entity interpolation (§6.6)
-  struct { uint32_t tick; int n; net_ent_t e[MAX_ENTS]; } snap[3];
-  int        snap_head;
+  v3         predpos[NET_HIST];      // predicted pos AFTER each seq's move
 } net_client_t;
 static net_client_t g_cl;
 static int g_cl_corrections;         // reconciliation count, for the proof
@@ -10308,10 +10504,12 @@ static void net_cl_send_input(uint16_t buttons, float yaw, float pitch,
                               float wx, float wy);   // defined below
 
 static void net_cl_send_connect(void) {
-  unsigned char b[16]; np_wr w = {b, sizeof b, 0, 0};
+  unsigned char b[NET_CONNECT_MIN] = {0}; np_wr w = {b, sizeof b, 0, 0};
   np_w16(&w, NET_PROTO); np_w8(&w, NP_CONNECT);
   for (int i = 0; i < 11 && g_cl.name[i]; i++) np_w8(&w, (uint8_t)g_cl.name[i]);
-  net_udp_send(g_cl.fd, g_cl.ip, g_cl.port, b, (int)w.at);
+  // Sent at full length whatever the name weighs: the padding IS the
+  // anti-amplification property, so it may not shrink with a short name.
+  net_udp_send(g_cl.fd, g_cl.ip, g_cl.port, b, NET_CONNECT_MIN);
   g_cl.last_send_ms = net_now_ms();
 }
 static void net_cl_send_join(void) {
@@ -10336,6 +10534,15 @@ static int net_cl_connect(uint32_t ip, uint16_t port, const char *name) {
   return 1;
 }
 static void net_cl_disconnect(void) {
+  // SAY GOODBYE. Best effort and unacknowledged — UDP, and a client that has
+  // already lost the link cannot be helped — but in the common case (LEAVE
+  // MATCH, or quitting) it hands the slot back at once instead of parking it
+  // for the 10 s idle timeout.
+  if (g_cl.fd >= 0 && (g_cl.state == NC_PLAYING || g_cl.state == NC_JOINING)) {
+    unsigned char b[4]; np_wr w = {b, sizeof b, 0, 0};
+    np_w16(&w, NET_PROTO); np_w8(&w, NP_LEAVE);
+    net_udp_send(g_cl.fd, g_cl.ip, g_cl.port, b, (int)w.at);
+  }
   if (g_cl.fd >= 0) net_udp_close(g_cl.fd);
   memset(&g_cl, 0, sizeof g_cl);
   g_cl.fd = -1;
@@ -10369,21 +10576,60 @@ static void net_cl_apply_ent(const net_ent_t *e) {
 }
 
 static void net_cl_snapshot(const unsigned char *b, int n) {
-  uint32_t st, li, wh;
+  uint32_t st, li, wh, sd;
   net_ent_t es[MAX_ENTS];
-  int cnt = net_snapshot_read(b, (size_t)n, &st, &li, &wh, es, MAX_ENTS);
+  int full = 0;
+  int cnt = net_snapshot_read(b, (size_t)n, &st, &li, &wh, &sd, es, MAX_ENTS, &full);
   if (cnt < 0) return;
   if (st < g_cl.server_tick) return;         // stale/out-of-order: drop
   g_cl.server_tick = st;
   g_cl.ack_input_tick = li;
   g_cl.world = wh;
-  // keep the newest in the interp ring
-  g_cl.snap_head = (g_cl.snap_head + 1) % 3;
-  g_cl.snap[g_cl.snap_head].tick = st;
-  g_cl.snap[g_cl.snap_head].n = cnt;
-  for (int i = 0; i < cnt; i++) g_cl.snap[g_cl.snap_head].e[i] = es[i];
+  // FOLLOW THE SERVER'S ARENA. A rematch regenerates it, so the seed can move
+  // mid-session; adopt it and re-upload the world VBO. Then check the hash the
+  // same way the join does — if the two disagree after regenerating from the
+  // server's own seed, the two builds do not agree on the generator, and §6.4
+  // says refuse rather than play a divergent map.
+  if (sd != g_map_seed) {
+    map_generate(sd); g_map_seed = sd;
+    g_world_dirty = 1;
+  }
+  if (wh != net_world_hash()) {
+    g_cl.reject = NR_WORLD;
+    g_cl.state = NC_FAILED;
+    return;
+  }
+  // Foreign entities are applied straight from the newest snapshot. Buffering
+  // a few for interpolation (§6.6) would need a ring HERE — there used to be
+  // one, filled every snapshot and read by nothing, which reads as a feature
+  // that exists. Add it back with the reader, not before it.
   for (int i = 0; i < cnt; i++)
     if ((int)es[i].id != g_cl.my_ent) net_cl_apply_ent(&es[i]);
+  // A ROSTER SHRINKS TOO. Every snapshot carries the FULL roster (the server
+  // walks ENT_FOREACH with no culling), so absence is information: a bot that
+  // yielded its slot to a joining human, or a human who left, is simply not in
+  // the record list. Applying only what arrives made the roster grow-only —
+  // the ghost kept its last position forever, was drawn, counted in the
+  // scoreboard's player total and traced against by every local probe.
+  // Only on a COMPLETE list: a truncated one is short at the TAIL, which is
+  // where the humans are, so a single bad record would read as a mass exit.
+  if (full) {
+    unsigned char seen[MAX_ENTS] = {0};
+    for (int i = 0; i < cnt; i++) seen[es[i].id] = 1;
+    int me = human_of_ent(g_cl.my_ent);
+    // From slot 0, not 1. On a server slot 0 is empty and is not in the list
+    // at all, so a client that skipped it kept its own pre-join entity 0 alive
+    // forever: drawn with a shadow, counted in the scoreboard, and a valid
+    // aim-assist target. Our OWN slot is exempt — the local block below owns it.
+    for (int h = 0; h < MAX_HUMANS; h++)
+      if (h != me && !seen[ent_of_human(h)]) g_humans_on[h] = 0;
+    int top = 0;
+    for (int e = 1; e <= MAX_BOTS; e++) {
+      if (seen[e]) top = e;
+      else g_bots[e - 1].active = 0;
+    }
+    g_match.nbots = top;
+  }
   // The LOCAL player's authoritative block: reconcile (§6.1/6.6). last_input_
   // tick (`li`) is the highest input seq the server has applied — the anchor.
   for (int i = 0; i < cnt; i++) {
@@ -10446,8 +10692,16 @@ static void net_cl_tick(const int held[IN_COUNT], float wx, float wy,
   player_t *p = &g_players[h];
   uint16_t btn = 0;
   for (int k = 0; k < IN_COUNT; k++) if (held[k]) btn |= (uint16_t)(1u << k);
-  int idx = g_cl.seq % NET_HIST;
-  g_cl.inring[idx] = (typeof(g_cl.inring[0])){btn, yaw, pitch, wx, wy};
+  // PREDICT ON THE VALUES THE SERVER WILL ACTUALLY SIMULATE (§6.2). The wire
+  // quantizes angles and the wish vector; predicting on the raw floats and
+  // sending the rounded ones makes client and server run different inputs
+  // every single tick, so reconciliation spends its budget correcting a
+  // difference the client created. Round-tripping here costs nothing visible
+  // (the yaw step is 0.003 deg) and makes the two simulations bit-identical.
+  yaw   = net_dq_yaw(net_q_yaw(yaw));
+  pitch = net_dq_pitch(net_q_pitch(pitch));
+  wx    = net_dq_wish(net_q_wish(wx));
+  wy    = net_dq_wish(net_q_wish(wy));
   p->yaw = yaw; p->pitch = pitch;
   if (g_cl.synced) {                 // predict forward once we have a fix
     g_predicting = 1;
@@ -10483,9 +10737,13 @@ static int net_query_directory(uint32_t dir_ip, uint16_t dir_port,
                                const char *code, uint32_t *out_ip, uint16_t *out_port) {
   int fd = net_udp_open(0);
   if (fd < 0) return -1;
-  unsigned char q[4]; np_wr w = {q, sizeof q, 0, 0};
+  // Padded to NET_QUERY_MIN: the INSTANCES answer is far bigger than a bare
+  // query, so without a floor the directory is a reflector pointed at whatever
+  // address an attacker forges. One Quick Join press costs one 704-byte
+  // datagram, which is nothing, and the directory drops anything shorter.
+  unsigned char q[NET_QUERY_MIN] = {0}; np_wr w = {q, sizeof q, 0, 0};
   np_w16(&w, NET_PROTO); np_w8(&w, NP_QUERY);
-  net_udp_send(fd, dir_ip, dir_port, q, (int)w.at);
+  net_udp_send(fd, dir_ip, dir_port, q, NET_QUERY_MIN);
   uint32_t t0 = net_now_ms();
   int best = -1, best_h = -1, total = 0, found = 0;
   uint32_t bip = 0; uint16_t bport = 0;
@@ -10493,6 +10751,11 @@ static int net_query_directory(uint32_t dir_ip, uint16_t dir_port,
     unsigned char b[1024]; uint32_t ip; uint16_t port;   // and platform-neutral
     int n = net_udp_recv(fd, &ip, &port, b, sizeof b);   // (no nanosleep on Win)
     if (n <= 0) continue;
+    // ONLY FROM THE DIRECTORY WE ASKED. An unchecked source meant any off-path
+    // host that could guess the ephemeral port could forge an INSTANCES reply
+    // and hand the player an address of its choosing — the one packet in the
+    // whole flow that decides which server you end up on.
+    if (ip != dir_ip || port != dir_port) continue;
     np_rd r = {b, (size_t)n, 0, 0};
     if (np_r16(&r) != NET_PROTO || np_r8(&r) != NP_INSTANCES) continue;
     int cnt = np_r8(&r);
@@ -10528,7 +10791,10 @@ static int net_cl_poll(void) {
   uint32_t ip; uint16_t port;
   int n, guard = 0;
   while ((n = net_udp_recv(g_cl.fd, &ip, &port, b, sizeof b)) > 0 && guard++ < 256) {
-    if (ip != g_cl.ip) continue;              // only our server
+    // Source ADDRESS and PORT: the port is half the identity of the socket we
+    // are talking to, and without it any other service on the same host (or
+    // anything that can guess it) can inject into the session.
+    if (ip != g_cl.ip || port != g_cl.port) continue;
     if (n < 3) continue;
     np_rd r = {b, (size_t)n, 0, 0};
     if (np_r16(&r) != NET_PROTO) continue;
@@ -10539,15 +10805,31 @@ static int net_cl_poll(void) {
       g_cl.state = NC_JOINING;
       net_cl_send_join();
     } else if (type == NP_ACCEPT && g_cl.state == NC_JOINING) {
-      g_cl.my_ent = np_r8(&r);
+      int me = np_r8(&r);
       uint32_t seed = np_r32(&r);
-      g_cl.world = np_r32(&r);
+      uint32_t world = np_r32(&r);
+      // The id the server hands out is an INDEX into g_players for the rest of
+      // the session (human_of_ent), so it is validated once, here, at the only
+      // place it enters the process. Unchecked, my_ent = 255 wrote past the
+      // roster on the first predicted tick.
+      if (me >= MAX_ENTS || human_of_ent(me) < 0) {
+        g_cl.reject = NR_PROTO; g_cl.state = NC_FAILED; return 0;
+      }
       map_generate(seed); g_map_seed = seed;  // adopt the server's arena
+      // A DIVERGENT ARENA IS REFUSED, NOT PLAYED (§6.4). Both sides generate
+      // the map from the seed, so the hashes agree unless the generators do
+      // not — and then every prediction, every trace and every spawn is wrong
+      // in a way that reads as cheating rather than as a version mismatch.
+      if (world != net_world_hash()) {
+        g_cl.reject = NR_WORLD; g_cl.state = NC_FAILED; return 0;
+      }
+      g_cl.my_ent = me;
+      g_cl.world = world;
       g_world_dirty = 1;                       // renderer re-uploads the VBO
       // g_local_ent / g_online flip only on the FIRST snapshot (§1.1): keep
       // playing the local match until the server's world actually arrives.
       g_cl.state = NC_PLAYING;
-    } else if (type == NP_REJECT) {
+    } else if (type == NP_REJECT && g_cl.state != NC_PLAYING) {
       g_cl.reject = np_r8(&r);
       g_cl.state = NC_FAILED;
       return 0;
@@ -11060,7 +11342,6 @@ static float g_ao_mul = 1.0f;
 #define MAT_GEAR_R     0.72f   // coyote nylon: carrier, pouches, webbing
 #define MAT_HELM_R     0.42f   // composite shell: broad semi-gloss
 #define MAT_RUBBER_R   0.90f   // knee / elbow pads
-#define MAT_SKIN_R     0.54f
 #define MAT_LEATHER_R  0.50f   // boots
 // A GLOVE is not a boot. At 0.50 the sky reflection carried a dark leather's
 // whole highlight, so every hand facet turned toward the sky rendered blue-grey
@@ -11309,8 +11590,9 @@ static float g_ui_vb[UI_MAX_VERTS * 8];
 static int   g_ui_nverts;
 // This ceiling had NO proof (P0-7): an overflowing HUD does not crash, it
 // simply stops drawing — a scoreboard that quietly ends after row N looks
-// exactly like a match with N players. `budget` prints peak and drops now;
-// re-measure against a 28-row scoreboard before Phase 1 raises the row count.
+// exactly like a match with N players. `budget` prints peak and drops now.
+// The board is ENT_FOREACH over MAX_ENTS, so the worst case is 28 rows, not
+// the 21 the ceiling above was sized against — re-measure it there.
 static int   g_ui_peak;
 static long  g_ui_drops;
 static float g_uis = 1;      // virtual->real pixel scale
@@ -11357,6 +11639,19 @@ static void ui_rect(float x, float y, float w, float h,
   float u = ((float)(GLYPH_SOLID * FONT_SLOT_W) + 2.5f) / FONT_TEX_W;
   float v = 3.5f / FONT_TEX_H;
   ui_quad(x, y, w, h, u, v, u, v, (float[4]){r, g, b, a});
+}
+
+// A panel whose height depends on its own content cannot be drawn last —
+// immediate mode paints in insertion order and it would cover what it frames.
+// So the quad goes down first and its BOTTOM EDGE is rewritten once the rows
+// have been laid out. ui_quad's vertex order is
+//   (x,y) (x+w,y) (x+w,y+h) | (x,y) (x+w,y+h) (x,y+h)
+// so exactly the last three carry the bottom edge.
+static int ui_mark(void) { return g_ui_nverts; }
+static void ui_rect_bottom(int mark, float ybot) {
+  if (mark < 0 || mark + 6 > g_ui_nverts) return;   // dropped: nothing to patch
+  float *p = g_ui_vb + (size_t)mark * 8;
+  p[2 * 8 + 1] = p[4 * 8 + 1] = p[5 * 8 + 1] = ybot * g_uis;
 }
 
 // Crisp line at any angle: an oriented quad (MSAA smooths the edges) — for
@@ -11440,16 +11735,20 @@ static int  quick_join(const char *code);                // directory-picked joi
 static void leave_match(void);                            // drop back to local
 // ONE predicate for "does this session pause?" (§9.7): the open menu pauses a
 // windowed SINGLEPLAYER session, but a networked one does NOT (you would stand
-// there being shot) and never scales with hit-stop. The g_headless term is
-// load-bearing and must survive: the harness never pauses (its `wait` bypasses
-// app_frame; `menu; appframe 3` must still print ticks=0), and a proof
-// screenshot must not carry a PAUSED/LIVE label that lies. Tick decision AND
-// label read this same function so they cannot drift.
+// there being shot) and never scales with hit-stop. Tick decision AND label
+// read this same function so the two cannot drift.
+//
+// It carries no g_headless term, and that is the fix for a regression rather
+// than an omission. The harness never pauses because its `wait` drives
+// sim_advance directly and never enters app_frame at all — nothing here has to
+// arrange that. The one harness path that DOES enter app_frame is the
+// `appframe` command, which exists precisely to prove the pause; exempting it
+// made the proof assert the opposite of the contract (`menu; appframe 3`
+// printed ticks=3 against a documented 0). The two things the term really
+// protected have their own guards where they belong: the PAUSED/LIVE label
+// below and ui_audio_pause both check g_headless themselves.
 static int session_pauses(void) {
   if (g_online) return 0;         // a live session is never frozen
-#ifndef _WIN32
-  if (g_headless) return 0;       // the harness drives sim_advance directly
-#endif
   return g_menu_open;
 }
 static int   g_ui_rebind = -1;   // action currently being rebound, -1 = none
@@ -11839,12 +12138,33 @@ static void ui_menu(void) {
 
   ui_rect(0, 0, g_ui_vw, g_ui_vh, 0, 0, 0, 0.45f);  // dim the world
 
-  // Centred vertically: the virtual space is only 360 tall when the height is
-  // a multiple of 360 — on the Deck's 800 px it is 400, and a top-pinned panel
-  // leaves a dead band below.
-  float pw = 300, px = g_ui_vw * 0.5f - pw * 0.5f, ph = 348;
-  float py = (g_ui_vh - ph) * 0.5f;
+  // THE PANEL IS AS TALL AS ITS TAB, not as tall as the tallest tab. The five
+  // tabs differ by ~120 virtual px, and one fixed height left MATCH sitting in
+  // a panel that was 45% empty — dead space reads as "something failed to
+  // load", and it pushed the footer buttons a long way from the rows they
+  // belong to. Immediate mode cannot know the height before laying the content
+  // out, so the measurement is carried to the NEXT frame: the same one-frame-
+  // late idiom g_ui_nfocus_last already uses for focus wrap-around. The seeds
+  // are the authored heights, so a tab is right on its very first frame too and
+  // the measurement only keeps it honest as rows are added or removed.
+  // Content bottom -> panel bottom: a 10 px gap, the version line, the button
+  // row and the grammar hint, with 5 px of air under it.
+  #define UI_FOOTER_H 56.0f
+  // The tallest tab (KEYBOARD/GAMEPAD-BUTTONS: IN_COUNT bind rows). It fixes
+  // where the panel starts, so the chrome cannot move between tabs.
+  #define UI_PANEL_MAX 358.0f
+  #define UI_BIND_ROW  14.0f   // see the KEYBOARD tab's bind loop
+  static float ph_tab[5] = {320, 276, 348, 230, 348};
+  float pw = 300, px = g_ui_vw * 0.5f - pw * 0.5f;
+  float ph = ph_tab[g_ui_tab];
+  // THE TOP IS ANCHORED, ONLY THE BOTTOM MOVES. Centring each tab's own height
+  // would slide the title, the tab strip and the footer buttons by up to 118 px
+  // as you page across the tabs — and the tab strip is exactly what the eye is
+  // holding while it does that. The anchor is the TALLEST tab's centring, so
+  // the chrome is nailed down and a short tab simply ends sooner.
+  float py = (g_ui_vh - UI_PANEL_MAX) * 0.5f;
   if (py < 6) py = 6;
+  int panel_mark = ui_mark();
   ui_rect(px, py, pw, ph, 0.07f, 0.08f, 0.09f, 0.95f);
   ui_rect(px, py, pw, 2, C_ACCENT, 1);
   ui_text("SETTINGS", px + (pw - ui_text_width("SETTINGS", 2)) * 0.5f, py + 10, 2, C_TEXT, 1);
@@ -11854,8 +12174,12 @@ static void ui_menu(void) {
   // stops" offline and "you are standing in the open" online, and the player
   // must be told which. The harness prints neither (a proof shot carries no
   // lying label).
-  if (session_pauses()) ui_text("PAUSED", px + 16, py + 13, 1, C_ACCENT, 0.9f);
-  else if (g_online)    ui_text("LIVE", px + 16, py + 13, 1, 0.95f, 0.35f, 0.30f, 0.95f);
+  int label = 1;
+#ifndef _WIN32
+  label = !g_headless;   // a proof shot carries no label at all
+#endif
+  if (label && session_pauses()) ui_text("PAUSED", px + 16, py + 13, 1, C_ACCENT, 0.9f);
+  else if (label && g_online)    ui_text("LIVE", px + 16, py + 13, 1, 0.95f, 0.35f, 0.30f, 0.95f);
 
   // Tab strip. Player-facing tabs first; DEV is the tuning workbench and wears
   // a subdued warning tint — DEV_MENU 0 removes it entirely for release.
@@ -11887,7 +12211,13 @@ static void ui_menu(void) {
   if (g_ui_tab == 2) {
   ui_section("KEYBOARD + MOUSE", px, pw, y);
   y += 14;
-  for (int i = 0; i < IN_COUNT; i++, y += 15) {
+  // UI_BIND_ROW, not the 15 every other list uses: IN_COUNT rows plus the
+  // header and the footer block do not fit a 360-unit screen at 15, and what
+  // that looked like was the last bind drawn straight through the permanent
+  // version line — both illegible, on the row a player is most likely to be
+  // rebinding last. 14 fits both bind pages with the tightest one (GAMEPAD ->
+  // BUTTONS, which also carries the sub-tab strip) landing 1 px clear.
+  for (int i = 0; i < IN_COUNT; i++, y += UI_BIND_ROW) {
     int armed = g_ui_rebind == i && !g_ui_rebind_pad;
     const char *tok = armed ? "PRESS KEY" : g_cfg.bind[i];
     if (ui_pill(ACTION_DEF[i].label, tok, px, pw, y, armed, 0, click, cx, cy)) {
@@ -11908,8 +12238,9 @@ static void ui_menu(void) {
         st == NC_CONNECTING ||
         st == NC_JOINING      ? "CONNECTING..." :
         st == NC_PLAYING      ? "JOINING ARENA..." :
-        st == NC_FAILED       ? (g_cl.reject == NR_FULL ? "ALL ARENAS FULL" :
+        st == NC_FAILED       ? (g_cl.reject == NR_FULL  ? "ALL ARENAS FULL" :
                                  g_cl.reject == NR_PROTO ? "UPDATE REQUIRED" :
+                                 g_cl.reject == NR_WORLD ? "ARENA MISMATCH" :
                                  "SERVER UNREACHABLE") :
                                 "OFFLINE";
     char line[128];
@@ -12043,6 +12374,7 @@ static void ui_menu(void) {
         ui_text(st, px + (pw - ui_text_width(st, 1)) * 0.5f, y, 1, C_DIM, 1);
       else
         ui_text(st, px + (pw - ui_text_width(st, 1)) * 0.5f, y, 1, C_ACCENT, 1);
+      y += 7;    // past the status line: `y` is what sizes the panel
     } else {
       // Movement rows LAST: the stick moves you, so FORWARD/BACK/LEFT/RIGHT
       // are legitimately "--" — leading with four unbound rows reads as a
@@ -12052,17 +12384,18 @@ static void ui_menu(void) {
         IN_SWAP, IN_SLOT1, IN_SLOT2, IN_SCORE, IN_VIEW,
         IN_FWD, IN_BACK, IN_LEFT, IN_RIGHT,
       };
-      ui_section("BUTTONS - MOVE+AIM ON STICKS", px, pw, y);
-      // The pad status on THIS page too (short form — the row grid leaves no
-      // free line): a player arming a PRESS BTN capture that can never
-      // complete while Steam holds the pad deserves to be told so here, not
-      // one sub-page away.
-      if (!g_pad.connected) {
-        const char *st = g_pad_denied ? "PAD HELD BY STEAM" : "NO PAD";
-        ui_text(st, px + pw - 16 - ui_text_width(st, 1), y, 1, C_ACCENT, 1);
-      }
+      // The pad status belongs on THIS page too — a player arming a PRESS BTN
+      // capture that can never complete while Steam holds the pad deserves to
+      // be told here, not one sub-page away. It goes IN the section title
+      // rather than beside it: ui_section rules off to the panel edge, so a
+      // right-aligned warning was struck through by its own separator and then
+      // clipped by the panel.
+      ui_section(g_pad.connected  ? "BUTTONS - MOVE+AIM ON STICKS"
+                 : g_pad_denied   ? "BUTTONS - PAD HELD BY STEAM"
+                                  : "BUTTONS - NO PAD DETECTED",
+                 px, pw, y);
       y += 14;
-      for (int k = 0; k < IN_COUNT; k++, y += 15) {
+      for (int k = 0; k < IN_COUNT; k++, y += UI_BIND_ROW) {
         int i = PAD_ROW[k];
         int armed = g_ui_rebind == i && g_ui_rebind_pad;
         const char *tok = armed ? "PRESS BTN" : pad_disp(g_cfg.padbind[i]);
@@ -12117,6 +12450,7 @@ static void ui_menu(void) {
       g_match.restart_req = 1;  // serviced by the next sim tick
       ui_close_menu();
     }
+    y += 16;   // past the button: `y` is what sizes the panel
   } else {
     // DEV — the developer tuning workbench: every knob a PLAYER never touches
     // (movement feel, weapon feel). Lives behind DEV_MENU so a release build
@@ -12199,7 +12533,21 @@ static void ui_menu(void) {
       if (!g_ui_quit_arm) { g_ui_quit_arm = 1; g_ui_upd_arm = 0; } \
       else { config_write(g_cfg_path, &g_cfg); g_ui_quit = 1; } \
     }
-  float fy = py + ph - 26;
+  // Close the panel under the content: everything below is the fixed footer
+  // block (version line, three buttons, grammar hint), so the height the tab
+  // wants is its own last row plus that block. Clamped so a pathological tab
+  // can neither collapse the panel nor run off a 360-unit screen.
+  {
+    // Clamped by the BOTTOM, not by the height: bounding the height alone let
+    // a tab that starts lower still run off the screen, and on the tallest tab
+    // the clamp silently compressed the footer block instead of the panel.
+    float want = f_clamp((y - py) + UI_FOOTER_H, 150.0f, g_ui_vh - py - 4.0f);
+    ph_tab[g_ui_tab] = want;
+    ph = want;
+    ui_rect_bottom(panel_mark, py + ph);
+  }
+
+  float fy = py + ph - 30;
   // The version line is PERMANENT and stateful, from frame 0 (design §15.1):
   // the player must be able to see their version at all, and an
   // asynchronously appearing row would shift every focus index under it. Only
@@ -12285,7 +12633,7 @@ static void ui_menu(void) {
     // Cursor mode: the accent-filled pill alone does not say typing works.
     h = "TYPE A-Z 0-9   ENTER DONE";
   }
-  if (h) ui_text(h, px + (pw - ui_text_width(h, 1)) * 0.5f, py + ph - 9, 1, C_DIM, 1);
+  if (h) ui_text(h, px + (pw - ui_text_width(h, 1)) * 0.5f, py + ph - 12, 1, C_DIM, 1);
   if (!g_ui_pad_mode) {
     // Software cursor (crosshair) — the hardware cursor stays hidden so
     // screenshots and Windows behave identically.
@@ -12322,19 +12670,30 @@ static void ui_scoreboard(void) {
     }
     idx[j] = v;
   }
-  float pw = 252, ph = 38 + (float)n * 11 + 8;
+  // A FULL ROSTER DOES NOT FIT, and it must not be allowed to try. 28 entities
+  // at 11 units plus the header is 354 against a 360-unit screen, and the
+  // winner banner pushes the panel down another 40 — so the bottom rows were
+  // drawn off the viewport entirely. Those are the LOSING rows, i.e. the ones a
+  // player is most often looking for. Bound the list to what fits and SAY what
+  // was left out; a silently truncated board reads as a board with fewer
+  // players in the match.
+  float top = g_match.over ? 64.0f : 24.0f;
+  int fit = (int)((g_ui_vh - top - 12.0f - 46.0f) / 11.0f);
+  if (fit < 1) fit = 1;
+  int shown = n < fit ? n : fit;
+  int hidden = n - shown;
+  float pw = 252, ph = 38 + (float)shown * 11 + 8 + (hidden ? 10.0f : 0.0f);
   float px = g_ui_vw * 0.5f - pw * 0.5f;
   // Centred on the REAL virtual height — 180 is only the centre when the
   // height is a multiple of 360 (the same trap the settings panel documents:
   // the Deck's 800 px viewport is 400 virtual units tall).
   float py = g_ui_vh * 0.5f - ph * 0.5f;
-  if (py < 24) py = 24;
-  if (g_match.over && py < 64) py = 64;  // leave room for the winner banner
+  if (py < top) py = top;
   ui_rect(px, py, pw, ph, 0.05f, 0.06f, 0.08f, 0.88f);
   ui_rect(px, py, pw, 2, C_ACCENT, 1);
   ui_text("DEATHMATCH", px + 12, py + 8, 1, C_TEXT, 1);
   char sub[28];
-  // "N SPIELER · M BOTS" makes 1-human-vs-7-bots legible instead of sad (§1.4):
+  // "N PLAYERS  M BOTS" makes 1-human-vs-7-bots legible instead of sad (§1.4):
   // the player knows exactly what he fights, and a second human arriving is an
   // event. In a networked session the instance code sits on the line below
   // (added in the UI phase); here the composition is what matters.
@@ -12356,9 +12715,8 @@ static void ui_scoreboard(void) {
   // bot names, so the rarer mark reads as a badge. '>' is the only leading
   // glyph the 5x7 font carries; other humans are marked AND tinted, the local
   // player keeps his highlight bar.
-  int humans_present = 0;
-  ENT_FOREACH(e) if (human_of_ent(e) >= 0) humans_present++;
-  for (int i = 0; i < n; i++) {
+  int humans_present = nh;   // the same walk two lines up; one count, not two
+  for (int i = 0; i < shown; i++) {
     int e = idx[i];
     char buf[16];
     int is_human = human_of_ent(e) >= 0;
@@ -12385,6 +12743,11 @@ static void ui_scoreboard(void) {
              g_match.hits[e] * 100 / g_match.shots[e] : 0);
     ui_text(buf, xa, y, 1, C_DIM, 1);
     y += 11;
+  }
+  if (hidden) {
+    char more[24];
+    snprintf(more, sizeof more, "+%d MORE", hidden);
+    ui_text(more, px + 12, y, 1, C_DIM, 1);
   }
 }
 
@@ -14508,7 +14871,7 @@ static void fig_ball(v3 c, float rx, float ry, float rz, v3 ax, v3 hint,
 // two things that decide whether it reads are both invisible to figcheck and to
 // vmcheck: whether the pad actually lands on the blade, and whether any part of
 // the finger is inside the guard's tube or the receiver. Both are perfectly
-// valid meshes and both are what "die Finger greifen durch das Waffenmodell"
+// valid meshes and both are what "the fingers reach through the weapon model"
 // means. `vmtrig` measures them against these, so the check and the geometry
 // can never describe two different rifles.
 static v3    g_gun_trig_p;    // world contact point on the blade's rear face
@@ -14578,7 +14941,7 @@ static v3 fig_trig_pt(v3 a, v3 c, v3 b, float t) {
 // 9.13 mm — so 6.5 mm of steel sat BEHIND the flesh and the blade rendered
 // impaled through the fingertip from every angle vmorbit can reach. Measured
 // blade-vs-hand: -10.96 mm (AR) and -12.69 mm (SR). That is the single most
-// visible instance of "der Trigger Finger durchgreift das Material", and vmtrig
+// visible instance of "the trigger finger reaches through the material", and vmtrig
 // could not see it because `reach` was the tip's own cap-centre vertex, i.e.
 // this very constant read back to itself.
 #define FTIP_RX 0.82f
@@ -14846,7 +15209,7 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
   // the one digit already rooted with a lerp ON the palm — measures -5.4 mm,
   // i.e. correctly buried. The FRAME is the whole difference, not the tuning,
   // and that is why the defect is state-dependent: k is not a constant, it is
-  // the pose. This is what "die Finger schweben vor der Hand" is.
+  // the pose. This is what "the fingers float in front of the hand" is.
   //
   // pu/pbx are the frame fig_chain itself builds for the distal ring (ny = the
   // last bone, nx = the hint projected perpendicular to it), derived here
@@ -14989,11 +15352,6 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
         float aph = ph0 + side * (0.30f + TRIG_MCP * g_gun_trig_s);
         float arad = rr + 0.0018f;
         tA = hand_pt(gc, ga, e1, e2, FAX[f] - 0.0050f, aph, arad);
-        // 0.22r, not 0.8: a fingertip PRESSES a trigger, and the pad flattens
-        // against it. `vmtrig`'s `reach` is the nearest hand vertex to the
-        // blade's contact point, and it is not monotone in this factor — the
-        // closest vertex switches between the tip's cap and its ring rim — so
-        // it is read as "is the pad on the steel", not tuned to a target.
         // The tip's own half-thickness minus the squash: the pad's SURFACE
         // lands on the steel and deforms into it by TRIG_PAD_SQUASH, which is
         // what vmtrig's `pad` reads back (-0.8 mm at rest, -1.9 pressed).
@@ -15200,8 +15558,8 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
     // a thumb that keeps climbing runs into it. Measured by painting the digit
     // and looking at the player's own frame, the tip came out the FAR side of
     // the AR's receiver as a severed green blob with the shaft on the near side
-    // — the single most visible instance of "der Finger greift durch das
-    // Waffenmaterial" left in the model, and invisible to every distance-based
+    // — the single most visible instance of "the finger reaches through the
+    // weapon material" left in the model, and invisible to every distance-based
     // proof because the thumb is not inside anything, it is THROUGH it.
     // The support hand keeps the full wrap: a handguard has nothing above it,
     // and there the C the thumb makes with the fingers is the whole grip cue.
@@ -15249,8 +15607,8 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
 // arm on his own body in third person were two different objects: nine nodes
 // with a gauntlet, a pronation roll and a five-step value ramp at profile 12,
 // against three nodes of plain tapered sleeve at profile 8. That is the
-// divergence the user actually noticed — "die Arme im first person view sind
-// rund, im third person low poly" — and it is the same class as the two rifles
+// divergence the user actually noticed — "the arms are round in first person
+// and low-poly in third" — and it is the same class as the two rifles
 // `gun_build` was written to collapse into one: an arm authored twice ends up
 // different in the two places the player sees it.
 //
@@ -15309,7 +15667,7 @@ static void fig_forearm(v3 wrist, v3 back, v3 pd, v3 lat, float side,
     // NEVER PUT THE VALUE STEP ON THE SHAPE STEP — the cuff crowns at node 2
     // while the leather -> slate boundary lands at node 4, on geometry that is
     // doing nothing. Stacked on one ring they multiply instead of masking each
-    // other, which relocated the original "kantig" complaint rather than
+    // other, which relocated the original "angular" complaint rather than
     // removing it.
     FAN(-0.010f, 0.0336f, 0.0248f, gnt,    0.99f),   // cuff lip, proud in BOTH axes
     FAN( 0.012f, 0.0364f, 0.0276f, gnt,    0.96f),   // cuff crown
@@ -15828,8 +16186,8 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // THE TRIGGER GROUP. A FINGER HAS TO FIT THROUGH THE GUARD, and this one's
     // opening was 25 x 10 mm — a curled index finger's distal phalanx is 17-19
     // mm thick, so there was no pose in which the digit could be inside the bow
-    // rather than through it. That is the whole "die Finger greifen durch das
-    // Waffenmodell": not a placement error, a hole too small to place anything
+    // rather than through it. That is the whole "the fingers reach through the
+    // weapon model": not a placement error, a hole too small to place anything
     // in. A real AR guard is ~30 x 28 mm inside, which is what this is, and the
     // bow is a rounded RECTANGLE rather than a shallow arc so the length is
     // usable rather than eaten by the uprights.
@@ -18746,8 +19104,8 @@ static long g_vm_muz_tick = -1000; // publish tick: a windowed session renders
 // blend, same weapon) and then draws it from a camera orbiting the hands.
 static struct { int on, which; float yaw, pit, dist; } g_vmorb;
 // Hand/wrist diagnostics, published by vm_build for the `vmhand` command. The
-// user complaint that started three rounds of this work was "wirkt sehr
-// abgeknickt", and it kept surviving fixes because it was being judged from
+// user complaint that started three rounds of this work was "the wrist looks
+// badly kinked", and it kept surviving fixes because it was being judged from
 // renders. These are the four numbers that decide it: how far the wrist bends,
 // how the forearm meets the weapon, how long the palm is, and how far the wrist
 // stands off the grip surface.
@@ -19037,7 +19395,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // the visible GLOVE rather than the forearm — the forearm is already
       // mostly off screen.
       // SOLVED AGAINST `vmhand`, NOT AGAINST RENDERS. Four numbers decide
-      // whether a hand looks "abgeknickt", and none of them can be read off a
+      // whether a hand looks KINKED at the wrist, and none can be read off a
       // screenshot because foreshortening hides all four: the WRIST BEND (palm
       // axis to forearm axis — a firing grip runs 15-25 degrees, 0 is a splint,
       // 45 is the original kink), the FOREARM-TO-BORE angle (a real support arm
@@ -19163,10 +19521,10 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // screen the arm ran 56 px at the cuff to 89 px at the bottom edge with a
       // second derivative of zero — a linear cone. Two nodes past the belly, each
       // stepping down harder than the last, bend that profile back.
-      // THE WRIST IS A LEDGE, and that ledge was most of "der Übergang ist sehr
-      // kantig". At the wrist station the palm ring was 33.2 x 20.5 and the arm
-      // ring 28.6 x 16.0 — the arm entered the hand 4.6 mm narrower and 4.5 mm
-      // thinner all the way round, at the same point in space, so the palm's
+      // THE WRIST IS A LEDGE, and that ledge was most of "the transition is
+      // very angular". At the wrist station the palm ring was 33.2 x 20.5 and
+      // the arm ring 28.6 x 16.0 — the arm entered the hand 4.6 mm narrower
+      // and 4.5 mm thinner all the way round, at the same point in space, so the palm's
       // proximal ring stood proud as a collar and the arm read as a pipe pushed
       // into a cup. Real anatomy runs the other way: at the wrist crease the hand
       // is ~62 x 30 mm and the styloid region 20 mm proximal is 58 x 42, i.e. the
@@ -20539,8 +20897,11 @@ static void pad_look(player_t *p, float dt) {
     // without the height clamp the assist drags deliberate head aim to the
     // chest (2-shot head kills become 4-shot body kills).
     v3 tpos = ent_pos(tgt);
-    float teye = tgt <= MAX_BOTS ? bot_eye(&g_bots[tgt - 1])
-                                 : g_players[human_of_ent(tgt)].eye;
+    // human_of_ent, not `tgt <= MAX_BOTS`: entity 0 IS a human (slot 0) and
+    // that test sent it down the bot branch, reading g_bots[-1]. The three-range
+    // rule has exactly one predicate for "which kind is this id" and this is it.
+    int th = human_of_ent(tgt);
+    float teye = th >= 0 ? g_players[th].eye : bot_eye(&g_bots[tgt - 1]);
     float dhx = tp.x - eye.x, dhz = tp.z - eye.z;
     float dh = sqrtf(dhx * dhx + dhz * dhz);
     float aim_y = eye.y + tanf(p->pitch) * dh;
@@ -20707,6 +21068,15 @@ static int app_frame(app_t *a, player_t *p, double dt, const frame_input_t *in) 
       while (a->acc >= TICK_DT) {
         g_tick++;
         client_online_tick(p, nt ? in->held : in->held_first);
+        // VFX ARE TICK-DRIVEN, so an online tick has to run them too. Every
+        // lifetime in this file is counted in ticks — tracers, muzzle flashes,
+        // impact sparks, decals, corpses, the hitmarker and the hit-stop
+        // window — and this fork ran none of them: effects spawned from
+        // snapshot events and then stood still for the rest of the match.
+        // It stays INSIDE the tick loop and BEFORE the present half below,
+        // which is the same order the singleplayer world tick uses and the
+        // reason corpse_t.born exists.
+        vfx_tick();
         a->acc -= TICK_DT;
         nt++;
       }
@@ -21378,7 +21748,7 @@ static void write_png(const char *path, int w, int h) {
 // width and were enough while the work was "make these buffers not be mono" —
 // they say nothing about the two qualities this round is about. "Fat" is a
 // question about the SPECTRUM (how much of the energy is weight and how much is
-// information) and "hallend" is a question about the ENVELOPE DECAY (how long
+// information) and "reverberant" is a question about the ENVELOPE DECAY (how long
 // the room keeps answering, and whether it darkens as it goes). Both are
 // measured here, so both are numbers.
 // ---------------------------------------------------------------------------
@@ -21476,7 +21846,7 @@ static void an_bands(float *band, float *centroid, float *a_gain) {
 //          actually lands. This is the one that catches a confirmation whose
 //          peak has drifted 70 ms past the event it confirms.
 // t20/t60 run from t_eng to the LAST time the envelope is still within
-// 20/60 dB of it, which is exactly what "hallend" asks: not how long the
+// 20/60 dB of it, which is exactly what "reverberant" asks: not how long the
 // buffer is, but how long it is still audible. Running the filters twice
 // (once for the peak, once for the crossings) beats storing an envelope for a
 // 2.5 s buffer and is bit for bit identical — the filters are deterministic.
@@ -21553,7 +21923,7 @@ static void an_report(const char *tag, const float *b, int frames, float win_s) 
   float band[4], cent, awg, atk, eng, t20, t60, d0, d1, d2, lo60, hi60;
   an_spec(b, nw, SFX_CH);
   an_bands(band, &cent, &awg);
-  // dBA is the number "satter / heftiger" is actually about. Unweighted RMS
+  // dBA is the number "fatter / harder-hitting" is actually about. Unweighted RMS
   // rewards putting energy at 40 Hz, where headphones roll off and the ear is
   // 25 dB down; dBA is what the player experiences as loudness, so it is the
   // ruler the confirmations are balanced against the gunshots on.
@@ -21624,6 +21994,9 @@ static void usage(void) {
        "                     with --port N --fighters N --cap-public N\n"
        "                     --cap-hard N --skill 0|1|2 --fraglimit N and\n"
        "                     --ticks N (exit after N ticks; 0 = run forever)\n"
+       "                     --dir-host H --dir-port N register with a directory\n"
+       "  --directory        instance directory for Quick Join: tracks server\n"
+       "                     heartbeats and answers QUERY. --port N --ticks N\n"
        "  --windowed         play in a window rather than borderless fullscreen\n"
        "  --w N --h N        window size when playing / framebuffer size for the\n"
        "                     harness (default 1280x720; fullscreen uses the display)\n"
@@ -21765,7 +22138,7 @@ static void sim_advance(sim_ctx_t *s) {
   net_hist_record();   // write-only lag-comp history; nothing reads it in SP,
                        // so the byte gate is untouched (the net* proofs read it)
   // Drive the AUDIO ROUTING from the headless sim too, so `sfxlog` and
-  // `mixdown` exercise exactly the code the Windows frame loop runs (the same
+  // `mixdown` exercise exactly the code the played frame loop runs (the same
   // audio_frame_drain). Off unless the harness asked for it, so it cannot
   // perturb a timing or determinism test.
   if (g_audio_route) {
@@ -22201,9 +22574,11 @@ static void run_script(char *script, sim_ctx_t *s) {
       // through the server loop's own tick body, from an identical saved sim
       // state, per-tick hash compared — MISMATCH prints the first divergent
       // tick. "36 000 ticks ran" was no proof: an output that cannot move is
-      // not a proof (parity's own rule). VFX/anim state is deliberately NOT
-      // restored — the sim never reads presentation back, which this equality
-      // also demonstrates.
+      // not a proof (parity's own rule). VFX and the per-human anim/corpse
+      // state are deliberately NOT restored — the sim never reads presentation
+      // back, which this equality also demonstrates. BOT anim is not in that
+      // set: anim_t sits inside bot_t, so it is saved, restored and hashed with
+      // the rest of the bot, and a solver that diverged would show up here.
       long n = next_n();
       if (n > 4096) n = 4096;
       struct {
@@ -22332,13 +22707,13 @@ static void run_script(char *script, sim_ctx_t *s) {
         np_rd r2 = {buf, (size_t)len, 0, 0};
         net_ent_t ne;
         if (net_ent_decode(&r2, &ne)) { accepted_ent++;
-          if (ne.id >= MAX_ENTS || ne.weapon > 3) accepted_ent = -1000000; }
+          if (ne.id >= MAX_ENTS || ne.weapon >= WPN_COUNT) accepted_ent = -1000000; }
         // Cookie validation must never index or trap on garbage inputs.
         (void)net_cookie_valid(rng_next(&rs), (uint16_t)rng_next(&rs),
                                rng_next(&rs), (uint32_t)i);
       }
       printf("netfuzz n=%ld no_crash=ok in_accepted=%ld ent_accepted=%ld "
-             "(all accepted ent ids < MAX_ENTS, weapon <= 3)\n",
+             "(all accepted ent ids < MAX_ENTS, weapon < WPN_COUNT)\n",
              n, accepted_in, accepted_ent < 0 ? -1 : accepted_ent);
     } else if (!strcmp(t, "netpredict")) {
       // The whole snapshot path, in one process: build a snapshot from live
@@ -22354,8 +22729,8 @@ static void run_script(char *script, sim_ctx_t *s) {
       size_t len = net_snapshot_build(snap, sizeof snap, (uint32_t)g_tick);
       net_ent_t a[MAX_ENTS], b[MAX_ENTS];
       uint32_t st, li, wh;
-      int na = net_snapshot_read(snap, len, &st, &li, &wh, a, MAX_ENTS);
-      int nb = net_snapshot_read(snap, len, NULL, NULL, NULL, b, MAX_ENTS);
+      int na = net_snapshot_read(snap, len, &st, &li, &wh, NULL, a, MAX_ENTS, NULL);
+      int nb = net_snapshot_read(snap, len, NULL, NULL, NULL, NULL, b, MAX_ENTS, NULL);
       float worst_mm = 0.0f;
       int mism = na != nb, live = 0;
       ENT_FOREACH(e) {
@@ -22674,16 +23049,23 @@ static void run_script(char *script, sim_ctx_t *s) {
       if (uf) { len = fread(buf, 1, sizeof buf, uf); fclose(uf); }
       char own[64], own_sha[65], rdate[11] = "", rsha[65] = "";
       const char *why;
-      update_asset_name(own, sizeof own);
+      // The DEV CONTAINER IS aarch64 and has no release asset, so
+      // update_asset_name() writes the "none" sentinel here — and a comparison
+      // against an asset that appears in no SHA256SUMS can only ever print
+      // MALFORMED, i.e. the proof of the naming contract would be inert on the
+      // one machine it is run from. Fall back to the first real asset and say
+      // which one was used, so the printed verdict is about the RULES.
+      int have = update_asset_name(own, sizeof own);
+      if (!have) upd_asset_name(own, sizeof own, 0);
       if (!upd_own_sha(own_sha)) own_sha[0] = '\0';
       upd_verdict_t v = uf ? upd_compare(buf, len, own, own_sha, local,
                                          rdate, rsha, &why)
                            : (why = "NO FILE", UPDV_MALFORMED);
       static const char *VN[] = {"MALFORMED", "CURRENT", "UPDATE", "RECUT",
                                  "DOWNGRADE"};
-      printf("updcheck verdict=%s local=%s remote=%s why=%s offer=%d\n",
+      printf("updcheck verdict=%s local=%s remote=%s why=%s offer=%d asset=%s%s\n",
              VN[v], local, rdate[0] ? rdate : "-", why[0] ? why : "-",
-             v == UPDV_UPDATE || v == UPDV_RECUT);
+             v == UPDV_UPDATE || v == UPDV_RECUT, own, have ? "" : " (stand-in)");
     } else if (!strcmp(t, "cfg")) {
       printf("cfg sense=%.2f fov=%d vsync=%d fps_cap=%d show_fps=%d msaa=%d binds=",
              (double)g_cfg.sense, (int)g_cfg.fov, g_cfg.vsync, g_cfg.fps_cap,
@@ -22979,8 +23361,8 @@ static void run_script(char *script, sim_ctx_t *s) {
               // guard and the blade are the two thin tubes and they are tested
               // as tubes; everything else the rifle is made of — receiver,
               // magwell, magazine, grip — is a fat closed chain, and a digit
-              // inside one of those is exactly the "Finger greift durch das
-              // Waffenmaterial" the user keeps seeing. Ray parity over the union
+              // inside one of those is exactly the "finger reaches through the
+              // weapon material" the user keeps seeing. Ray parity over the union
               // works because vmcheck proves every chain is closed.
               int grn[4], ngrn = 0;
               for (int i = 0; i < g_nprobe && ngrn < 2; i++)
@@ -24066,18 +24448,18 @@ static void run_script(char *script, sim_ctx_t *s) {
       s->cam.yaw = next_f();
       s->cam.pitch = next_f();
     } else if (!strcmp(t, "vmhand")) {
-      // THE FOUR NUMBERS THAT DECIDE "abgeknickt". A render cannot answer how
-      // far a wrist bends — foreshortening hides it, and three rounds of this
-      // were judged from screenshots and kept coming back. `bend` is the angle
-      // between the palm's axis and the forearm's (a firing grip runs 20-30
-      // degrees; 0 is a splint, 45+ is the original kink), `bore` is how the
-      // forearm meets the weapon's axis (a real support arm sits 40-55 degrees
-      // off it, 90 is the perpendicular clamp), `palm` is the wrist-to-knuckle
-      // chord against ANSUR's 116 mm p50, and `off` is how far the wrist stands
-      // off the grip SURFACE.
+      // THE FOUR NUMBERS THAT DECIDE WHETHER A WRIST LOOKS KINKED. A render
+      // cannot answer how far a wrist bends — foreshortening hides it, and
+      // three rounds of this were judged from screenshots and kept coming back.
+      // `bend` is the angle between the palm's axis and the forearm's (a firing
+      // grip runs 20-30 degrees; 0 is a splint, 45+ is the original kink),
+      // `bore` is how the forearm meets the weapon's axis (a real support arm
+      // sits 40-55 degrees off it, 90 is the perpendicular clamp), `palm` is
+      // the wrist-to-knuckle chord against ANSUR's 116 mm p50, and `off` is how
+      // far the wrist stands off the grip SURFACE.
       // THE RELOAD IS COVERED TOO, and it was the hole in this proof. The
-      // complaint that started three rounds of wrist work was "das Handgelenk
-      // knickt awkward ab beim halten der Waffe UND BEI RELOAD", and this
+      // complaint that started three rounds of wrist work was "the wrist kinks
+      // awkwardly while holding the weapon AND DURING THE RELOAD", and this
       // command only ever measured the two static holds. A reload moves both
       // grip cylinders — the support hand onto a magazine, the trigger hand onto
       // a bolt knob — so the four numbers are different numbers there, and they
@@ -24350,6 +24732,7 @@ static double nat_now(void) {
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/random.h>    // getrandom() for the cookie secret (net_secret_init)
 
 // --- UDP socket backend, POSIX half (design §6.10) ---
 static int net_udp_open(int port) {
@@ -24398,6 +24781,30 @@ static uint32_t net_now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
+// The ONE seed for g_net_secret, and it has to be unguessable rather than
+// merely different per process. Both consumers are adversarial:
+//   - net_cookie proves a source address is REACHABLE. An attacker who can
+//     compute the server's cookies computes them for addresses that are not
+//     his, and then JOINs from spoofed sources until every human slot holds a
+//     ghost that only the 10 s idle timeout clears — precisely the
+//     slot-exhaustion the cookie exists to prevent, with NET_JOIN_PER_HOST
+//     counting each forged address separately.
+//   - net_code_make derives the instance's friend code from it.
+// The old seed was time(NULL) * 2654435761 ^ pid<<32. The clock is public to
+// the second and Linux's default pid_max is 22 bits, so the whole space is a
+// few million offline guesses against one observed cookie — days of work
+// reduced to seconds. getrandom() is the kernel CSPRNG, needs no fd (so it
+// survives any sandbox that hides /dev), and blocks only before the entropy
+// pool is initialised, which cannot happen to a service started after boot.
+// The fallback keeps a server that somehow gets EAGAIN running rather than
+// refusing to start; it is the old mix, and it is why this is a warning.
+static void net_secret_init(void) {
+  uint64_t s = 0;
+  if (getrandom(&s, sizeof s, 0) == (ssize_t)sizeof s && s) { g_net_secret = s; return; }
+  fprintf(stderr, "server: getrandom() unavailable — cookie secret is GUESSABLE\n");
+  g_net_secret = (uint64_t)time(NULL) * 2654435761u ^ ((uint64_t)getpid() << 32);
 }
 
 typedef struct {           // struct input_event, 64-bit ABI (SteamOS and this
@@ -25616,7 +26023,7 @@ static int upd_apply(void) {
   int st = atomic_load(&g_upd_state);
   if (st != UPD_UPDATE && st != UPD_RECUT) return 0;
   char own[64], url[128 + 128];
-  update_asset_name(own, sizeof own);
+  if (!update_asset_name(own, sizeof own)) return 0;   // no asset: nothing to install
   snprintf(url, sizeof url, "%s/releases/latest/download/%s", g_cfg.update_url, own);
   size_t cap = 4u << 20;                   // == curl's own --max-filesize
   char *buf = malloc(cap);
@@ -25856,13 +26263,16 @@ static void srv_sig(int sig) { (void)sig; g_srv_stop = 1; }
 static int directory_main(void) {
   int fd = net_udp_open(g_srv.port);
   if (fd < 0) { fprintf(stderr, "directory: cannot bind UDP port %d\n", g_srv.port); return 1; }
-  g_net_secret = (uint64_t)time(NULL) * 2654435761u ^ ((uint64_t)getpid() << 32);
+  net_secret_init();
   signal(SIGINT, srv_sig); signal(SIGTERM, srv_sig);
   fprintf(stderr, "directory: port %d, up\n", g_srv.port);
   long done = 0;
   while (!g_srv_stop) {
     uint32_t now = net_now_ms();
-    unsigned char b[512]; uint32_t ip; uint16_t port;
+    // >= NET_QUERY_MIN: recvfrom TRUNCATES a datagram that does not fit and
+    // reports only what it kept, so a buffer under the floor would silently
+    // reject every conforming query as too short.
+    unsigned char b[NET_QUERY_MIN]; uint32_t ip; uint16_t port;
     int n, guard = 0;
     while ((n = net_udp_recv(fd, &ip, &port, b, sizeof b)) > 0 && guard++ < 256) {
       if (n < 3) continue;
@@ -25870,9 +26280,15 @@ static int directory_main(void) {
       if (np_r16(&r) != NET_PROTO) continue;
       int type = np_r8(&r);
       if (type == NP_HEARTBEAT) net_dir_heartbeat(ip, port, b, n, now);
-      else if (type == NP_QUERY) {          // reply SMALLER-first is impossible
-        unsigned char out[1024];            // here, so rate-limit instead: one
-        int len = net_dir_reply(out, sizeof out);   // reply per query, capped list
+      else if (type == NP_QUERY && n >= NET_QUERY_MIN) {
+        // The size floor IS the anti-reflection measure: the INSTANCES reply
+        // is bounded by this same buffer, so the directory can only ever
+        // answer with less than it was sent.
+        // The comment that used to sit here promised a rate limit that was
+        // never written — a bare 3-byte query got the whole list back, i.e.
+        // ~228x amplification toward any address an attacker cared to forge.
+        unsigned char out[NET_QUERY_MIN];
+        int len = net_dir_reply(out, sizeof out);
         if (len) net_udp_send(fd, ip, port, out, len);
       }
     }
@@ -25910,7 +26326,7 @@ static int server_main(uint32_t seed) {
   signal(SIGTERM, srv_sig);
   app_start(&g_players[0], 16, 16, seed);
   g_srv_started = time(NULL);
-  g_net_secret = (uint64_t)time(NULL) * 2654435761u ^ ((uint64_t)getpid() << 32);
+  net_secret_init();
   g_srv_fd = net_udp_open(g_srv.port);
   if (g_srv_fd < 0) {
     fprintf(stderr, "server: cannot bind UDP port %d (in use?)\n", g_srv.port);
@@ -25924,8 +26340,12 @@ static int server_main(uint32_t seed) {
   // core — the VPS bottleneck is bandwidth, never CPU (§3.1).
   struct timespec next;
   clock_gettime(CLOCK_MONOTONIC, &next);
-  // This instance's join code, derived from secret+port (survives a restart,
-  // §1.5) and heartbeat target (Quick Join finds us through the directory).
+  // This instance's join code, derived from secret+port, and the heartbeat
+  // target (Quick Join finds us through the directory). The code is NOT stable
+  // across a restart — the secret is per-process by design, and now
+  // unguessably so (net_secret_init), which is the trade §1.5's "survives a
+  // restart" wording predates: a code an attacker can precompute is a code
+  // that walks him into a private instance.
   char code[7]; net_code_make(code, g_net_secret, g_srv.port);
   uint32_t dir_ip = g_srv.dir_host ? net_resolve(g_srv.dir_host) : 0;
   fprintf(stderr, "server: join code %s%s\n", code,
@@ -26655,7 +27075,7 @@ static int upd_apply(void) {
   int st = atomic_load(&g_upd_state);
   if (st != UPD_UPDATE && st != UPD_RECUT) return 0;
   char own[64], url[128 + 128];
-  update_asset_name(own, sizeof own);
+  if (!update_asset_name(own, sizeof own)) return 0;   // no asset: nothing to install
   snprintf(url, sizeof url, "%s/releases/latest/download/%s", g_cfg.update_url, own);
   size_t cap = 4u << 20;
   char *buf = malloc(cap);

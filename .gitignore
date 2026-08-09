@@ -13,3 +13,4 @@ docs/
 tmp.txt
 __pycache__
 trailer
+.env
