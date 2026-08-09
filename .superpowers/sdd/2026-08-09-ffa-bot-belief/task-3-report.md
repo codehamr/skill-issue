@@ -73,3 +73,52 @@ botmemoryobserve speed=0.000
 - No hidden live target reads in lost-sight path: lost-sight pre-aim, peek probes, and movement derive from `bot_belief_aimpoint(b)`.
 - Deterministic focus: damage reveal stores `threat_src`, bounded `threat_t`, and `threat_score`; same-score crossfire has a stable lower-entity-id tie-break and is covered by `crossfire=1`.
 - Proof restoration: `botmemory_proof` now saves/restores the full bot array plus prior globals/events/RNG state, and still runs `bothear_proof()` after restoration.
+
+## Fix Round 1
+
+Reviewer finding: the `after_60` checkpoint accepted only `BOT_BELIEF_INVESTIGATE`, while the Task 3 brief allows `BOT_BELIEF_INVESTIGATE` or `BOT_BELIEF_SEARCH_SWEEP`.
+
+Change made: updated only the `botmemory_proof` `after_60` assertion to accept either allowed state. Production behavior was unchanged.
+
+Focused proof:
+
+```sh
+make build/game && CFG=$(mktemp -u) && ./build/game --seed 1337 --config "$CFG" --do "botmemory"
+```
+
+Output:
+
+```text
+mkdir -p build
+gcc -std=c23 -O3 -ffast-math -funroll-loops -flto=auto -fno-tree-vectorize -Wall -Wextra -DBUILD_VERSION='"dev"' -DBUILD_COMMIT='"unknown"' code/game.c -o build/game -lEGL -lGL -lX11 -lm
+bothear shot=1 turn=1 move=1 nofire=1 step=1 crouch=0 far=0 priority=shot expiry=patrol cap=1
+botmemory acquired=1 loss=1 t60=1 t300=1 reacquired=1 retained=1 hidden_fire=0 crossfire=1 lose_t=300
+```
+
+Strict compile:
+
+```sh
+gcc -std=c23 -O2 -Wall -Wextra -Werror -fsyntax-only code/game.c
+```
+
+Output: no output, exit 0.
+
+Relevant existing proofs:
+
+```sh
+CFG=$(mktemp -u) && ./build/game --seed 1337 --config "$CFG" --do "bothear; botweapon; botmemoryobserve"
+```
+
+Output:
+
+```text
+bothear shot=1 turn=1 move=1 nofire=1 step=1 crouch=0 far=0 priority=shot expiry=patrol cap=1
+botweapon empty=sr far=sr near=ar moving=ar heard=ar raise=1 cooldown=kept hysteresis=1
+botmemoryobserve speed=0.000
+```
+
+Self-review:
+
+- Proof now matches the brief at both the 60-tick and 300-tick hidden checkpoints.
+- No production perception, damage, movement, or firing behavior changed in this fix round.
+- Hidden fire remains covered by `hidden_fire=0`; deterministic crossfire remains covered by `crossfire=1`.

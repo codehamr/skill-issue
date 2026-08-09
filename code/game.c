@@ -23379,7 +23379,8 @@ static void botmemory_proof(void) {
     if (g_match.shots[1] != old_shots) hidden_fire = 1;
   }
   int after_60 = g_bots[0].tgt == 0 &&
-                 g_bots[0].belief == BOT_BELIEF_INVESTIGATE &&
+                 (g_bots[0].belief == BOT_BELIEF_INVESTIGATE ||
+                  g_bots[0].belief == BOT_BELIEF_SEARCH_SWEEP) &&
                  g_bots[0].lose_t >= 60;
 
   for (int i = 60; i < 300; i++) {
