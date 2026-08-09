@@ -1,4 +1,5 @@
 build/
+.worktrees/
 screenshots/
 .superpowers/
 .agents/
