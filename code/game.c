@@ -22447,6 +22447,7 @@ static void usage(void) {
        "  parity             24 player-vs-bot gameplay rows, ok/MISMATCH each\n"
        "  bothear            authoritative shot/step hearing and investigation proof\n"
        "  botweapon          bot weapon-choice/swap/cooldown hysteresis proof\n"
+       "  botmemory          bot line-of-sight memory proof\n"
        "  tacstat N          bot tactics census: slides/crouch/pre-aim/cover/jumps\n"
        "  budget             scene/peak/max verts + drops (render a frame FIRST —\n"
        "                     it only accumulates while the scene is being built)\n"
@@ -23167,6 +23168,80 @@ static void botweapon_proof(void) {
       !live_emergency || !live_loaded_sr) exit(1);
 }
 
+// Deterministic proof that a bot retains a target through a line-of-sight
+// break longer than the current memory window. The production behavior is
+// intentionally not changed here; this is the red proof for that change.
+static void botmemory_proof(void) {
+  bot_t saved_bot = g_bots[0];
+  player_t saved_player = g_players[0];
+  match_t saved_match = g_match;
+  solid_t saved_solids[MAX_SOLIDS];
+  event_t saved_events[MAX_EVENTS];
+  unsigned char saved_humans[MAX_HUMANS];
+  int saved_num_solids = g_num_solids;
+  int saved_num_events = g_num_events;
+  int saved_frozen = g_bots_frozen;
+  int saved_predicting = g_predicting;
+  int saved_ev_peak = g_ev_peak;
+  long saved_tick = g_tick;
+  long saved_ev_drops = g_ev_drops;
+  uint64_t saved_rng_bot = g_rng_bot;
+  memcpy(saved_solids, g_solids, sizeof saved_solids);
+  memcpy(saved_events, g_events, sizeof saved_events);
+  memcpy(saved_humans, g_humans_on, sizeof saved_humans);
+
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_humans_on[0] = 1;
+  g_num_solids = 0;
+  g_num_events = 0;
+  g_bots_frozen = 0;
+  g_predicting = 1;
+  g_tick = 100;
+  g_bots[0] = (bot_t){.pos = {{0,0,0}}, .prev_pos = {{0,0,0}},
+                       .target = {{0,0,-8}}, .hp = PLAYER_HP, .alive = 1,
+                       .active = 1, .grounded = 1, .eye = EYE_STAND,
+                       .tgt = -1, .wp.cur = WPN_AR};
+  for (int w = 0; w < WPN_COUNT; w++)
+    g_bots[0].wp.ammo[w] = WPN_DEF[w].mag;
+  anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw);
+  g_players[0] = (player_t){.pos = {{0,0,-8}}, .hp = PLAYER_HP,
+                             .alive = 1, .grounded = 1, .eye = EYE_STAND};
+
+  g_tick++;
+  bot_tick(0);
+  int acquired = g_bots[0].tgt == 0;
+
+  g_num_solids = 1;
+  g_solids[0] = (solid_t){.min = {{-2,0,-5}}, .max = {{2,3,-4}}, .pen = 0};
+  for (int i = 0; i < 300; i++) {
+    g_tick++;
+    bot_tick(0);
+  }
+  int held_after_old_window = g_bots[0].tgt == 0 && g_bots[0].lose_t > 240;
+  int lose_t = g_bots[0].lose_t;
+
+  g_bots[0] = saved_bot;
+  g_players[0] = saved_player;
+  g_match = saved_match;
+  memcpy(g_solids, saved_solids, sizeof saved_solids);
+  memcpy(g_events, saved_events, sizeof saved_events);
+  memcpy(g_humans_on, saved_humans, sizeof saved_humans);
+  g_num_solids = saved_num_solids;
+  g_num_events = saved_num_events;
+  g_bots_frozen = saved_frozen;
+  g_predicting = saved_predicting;
+  g_ev_peak = saved_ev_peak;
+  g_tick = saved_tick;
+  g_ev_drops = saved_ev_drops;
+  g_rng_bot = saved_rng_bot;
+  bothear_proof();
+  printf("botmemory acquired=%d held=%d lose_t=%d\n",
+         acquired, held_after_old_window, lose_t);
+  if (!acquired || !held_after_old_window) exit(1);
+}
+
 static void run_script(char *script, sim_ctx_t *s) {
   g_tok_pushback = NULL;
   for (char *t = strtok(script, " \t\r\n;"); t; t = take_tok()) {
@@ -23177,6 +23252,8 @@ static void run_script(char *script, sim_ctx_t *s) {
       bothear_proof();
     } else if (!strcmp(t, "botweapon")) {
       botweapon_proof();
+    } else if (!strcmp(t, "botmemory")) {
+      botmemory_proof();
     } else if (t[0] == '+' || t[0] == '-') {
       s->held[action_from_name(t + 1)] = t[0] == '+';
     } else if (!strcmp(t, "tap")) {
