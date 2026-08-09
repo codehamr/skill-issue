@@ -9508,10 +9508,11 @@ static void bot_belief_clear(bot_t *b) {
 static void bot_belief_observe(bot_t *b, int e) {
   v3 pos = ent_pos(e);
   v3 vel = {{0, 0, 0}};
-  if (b->last_seen_tick > 0 && g_tick > b->last_seen_tick) {
+  if (b->belief == BOT_BELIEF_VISIBLE && b->last_seen_tick > 0 &&
+      g_tick > b->last_seen_tick) {
     float inv_dt = 1.0f / ((float)(g_tick - b->last_seen_tick) * TICK_DT);
-    vel.x = (pos.x - b->belief_pos.x) * inv_dt;
-    vel.z = (pos.z - b->belief_pos.z) * inv_dt;
+    vel.x = (pos.x - b->last_seen.x) * inv_dt;
+    vel.z = (pos.z - b->last_seen.z) * inv_dt;
     float speed = sqrtf(vel.x * vel.x + vel.z * vel.z);
     float max_speed = g_cfg.mv[MV_RUN];
     if (speed > max_speed && speed > 1e-6f) {
@@ -23335,6 +23336,54 @@ static void botmemory_proof(void) {
   if (!acquired || !held_after_old_window) exit(1);
 }
 
+static void botmemoryobserve_proof(void) {
+  bot_t saved_bot = g_bots[0];
+  player_t saved_player = g_players[0];
+  match_t saved_match = g_match;
+  unsigned char saved_humans[MAX_HUMANS];
+  long saved_tick = g_tick;
+  memcpy(saved_humans, g_humans_on, sizeof saved_humans);
+
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_humans_on[0] = 1;
+  g_tick = 100;
+  g_bots[0] = (bot_t){.hp = PLAYER_HP, .alive = 1, .active = 1, .grounded = 1,
+                       .eye = EYE_STAND, .tgt = 0};
+  g_players[0] = (player_t){.hp = PLAYER_HP, .alive = 1, .grounded = 1,
+                             .eye = EYE_STAND};
+
+  float dx = g_cfg.mv[MV_RUN] * TICK_DT * 0.5f;
+  g_players[0].pos = (v3){{0, 0, -8}};
+  bot_belief_observe(&g_bots[0], 0);
+  g_bots[0].last_seen = ent_pos(0);
+
+  g_tick++;
+  g_players[0].pos.x += dx;
+  bot_belief_observe(&g_bots[0], 0);
+  g_bots[0].last_seen = ent_pos(0);
+
+  g_tick++;
+  g_bots[0].belief = BOT_BELIEF_OCCLUDED_HOLD;
+  bot_belief_predict(&g_bots[0]);
+
+  g_tick++;
+  g_players[0].pos.x += dx * 2.0f;
+  bot_belief_observe(&g_bots[0], 0);
+
+  float speed = sqrtf(g_bots[0].last_seen_vel.x * g_bots[0].last_seen_vel.x +
+                      g_bots[0].last_seen_vel.z * g_bots[0].last_seen_vel.z);
+
+  g_bots[0] = saved_bot;
+  g_players[0] = saved_player;
+  g_match = saved_match;
+  memcpy(g_humans_on, saved_humans, sizeof saved_humans);
+  g_tick = saved_tick;
+  printf("botmemoryobserve speed=%.3f\n", speed);
+  if (speed > 0.001f) exit(1);
+}
+
 static void run_script(char *script, sim_ctx_t *s) {
   g_tok_pushback = NULL;
   for (char *t = strtok(script, " \t\r\n;"); t; t = take_tok()) {
@@ -23347,6 +23396,8 @@ static void run_script(char *script, sim_ctx_t *s) {
       botweapon_proof();
     } else if (!strcmp(t, "botmemory")) {
       botmemory_proof();
+    } else if (!strcmp(t, "botmemoryobserve")) {
+      botmemoryobserve_proof();
     } else if (t[0] == '+' || t[0] == '-') {
       s->held[action_from_name(t + 1)] = t[0] == '+';
     } else if (!strcmp(t, "tap")) {
