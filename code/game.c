@@ -7365,6 +7365,9 @@ static float ent_flash01(int flash, int head) {
 #define BOT_HEAR_SHOT_TICKS 180
 #define BOT_THREAT_TICKS 150
 #define BOT_SWAP_COOLDOWN_TICKS 240
+#define BOT_TARGET_EPS 0.001f
+#define BOT_TARGET_HOLD_BONUS 450.0f
+#define BOT_TARGET_HIDDEN_BREAK_MARGIN 250.0f
 #define BOT_SNIPER_ENTER_DIST   24.0f
 #define BOT_AR_RETURN_DIST      16.0f
 #define BOT_SNIPER_ENTER_SPEED   2.5f
@@ -8532,9 +8535,18 @@ static int bot_threat_accept(const bot_t *b, int src, int score) {
   return src < b->threat_src;   // stable same-evidence crossfire tie-break
 }
 
+static void bot_focus_invalidate(bot_t *b) {
+  b->cov_valid = 0;
+  b->in_cover = 0;
+  b->search_pos = (v3){{0, 0, 0}};
+  b->search_index = 0;
+  b->search_t = 0;
+}
+
 static void bot_damage_reveal(bot_t *b, int src, int score) {
   const bot_skill_t *sk = &BOT_SKILL[g_cfg.sp_diff];
   v3 pos = ent_pos(src);
+  if (b->tgt != src) bot_focus_invalidate(b);
   b->tgt = src;
   b->lose_t = 0;
   b->last_seen = pos;
@@ -9615,10 +9627,8 @@ static void bot_belief_clear(bot_t *b) {
   b->belief_pos = (v3){{0, 0, 0}};
   b->belief_radius = 0.0f;
   b->last_seen_tick = 0;
-  b->search_pos = (v3){{0, 0, 0}};
-  b->search_index = 0;
+  bot_focus_invalidate(b);
   b->search_dir = 1;
-  b->search_t = 0;
   b->reacquire_count = 0;
   b->threat_src = -1;
   b->threat_t = 0;
@@ -9659,6 +9669,48 @@ static void bot_belief_predict(bot_t *b) {
   b->belief_pos.z += b->last_seen_vel.z * TICK_DT;
   b->belief_radius += 0.015f + speed * TICK_DT * 0.20f;
   if (b->belief_radius > 4.5f) b->belief_radius = 4.5f;
+}
+
+typedef struct {
+  int ent;
+  float score, dist;
+} bot_target_choice_t;
+
+static float bot_target_score(const bot_t *b, int e, float dist, float align) {
+  float fov01 = f_clamp((align - BOT_FOV_COS) / (1.0f - BOT_FOV_COS),
+                        0.0f, 1.0f);
+  float score = 1000.0f / (1.0f + dist) + 350.0f * fov01;
+  if (b->threat_t > 0 && b->threat_src == e)
+    score += 650.0f + 70.0f * (float)b->threat_score;
+  if (b->tgt == e) score += BOT_TARGET_HOLD_BONUS;
+  return score;
+}
+
+static int bot_target_better(bot_target_choice_t a, bot_target_choice_t b) {
+  if (a.ent < 0) return 0;
+  if (b.ent < 0) return 1;
+  if (a.score > b.score + BOT_TARGET_EPS) return 1;
+  if (b.score > a.score + BOT_TARGET_EPS) return 0;
+  if (a.dist < b.dist - BOT_TARGET_EPS) return 1;
+  if (b.dist < a.dist - BOT_TARGET_EPS) return 0;
+  return a.ent < b.ent;
+}
+
+static int bot_target_breaks_hidden(const bot_t *b, bot_target_choice_t c) {
+  if (c.ent < 0) return 0;
+  if (b->threat_t > 0 && b->threat_src == c.ent) return 1;
+  return c.score > BOT_TARGET_HOLD_BONUS + BOT_TARGET_HIDDEN_BREAK_MARGIN;
+}
+
+[[maybe_unused]] static const char *bot_belief_label(const bot_t *b) {
+  if (!b->alive || b->tgt < 0) return "patrol";
+  switch (b->belief) {
+    case BOT_BELIEF_VISIBLE: return "visible";
+    case BOT_BELIEF_OCCLUDED_HOLD: return "hold";
+    case BOT_BELIEF_INVESTIGATE: return "investigate";
+    case BOT_BELIEF_SEARCH_SWEEP: return "search";
+  }
+  return "patrol";
 }
 
 static void bot_tick(int bi) {
@@ -9750,8 +9802,7 @@ static void bot_tick(int bi) {
     b->scan_t = 10;
     float fx = sinf(b->yaw), fz = -cosf(b->yaw);
     v3 eo = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
-    int best = -1;
-    float best_d = 1e9f;
+    bot_target_choice_t best = {.ent = -1, .score = -1.0e30f, .dist = 1.0e9f};
     ENT_FOREACH(e) {   // P1-54: without the human range, humans are invisible to the whole AI
       if (e == bi + 1 || !ent_alive(e)) continue;
       // Cheap rejects FIRST: most candidates fail the cone/heard gate, and the
@@ -9762,19 +9813,30 @@ static void bot_tick(int bi) {
       if (d < 0.01f || d > GUN_RANGE) continue;
       float dx = tp.x - b->pos.x, dz = tp.z - b->pos.z;
       float hl = sqrtf(dx * dx + dz * dz);
-      int in_fov = hl > 0.01f && (dx * fx + dz * fz) / hl > BOT_FOV_COS;
-      if (!in_fov) continue;
+      if (hl <= 0.01f) continue;
+      float align = (dx * fx + dz * fz) / hl;
+      if (align <= BOT_FOV_COS) continue;
       // The current target's LOS was already traced by the perception step
       // this tick, and bot_can_see is pure — reuse that verdict.
       if (e == b->tgt) { if (!see) continue; }
       else if (!los_clear(eo, tp)) continue;
-      if (d < best_d) { best_d = d; best = e; }
+      bot_target_choice_t cand = {
+        .ent = e,
+        .score = bot_target_score(b, e, d, align),
+        .dist = d,
+      };
+      if (bot_target_better(cand, best)) best = cand;
     }
-    // Switch targets only when nothing is in sight or the new one is much
-    // closer — no frantic flip-flopping between two visible enemies.
-    if (best >= 0 && best != b->tgt && (!see || best_d < tdist * 0.5f)) {
-      b->tgt = best;
-      bot_belief_clear(b);
+    // Visible candidates use one deterministic score with an explicit hold
+    // bonus and epsilon ties. A hidden remembered target is different: the bot
+    // keeps that focus unless the new visible entity is the recorded attacker
+    // or is close/centered enough to clear the stronger immediate-threat gate.
+    int hidden_current = b->tgt >= 0 && !see && ent_alive(b->tgt);
+    int can_switch = best.ent >= 0 && best.ent != b->tgt &&
+                     (!hidden_current || bot_target_breaks_hidden(b, best));
+    if (can_switch) {
+      bot_focus_invalidate(b);
+      b->tgt = best.ent;
       b->lose_t = 0;
       b->err = sk->err0;
       b->react_t = (int)(sk->react_ms * rng_rangef(&g_rng_bot, 0.85f, 1.25f) *
@@ -22644,7 +22706,7 @@ static void usage(void) {
        "  pos                print tick/position/velocity/eye/grounded/lean/shots\n"
        "  lean               print lean command/clearance/eye+head offset/exposure\n"
        "  wpn                print ammo/spread/recoil/bloom/ads/reload\n"
-       "  bot                print every bot: position/hp/state/target\n"
+       "  bot                print every bot: position/hp/state/target + belief\n"
        "  aimbot             snap yaw/pitch onto the nearest bot's head\n"
        "  botfreeze [on|off] toggle or set ALL bot AI (stable capture target)\n"
        "  rag N [BOT]      ragdoll per tick + summary, across the corpse handover\n"
@@ -22696,7 +22758,7 @@ static void usage(void) {
        "  bothear            authoritative shot/step hearing and investigation proof\n"
        "  botweapon          bot weapon-choice/swap/cooldown hysteresis proof\n"
        "  botmemory          bot line-of-sight memory proof\n"
-       "  tacstat N          bot tactics census: slides/crouch/pre-aim/cover/jumps\n"
+       "  tacstat N          bot tactics census incl. belief memory/search/reacq\n"
        "  budget             scene/peak/max verts + drops (render a frame FIRST —\n"
        "                     it only accumulates while the scene is being built)\n"
        "gamepad commands (raw state exactly as a platform pump writes it):\n"
@@ -23482,10 +23544,15 @@ static void botmemory_proof(void) {
   g_solids[1] = (solid_t){.min = {{10,0,-10}}, .max = {{14,3,-6}}, .pen = 0};
   g_num_solids = 2;
   if (g_match.shots[1] != old_shots) hidden_fire = 1;
+  g_match.nbots = 2;
+  g_bots[1] = (bot_t){.pos = {{5,0,-8}}, .hp = PLAYER_HP, .alive = 1,
+                       .active = 1, .grounded = 1, .eye = EYE_STAND};
+  int visible_decoy_held = 1;
 
   for (int i = 1; i < 60; i++) {
     g_tick++;
     bot_tick(0);
+    if (g_bots[0].tgt != 0) visible_decoy_held = 0;
     if (g_bots[0].tgt != 0 || g_bots[0].lose_t <= 0) hidden_retained = 0;
     if (g_match.shots[1] != old_shots) hidden_fire = 1;
   }
@@ -23519,7 +23586,6 @@ static void botmemory_proof(void) {
                    g_bots[0].lose_t == 0 &&
                    g_bots[0].reacquire_count == reacquire0 + 1;
 
-  g_match.nbots = 2;
   g_bots[1] = (bot_t){.pos = {{3,0,-8}}, .hp = PLAYER_HP, .alive = 1,
                        .active = 1, .grounded = 1, .eye = EYE_STAND};
   g_bots[0].hp = PLAYER_HP;
@@ -23557,13 +23623,13 @@ static void botmemory_proof(void) {
   bothear_proof();
   printf("botmemory acquired=%d loss=%d t60=%d t300=%d reacquired=%d "
          "retained=%d hidden_fire=%d crossfire=%d holdstill=%d "
-         "searchanchor=%d lose_t=%d\n",
+         "searchanchor=%d decoyhold=%d lose_t=%d\n",
          acquired, after_loss, after_60, after_300, reacquired,
          hidden_retained, hidden_fire, crossfire_stable, search_hold_still,
-         fixed_search_anchor, lose_t);
+         fixed_search_anchor, visible_decoy_held, lose_t);
   if (!acquired || !after_loss || !after_60 || !after_300 || !reacquired ||
       !hidden_retained || hidden_fire || !crossfire_stable ||
-      !search_hold_still || !fixed_search_anchor) exit(1);
+      !search_hold_still || !fixed_search_anchor || !visible_decoy_held) exit(1);
 }
 
 static void botmemoryobserve_proof(void) {
@@ -24878,6 +24944,13 @@ static void run_script(char *script, sim_ctx_t *s) {
                b->sliding ? "slide" : b->crouch ? "crouch" : "stand", b->in_cover,
                b->alive && b->tgt >= 0 ? ent_name(b->tgt) : "none",
                b->alive ? 0 : b->respawn_t);
+        printf(" state=%s lose=%d belief=(%.3f %.3f %.3f) rad=%.2f "
+               "search=(%.3f %.3f %.3f) reacq=%d",
+               bot_belief_label(b), b->lose_t,
+               (double)b->belief_pos.x, (double)b->belief_pos.y,
+               (double)b->belief_pos.z, (double)b->belief_radius,
+               (double)b->search_pos.x, (double)b->search_pos.y,
+               (double)b->search_pos.z, b->reacquire_count);
         // The FALL, which no screenshot answers: how far it has toppled, about
         // which horizontal axis, how far it has spun about its own vertical and
         // what the round threw it with. Dead rows only, so every living row is
@@ -25334,13 +25407,35 @@ static void run_script(char *script, sim_ctx_t *s) {
       // does not exist, and a census is the only way to know.
       long n = next_n();
       long slides = 0, jumps = 0, cr_ticks = 0, sl_ticks = 0, preaim = 0, tot = 0;
-      long cov_ticks = 0;
+      long cov_ticks = 0, hold_ticks = 0, investigate_ticks = 0, search_ticks = 0;
+      long visible_ticks = 0, memory_ticks = 0, reacquired = 0, search_anchors = 0;
       int was_sl[MAX_BOTS] = {0}, was_air[MAX_BOTS] = {0};
+      int was_memory[MAX_BOTS] = {0}, was_searching[MAX_BOTS] = {0};
+      int was_search_index[MAX_BOTS] = {0};
+      v3 was_search_pos[MAX_BOTS];
+      for (int b = 0; b < MAX_BOTS; b++) {
+        const bot_t *bt = &g_bots[b];
+        was_memory[b] = bt->active && bt->alive && bt->tgt >= 0 &&
+                        bt->belief != BOT_BELIEF_VISIBLE;
+        was_searching[b] = bt->active && bt->alive && bt->tgt >= 0 &&
+                           (bt->belief == BOT_BELIEF_INVESTIGATE ||
+                            bt->belief == BOT_BELIEF_SEARCH_SWEEP);
+        was_search_index[b] = bt->search_index;
+        was_search_pos[b] = bt->search_pos;
+      }
       for (long i = 0; i < n; i++) {
         sim_advance(s);
         for (int b = 0; b < g_match.nbots; b++) {
           const bot_t *bt = &g_bots[b];
-          if (!bt->active || !bt->alive) { was_sl[b] = 0; was_air[b] = 0; continue; }
+          if (!bt->active || !bt->alive) {
+            was_sl[b] = 0;
+            was_air[b] = 0;
+            was_memory[b] = 0;
+            was_searching[b] = 0;
+            was_search_index[b] = bt->search_index;
+            was_search_pos[b] = bt->search_pos;
+            continue;
+          }
           tot++;
           if (bt->sliding) sl_ticks++;
           if (bt->crouch) cr_ticks++;
@@ -25348,16 +25443,46 @@ static void run_script(char *script, sim_ctx_t *s) {
           if (!bt->grounded && was_air[b] == 0 && bt->vel.y > 1.0f) jumps++;
           if (bt->tgt >= 0 && bt->lose_t > 0) preaim++;
           if (bt->in_cover) cov_ticks++;
+          int memory = bt->tgt >= 0 && bt->belief != BOT_BELIEF_VISIBLE;
+          int searching = bt->tgt >= 0 &&
+                          (bt->belief == BOT_BELIEF_INVESTIGATE ||
+                           bt->belief == BOT_BELIEF_SEARCH_SWEEP);
+          if (bt->tgt >= 0 && bt->belief == BOT_BELIEF_VISIBLE) visible_ticks++;
+          if (bt->belief == BOT_BELIEF_OCCLUDED_HOLD) hold_ticks++;
+          if (bt->belief == BOT_BELIEF_INVESTIGATE) investigate_ticks++;
+          if (bt->belief == BOT_BELIEF_SEARCH_SWEEP) search_ticks++;
+          if (memory) memory_ticks++;
+          if (was_memory[b] && bt->tgt >= 0 && bt->belief == BOT_BELIEF_VISIBLE)
+            reacquired++;
+          if (searching) {
+            v3 d = v3_sub(bt->search_pos, was_search_pos[b]);
+            float moved2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (!was_searching[b] || bt->search_index != was_search_index[b] ||
+                moved2 > BOT_TARGET_EPS * BOT_TARGET_EPS)
+              search_anchors++;
+          }
           was_sl[b] = bt->sliding;
           was_air[b] = !bt->grounded;
+          was_memory[b] = memory;
+          was_searching[b] = searching;
+          was_search_index[b] = bt->search_index;
+          was_search_pos[b] = bt->search_pos;
         }
       }
       printf("tacstat ticks=%ld botticks=%ld slides=%ld slide_pct=%.1f jumps=%ld "
-             "crouch_pct=%.1f preaim_pct=%.1f cover_pct=%.1f\n", n, tot, slides,
+             "crouch_pct=%.1f preaim_pct=%.1f cover_pct=%.1f hold=%ld "
+             "investigate=%ld search=%ld visible=%ld reacquisition=%ld "
+             "memory_pct=%.1f investigate_pct=%.1f search_pct=%.1f "
+             "reacquired=%ld searchanchors=%ld\n", n, tot, slides,
              tot ? 100.0 * (double)sl_ticks / (double)tot : 0.0, jumps,
              tot ? 100.0 * (double)cr_ticks / (double)tot : 0.0,
              tot ? 100.0 * (double)preaim / (double)tot : 0.0,
-             tot ? 100.0 * (double)cov_ticks / (double)tot : 0.0);
+             tot ? 100.0 * (double)cov_ticks / (double)tot : 0.0,
+             hold_ticks, investigate_ticks, search_ticks, visible_ticks,
+             reacquired, tot ? 100.0 * (double)memory_ticks / (double)tot : 0.0,
+             tot ? 100.0 * (double)investigate_ticks / (double)tot : 0.0,
+             tot ? 100.0 * (double)search_ticks / (double)tot : 0.0,
+             reacquired, search_anchors);
     } else if (!strcmp(t, "figv")) {
       g_fchk_v = !g_fchk_v;  // locate every offending triangle, not just count
     } else if (!strcmp(t, "figcheck")) {
