@@ -23680,6 +23680,57 @@ static void botmemoryobserve_proof(void) {
   if (speed > 0.001f) exit(1);
 }
 
+static uint32_t proof_hash_bytes(uint32_t h, const void *data, size_t n) {
+  const unsigned char *p = (const unsigned char *)data;
+  for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+  return h;
+}
+
+static void proof_hash_qpos(np_wr *w, v3 p) {
+  np_w16(w, (uint16_t)net_q_pos(p.x));
+  np_w16(w, (uint16_t)net_q_pos(p.y));
+  np_w16(w, (uint16_t)net_q_pos(p.z));
+}
+
+static uint32_t netloop_report_hash(void) {
+  unsigned char buf[4096];
+  np_wr w = {buf, sizeof buf, 0, 0};
+
+  np_w32(&w, (uint32_t)g_tick);
+  np_w32(&w, g_map_seed);
+  np_w8(&w, (uint8_t)g_match.nbots);
+  np_w8(&w, (uint8_t)g_match.over);
+  np_w8(&w, (uint8_t)g_match.winner);
+  np_w8(&w, (uint8_t)g_match.restart_req);
+
+  ENT_FOREACH(e) {
+    net_ent_t ne;
+    net_ent_from_live(&ne, e);
+    net_ent_encode(&w, &ne);
+    np_w16(&w, (uint16_t)g_match.kills[e]);
+    np_w16(&w, (uint16_t)g_match.deaths[e]);
+    np_w16(&w, (uint16_t)g_match.shots[e]);
+    np_w16(&w, (uint16_t)g_match.hits[e]);
+  }
+
+  for (int i = 0; i < g_match.nbots; i++) {
+    const bot_t *b = &g_bots[i];
+    np_w8(&w, (uint8_t)b->active);
+    np_w8(&w, (uint8_t)b->alive);
+    np_w8(&w, (uint8_t)b->belief);
+    np_w8(&w, (uint8_t)(b->tgt + 1));
+    np_w16(&w, (uint16_t)b->lose_t);
+    np_w16(&w, (uint16_t)b->search_index);
+    np_w16(&w, (uint16_t)b->search_t);
+    np_w16(&w, (uint16_t)b->reacquire_count);
+    proof_hash_qpos(&w, b->belief_pos);
+    proof_hash_qpos(&w, b->search_pos);
+    proof_hash_qpos(&w, b->last_seen);
+  }
+
+  return w.bad ? 0 : proof_hash_bytes(2166136261u, buf, w.at);
+}
+
 static void run_script(char *script, sim_ctx_t *s) {
   g_tok_pushback = NULL;
   for (char *t = strtok(script, " \t\r\n;"); t; t = take_tok()) {
@@ -23927,7 +23978,7 @@ static void run_script(char *script, sim_ctx_t *s) {
         printf("netloop n=%ld MISMATCH at tick %ld (sim %08x vs server %08x)\n",
                n, bad, ha[bad], hb[bad]);
       else
-        printf("netloop n=%ld ok hash=%08x\n", n, n ? ha[n - 1] : 0);
+        printf("netloop n=%ld ok hash=%08x\n", n, n ? netloop_report_hash() : 0);
       s->tick += n;   // the second pass advanced the world again
     } else if (!strcmp(t, "netpack")) {
       // Encode/decode round-trip over random states, worst error PER FIELD.
