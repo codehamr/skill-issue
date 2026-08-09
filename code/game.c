@@ -28620,7 +28620,10 @@ static int win_gameinput_pump(pad_state_t *out) {
     g_gameinput, WIN_GI_KIND_GAMEPAD, NULL, &reading);
   if (FAILED(hr) || !reading) return 0;
   win_gi_gamepad_state_t g = {0};
-  int ok = reading->lpVtbl->GetGamepadState(reading, &g) != 0;
+  // GameInput follows COM HRESULT semantics: S_OK is zero. Treating a
+  // non-zero result as success made every real reading look disconnected,
+  // leaving the controls page stuck on "NO PAD DETECTED".
+  int ok = SUCCEEDED(reading->lpVtbl->GetGamepadState(reading, &g));
   if (ok) {
     pad_standard_state_t sample = {
       .connected = 1, .lx = g.leftThumbstickX, .ly = g.leftThumbstickY,
