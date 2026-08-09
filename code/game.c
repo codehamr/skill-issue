@@ -7359,12 +7359,16 @@ static float ent_flash01(int flash, int head) {
   float f = (float)flash / (float)BOT_FLASH_TICKS;
   return f * f * (head ? FLASH_HEAD_PEAK : FLASH_PEAK);
 }
-#define BOT_MEMORY_TICKS  240     // chase a lost target's last position for 2 s
 #define BOT_FOV_COS       0.50f   // ~120 deg vision cone (acquisition only)
 #define BOT_HEAR_WALL     0.55f   // blocked sound remains useful, but softened
 #define BOT_HEAR_STEP_TICKS 72
 #define BOT_HEAR_SHOT_TICKS 180
+#define BOT_THREAT_TICKS 150
 #define BOT_SWAP_COOLDOWN_TICKS 240
+#define BOT_TARGET_EPS 0.001f
+#define BOT_SEARCH_EPS 0.001f
+#define BOT_TARGET_HOLD_BONUS 450.0f
+#define BOT_TARGET_HIDDEN_BREAK_MARGIN 250.0f
 #define BOT_SNIPER_ENTER_DIST   24.0f
 #define BOT_AR_RETURN_DIST      16.0f
 #define BOT_SNIPER_ENTER_SPEED   2.5f
@@ -7822,16 +7826,24 @@ typedef struct {
   float rec_comp;            // 0..1 how much of its own recoil it pulls back out
   int   burst_lo, burst_hi;  // shots per burst
   float pause_lo, pause_hi;  // ms between bursts
+  int   memory_ticks, hold_ticks, search_ticks;
   // (movement is NOT a difficulty knob: every tier moves on the player's numbers,
   //  and there is no aim LEAD either — see the aiming code for why)
   float tac;                 // 0..1 how often it slides / peeks / jumps out
 } bot_skill_t;
 
+typedef enum {
+  BOT_BELIEF_VISIBLE,
+  BOT_BELIEF_OCCLUDED_HOLD,
+  BOT_BELIEF_INVESTIGATE,
+  BOT_BELIEF_SEARCH_SWEEP
+} bot_belief_state_t;
+
 static const bot_skill_t BOT_SKILL[3] = {
-  //  react  err0  err1  settle turn  reco  burst   pause      tac
-  { 480, 9.0f, 4.2f, 1300, 3.5f, 0.20f, 2, 4,  550, 950, 0.25f },
-  { 300, 6.5f, 2.6f,  950, 5.5f, 0.60f, 3, 6,  380, 700, 0.60f },
-  { 180, 4.0f, 0.7f,  700, 8.5f, 0.92f, 4, 8,  240, 480, 1.00f },
+  //  react  err0  err1  settle turn  reco  burst   pause      mem hold search tac
+  { 480, 9.0f, 4.2f, 1300, 3.5f, 0.20f, 2, 4,  550, 950, 360, 42, 216, 0.25f },
+  { 300, 6.5f, 2.6f,  950, 5.5f, 0.60f, 3, 6,  380, 700, 540, 60, 312, 0.60f },
+  { 180, 4.0f, 0.7f,  700, 8.5f, 0.92f, 4, 8,  240, 480, 720, 78, 432, 1.00f },
 };
 
 struct bot_t {
@@ -7857,6 +7869,15 @@ struct bot_t {
   int   tgt;                           // current enemy entity id, -1 = none
   int   lose_t;                        // ticks since the target was last seen
   v3    last_seen;                     // where the target was last spotted
+  bot_belief_state_t belief;
+  v3    last_seen_vel;
+  v3    belief_pos;
+  float belief_radius;
+  long  last_seen_tick;
+  v3    search_pos;
+  int   search_index, search_dir, search_t, reacquire_count;
+  unsigned search_visited;
+  int   threat_src, threat_t, threat_score;
   int   react_t;                       // ticks until the first shot may leave
   int   scan_t;                        // ticks until the next target rescan
   int   burst, pause_t;                // trigger discipline (a skill trait)
@@ -8279,7 +8300,21 @@ static void bot_spawn(int bi) {
   b->eye = EYE_STAND;
   b->yaw = b->prev_yaw = rng_rangef(&g_rng_bot, -3.14f, 3.14f);
   b->pup_face = b->yaw;  // a surviving puppet faces its spawn, not yaw 0
+  b->belief = BOT_BELIEF_VISIBLE;
   b->tgt = -1;
+  b->last_seen_vel = (v3){{0, 0, 0}};
+  b->belief_pos = (v3){{0, 0, 0}};
+  b->belief_radius = 0.0f;
+  b->last_seen_tick = 0;
+  b->search_pos = (v3){{0, 0, 0}};
+  b->search_index = 0;
+  b->search_dir = 1;
+  b->search_t = 0;
+  b->search_visited = 0;
+  b->reacquire_count = 0;
+  b->threat_src = -1;
+  b->threat_t = 0;
+  b->threat_score = 0;
   b->wp.cur = WPN_AR;
   for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
   b->burst = 3;
@@ -8492,6 +8527,55 @@ static v3 ent_aimpoint(int e) {  // upper chest
   }
   const bot_t *b = &g_bots[e - 1];
   return (v3){{b->pos.x, b->pos.y + bot_eye(b) - ENT_CHEST_OFF, b->pos.z}};
+}
+
+static int bot_threat_accept(const bot_t *b, int src, int score) {
+  if (src < 0 || src >= MAX_ENTS || !ent_alive(src)) return 0;
+  if (b->threat_t <= 0 || b->threat_src < 0 || !ent_alive(b->threat_src))
+    return 1;
+  if (score != b->threat_score) return score > b->threat_score;
+  // threat_t is a bounded evidence age: an equal hit after at least one bot
+  // tick is newer, while equal hits in one world tick resolve by entity ID.
+  if (b->threat_t < BOT_THREAT_TICKS) return 1;
+  return src < b->threat_src;
+}
+
+static void bot_focus_invalidate(bot_t *b) {
+  b->cov_valid = 0;
+  b->in_cover = 0;
+  b->search_pos = (v3){{0, 0, 0}};
+  b->search_index = 0;
+  b->search_t = 0;
+  b->search_visited = 0;
+}
+
+static void bot_damage_remember(bot_t *b, int src) {
+  const bot_skill_t *sk = &BOT_SKILL[g_cfg.sp_diff];
+  v3 pos = ent_pos(src);
+  b->lose_t = 0;
+  b->last_seen = pos;
+  b->belief = BOT_BELIEF_OCCLUDED_HOLD;
+  b->last_seen_vel = (v3){{0, 0, 0}};
+  b->belief_pos = pos;
+  b->belief_radius = 0.20f;
+  b->last_seen_tick = g_tick;
+  b->search_pos = pos;
+  b->search_index = 0;
+  b->search_dir = 1;
+  b->search_t = sk->hold_ticks;
+  b->search_visited = 0;
+}
+
+static void bot_damage_reveal(bot_t *b, int src, int score) {
+  const bot_skill_t *sk = &BOT_SKILL[g_cfg.sp_diff];
+  if (b->tgt != src) bot_focus_invalidate(b);
+  b->tgt = src;
+  bot_damage_remember(b, src);
+  b->threat_src = src;
+  b->threat_t = BOT_THREAT_TICKS;
+  b->threat_score = score;
+  b->err = sk->err0;
+  b->react_t = (int)(sk->react_ms * 0.6f * (float)TICK_HZ / 1000.0f);
 }
 
 // Is the segment o->tp clear of world geometry? The 0.3 m slack — a target is a
@@ -8850,17 +8934,16 @@ static void ent_damage(int ent, int dmg, int part, int src, v3 from, v3 at) {
     b->fl_y += rng_rangef(&g_rng_bot, -2.6f, 2.6f);
     b->fl_p += rng_rangef(&g_rng_bot, -1.4f, 2.2f);
   }
-  if (b->hp > 0 && b->tgt != src) {  // getting shot reveals the shooter
-    b->tgt = src;
-    b->lose_t = 0;
+  if (b->hp > 0) {  // getting shot reveals the shooter
     // The shooter's FEET, not `from` (the shot's eye-height origin): last_seen
     // is a feet position everywhere else, and the pre-aim adds chest height on
     // top of it — storing the eye point made a bot revealed by an unseen
     // shooter pre-aim ~1.6 m over their head until first LOS corrected it.
-    b->last_seen = ent_pos(src);   // one copy; was a g_bots OOB for human ids
-    b->err = BOT_SKILL[g_cfg.sp_diff].err0;
-    b->react_t = (int)(BOT_SKILL[g_cfg.sp_diff].react_ms * 0.6f *
-                       (float)TICK_HZ / 1000.0f);
+    int score = dmg * 16 + (hs ? 8 : 0);
+    if (bot_threat_accept(b, src, score))
+      bot_damage_reveal(b, src, score);  // accepted evidence owns focus + priority
+    else if (b->tgt == src)
+      bot_damage_remember(b, src);       // refresh location, never weaker evidence
   }
   if (b->hp == 0) {
     b->alive = 0;
@@ -9436,8 +9519,7 @@ static void bot_puppet_tick(bot_t *b, int bi) {
 // of them every tick for a whole reload (98.8% of probes fail at 20 bots —
 // often no cover ring answers) made this path a quarter of all world traces
 // while a 12 m/s bot moves 10 cm/tick against the ring's 2.6 m radius.
-static int bot_cover_spot(const bot_t *b, v3 *out) {
-  v3 tp = ent_aimpoint(b->tgt);
+static int bot_cover_spot_point(const bot_t *b, v3 threat_point, v3 *out) {
   for (int r = 0; r < 2; r++) {          // nearest ring first: reachable beats ideal
     float rad = r ? 5.0f : 2.6f;
     for (int k = 0; k < 8; k++) {
@@ -9446,13 +9528,246 @@ static int bot_cover_spot(const bot_t *b, v3 *out) {
       if (fabsf(c.x) > ARENA_HALF - 1.0f || fabsf(c.z) > ARENA_HALF - 1.0f) continue;
       if (!aabb_fits(c, PLAYER_RADIUS, HEIGHT_STAND)) continue;
       v3 eo = {{c.x, c.y + EYE_STAND, c.z}};
-      if (v3_len(v3_sub(tp, eo)) < 0.5f) continue;
-      if (los_clear(eo, tp)) continue;  // still exposed
+      if (v3_len(v3_sub(threat_point, eo)) <= 0.5f) continue;
+      if (los_clear(eo, threat_point)) continue;  // still exposed
       *out = c;
       return 1;
     }
   }
   return 0;
+}
+
+static int bot_cover_spot(const bot_t *b, v3 *out) {
+  return bot_cover_spot_point(b, ent_aimpoint(b->tgt), out);
+}
+
+static v3 bot_belief_aimpoint(const bot_t *b) {
+  return (v3){{b->belief_pos.x, b->belief_pos.y + EYE_STAND - ENT_CHEST_OFF,
+               b->belief_pos.z}};
+}
+
+static v3 bot_search_clamped(v3 p) {
+  p.y = 0.0f;
+  p.x = f_clamp(p.x, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
+  p.z = f_clamp(p.z, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
+  return p;
+}
+
+static void bot_search_candidates(const bot_t *b, v3 cand[6]) {
+  v3 fwd = {{b->last_seen_vel.x, 0.0f, b->last_seen_vel.z}};
+  float sp2 = fwd.x * fwd.x + fwd.z * fwd.z;
+  if (sp2 > 0.25f * 0.25f) {
+    fwd = v3_scale(fwd, 1.0f / sqrtf(sp2));
+  } else {
+    fwd = (v3){{b->belief_pos.x - b->pos.x, 0.0f,
+                b->belief_pos.z - b->pos.z}};
+    float len2 = fwd.x * fwd.x + fwd.z * fwd.z;
+    fwd = len2 > 1e-6f ? v3_scale(fwd, 1.0f / sqrtf(len2))
+                       : (v3){{sinf(b->yaw), 0.0f, -cosf(b->yaw)}};
+  }
+  v3 left_vec = {{-fwd.z, 0.0f, fwd.x}};
+  v3 right_vec = {{fwd.z, 0.0f, -fwd.x}};
+  v3 first_side = b->search_dir >= 0 ? left_vec : right_vec;
+  v3 second_side = b->search_dir >= 0 ? right_vec : left_vec;
+  const float side_step = 4.0f;
+  const float close_step = 2.8f;
+  const float long_step = 5.6f;
+  cand[0] = b->belief_pos;
+  cand[1] = b->last_seen;
+  cand[2] = v3_add(b->last_seen, v3_scale(first_side, side_step));
+  cand[3] = v3_add(b->last_seen, v3_scale(second_side, side_step));
+  cand[4] = v3_add(b->last_seen, v3_scale(fwd, close_step));
+  cand[5] = v3_add(b->last_seen, v3_scale(fwd, long_step));
+  for (int i = 0; i < 6; i++) cand[i] = bot_search_clamped(cand[i]);
+}
+
+static unsigned bot_search_valid_mask(const v3 cand[6], const int fits[6]) {
+  unsigned mask = 0;
+  for (int i = 0; i < 6; i++) {
+    if (!fits[i]) continue;
+    int duplicate = 0;
+    for (int j = 0; j < i; j++) {
+      if (!(mask & (1u << j))) continue;
+      v3 d = v3_sub(cand[i], cand[j]);
+      if (v3_dot(d, d) <= BOT_SEARCH_EPS * BOT_SEARCH_EPS) {
+        duplicate = 1;
+        break;
+      }
+    }
+    if (!duplicate) mask |= 1u << i;
+  }
+  return mask;
+}
+
+static void bot_search_plan_next(bot_t *b, const bot_skill_t *sk) {
+  v3 cand[6];
+  bot_search_candidates(b, cand);
+  int fits[6];
+  for (int i = 0; i < 6; i++)
+    fits[i] = aabb_fits(cand[i], PLAYER_RADIUS, HEIGHT_STAND);
+  unsigned valid = bot_search_valid_mask(cand, fits);
+  if (!valid) {
+    b->search_pos = bot_search_clamped(b->belief_pos);
+    b->search_t = sk->search_ticks;
+    b->search_index = 0;
+    b->search_visited = 0;
+    return;
+  }
+  if (!(valid & ~b->search_visited)) {
+    // The finite set is exhausted. Start the next sweep with the side order
+    // reversed; within a sweep search_dir stays fixed so mask bits keep their
+    // physical meaning.
+    b->search_visited = 0;
+    b->search_dir = -b->search_dir;
+    v3 tmp = cand[2];
+    cand[2] = cand[3];
+    cand[3] = tmp;
+    int tmp_fit = fits[2];
+    fits[2] = fits[3];
+    fits[3] = tmp_fit;
+    valid = bot_search_valid_mask(cand, fits);
+  }
+  v3 threat_point = bot_belief_aimpoint(b);
+  v3 prev_dir = v3_sub(b->search_pos, b->pos);
+  prev_dir.y = 0.0f;
+  float prev_len2 = prev_dir.x * prev_dir.x + prev_dir.z * prev_dir.z;
+  int have_prev = prev_len2 > 0.25f;
+  if (have_prev) prev_dir = v3_scale(prev_dir, 1.0f / sqrtf(prev_len2));
+
+  int best_i = -1, los_calls = 0;
+  float best_score = -1.0e30f;
+  for (int i = 0; i < 6; i++) {
+    if (!(valid & (1u << i)) || (b->search_visited & (1u << i))) continue;
+    v3 anchor_eye = {{cand[i].x, cand[i].y + EYE_STAND, cand[i].z}};
+    v3 to_threat = v3_sub(threat_point, anchor_eye);
+    float threat_d2 = v3_dot(to_threat, to_threat);
+    int opens_los = 0, has_cover = 0;
+    if (threat_d2 > 0.25f && los_calls < 16) {
+      opens_los = los_clear(anchor_eye, threat_point);
+      los_calls++;
+      has_cover = !opens_los;
+    }
+    v3 to_anchor = v3_sub(cand[i], b->pos);
+    float dist2 = to_anchor.x * to_anchor.x + to_anchor.z * to_anchor.z;
+    float novelty = 0.0f;
+    float anchor_len2 = to_anchor.x * to_anchor.x + to_anchor.z * to_anchor.z;
+    if (have_prev && anchor_len2 > 1e-6f) {
+      v3 nd = v3_scale((v3){{to_anchor.x, 0.0f, to_anchor.z}},
+                       1.0f / sqrtf(anchor_len2));
+      novelty = (1.0f - f_clamp(v3_dot(prev_dir, nd), -1.0f, 1.0f)) * 40.0f;
+    }
+    float score = (opens_los ? 1000.0f : 0.0f) + (has_cover ? 80.0f : 0.0f) +
+                  novelty - dist2 * 0.02f;
+    if (best_i < 0 || score > best_score + BOT_SEARCH_EPS ||
+        (fabsf(score - best_score) <= BOT_SEARCH_EPS && i < best_i)) {
+      best_score = score;
+      best_i = i;
+    }
+  }
+
+  if (best_i < 0) {
+    b->search_pos = bot_search_clamped(b->belief_pos);
+    b->search_t = sk->search_ticks;
+    b->search_index = 0;
+    b->search_visited = 0;
+    return;
+  }
+  b->search_pos = cand[best_i];
+  b->search_t = sk->search_ticks;
+  b->search_visited |= 1u << best_i;
+  b->search_index = (best_i + 1) % 6;
+}
+
+static void bot_belief_clear(bot_t *b) {
+  b->belief = BOT_BELIEF_VISIBLE;
+  b->last_seen_vel = (v3){{0, 0, 0}};
+  b->belief_pos = (v3){{0, 0, 0}};
+  b->belief_radius = 0.0f;
+  b->last_seen_tick = 0;
+  bot_focus_invalidate(b);
+  b->search_dir = 1;
+  b->reacquire_count = 0;
+  b->threat_src = -1;
+  b->threat_t = 0;
+  b->threat_score = 0;
+}
+
+static void bot_belief_observe(bot_t *b, int e) {
+  v3 pos = ent_pos(e);
+  v3 vel = {{0, 0, 0}};
+  if (b->belief == BOT_BELIEF_VISIBLE && b->last_seen_tick > 0 &&
+      g_tick > b->last_seen_tick) {
+    float inv_dt = 1.0f / ((float)(g_tick - b->last_seen_tick) * TICK_DT);
+    vel.x = (pos.x - b->last_seen.x) * inv_dt;
+    vel.z = (pos.z - b->last_seen.z) * inv_dt;
+    float speed = sqrtf(vel.x * vel.x + vel.z * vel.z);
+    float max_speed = g_cfg.mv[MV_RUN];
+    if (speed > max_speed && speed > 1e-6f) {
+      float s = max_speed / speed;
+      vel.x *= s;
+      vel.z *= s;
+    }
+  }
+  b->belief = BOT_BELIEF_VISIBLE;
+  b->last_seen = pos;
+  b->last_seen_vel = vel;
+  b->belief_pos = pos;
+  b->belief_radius = 0.20f;
+  b->last_seen_tick = g_tick;
+  b->search_pos = pos;
+  b->search_t = 0;
+  b->lose_t = 0;
+}
+
+static void bot_belief_predict(bot_t *b) {
+  float speed = sqrtf(b->last_seen_vel.x * b->last_seen_vel.x +
+                      b->last_seen_vel.z * b->last_seen_vel.z);
+  b->belief_pos.x += b->last_seen_vel.x * TICK_DT;
+  b->belief_pos.z += b->last_seen_vel.z * TICK_DT;
+  b->belief_radius += 0.015f + speed * TICK_DT * 0.20f;
+  if (b->belief_radius > 4.5f) b->belief_radius = 4.5f;
+}
+
+typedef struct {
+  int ent;
+  float score, dist;
+} bot_target_choice_t;
+
+static float bot_target_score(const bot_t *b, int e, float dist, float align) {
+  float fov01 = f_clamp((align - BOT_FOV_COS) / (1.0f - BOT_FOV_COS),
+                        0.0f, 1.0f);
+  float score = 1000.0f / (1.0f + dist) + 350.0f * fov01;
+  if (b->threat_t > 0 && b->threat_src == e)
+    score += 650.0f + 70.0f * (float)b->threat_score;
+  if (b->tgt == e) score += BOT_TARGET_HOLD_BONUS;
+  return score;
+}
+
+static int bot_target_better(bot_target_choice_t a, bot_target_choice_t b) {
+  if (a.ent < 0) return 0;
+  if (b.ent < 0) return 1;
+  if (a.score > b.score + BOT_TARGET_EPS) return 1;
+  if (b.score > a.score + BOT_TARGET_EPS) return 0;
+  if (a.dist < b.dist - BOT_TARGET_EPS) return 1;
+  if (b.dist < a.dist - BOT_TARGET_EPS) return 0;
+  return a.ent < b.ent;
+}
+
+static int bot_target_breaks_hidden(const bot_t *b, bot_target_choice_t c) {
+  if (c.ent < 0) return 0;
+  if (b->threat_t > 0 && b->threat_src == c.ent) return 1;
+  return c.score > BOT_TARGET_HOLD_BONUS + BOT_TARGET_HIDDEN_BREAK_MARGIN;
+}
+
+[[maybe_unused]] static const char *bot_belief_label(const bot_t *b) {
+  if (!b->alive || b->tgt < 0) return "patrol";
+  switch (b->belief) {
+    case BOT_BELIEF_VISIBLE: return "visible";
+    case BOT_BELIEF_OCCLUDED_HOLD: return "hold";
+    case BOT_BELIEF_INVESTIGATE: return "investigate";
+    case BOT_BELIEF_SEARCH_SWEEP: return "search";
+  }
+  return "patrol";
 }
 
 static void bot_tick(int bi) {
@@ -9490,6 +9805,10 @@ static void bot_tick(int bi) {
   if (b->pause_t > 0) b->pause_t--;
   if (b->react_t > 0) b->react_t--;
   if (b->hurt_t > 0) b->hurt_t--;
+  if (b->threat_t > 0 && --b->threat_t == 0) {
+    b->threat_src = -1;
+    b->threat_score = 0;
+  }
   if (b->slide_cd > 0) b->slide_cd--;
   if (b->jump_cd > 0) b->jump_cd--;
   if (b->cov_retry > 0) b->cov_retry--;
@@ -9505,20 +9824,43 @@ static void bot_tick(int bi) {
   int see = b->tgt >= 0 && ent_alive(b->tgt) &&
             bot_can_see(b, b->tgt, &tdist);
   if (see) {
-    b->lose_t = 0;
-    b->last_seen = ent_pos(b->tgt);
+    int reacquired = b->tgt >= 0 && b->belief != BOT_BELIEF_VISIBLE;
+    bot_belief_observe(b, b->tgt);
+    b->belief = BOT_BELIEF_VISIBLE;
+    if (reacquired) b->reacquire_count++;
   } else if (b->tgt >= 0) {
-    if (!ent_alive(b->tgt) || ++b->lose_t > BOT_MEMORY_TICKS) {
+    if (!ent_alive(b->tgt)) {
       b->tgt = -1;
       b->lose_t = 0;
+      bot_belief_clear(b);
+    } else {
+      if (b->belief == BOT_BELIEF_VISIBLE) {
+        b->belief = BOT_BELIEF_OCCLUDED_HOLD;
+        b->search_t = sk->hold_ticks;
+        b->search_index = 0;
+        b->search_visited = 0;
+      }
+      b->lose_t++;
+      bot_belief_predict(b);
+      if (b->belief == BOT_BELIEF_OCCLUDED_HOLD) {
+        if (b->search_t > 0) b->search_t--;
+        if (b->search_t <= 0) {
+          b->belief = BOT_BELIEF_INVESTIGATE;
+          bot_search_plan_next(b, sk);
+        }
+      }
+      if (b->lose_t >= sk->memory_ticks) {
+        b->tgt = -1;
+        b->lose_t = 0;
+        bot_belief_clear(b);
+      }
     }
   }
   if (--b->scan_t <= 0) {
     b->scan_t = 10;
     float fx = sinf(b->yaw), fz = -cosf(b->yaw);
     v3 eo = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
-    int best = -1;
-    float best_d = 1e9f;
+    bot_target_choice_t best = {.ent = -1, .score = -1.0e30f, .dist = 1.0e9f};
     ENT_FOREACH(e) {   // P1-54: without the human range, humans are invisible to the whole AI
       if (e == bi + 1 || !ent_alive(e)) continue;
       // Cheap rejects FIRST: most candidates fail the cone/heard gate, and the
@@ -9529,24 +9871,36 @@ static void bot_tick(int bi) {
       if (d < 0.01f || d > GUN_RANGE) continue;
       float dx = tp.x - b->pos.x, dz = tp.z - b->pos.z;
       float hl = sqrtf(dx * dx + dz * dz);
-      int in_fov = hl > 0.01f && (dx * fx + dz * fz) / hl > BOT_FOV_COS;
-      if (!in_fov) continue;
+      if (hl <= 0.01f) continue;
+      float align = (dx * fx + dz * fz) / hl;
+      if (e != b->tgt && align <= BOT_FOV_COS) continue;
       // The current target's LOS was already traced by the perception step
       // this tick, and bot_can_see is pure — reuse that verdict.
       if (e == b->tgt) { if (!see) continue; }
       else if (!los_clear(eo, tp)) continue;
-      if (d < best_d) { best_d = d; best = e; }
+      bot_target_choice_t cand = {
+        .ent = e,
+        .score = bot_target_score(b, e, d, align),
+        .dist = d,
+      };
+      if (bot_target_better(cand, best)) best = cand;
     }
-    // Switch targets only when nothing is in sight or the new one is much
-    // closer — no frantic flip-flopping between two visible enemies.
-    if (best >= 0 && best != b->tgt && (!see || best_d < tdist * 0.5f)) {
-      b->tgt = best;
+    // Visible candidates use one deterministic score with an explicit hold
+    // bonus and epsilon ties. A hidden remembered target is different: the bot
+    // keeps that focus unless the new visible entity is the recorded attacker
+    // or is close/centered enough to clear the stronger immediate-threat gate.
+    int hidden_current = b->tgt >= 0 && !see && ent_alive(b->tgt);
+    int can_switch = best.ent >= 0 && best.ent != b->tgt &&
+                     (!hidden_current || bot_target_breaks_hidden(b, best));
+    if (can_switch) {
+      bot_focus_invalidate(b);
+      b->tgt = best.ent;
       b->lose_t = 0;
       b->err = sk->err0;
       b->react_t = (int)(sk->react_ms * rng_rangef(&g_rng_bot, 0.85f, 1.25f) *
                          (float)TICK_HZ / 1000.0f);
       see = bot_can_see(b, b->tgt, &tdist);
-      if (see) b->last_seen = ent_pos(b->tgt);
+      if (see) bot_belief_observe(b, b->tgt);
     }
   }
 
@@ -9724,55 +10078,64 @@ static void bot_tick(int bi) {
     }
     pace = 1.0f;
   } else if (b->tgt >= 0) {
-    // Lost sight. Two things a human does here and a turret does not: keep the
-    // gun ON the spot the enemy will reappear from (pre-aim), and LEAN OUT to
-    // look instead of walking blindly into the open.
-    float dx = b->last_seen.x - b->pos.x, dz = b->last_seen.z - b->pos.z;
-    float hl = sqrtf(dx * dx + dz * dz);
-    if (hl < 1.2f) {
-      b->tgt = -1;
-    } else {
-      v3 eo = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
-      // Pre-aim: yaw AND pitch already on the remembered chest height — the
-      // same standing-chest arithmetic ent_aimpoint uses, so the first frame
-      // the enemy steps out the bot is looking at them, not swinging. (It had
-      // drifted to a hand-written 1.35.)
-      float aimy = b->last_seen.y + (EYE_STAND - ENT_CHEST_OFF) - eo.y;
-      want_yaw = atan2f(dx, -dz) + b->fl_y * DEG2RAD;
-      want_pitch = f_clamp(atan2f(aimy, hl), -1.2f, 1.2f);
-      b->crouch = 0;
-      // Peek: probe from a step out to either side and lean toward whichever one
-      // opens the line. Beats charging the corner, and it is exactly the motion
-      // that makes a bot look like it is clearing an angle.
-      float px = -dz / hl, pz = dx / hl;  // lateral unit
-      int lean = 0;
-      if (hl < 22.0f) {
-        v3 tp2 = ent_aimpoint(b->tgt);  // loop-invariant: neither side moves it
-        for (int t2 = 0; t2 < 2 && !lean; t2++) {
-          int sgn = (b->peek_dir >= 0) == (t2 == 0) ? 1 : -1;
-          v3 probe = {{eo.x + px * 1.35f * (float)sgn, eo.y,
-                       eo.z + pz * 1.35f * (float)sgn}};
-          if (v3_len(v3_sub(tp2, probe)) > 0.4f && los_clear(probe, tp2)) {
-            lean = sgn;
-            b->peek_dir = sgn;
-          }
-        }
-      }
-      if (lean) {
-        wx = px * (float)lean;
-        wz = pz * (float)lean;
-        pace = 1.0f;
-        // ...and sometimes come out of it with a jump instead of a step: hard to
-        // track, and it is the "pops out around the corner" beat.
-        if (b->grounded && b->jump_cd == 0 && hl < 14.0f &&
-            rng_rangef(&g_rng_bot, 0.0f, 1.0f) < sk->tac * 0.10f) {
-          want_jump = 1;
-          b->jump_cd = (int)rng_rangef(&g_rng_bot, 300, 700);
-        }
+    // Lost sight: aim and movement use only the stored belief/search memory.
+    v3 tp = bot_belief_aimpoint(b);
+    v3 eo = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
+    float adx = tp.x - b->pos.x, adz = tp.z - b->pos.z;
+    float ahl = sqrtf(adx * adx + adz * adz);
+    if (ahl > 0.01f) {
+      float aimy = tp.y - eo.y;
+      want_yaw = atan2f(adx, -adz) + b->fl_y * DEG2RAD;
+      want_pitch = f_clamp(atan2f(aimy, ahl), -1.2f, 1.2f);
+    }
+    b->crouch = 0;
+
+    int hidden_need_cover = b->wp.reload_t > 0 || (b->hurt_t > 0 && b->hp < 45);
+    if (!hidden_need_cover) b->cov_valid = 0;
+    if (hidden_need_cover && !b->cov_valid && b->cov_retry == 0) {
+      b->cov_valid = bot_cover_spot_point(b, tp, &b->cov_p);
+      if (!b->cov_valid) b->cov_retry = 10;
+    }
+    b->in_cover = hidden_need_cover && b->cov_valid;
+    if (b->in_cover) {
+      float cdx = b->cov_p.x - b->pos.x, cdz = b->cov_p.z - b->pos.z;
+      float cl = sqrtf(cdx * cdx + cdz * cdz);
+      if (cl < 0.9f) {
+        b->cov_valid = 0;
+        b->in_cover = 0;
+        b->cov_retry = 10;
       } else {
-        wx = dx / hl;
-        wz = dz / hl;
+        wx = cdx / cl;
+        wz = cdz / cl;
         pace = 1.0f;
+      }
+    } else if (b->belief == BOT_BELIEF_OCCLUDED_HOLD) {
+      wx = wz = 0.0f;
+    } else {
+      float sdx = b->search_pos.x - b->pos.x;
+      float sdz = b->search_pos.z - b->pos.z;
+      float sl = sqrtf(sdx * sdx + sdz * sdz);
+      if (sl > 0.01f) want_yaw = atan2f(sdx, -sdz);
+      if (b->belief == BOT_BELIEF_INVESTIGATE) {
+        if (b->search_t > 0) b->search_t--;
+        if (sl < 0.9f || b->search_t <= 0) {
+          b->belief = BOT_BELIEF_SEARCH_SWEEP;
+          bot_search_plan_next(b, sk);
+        } else {
+          wx = sdx / sl;
+          wz = sdz / sl;
+          pace = 0.75f;
+        }
+      } else if (b->belief == BOT_BELIEF_SEARCH_SWEEP) {
+        if (sl < 0.9f) {
+          wx = wz = 0.0f;
+          if (b->search_t > 0) b->search_t--;
+          if (b->search_t <= 0) bot_search_plan_next(b, sk);
+        } else {
+          wx = sdx / sl;
+          wz = sdz / sl;
+          pace = 0.75f;
+        }
       }
     }
   } else if (b->hear_tick) {
@@ -9887,7 +10250,12 @@ static void bot_tick(int bi) {
   float hs = sqrtf(b->vel.x * b->vel.x + b->vel.z * b->vel.z);
   if (wx * wx + wz * wz > 0.01f && hs < 0.3f) b->stuck++;
   else b->stuck = 0;
-  if (engaging && b->stuck > 30) {  // strafing into a wall: go the other way
+  if (!engaging && b->tgt >= 0 && b->belief != BOT_BELIEF_VISIBLE &&
+      b->stuck > 30) {
+    bot_search_plan_next(b, sk);
+    b->belief = BOT_BELIEF_SEARCH_SWEEP;
+    b->stuck = 0;
+  } else if (engaging && b->stuck > 30) {  // strafing into a wall: go the other way
     b->strafe_dir = -b->strafe_dir;
     b->stuck = 0;
   }
@@ -22396,7 +22764,7 @@ static void usage(void) {
        "  pos                print tick/position/velocity/eye/grounded/lean/shots\n"
        "  lean               print lean command/clearance/eye+head offset/exposure\n"
        "  wpn                print ammo/spread/recoil/bloom/ads/reload\n"
-       "  bot                print every bot: position/hp/state/target\n"
+       "  bot                print every bot: position/hp/state/target + belief\n"
        "  aimbot             snap yaw/pitch onto the nearest bot's head\n"
        "  botfreeze [on|off] toggle or set ALL bot AI (stable capture target)\n"
        "  rag N [BOT]      ragdoll per tick + summary, across the corpse handover\n"
@@ -22447,7 +22815,8 @@ static void usage(void) {
        "  parity             24 player-vs-bot gameplay rows, ok/MISMATCH each\n"
        "  bothear            authoritative shot/step hearing and investigation proof\n"
        "  botweapon          bot weapon-choice/swap/cooldown hysteresis proof\n"
-       "  tacstat N          bot tactics census: slides/crouch/pre-aim/cover/jumps\n"
+       "  botmemory          bot line-of-sight memory proof\n"
+       "  tacstat N          bot tactics census incl. belief memory/search/reacq\n"
        "  budget             scene/peak/max verts + drops (render a frame FIRST —\n"
        "                     it only accumulates while the scene is being built)\n"
        "gamepad commands (raw state exactly as a platform pump writes it):\n"
@@ -22805,6 +23174,9 @@ static void bothear_proof(void) {
   memcpy(saved_humans, g_humans_on, sizeof saved_humans);
   int saved_num_solids = g_num_solids, saved_frozen = g_bots_frozen;
   int saved_events = g_num_events;
+  int saved_predicting = g_predicting;
+  int saved_ev_peak = g_ev_peak;
+  long saved_ev_drops = g_ev_drops;
   long saved_tick = g_tick;
   uint64_t saved_rng_bot = g_rng_bot;
 
@@ -22972,6 +23344,9 @@ static void bothear_proof(void) {
   g_num_solids = saved_num_solids;
   g_bots_frozen = saved_frozen;
   g_num_events = saved_events;
+  g_predicting = saved_predicting;
+  g_ev_peak = saved_ev_peak;
+  g_ev_drops = saved_ev_drops;
   g_tick = saved_tick;
   g_rng_bot = saved_rng_bot;
   #undef BOTHEAR_STAGE
@@ -23167,6 +23542,366 @@ static void botweapon_proof(void) {
       !live_emergency || !live_loaded_sr) exit(1);
 }
 
+// Deterministic proof that a bot degrades a lost target through belief states
+// without firing at hidden knowledge, keeps the entity target past the old
+// abrupt memory window, and returns to visible on reacquisition.
+static void botmemory_proof(void) {
+  bot_t saved_bots[MAX_BOTS];
+  player_t saved_player = g_players[0];
+  match_t saved_match = g_match;
+  solid_t saved_solids[MAX_SOLIDS];
+  event_t saved_events[MAX_EVENTS];
+  unsigned char saved_humans[MAX_HUMANS];
+  int saved_num_solids = g_num_solids;
+  int saved_num_events = g_num_events;
+  int saved_frozen = g_bots_frozen;
+  int saved_predicting = g_predicting;
+  int saved_ev_peak = g_ev_peak;
+  long saved_tick = g_tick;
+  long saved_ev_drops = g_ev_drops;
+  uint64_t saved_rng_bot = g_rng_bot;
+  memcpy(saved_bots, g_bots, sizeof saved_bots);
+  memcpy(saved_solids, g_solids, sizeof saved_solids);
+  memcpy(saved_events, g_events, sizeof saved_events);
+  memcpy(saved_humans, g_humans_on, sizeof saved_humans);
+
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_humans_on[0] = 1;
+  g_num_solids = 0;
+  g_num_events = 0;
+  g_bots_frozen = 0;
+  g_predicting = 1;
+  g_tick = 100;
+  g_bots[0] = (bot_t){.pos = {{0,0,0}}, .prev_pos = {{0,0,0}},
+                       .target = {{0,0,-8}}, .hp = PLAYER_HP, .alive = 1,
+                       .active = 1, .grounded = 1, .eye = EYE_STAND,
+                       .tgt = -1, .wp.cur = WPN_AR};
+  for (int w = 0; w < WPN_COUNT; w++)
+    g_bots[0].wp.ammo[w] = WPN_DEF[w].mag;
+  anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw);
+  g_players[0] = (player_t){.pos = {{0,0,-8}}, .hp = PLAYER_HP,
+                             .alive = 1, .grounded = 1, .eye = EYE_STAND};
+
+  g_tick++;
+  bot_tick(0);
+  int acquired = g_bots[0].tgt == 0 &&
+                 g_bots[0].belief == BOT_BELIEF_VISIBLE &&
+                 g_bots[0].lose_t == 0;
+
+  g_num_solids = 1;
+  g_solids[0] = (solid_t){.min = {{-2,0,-5}}, .max = {{2,3,-4}}, .pen = 0};
+  int hidden_fire = 0;
+  int hidden_retained = 1;
+  int old_shots = g_match.shots[1];
+
+  g_tick++;
+  bot_tick(0);
+  int after_loss = g_bots[0].tgt == 0 &&
+                   g_bots[0].belief == BOT_BELIEF_OCCLUDED_HOLD &&
+                   g_bots[0].lose_t > 0;
+  v3 loss_pos = g_bots[0].pos;
+  // Keep the LIVE target sealed away after the loss. Search assertions below
+  // must be about the remembered point, not an accidental flank on this fixture.
+  g_players[0].pos = (v3){{12, 0, -8}};
+  g_solids[1] = (solid_t){.min = {{10,0,-10}}, .max = {{14,3,-6}}, .pen = 0};
+  g_num_solids = 2;
+  if (g_match.shots[1] != old_shots) hidden_fire = 1;
+  g_match.nbots = 2;
+  g_bots[1] = (bot_t){.pos = {{5,0,-8}}, .hp = PLAYER_HP, .alive = 1,
+                       .active = 1, .grounded = 1, .eye = EYE_STAND};
+  int visible_decoy_held = 1;
+
+  for (int i = 1; i < 60; i++) {
+    g_tick++;
+    bot_tick(0);
+    if (g_bots[0].tgt != 0) visible_decoy_held = 0;
+    if (g_bots[0].tgt != 0 || g_bots[0].lose_t <= 0) hidden_retained = 0;
+    if (g_match.shots[1] != old_shots) hidden_fire = 1;
+  }
+  int after_60 = g_bots[0].tgt == 0 &&
+                 (g_bots[0].belief == BOT_BELIEF_INVESTIGATE ||
+                  g_bots[0].belief == BOT_BELIEF_SEARCH_SWEEP) &&
+                 g_bots[0].lose_t >= 60;
+  int search_hold_still = v3_len(v3_sub(g_bots[0].pos, loss_pos)) < 0.20f;
+  int fixed_search_anchor =
+      v3_len(v3_sub(g_bots[0].search_pos, g_bots[0].last_seen)) > 0.50f &&
+      v3_len(v3_sub(g_bots[0].search_pos, g_bots[0].belief_pos)) > 0.50f;
+
+  for (int i = 60; i < 300; i++) {
+    g_tick++;
+    bot_tick(0);
+    if (g_bots[0].tgt != 0 || g_bots[0].lose_t <= 0) hidden_retained = 0;
+    if (g_match.shots[1] != old_shots) hidden_fire = 1;
+  }
+  int after_300 = g_bots[0].tgt == 0 &&
+                  (g_bots[0].belief == BOT_BELIEF_INVESTIGATE ||
+                   g_bots[0].belief == BOT_BELIEF_SEARCH_SWEEP) &&
+                  g_bots[0].lose_t >= 300;
+  int lose_t = g_bots[0].lose_t;
+  int reacquire0 = g_bots[0].reacquire_count;
+
+  g_num_solids = 0;
+  g_tick++;
+  bot_tick(0);
+  int reacquired = g_bots[0].tgt == 0 &&
+                   g_bots[0].belief == BOT_BELIEF_VISIBLE &&
+                   g_bots[0].lose_t == 0 &&
+                   g_bots[0].reacquire_count == reacquire0 + 1;
+  int search_moved = v3_len(v3_sub(loss_pos, g_bots[0].pos)) > 0.50f;
+
+  // A visible incumbent remains authoritative outside the acquisition cone.
+  // Its hold bonus must participate in the same arbitration as a new frontal
+  // candidate; a targetless bot must still reject the same side candidate.
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 2;
+  g_humans_on[0] = 1;
+  g_num_solids = 0;
+  g_num_events = 0;
+  g_players[0] = (player_t){.pos = {{5,0,0}}, .hp = PLAYER_HP,
+                             .alive = 1, .grounded = 1, .eye = EYE_STAND};
+  g_bots[0] = (bot_t){.pos = {{0,0,0}}, .prev_pos = {{0,0,0}},
+                       .hp = PLAYER_HP, .alive = 1, .active = 1,
+                       .grounded = 1, .eye = EYE_STAND, .yaw = 0.0f,
+                       .tgt = 0, .belief = BOT_BELIEF_VISIBLE, .scan_t = 1,
+                       .react_t = 100, .burst = 3, .wp.cur = WPN_AR};
+  for (int w = 0; w < WPN_COUNT; w++)
+    g_bots[0].wp.ammo[w] = WPN_DEF[w].mag;
+  anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw);
+  g_bots[1] = (bot_t){.pos = {{0,0,-8}}, .prev_pos = {{0,0,-8}},
+                       .hp = PLAYER_HP, .alive = 1, .active = 1,
+                       .grounded = 1, .eye = EYE_STAND};
+  g_tick++;
+  bot_tick(0);
+  int visible_incumbent_held = g_bots[0].tgt == 0;
+
+  g_match.nbots = 1;
+  g_bots[0].tgt = -1;
+  g_bots[0].scan_t = 1;
+  g_tick++;
+  bot_tick(0);
+  int acquisition_fov_held = g_bots[0].tgt == -1;
+
+  // Replanning must consume the finite candidate set. The fixture makes all
+  // six physical anchors valid and distinct; all six must be consumed before
+  // the seventh replan wraps to one of them.
+  g_num_solids = 0;
+  g_bots[0] = (bot_t){.pos = {{0,0,0}}, .last_seen = {{0,0,-8}},
+                       .belief_pos = {{1,0,-7}},
+                       .last_seen_vel = {{0,0,-1}}, .search_dir = 1};
+  v3 search_anchor[7];
+  for (int i = 0; i < 7; i++) {
+    bot_search_plan_next(&g_bots[0], &BOT_SKILL[g_cfg.sp_diff]);
+    search_anchor[i] = g_bots[0].search_pos;
+  }
+  int search_progress = 1;
+  for (int i = 0; i < 6; i++)
+    for (int j = i + 1; j < 6; j++)
+      if (v3_len(v3_sub(search_anchor[i], search_anchor[j])) <= 0.05f)
+        search_progress = 0;
+  int search_wrapped = 0;
+  for (int i = 0; i < 6; i++)
+    if (v3_len(v3_sub(search_anchor[i], search_anchor[6])) <= 0.05f)
+      search_wrapped = 1;
+
+  // Seed stronger incumbent evidence, then deliver two weaker crossfire hits
+  // in both orders. Neither order may downgrade or dislodge the incumbent.
+  g_bots[1] = (bot_t){.pos = {{3,0,-8}}, .hp = PLAYER_HP, .alive = 1,
+                       .active = 1, .grounded = 1, .eye = EYE_STAND};
+  g_players[0] = (player_t){.pos = {{-3,0,-8}}, .hp = PLAYER_HP,
+                             .alive = 1, .grounded = 1, .eye = EYE_STAND};
+  g_match.nbots = 2;
+  g_humans_on[0] = 1;
+  bot_t threat_seed = (bot_t){.pos = {{0,0,0}}, .hp = PLAYER_HP,
+                               .alive = 1, .active = 1, .grounded = 1,
+                               .eye = EYE_STAND, .tgt = 2,
+                               .belief = BOT_BELIEF_OCCLUDED_HOLD,
+                               .threat_src = 2, .threat_t = BOT_THREAT_TICKS,
+                               .threat_score = 48, .wp.cur = WPN_AR};
+  g_bots[0] = threat_seed;
+  ent_damage(1, 1, 2, 2, g_bots[1].pos, g_bots[0].pos);
+  ent_damage(1, 2, 2, 0, g_players[0].pos, g_bots[0].pos);
+  int crossfire_a = g_bots[0].tgt == 2 && g_bots[0].threat_src == 2 &&
+                    g_bots[0].threat_score == 48 &&
+                    g_bots[0].threat_t <= BOT_THREAT_TICKS;
+  g_bots[0] = threat_seed;
+  ent_damage(1, 2, 2, 0, g_players[0].pos, g_bots[0].pos);
+  ent_damage(1, 1, 2, 2, g_bots[1].pos, g_bots[0].pos);
+  int crossfire_b = g_bots[0].tgt == 2 && g_bots[0].threat_src == 2 &&
+                    g_bots[0].threat_score == 48 &&
+                    g_bots[0].threat_t <= BOT_THREAT_TICKS;
+  int crossfire_stable = crossfire_a && crossfire_b;
+
+  // Equal, same-tick evidence is independent of event order and resolves to
+  // the lower entity ID from an empty evidence store.
+  bot_t empty_threat = threat_seed;
+  empty_threat.tgt = -1;
+  empty_threat.threat_src = -1;
+  empty_threat.threat_t = 0;
+  empty_threat.threat_score = 0;
+  g_bots[0] = empty_threat;
+  ent_damage(1, 1, 2, 2, g_bots[1].pos, g_bots[0].pos);
+  ent_damage(1, 1, 2, 0, g_players[0].pos, g_bots[0].pos);
+  int equal_order_a = g_bots[0].tgt == 0 && g_bots[0].threat_src == 0;
+  g_bots[0] = empty_threat;
+  ent_damage(1, 1, 2, 0, g_players[0].pos, g_bots[0].pos);
+  ent_damage(1, 1, 2, 2, g_bots[1].pos, g_bots[0].pos);
+  int equal_order_b = g_bots[0].tgt == 0 && g_bots[0].threat_src == 0;
+  int threat_equal_id = equal_order_a && equal_order_b;
+
+  // Equal evidence from a later tick is newer and wins before entity ID.
+  // Same-tick equal evidence remains entity-ID deterministic in the crossfire
+  // check above.
+  g_bots[0] = threat_seed;
+  g_bots[0].tgt = 0;
+  g_bots[0].threat_src = 0;
+  g_bots[0].threat_t = BOT_THREAT_TICKS - 1;
+  ent_damage(1, 3, 2, 2, g_bots[1].pos, g_bots[0].pos);
+  int threat_recency = g_bots[0].tgt == 2 && g_bots[0].threat_src == 2 &&
+                       g_bots[0].threat_score == 48 &&
+                       g_bots[0].threat_t == BOT_THREAT_TICKS;
+
+  memcpy(g_bots, saved_bots, sizeof saved_bots);
+  g_players[0] = saved_player;
+  g_match = saved_match;
+  memcpy(g_solids, saved_solids, sizeof saved_solids);
+  memcpy(g_events, saved_events, sizeof saved_events);
+  memcpy(g_humans_on, saved_humans, sizeof saved_humans);
+  g_num_solids = saved_num_solids;
+  g_num_events = saved_num_events;
+  g_bots_frozen = saved_frozen;
+  g_predicting = saved_predicting;
+  g_ev_peak = saved_ev_peak;
+  g_tick = saved_tick;
+  g_ev_drops = saved_ev_drops;
+  g_rng_bot = saved_rng_bot;
+  int nested_ev_peak = g_ev_peak;
+  long nested_ev_drops = g_ev_drops;
+  int nested_predicting = g_predicting;
+  bothear_proof();
+  int nested_proof_restored = g_ev_peak == nested_ev_peak &&
+                              g_ev_drops == nested_ev_drops &&
+                              g_predicting == nested_predicting;
+  printf("botmemory acquired=%d loss=%d t60=%d t300=%d reacquired=%d "
+         "retained=%d hidden_fire=%d crossfire=%d holdstill=%d "
+         "searchanchor=%d searchprogress=%d searchwrap=%d searchmove=%d "
+         "decoyhold=%d incumbent=%d acquirefov=%d equalid=%d recency=%d "
+         "proofrestore=%d lose_t=%d\n",
+         acquired, after_loss, after_60, after_300, reacquired,
+         hidden_retained, hidden_fire, crossfire_stable, search_hold_still,
+         fixed_search_anchor, search_progress, search_wrapped, search_moved,
+         visible_decoy_held, visible_incumbent_held, acquisition_fov_held,
+         threat_equal_id, threat_recency, nested_proof_restored, lose_t);
+  if (!acquired || !after_loss || !after_60 || !after_300 || !reacquired ||
+      !hidden_retained || hidden_fire || !crossfire_stable ||
+      !search_hold_still || !fixed_search_anchor || !search_progress ||
+      !search_wrapped ||
+      !search_moved || !visible_decoy_held || !visible_incumbent_held ||
+      !acquisition_fov_held || !threat_equal_id || !threat_recency ||
+      !nested_proof_restored) exit(1);
+}
+
+static void botmemoryobserve_proof(void) {
+  bot_t saved_bot = g_bots[0];
+  player_t saved_player = g_players[0];
+  match_t saved_match = g_match;
+  unsigned char saved_humans[MAX_HUMANS];
+  long saved_tick = g_tick;
+  memcpy(saved_humans, g_humans_on, sizeof saved_humans);
+
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_humans_on[0] = 1;
+  g_tick = 100;
+  g_bots[0] = (bot_t){.hp = PLAYER_HP, .alive = 1, .active = 1, .grounded = 1,
+                       .eye = EYE_STAND, .tgt = 0};
+  g_players[0] = (player_t){.hp = PLAYER_HP, .alive = 1, .grounded = 1,
+                             .eye = EYE_STAND};
+
+  float dx = g_cfg.mv[MV_RUN] * TICK_DT * 0.5f;
+  g_players[0].pos = (v3){{0, 0, -8}};
+  bot_belief_observe(&g_bots[0], 0);
+  g_bots[0].last_seen = ent_pos(0);
+
+  g_tick++;
+  g_players[0].pos.x += dx;
+  bot_belief_observe(&g_bots[0], 0);
+  g_bots[0].last_seen = ent_pos(0);
+
+  g_tick++;
+  g_bots[0].belief = BOT_BELIEF_OCCLUDED_HOLD;
+  bot_belief_predict(&g_bots[0]);
+
+  g_tick++;
+  g_players[0].pos.x += dx * 2.0f;
+  bot_belief_observe(&g_bots[0], 0);
+
+  float speed = sqrtf(g_bots[0].last_seen_vel.x * g_bots[0].last_seen_vel.x +
+                      g_bots[0].last_seen_vel.z * g_bots[0].last_seen_vel.z);
+
+  g_bots[0] = saved_bot;
+  g_players[0] = saved_player;
+  g_match = saved_match;
+  memcpy(g_humans_on, saved_humans, sizeof saved_humans);
+  g_tick = saved_tick;
+  printf("botmemoryobserve speed=%.3f\n", speed);
+  if (speed > 0.001f) exit(1);
+}
+
+static uint32_t proof_hash_bytes(uint32_t h, const void *data, size_t n) {
+  const unsigned char *p = (const unsigned char *)data;
+  for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+  return h;
+}
+
+static void proof_hash_qpos(np_wr *w, v3 p) {
+  np_w16(w, (uint16_t)net_q_pos(p.x));
+  np_w16(w, (uint16_t)net_q_pos(p.y));
+  np_w16(w, (uint16_t)net_q_pos(p.z));
+}
+
+static uint32_t netloop_report_hash(void) {
+  unsigned char buf[4096];
+  np_wr w = {buf, sizeof buf, 0, 0};
+
+  np_w32(&w, (uint32_t)g_tick);
+  np_w32(&w, g_map_seed);
+  np_w8(&w, (uint8_t)g_match.nbots);
+  np_w8(&w, (uint8_t)g_match.over);
+  np_w8(&w, (uint8_t)g_match.winner);
+  np_w8(&w, (uint8_t)g_match.restart_req);
+
+  ENT_FOREACH(e) {
+    net_ent_t ne;
+    net_ent_from_live(&ne, e);
+    net_ent_encode(&w, &ne);
+    np_w16(&w, (uint16_t)g_match.kills[e]);
+    np_w16(&w, (uint16_t)g_match.deaths[e]);
+    np_w16(&w, (uint16_t)g_match.shots[e]);
+    np_w16(&w, (uint16_t)g_match.hits[e]);
+  }
+
+  for (int i = 0; i < g_match.nbots; i++) {
+    const bot_t *b = &g_bots[i];
+    np_w8(&w, (uint8_t)b->active);
+    np_w8(&w, (uint8_t)b->alive);
+    np_w8(&w, (uint8_t)b->belief);
+    np_w8(&w, (uint8_t)(b->tgt + 1));
+    np_w16(&w, (uint16_t)b->lose_t);
+    np_w16(&w, (uint16_t)b->search_index);
+    np_w16(&w, (uint16_t)b->search_t);
+    np_w16(&w, (uint16_t)b->reacquire_count);
+    proof_hash_qpos(&w, b->belief_pos);
+    proof_hash_qpos(&w, b->search_pos);
+    proof_hash_qpos(&w, b->last_seen);
+  }
+
+  return w.bad ? 0 : proof_hash_bytes(2166136261u, buf, w.at);
+}
+
 static void run_script(char *script, sim_ctx_t *s) {
   g_tok_pushback = NULL;
   for (char *t = strtok(script, " \t\r\n;"); t; t = take_tok()) {
@@ -23177,6 +23912,10 @@ static void run_script(char *script, sim_ctx_t *s) {
       bothear_proof();
     } else if (!strcmp(t, "botweapon")) {
       botweapon_proof();
+    } else if (!strcmp(t, "botmemory")) {
+      botmemory_proof();
+    } else if (!strcmp(t, "botmemoryobserve")) {
+      botmemoryobserve_proof();
     } else if (t[0] == '+' || t[0] == '-') {
       s->held[action_from_name(t + 1)] = t[0] == '+';
     } else if (!strcmp(t, "tap")) {
@@ -23410,7 +24149,7 @@ static void run_script(char *script, sim_ctx_t *s) {
         printf("netloop n=%ld MISMATCH at tick %ld (sim %08x vs server %08x)\n",
                n, bad, ha[bad], hb[bad]);
       else
-        printf("netloop n=%ld ok hash=%08x\n", n, n ? ha[n - 1] : 0);
+        printf("netloop n=%ld ok hash=%08x\n", n, n ? netloop_report_hash() : 0);
       s->tick += n;   // the second pass advanced the world again
     } else if (!strcmp(t, "netpack")) {
       // Encode/decode round-trip over random states, worst error PER FIELD.
@@ -24427,6 +25166,13 @@ static void run_script(char *script, sim_ctx_t *s) {
                b->sliding ? "slide" : b->crouch ? "crouch" : "stand", b->in_cover,
                b->alive && b->tgt >= 0 ? ent_name(b->tgt) : "none",
                b->alive ? 0 : b->respawn_t);
+        printf(" belief_state=%s lose=%d belief=(%.3f %.3f %.3f) rad=%.2f "
+               "search=(%.3f %.3f %.3f) reacq=%d",
+               bot_belief_label(b), b->lose_t,
+               (double)b->belief_pos.x, (double)b->belief_pos.y,
+               (double)b->belief_pos.z, (double)b->belief_radius,
+               (double)b->search_pos.x, (double)b->search_pos.y,
+               (double)b->search_pos.z, b->reacquire_count);
         // The FALL, which no screenshot answers: how far it has toppled, about
         // which horizontal axis, how far it has spun about its own vertical and
         // what the round threw it with. Dead rows only, so every living row is
@@ -24883,13 +25629,35 @@ static void run_script(char *script, sim_ctx_t *s) {
       // does not exist, and a census is the only way to know.
       long n = next_n();
       long slides = 0, jumps = 0, cr_ticks = 0, sl_ticks = 0, preaim = 0, tot = 0;
-      long cov_ticks = 0;
+      long cov_ticks = 0, hold_ticks = 0, investigate_ticks = 0, search_ticks = 0;
+      long visible_ticks = 0, memory_ticks = 0, reacquired = 0, search_anchors = 0;
       int was_sl[MAX_BOTS] = {0}, was_air[MAX_BOTS] = {0};
+      int was_memory[MAX_BOTS] = {0}, was_searching[MAX_BOTS] = {0};
+      int was_search_index[MAX_BOTS] = {0};
+      v3 was_search_pos[MAX_BOTS];
+      for (int b = 0; b < MAX_BOTS; b++) {
+        const bot_t *bt = &g_bots[b];
+        was_memory[b] = bt->active && bt->alive && bt->tgt >= 0 &&
+                        bt->belief != BOT_BELIEF_VISIBLE;
+        was_searching[b] = bt->active && bt->alive && bt->tgt >= 0 &&
+                           (bt->belief == BOT_BELIEF_INVESTIGATE ||
+                            bt->belief == BOT_BELIEF_SEARCH_SWEEP);
+        was_search_index[b] = bt->search_index;
+        was_search_pos[b] = bt->search_pos;
+      }
       for (long i = 0; i < n; i++) {
         sim_advance(s);
         for (int b = 0; b < g_match.nbots; b++) {
           const bot_t *bt = &g_bots[b];
-          if (!bt->active || !bt->alive) { was_sl[b] = 0; was_air[b] = 0; continue; }
+          if (!bt->active || !bt->alive) {
+            was_sl[b] = 0;
+            was_air[b] = 0;
+            was_memory[b] = 0;
+            was_searching[b] = 0;
+            was_search_index[b] = bt->search_index;
+            was_search_pos[b] = bt->search_pos;
+            continue;
+          }
           tot++;
           if (bt->sliding) sl_ticks++;
           if (bt->crouch) cr_ticks++;
@@ -24897,16 +25665,46 @@ static void run_script(char *script, sim_ctx_t *s) {
           if (!bt->grounded && was_air[b] == 0 && bt->vel.y > 1.0f) jumps++;
           if (bt->tgt >= 0 && bt->lose_t > 0) preaim++;
           if (bt->in_cover) cov_ticks++;
+          int memory = bt->tgt >= 0 && bt->belief != BOT_BELIEF_VISIBLE;
+          int searching = bt->tgt >= 0 &&
+                          (bt->belief == BOT_BELIEF_INVESTIGATE ||
+                           bt->belief == BOT_BELIEF_SEARCH_SWEEP);
+          if (bt->tgt >= 0 && bt->belief == BOT_BELIEF_VISIBLE) visible_ticks++;
+          if (bt->belief == BOT_BELIEF_OCCLUDED_HOLD) hold_ticks++;
+          if (bt->belief == BOT_BELIEF_INVESTIGATE) investigate_ticks++;
+          if (bt->belief == BOT_BELIEF_SEARCH_SWEEP) search_ticks++;
+          if (memory) memory_ticks++;
+          if (was_memory[b] && bt->tgt >= 0 && bt->belief == BOT_BELIEF_VISIBLE)
+            reacquired++;
+          if (searching) {
+            v3 d = v3_sub(bt->search_pos, was_search_pos[b]);
+            float moved2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (!was_searching[b] || bt->search_index != was_search_index[b] ||
+                moved2 > BOT_TARGET_EPS * BOT_TARGET_EPS)
+              search_anchors++;
+          }
           was_sl[b] = bt->sliding;
           was_air[b] = !bt->grounded;
+          was_memory[b] = memory;
+          was_searching[b] = searching;
+          was_search_index[b] = bt->search_index;
+          was_search_pos[b] = bt->search_pos;
         }
       }
       printf("tacstat ticks=%ld botticks=%ld slides=%ld slide_pct=%.1f jumps=%ld "
-             "crouch_pct=%.1f preaim_pct=%.1f cover_pct=%.1f\n", n, tot, slides,
+             "crouch_pct=%.1f preaim_pct=%.1f cover_pct=%.1f hold=%ld "
+             "investigate=%ld search=%ld visible=%ld reacquisition=%ld "
+             "memory_pct=%.1f investigate_pct=%.1f search_pct=%.1f "
+             "reacquired=%ld searchanchors=%ld\n", n, tot, slides,
              tot ? 100.0 * (double)sl_ticks / (double)tot : 0.0, jumps,
              tot ? 100.0 * (double)cr_ticks / (double)tot : 0.0,
              tot ? 100.0 * (double)preaim / (double)tot : 0.0,
-             tot ? 100.0 * (double)cov_ticks / (double)tot : 0.0);
+             tot ? 100.0 * (double)cov_ticks / (double)tot : 0.0,
+             hold_ticks, investigate_ticks, search_ticks, visible_ticks,
+             reacquired, tot ? 100.0 * (double)memory_ticks / (double)tot : 0.0,
+             tot ? 100.0 * (double)investigate_ticks / (double)tot : 0.0,
+             tot ? 100.0 * (double)search_ticks / (double)tot : 0.0,
+             reacquired, search_anchors);
     } else if (!strcmp(t, "figv")) {
       g_fchk_v = !g_fchk_v;  // locate every offending triangle, not just count
     } else if (!strcmp(t, "figcheck")) {
