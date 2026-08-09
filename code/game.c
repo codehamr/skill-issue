@@ -1933,6 +1933,23 @@ typedef enum {
   EV_RESPAWN, EV_END, EV_STEP, EV_LAND
 } ev_type_t;
 
+// AI hearing is simulation state, deliberately separate from g_events: events
+// are drained by presentation and can never be an authoritative AI input.
+typedef enum { BOT_NOISE_SHOT, BOT_NOISE_STEP, BOT_NOISE_COUNT } bot_noise_kind_t;
+typedef struct {
+  v3 pos;
+  long tick;
+  float radius;
+  int src;
+} bot_noise_t;
+
+typedef struct bot_t bot_t;
+static void bot_noise_emit(int src, bot_noise_kind_t kind, v3 pos, float radius);
+static float bot_step_noise_radius(float speed, float crouch);
+static void bot_hear_update(bot_t *b, int bi);
+static float bot_eye(const bot_t *b);
+static int los_clear(v3 o, v3 tp);
+
 // EV_FIRE:   a = impact/end point, b = shot dir, f = hit distance, i = shot
 //            index, k = 0 none / 1 solid / 2 body / 3 head,
 //            g = ads blend (the tracer's muzzle offset collapses onto the
@@ -3865,14 +3882,11 @@ static void audio_play(int id, float gain, float rate, float pan, float delay_s)
 // cancelled reload — the buffer would otherwise play to its end and announce
 // A LIVE WEAPON (the bolt cue) for a magazine that never went in. A fade, not
 // a stop: cutting a voice mid-body is a step to zero, i.e. a click.
-static void audio_kill(int id) {
+static void audio_kill(int id, int tag) {
   uint32_t w = atomic_load_explicit(&g_trig_w, memory_order_relaxed);
   uint32_t r = atomic_load_explicit(&g_trig_r, memory_order_acquire);
   if (w - r >= TRIG_RING) { g_trig_flooded++; return; }
-  // tag 1: only the PLAYER's own voice on this buffer fades — the sole caller
-  // is the player's reload cancel, and bots share the reload buffers, so an
-  // untagged kill silenced every bot mid-reload within earshot too.
-  g_trig[w % TRIG_RING] = (sfx_trig_t){.id = id, .kill = 1, .tag = 1};
+  g_trig[w % TRIG_RING] = (sfx_trig_t){.id = id, .kill = 1, .tag = tag};
   atomic_store_explicit(&g_trig_w, w + 1, memory_order_release);
 }
 
@@ -4105,22 +4119,20 @@ static void audio_on_event(const event_t *e) {
     } else {
       float dist, pan = audio_place(e->a, &dist);
       if (dist < 14.0f)
-        audio_play(rid,
-                   0.75f * f_clamp(1.0f / (1.0f + dist * dist * 0.028f), 0.0f, 1.0f),
-                   rng_rangef(&g_rng_audio, 0.96f, 1.04f), pan, dist / 343.0f);
+        audio_play_tag(rid,
+                       0.75f * f_clamp(1.0f / (1.0f + dist * dist * 0.028f), 0.0f, 1.0f),
+                       rng_rangef(&g_rng_audio, 0.96f, 1.04f), pan, dist / 343.0f,
+                       e->src + 2);
     }
     }
     break;
-  // ...and the cancel is PLAYER-SCOPED twice over: only the player's cancel
-  // pushes the event, and the kill trigger carries tag 1 so it fades only the
-  // player-tagged voice — bots share these buffers, and an untagged kill
-  // silenced every bot mid-reload within earshot as collateral. A bot's own
-  // abandoned reload simply plays out: 1.3 s of magazine change from a body
-  // that is no longer there is inaudible inside a firefight.
+  // The tag is entity-specific, so a bot's aborted reload fades only its own
+  // voice rather than every nearby bot sharing the same weapon buffer.
   case EV_RELOAD_CANCEL:
-    if (e->src == g_local_ent) {
-      audio_kill(WPN_DEF[e->wpn].sfx_reload);
-      if (e->wpn == WPN_AR) audio_kill(SFX_RELOAD_AR_TAC);
+    {
+      int tag = e->src == g_local_ent ? 1 : e->src + 2;
+      audio_kill(WPN_DEF[e->wpn].sfx_reload, tag);
+      if (e->wpn == WPN_AR) audio_kill(SFX_RELOAD_AR_TAC, tag);
     }
     break;
   case EV_END:
@@ -7194,10 +7206,13 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
           // correction while standing still does not thud. No grounded test:
           // this whole branch is the grounded-stepping arm of the air/slide/
           // ground split, so grounded holds by construction here.
-          if (v3_dot(a->vel_s, a->vel_s) > 0.6f)
+          if (v3_dot(a->vel_s, a->vel_s) > 0.6f) {
+            float step_speed = sqrtf(v3_dot(a->vel_s, a->vel_s));
             ev_push((event_t){.type = EV_STEP, .a = f->pos, .src = ent,
-                              .f = sqrtf(v3_dot(a->vel_s, a->vel_s)),
-                              .g = a->crouch_s});
+                              .f = step_speed, .g = a->crouch_s});
+            bot_noise_emit(ent, BOT_NOISE_STEP, f->pos,
+                           bot_step_noise_radius(step_speed, a->crouch_s));
+          }
         } else {
           float tc = f_clamp(f->t, 0.0f, 1.0f);
           // Forward swings ease OUT (fast off the toe — the pendulum);
@@ -7346,7 +7361,22 @@ static float ent_flash01(int flash, int head) {
 }
 #define BOT_MEMORY_TICKS  240     // chase a lost target's last position for 2 s
 #define BOT_FOV_COS       0.50f   // ~120 deg vision cone (acquisition only)
-#define BOT_HEAR_DIST     20.0f   // gunfire inside this radius reveals the shooter
+#define BOT_HEAR_WALL     0.55f   // blocked sound remains useful, but softened
+#define BOT_HEAR_STEP_TICKS 72
+#define BOT_HEAR_SHOT_TICKS 180
+#define BOT_SWAP_COOLDOWN_TICKS 240
+#define BOT_SNIPER_ENTER_DIST   24.0f
+#define BOT_AR_RETURN_DIST      16.0f
+#define BOT_SNIPER_ENTER_SPEED   2.5f
+#define BOT_AR_RETURN_SPEED      5.0f
+
+// One side-effect-free source for physical step reach, shared by the real
+// animation contact and the hearing proof. At configured run speed an upright
+// boot reaches 11 m; crouching removes 65 percent of that reach.
+static float bot_step_noise_radius(float speed, float crouch) {
+  return 11.0f * f_clamp(speed / g_cfg.mv[MV_RUN], 0.0f, 1.0f) *
+         (1.0f - 0.65f * crouch);
+}
 
 // --- death kinematics ------------------------------------------------------
 // A corpse used to be thrown along the shooter->victim horizontal vector and
@@ -7804,7 +7834,7 @@ static const bot_skill_t BOT_SKILL[3] = {
   { 180, 4.0f, 0.7f,  700, 8.5f, 0.92f, 4, 8,  240, 480, 1.00f },
 };
 
-typedef struct {
+struct bot_t {
   v3    pos, prev_pos, vel;
   float yaw, prev_yaw, pitch;
   int   active, hp, alive, grounded;
@@ -7846,8 +7876,14 @@ typedef struct {
   int   cov_retry;                     // ticks until a FAILED probe may re-run
   int   in_cover;                      // moving to break the line right now
   int   slide_cd, jump_cd;             // tactical cooldowns
+  int   swap_cd;                       // AI-policy cooldown; never a weapon timer
   int   peek_dir;                      // -1/+1 side it leans out from cover
-} bot_t;
+  // Authoritative auditory investigation. A zero hear_tick means no memory.
+  v3    hear_pos;
+  long  hear_tick, hear_until;
+  bot_noise_kind_t hear_kind;
+  float hear_score;
+};
 
 static bot_t g_bots[MAX_BOTS];
 static int   g_bots_frozen;  // harness switch: no wander, no combat
@@ -7860,7 +7896,7 @@ typedef struct {
   // would make all five OOB at once.
   int  kills[MAX_ENTS], deaths[MAX_ENTS];
   int  shots[MAX_ENTS], hits[MAX_ENTS];                  // accuracy source
-  long last_fire[MAX_ENTS];                              // hearing
+  bot_noise_t noise[BOT_NOISE_COUNT][MAX_ENTS];          // latest per kind/source
   int  over, winner, last_killer, restart_req;
 } match_t;
 
@@ -7871,6 +7907,58 @@ typedef struct {
 
 static match_t g_match;
 static int g_match_nbots_fwd(void) { return g_match.nbots; }  // for ent_next
+
+// Bounded, simulation-owned writer. tick==0 remains the empty-store marker.
+static void bot_noise_emit(int src, bot_noise_kind_t kind, v3 pos, float radius) {
+  uint32_t radius_bits;
+  memcpy(&radius_bits, &radius, sizeof radius_bits);
+  if (src < 0 || src >= MAX_ENTS || kind < 0 || kind >= BOT_NOISE_COUNT ||
+      !(radius > 0.0f) || (radius_bits & 0x7FFFFFFFu) >= 0x7F800000u) return;
+  g_match.noise[kind][src] = (bot_noise_t){pos, g_tick, radius, src};
+}
+
+static int bot_hear_life(bot_noise_kind_t kind) {
+  return kind == BOT_NOISE_SHOT ? BOT_HEAR_SHOT_TICKS : BOT_HEAR_STEP_TICKS;
+}
+
+// Perception reads only a completed world tick. That makes a stimulus equally
+// available to every bot on the following tick, independent of entity order.
+static void bot_hear_update(bot_t *b, int bi) {
+  if (b->hear_tick && g_tick > b->hear_until) {
+    b->hear_tick = 0;
+    b->hear_until = 0;
+    b->hear_score = 0.0f;
+  }
+
+  v3 ear = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
+  const bot_noise_t *best = NULL;
+  bot_noise_kind_t best_kind = BOT_NOISE_SHOT;
+  float best_score = 0.0f;
+  for (int kind = 0; kind < BOT_NOISE_COUNT; kind++) {
+    for (int src = 0; src < MAX_ENTS; src++) {
+      const bot_noise_t *n = &g_match.noise[kind][src];
+      if (n->tick == 0 || n->tick >= g_tick || n->src == bi + 1) continue;
+      if (g_tick - n->tick > bot_hear_life((bot_noise_kind_t)kind)) continue;
+      float dist = v3_len(v3_sub(n->pos, b->pos));
+      float score = n->radius - dist;
+      if (score <= 0.0f) continue;
+      if (!los_clear(ear, n->pos)) score *= BOT_HEAR_WALL;
+      if (score > best_score) {
+        best = n;
+        best_kind = (bot_noise_kind_t)kind;
+        best_score = score;
+      }
+    }
+  }
+  if (best && (!b->hear_tick || g_tick > b->hear_until ||
+               best_score > b->hear_score * 1.15f)) {
+    b->hear_pos = best->pos;
+    b->hear_tick = best->tick;
+    b->hear_until = best->tick + bot_hear_life(best_kind);
+    b->hear_kind = best_kind;
+    b->hear_score = best_score;
+  }
+}
 
 // Server observability (§3.2): ONE function feeds both the server's 10 s
 // stdout digest (journald catches it; `journalctl -u game@PORT -f` is the
@@ -8197,6 +8285,56 @@ static void bot_spawn(int bi) {
   b->burst = 3;
   b->strafe_dir = (rng_next(&g_rng_bot) & 1) ? 1 : -1;
   anim_reset(&b->anim, b->pos, b->yaw);
+}
+
+static int bot_investigating(const bot_t *b) {
+  return b->hear_tick && g_tick <= b->hear_until;
+}
+
+// Player-equivalent swap semantics for an AI request. The bot policy owns the
+// rate limit; this helper is deliberately just an immediate request/transition.
+static int bot_request_weapon(bot_t *b, int bi, int desired) {
+  weapon_t *w = &b->wp;
+  if (desired < 0 || desired >= WPN_COUNT || desired == w->cur || w->switch_t > 0)
+    return 0;
+  if (w->reload_t > 0)
+    ev_push((event_t){.type = EV_RELOAD_CANCEL, .src = bi + 1, .a = b->pos,
+                      .wpn = w->cur});
+  w->cur = desired;
+  w->switch_t = GUN_SWITCH_TICKS;
+  w->reload_t = w->reload_tac = 0;
+  w->dry_done = 0;
+  w->idx = 0;
+  // ammo[] and cool[] remain per weapon: holstering never refills/re-cocks it.
+  return 1;
+}
+
+// The two distance bands deliberately differ: 24 m enters sniper preference,
+// while only sub-16 m combat returns to AR. That gap stops boundary thrashing.
+static int bot_desired_weapon(const bot_t *b, int engaging, float target_dist,
+                              float horizontal_speed) {
+  int cur = b->wp.cur;
+  int other = (cur + 1) % WPN_COUNT;
+  if (engaging && b->wp.ammo[cur] <= 0 && b->wp.ammo[other] > 0) return other;
+  int investigating = bot_investigating(b);
+  if (investigating) {
+    if (cur == WPN_SR && b->wp.ammo[WPN_AR] > 0) return WPN_AR;
+    return cur;
+  }
+  if (!engaging) return cur;
+
+  if (cur == WPN_AR) {
+    if (b->wp.ammo[WPN_SR] > 0 && target_dist >= BOT_SNIPER_ENTER_DIST &&
+        b->grounded && horizontal_speed < BOT_SNIPER_ENTER_SPEED && !b->sliding &&
+        b->hurt_t == 0)
+      return WPN_SR;
+  } else if (b->wp.ammo[WPN_AR] > 0 &&
+             (target_dist < BOT_AR_RETURN_DIST ||
+              horizontal_speed > BOT_AR_RETURN_SPEED ||
+              b->sliding || b->hurt_t > 0)) {
+    return WPN_AR;
+  }
+  return cur;
 }
 
 // ONE hitbox for every entity, keyed on the eye height: head straddling the
@@ -8770,7 +8908,7 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   const float *wp = g_cfg.wp[w->cur];
   w->ammo[w->cur]--;
   g_match.shots[ent]++;
-  g_match.last_fire[ent] = g_tick;
+  bot_noise_emit(ent, BOT_NOISE_SHOT, o, 34.0f);
   w->cool[w->cur] = (int)((float)TICK_HZ * 60.0f / wp[WP_RPM] + 0.5f);
   if (w->cool[w->cur] < 1) w->cool[w->cur] = 1;
 
@@ -9355,23 +9493,8 @@ static void bot_tick(int bi) {
   if (b->slide_cd > 0) b->slide_cd--;
   if (b->jump_cd > 0) b->jump_cd--;
   if (b->cov_retry > 0) b->cov_retry--;
-  // Reload the moment the mag is dry — the reason the cover probe fires.
-  if (b->wp.ammo[b->wp.cur] <= 0 && b->wp.reload_t == 0) {
-    b->wp.reload_tac = 0;    // a bot only ever reloads when the mag is dry
-    b->wp.reload_t = WPN_DEF[b->wp.cur].reload_ticks;
-    // AND THE ARENA HEARS IT. "Bot reloads are silent by design" was never a
-    // design argument — the comment that recorded it says the constraint was
-    // that EV_RELOAD_CANCEL's audio_kill is keyed on the SOUND ID and would kill
-    // every entity's reload voice at once. That is an implementation coupling,
-    // and it is fixed in the same change (see the routing). Measured, 234 routed
-    // voices in 7.5 s of an 8-bot hard match contained ZERO reloads, i.e. an
-    // enemy changing a magazine three metres away behind cover made no sound at
-    // all — and "he's reloading, push" is the single strongest information cue
-    // the genre has. The buffers already exist, are already per weapon, and are
-    // already exactly as long as the tell.
-    ev_push((event_t){.type = EV_RELOAD, .a = b->pos, .wpn = b->wp.cur,
-                      .src = bi + 1});
-  }
+  if (b->swap_cd > 0) b->swap_cd--;
+  bot_hear_update(b, bi);
   float flk = expf(-6.0f * TICK_DT);
   b->fl_y *= flk;
   b->fl_p *= flk;
@@ -9407,12 +9530,7 @@ static void bot_tick(int bi) {
       float dx = tp.x - b->pos.x, dz = tp.z - b->pos.z;
       float hl = sqrtf(dx * dx + dz * dz);
       int in_fov = hl > 0.01f && (dx * fx + dz * fz) / hl > BOT_FOV_COS;
-      // last_fire is 0 for an entity that never fired, which for the first 40
-      // ticks of the process reads as "fired at tick 0" — bots opening a match
-      // by hearing every silent enemy inside 20 m. Zero means never.
-      int heard = g_match.last_fire[e] > 0 &&
-                  g_tick - g_match.last_fire[e] < 40 && d < BOT_HEAR_DIST;
-      if (!in_fov && !heard) continue;
+      if (!in_fov) continue;
       // The current target's LOS was already traced by the perception step
       // this tick, and bot_can_see is pure — reuse that verdict.
       if (e == b->tgt) { if (!see) continue; }
@@ -9432,6 +9550,25 @@ static void bot_tick(int bi) {
     }
   }
 
+  int engaging = b->tgt >= 0 && see;
+  float horizontal_speed = sqrtf(b->vel.x * b->vel.x + b->vel.z * b->vel.z);
+  int other_weapon = (b->wp.cur + 1) % WPN_COUNT;
+  int emergency_swap = engaging && b->wp.ammo[b->wp.cur] <= 0 &&
+                       b->wp.ammo[other_weapon] > 0;
+  int desired = bot_desired_weapon(b, engaging, tdist, horizontal_speed);
+  if (b->wp.switch_t == 0 && (b->swap_cd == 0 || emergency_swap) &&
+      bot_request_weapon(b, bi, desired))
+    b->swap_cd = BOT_SWAP_COOLDOWN_TICKS;
+
+  // An available alternate weapon wins before the automatic empty-mag reload.
+  // When neither weapon can fire, retain the existing reload/cover behavior.
+  if (b->wp.ammo[b->wp.cur] <= 0 && b->wp.reload_t == 0 && b->wp.switch_t == 0) {
+    b->wp.reload_tac = 0;    // a bot only ever reloads when the mag is dry
+    b->wp.reload_t = WPN_DEF[b->wp.cur].reload_ticks;
+    ev_push((event_t){.type = EV_RELOAD, .a = b->pos, .wpn = b->wp.cur,
+                      .src = bi + 1});
+  }
+
   // Decide where to look and where to move.
   float want_yaw = b->yaw, want_pitch = 0;
   // Intent, not physics: what a human would be holding on the keyboard this
@@ -9440,7 +9577,6 @@ static void bot_tick(int bi) {
   // full RUN SPEED.
   float wx = 0, wz = 0, pace = BOT_PATROL_PACE;
   int want_slide = 0, want_jump = 0;
-  int engaging = b->tgt >= 0 && see;
   if (engaging) {
     // The error magnitude settles while tracking; its direction drifts a few
     // times a second and the offset eases toward the goal — imperfect like a
@@ -9639,8 +9775,24 @@ static void bot_tick(int bi) {
         pace = 1.0f;
       }
     }
+  } else if (b->hear_tick) {
+    // An audible position is not a target: no aimpoint, no target assignment,
+    // no combat trigger. Turn first, then walk the patrol pace to investigate.
+    float dx = b->hear_pos.x - b->pos.x, dz = b->hear_pos.z - b->pos.z;
+    float hl = sqrtf(dx * dx + dz * dz);
+    float dy = b->hear_pos.y - (b->pos.y + bot_eye(b));
+    if (hl > 0.01f) {
+      want_yaw = atan2f(dx, -dz);
+      want_pitch = f_clamp(atan2f(dy, hl), -1.2f, 1.2f);
+      if (hl > 1.8f && fabsf(wrap_pi(want_yaw - b->yaw)) <= 1.0471976f) {
+        wx = dx / hl;
+        wz = dz / hl;
+        pace = BOT_PATROL_PACE;
+      }
+    }
+    b->crouch = 0;
   }
-  if (b->tgt < 0) {
+  if (b->tgt < 0 && !b->hear_tick) {
     // Patrol: wander between random reachable waypoints.
     float dx = b->target.x - b->pos.x, dz = b->target.z - b->pos.z;
     float dist = sqrtf(dx * dx + dz * dz);
@@ -9743,6 +9895,7 @@ static void bot_tick(int bi) {
   // Trigger discipline: shots leave only once the (imperfect) aim has settled
   // onto the target, after the reaction delay, in bursts with pauses.
   int trigger = engaging && b->react_t == 0 && b->pause_t == 0 && !b->sliding &&
+                b->wp.switch_t == 0 &&
                 diff > -0.05f && diff < 0.05f && pdiff > -0.06f && pdiff < 0.06f;
   if (trigger && b->wp.cool[b->wp.cur] == 0 && b->wp.reload_t == 0 &&
       b->wp.ammo[b->wp.cur] > 0) {
@@ -9759,7 +9912,8 @@ static void bot_tick(int bi) {
   // the weapon for a distant target, which buys it the tuned base spread and
   // costs it the same aimed-walk slow. Not shouldering it would have been a
   // quiet asymmetry in the player's favour.
-  int want_ads = engaging && b->wp.reload_t == 0 && !b->sliding && tdist > 9.0f;
+  int want_ads = engaging && b->wp.reload_t == 0 && b->wp.switch_t == 0 &&
+                 !b->sliding && tdist > 9.0f;
   gun_ads(&b->wp, want_ads);
   // Recoil recovers the same way it does for the player: only once the trigger
   // is off, so a bot has to fight its own climb through a burst.
@@ -9804,8 +9958,6 @@ static void match_tick(void) {
     int i = g_match.nbots++;
     g_match.kills[i + 1] = g_match.deaths[i + 1] = 0;
     g_match.shots[i + 1] = g_match.hits[i + 1] = 0;
-    g_match.last_fire[i + 1] = 0;  // a retired slot's stale tick reads as
-                                   // phantom gunfire to the hearing gate
     bot_spawn(i);
   }
   while (g_match.nbots > want) g_bots[--g_match.nbots].active = 0;
@@ -10424,7 +10576,6 @@ static int net_srv_admit(uint32_t ip, uint16_t port, const char *name) {
   net_srv_rebalance();               // fighter count stays constant (§1.3)
   int e = ent_of_human(h);
   g_match.kills[e] = g_match.deaths[e] = g_match.shots[e] = g_match.hits[e] = 0;
-  g_match.last_fire[e] = 0;
   int n = 0;
   for (const char *q = name; *q && n < (int)sizeof g_human_name[h] - 1; q++) {
     char g = name_glyph(*q);
@@ -10450,7 +10601,6 @@ static void net_srv_drop(int conn) {
     g_humans_on[h] = 0;
     int e = ent_of_human(h);
     g_match.kills[e] = g_match.deaths[e] = g_match.shots[e] = g_match.hits[e] = 0;
-    g_match.last_fire[e] = 0;
     net_srv_rebalance();               // a bot fills the freed slot (§1.4)
   }
   g_conns[conn] = (net_conn_t){0};
@@ -11973,7 +12123,7 @@ static int session_pauses(void) {
 static int   g_ui_rebind = -1;   // action currently being rebound, -1 = none
 static int   g_ui_rebind_pad;    // ...and which bind table that row edits
 static int   g_ui_quit;          // set by the QUIT button
-static int   g_ui_quit_arm;      // QUIT needs a second press — see the footer
+static int   g_ui_quit_arm;      // QUIT needs a second press on the Root page
 static int   g_ui_upd_arm;       // UPDATE/ZURUECK too: one press must never
                                  // end the session (design §15.1)
 static float g_ui_cx, g_ui_cy;   // cursor in real framebuffer px
@@ -11983,19 +12133,28 @@ static int   g_ui_drag;          // active slider, 0 = none
 // --- Pad navigation. pad_sync (or the harness's `nav`) pushes events; ui_menu
 // consumes them in its preamble. Focus is a row index in LAYOUT order — every
 // interactive row registers itself once per frame via ui_focus_row, so the
-// index is stable exactly as long as the layout is, and a tab switch resets it.
+// index is stable exactly as long as the layout is, and a page change resets it.
 enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK, NAV_BACK, NAV_TABL, NAV_TABR };
 static int g_nav_q[16], g_nav_n;
-static int g_nav_kbd;   // last nav event came from the keyboard: the footer
-                        // hint then speaks ARROWS/ENTER/ESC instead of A/B/LB
+static int g_nav_kbd;   // last nav event came from the keyboard: the page hint
+                        // then speaks ARROWS/ENTER/ESC instead of A/B
 static void nav_push(int ev) {
   if (g_nav_n < (int)(sizeof g_nav_q / sizeof g_nav_q[0])) g_nav_q[g_nav_n++] = ev;
 }
-static int g_ui_focus;         // focused row within the active tab
+static int g_ui_focus;         // focused row within the active page
 static int g_ui_nfocus;        // rows registered this frame...
 static int g_ui_nfocus_last;   // ...and last frame (wrap-around runs pre-layout)
 static int g_ui_pad_mode;      // last menu input was the pad: focus ring, no cursor
 static int g_nav_act = -1;     // OK/LEFT/RIGHT pending for the focused row
+
+typedef enum { UI_PAGE_ROOT, UI_PAGE_MATCH, UI_PAGE_SETTINGS,
+               UI_PAGE_CONTROLS, UI_PAGE_DEV, UI_PAGE_COUNT } ui_page_t;
+
+static ui_page_t g_ui_page = UI_PAGE_ROOT;
+static int g_ui_control;  // CONTROLS page: 0 keyboard/mouse, 1 gamepad
+static int g_ui_tab;      // legacy uistat field; mirrors the page enum
+static int g_ui_pad_sub;  // CONTROLS/GAMEPAD: 0 sticks+aim, 1 buttons
+static int g_ui_dev_sub;  // DEV page: 0 movement, 1 weapon
 
 // Swallow currently-held pad buttons until they are released — the pad
 // analogue of WM_MOUSEACTIVATE's MA_ACTIVATEANDEAT and the 150 ms refocus
@@ -12011,7 +12170,7 @@ static void pad_eat_held(void);
 static void platform_menu_changed(void);
 static void platform_vsync_changed(void);
 
-static int g_ui_name_edit;  // MATCH tab: the name field is capturing keys
+static int g_ui_name_edit;  // Singleplayer page: the name field is capturing keys
 
 // Feed a token to the name editor: single chars append (A-Z/0-9), "back"
 // deletes, "enter"/"escape" finish. An empty name falls back to PLAYER.
@@ -12029,6 +12188,25 @@ static void ui_name_key(const char *tok) {
       g_cfg.name[l + 1] = '\0';
     }
   }
+}
+
+[[maybe_unused]] static const char *ui_page_name(ui_page_t page) {
+  static const char *const NAME[UI_PAGE_COUNT] = {
+    "root", "match", "settings", "controls", "dev"
+  };
+  return page >= 0 && page < UI_PAGE_COUNT ? NAME[page] : "root";
+}
+
+static void ui_route(ui_page_t page) {
+  if (page < 0 || page >= UI_PAGE_COUNT) page = UI_PAGE_ROOT;
+  if (g_ui_name_edit) ui_name_key("enter");
+  g_ui_rebind = -1;
+  g_ui_drag = 0;
+  g_ui_page = page;
+  g_ui_tab = (int)page;
+  g_ui_focus = 0;
+  g_ui_quit_arm = 0;
+  g_ui_upd_arm = 0;
 }
 
 // The pause reaches the audio timeline too (see g_audio_pause at the mixer):
@@ -12054,6 +12232,7 @@ static void ui_close_menu(void) {
 }
 
 static void ui_open_menu(void) {
+  ui_route(UI_PAGE_ROOT);
   g_menu_open = 1;
   g_nav_n = 0;  // events queued while closed must not replay into the session
   // The audio timeline freezes with the SIM, so it follows the same predicate:
@@ -12068,6 +12247,7 @@ static void ui_open_menu(void) {
 static void ui_on_escape(void) {
   if (g_ui_name_edit) ui_name_key("escape");
   else if (g_ui_rebind >= 0) g_ui_rebind = -1;
+  else if (g_menu_open && g_ui_page != UI_PAGE_ROOT) ui_route(UI_PAGE_ROOT);
   else if (g_menu_open) ui_close_menu();
   else ui_open_menu();
 }
@@ -12103,10 +12283,6 @@ static const char *pad_disp(const char *tok) {
 
 enum { DRAG_SENSE = 1, DRAG_FOV, DRAG_CAP, DRAG_VOL, DRAG_BOTS, DRAG_FRAG,
        DRAG_MV0 = 8, DRAG_WP0 = 32, DRAG_PAD0 = 56 };  // +i = tuning slider i
-
-static int g_ui_tab;      // 0 GAME, 1 GAMEPAD, 2 CONTROLS, 3 MATCH, 4 DEV
-static int g_ui_pad_sub;  // GAMEPAD tab: 0 sticks+aim, 1 buttons
-static int g_ui_dev_sub;  // DEV tab: 0 movement, 1 weapon
 
 // Register one interactive row (layout order) and draw the focus ring when the
 // pad drives the menu. Returns whether this row has focus — the row then also
@@ -12263,7 +12439,7 @@ static float ui_mv_row(int i, float px, float y, int click, float cx, float cy) 
   return ui_param_row(&MV_DEF[i], &g_cfg.mv[i], DRAG_MV0 + i, px, y, click, cx, cy);
 }
 
-static int g_ui_wpn;  // which weapon the WEAPON tab edits (WPN_AR / WPN_SR)
+static int g_ui_wpn;  // which weapon the DEV/WEAPON view edits (WPN_AR / WPN_SR)
 
 static float ui_wp_row(int i, float px, float y, int click, float cx, float cy) {
   return ui_param_row(&WP_DEF[i], &g_cfg.wp[g_ui_wpn][i], DRAG_WP0 + i,
@@ -12275,9 +12451,9 @@ static float ui_pad_row(int i, float px, float y, int click, float cx, float cy)
                       px, y, click, cx, cy);
 }
 
-// Horizontal sub-selector (STICKS/BUTTONS, MOVEMENT/WEAPON, the weapon pick):
+// Horizontal sub-selector (device, STICKS/BUTTONS, MOVEMENT/WEAPON, weapon):
 // one focus row, LEFT/RIGHT or A cycles, the mouse clicks a cell directly.
-// This is the WEAPON tab's selector generalised — it was about to be copied
+// This is the original weapon selector generalised — it was about to be copied
 // twice more.
 static void ui_subsel(const char *const *opts, int n, int *idx, float px,
                       float pw, float y, int click, float cx, float cy) {
@@ -12301,21 +12477,13 @@ static void ui_subsel(const char *const *opts, int n, int *idx, float px,
 static void ui_menu(void) {
   static int prev_down;
   static float pmx = -1e9f, pmy;
-  // DEV is a RUNTIME opt-in: `devmode 1` in the config (or `dev on` in the
-  // harness), with the compile-time DEV_MENU as a hard OFF override for a
-  // release build. Default off, so a player never meets the tuning workbench
-  // and a developer needs no rebuild. `dev` is read once here and used
-  // everywhere below — a second `DEV_MENU && g_cfg.devmode` is exactly the
-  // drift that lets the tab strip and the footer disagree.
+  // DEV is a runtime opt-in behind the existing compile-time and config gate.
   int dev = DEV_MENU && g_cfg.devmode;
-  int ntabs = dev ? 5 : 4;
-  // Parked on DEV when it goes away (config reload, `dev off`): every tab
-  // index below is bounded by ntabs, but g_ui_tab itself is not.
-  if (g_ui_tab >= ntabs) g_ui_tab = 0;
+  if (g_ui_page == UI_PAGE_DEV && !dev) ui_route(UI_PAGE_ROOT);
 
-  // Pad navigation first, so the layout below already reflects the tab and
-  // focus these events produced. UP/DOWN/LB/RB move immediately; OK/LEFT/RIGHT
-  // are parked in g_nav_act for whichever row holds the focus. While a rebind
+  // Pad navigation first, so the layout below already reflects the page and
+  // focus these events produced. OK/LEFT/RIGHT are parked in g_nav_act for
+  // whichever row holds the focus. While a rebind
   // capture or the name field is armed, navigation is suspended and B backs
   // out — the same contract ESC has.
   for (int i = 0; i < g_nav_n; i++) {
@@ -12335,17 +12503,15 @@ static void ui_menu(void) {
         if (g_ui_nfocus_last > 0) g_ui_focus = (g_ui_focus + 1) % g_ui_nfocus_last;
         g_ui_quit_arm = 0; g_ui_upd_arm = 0;
         break;
-      case NAV_TABL:
-        g_ui_tab = (g_ui_tab + ntabs - 1) % ntabs;
-        g_ui_focus = 0;
+      // LB/RB and PgUp/PgDn no longer cycle hidden global tabs. Visible local
+      // selectors on Controls and Dev own all lateral navigation.
+      case NAV_TABL: case NAV_TABR:
         g_ui_quit_arm = 0; g_ui_upd_arm = 0;
         break;
-      case NAV_TABR:
-        g_ui_tab = (g_ui_tab + 1) % ntabs;
-        g_ui_focus = 0;
-        g_ui_quit_arm = 0; g_ui_upd_arm = 0;
+      case NAV_BACK:
+        if (g_ui_page == UI_PAGE_ROOT) ui_close_menu();
+        else ui_route(UI_PAGE_ROOT);
         break;
-      case NAV_BACK: ui_close_menu(); break;
       default: g_nav_act = ev; break;
     }
   }
@@ -12362,41 +12528,34 @@ static void ui_menu(void) {
   if (click) g_ui_pad_mode = 0;
   pmx = cx; pmy = cy;
   g_ui_nfocus = 0;
-  if (g_ui_tab >= ntabs) g_ui_tab = 0;
+  g_ui_tab = (int)g_ui_page;
   char buf[16];
 
   ui_rect(0, 0, g_ui_vw, g_ui_vh, 0, 0, 0, 0.45f);  // dim the world
 
-  // THE PANEL IS AS TALL AS ITS TAB, not as tall as the tallest tab. The five
-  // tabs differ by ~120 virtual px, and one fixed height left MATCH sitting in
-  // a panel that was 45% empty — dead space reads as "something failed to
-  // load", and it pushed the footer buttons a long way from the rows they
-  // belong to. Immediate mode cannot know the height before laying the content
-  // out, so the measurement is carried to the NEXT frame: the same one-frame-
-  // late idiom g_ui_nfocus_last already uses for focus wrap-around. The seeds
-  // are the authored heights, so a tab is right on its very first frame too and
-  // the measurement only keeps it honest as rows are added or removed.
-  // Content bottom -> panel bottom: a 10 px gap, the version line, the button
-  // row and the grammar hint, with 5 px of air under it.
-  #define UI_FOOTER_H 56.0f
-  // The tallest tab (KEYBOARD/GAMEPAD-BUTTONS: IN_COUNT bind rows). It fixes
-  // where the panel starts, so the chrome cannot move between tabs.
-  #define UI_PANEL_MAX 358.0f
-  #define UI_BIND_ROW  14.0f   // see the KEYBOARD tab's bind loop
-  static float ph_tab[5] = {320, 276, 348, 230, 348};
-  float pw = 300, px = g_ui_vw * 0.5f - pw * 0.5f;
-  float ph = ph_tab[g_ui_tab];
-  // THE TOP IS ANCHORED, ONLY THE BOTTOM MOVES. Centring each tab's own height
-  // would slide the title, the tab strip and the footer buttons by up to 118 px
-  // as you page across the tabs — and the tab strip is exactly what the eye is
-  // holding while it does that. The anchor is the TALLEST tab's centring, so
-  // the chrome is nailed down and a short tab simply ends sooner.
+  // Every page shares one top anchor. Short pages end where their content ends;
+  // the dense binding pages use the full authored height without moving the
+  // title when the player changes page.
+  #define UI_FOOTER_H 24.0f
+  #define UI_PANEL_MAX 348.0f
+  #define UI_BIND_ROW  14.0f   // see the keyboard binding page's loop
+  static float ph_page[UI_PAGE_COUNT] = {276, 210, 286, 344, 344};
+  ui_page_t drawn_page = g_ui_page;
+  float pw = 320, px = g_ui_vw * 0.5f - pw * 0.5f;
+  float ph = ph_page[drawn_page];
+  // THE TOP IS ANCHORED, ONLY THE BOTTOM MOVES. Centring each page's own height
+  // would slide the title by up to 118 px. The anchor is the tallest page's
+  // centring, so the chrome is nailed down and a short page simply ends sooner.
   float py = (g_ui_vh - UI_PANEL_MAX) * 0.5f;
   if (py < 6) py = 6;
   int panel_mark = ui_mark();
   ui_rect(px, py, pw, ph, 0.07f, 0.08f, 0.09f, 0.95f);
   ui_rect(px, py, pw, 2, C_ACCENT, 1);
-  ui_text("SETTINGS", px + (pw - ui_text_width("SETTINGS", 2)) * 0.5f, py + 10, 2, C_TEXT, 1);
+  static const char *const PAGE_TITLE[UI_PAGE_COUNT] = {
+    "PAUSE MENU", "SINGLEPLAYER", "SETTINGS", "CONTROLS", "DEV TOOLS"
+  };
+  const char *title = PAGE_TITLE[drawn_page];
+  ui_text(title, px + (pw - ui_text_width(title, 2)) * 0.5f, py + 10, 2, C_TEXT, 1);
   // The label reads the SAME predicate the tick does (§9.7), so it can never
   // say PAUSED while the world ticks or LIVE while it is frozen. A networked
   // session shows LIVE where PAUSED would be — the same key means "the world
@@ -12410,42 +12569,21 @@ static void ui_menu(void) {
   if (label && session_pauses()) ui_text("PAUSED", px + 16, py + 13, 1, C_ACCENT, 0.9f);
   else if (label && g_online)    ui_text("LIVE", px + 16, py + 13, 1, 0.95f, 0.35f, 0.30f, 0.95f);
 
-  // Tab strip. Player-facing tabs first; DEV is the tuning workbench and wears
-  // a subdued warning tint — `devmode 0` (or DEV_MENU 0) removes it entirely.
-  // "KEYBOARD", not "CONTROLS": next to GAMEPAD the two categories overlap
-  // and a controller player hunting the button remap opens the wrong tab.
-  static const char *const TAB_LABEL[5] = {"GAME", "GAMEPAD", "KEYBOARD", "MATCH", "DEV"};
-  float tabw = (pw - 32) / (float)ntabs, taby = py + 28;
-  for (int i = 0; i < ntabs; i++) {
-    float tx = px + 16 + (float)i * tabw;
-    int hot = cx >= tx && cx <= tx + tabw && cy >= taby && cy <= taby + 13;
-    if (g_ui_tab == i)  ui_rect(tx, taby, tabw, 13, C_ACCENT, 0.90f);
-    else if (i == 4)    ui_rect(tx, taby, tabw, 13, 0.75f, 0.30f, 0.20f, hot ? 0.35f : 0.16f);
-    else                ui_rect(tx, taby, tabw, 13, 1, 1, 1, hot ? 0.14f : 0.06f);
-    float lw = ui_text_width(TAB_LABEL[i], 1);
-    if (g_ui_tab == i) ui_text(TAB_LABEL[i], tx + (tabw - lw) * 0.5f, taby + 3, 1, 0.08f, 0.07f, 0.06f, 1);
-    else               ui_text(TAB_LABEL[i], tx + (tabw - lw) * 0.5f, taby + 3, 1, C_TEXT, 1);
-    if (click && hot && g_ui_rebind < 0 && !g_ui_drag) {
-      // The pad tab-switch paths disarm the QUIT confirm and finish the name
-      // edit; the mouse path must honour the same contract, or a stale CONFIRM
-      // waits behind a tab switch and hidden keystrokes keep editing the name.
-      if (g_ui_name_edit) ui_name_key("enter");
-      g_ui_tab = i;
-      g_ui_focus = 0;
-      g_ui_quit_arm = 0; g_ui_upd_arm = 0;
-    }
+  float y = py + 34;
+  if (drawn_page == UI_PAGE_CONTROLS) {
+    static const char *const CONTROL[2] = {"KEYBOARD + MOUSE", "GAMEPAD"};
+    ui_subsel(CONTROL, 2, &g_ui_control, px, pw, y, click, cx, cy);
+    y += 18;
   }
-
-  float y = py + 46;
-  if (g_ui_tab == 2) {
+  if (drawn_page == UI_PAGE_CONTROLS && g_ui_control == 0) {
   ui_section("KEYBOARD + MOUSE", px, pw, y);
   y += 14;
   // UI_BIND_ROW, not the 15 every other list uses: IN_COUNT rows plus the
-  // header and the footer block do not fit a 360-unit screen at 15, and what
+  // header and Back/hint block do not fit a 360-unit screen at 15, and what
   // that looked like was the last bind drawn straight through the permanent
   // version line — both illegible, on the row a player is most likely to be
   // rebinding last. 14 fits both bind pages with the tightest one (GAMEPAD ->
-  // BUTTONS, which also carries the sub-tab strip) landing 1 px clear.
+  // BUTTONS, which also carries the local selector) landing 1 px clear.
   for (int i = 0; i < IN_COUNT; i++, y += UI_BIND_ROW) {
     int armed = g_ui_rebind == i && !g_ui_rebind_pad;
     const char *tok = armed ? "PRESS KEY" : g_cfg.bind[i];
@@ -12454,12 +12592,9 @@ static void ui_menu(void) {
       g_ui_rebind_pad = 0;
     }
   }
-  } else if (g_ui_tab == 0) {
-  // ONLINE (§9.3): Quick Join dials the configured server (mp_host/mp_port),
-  // the local match keeps running until its first snapshot (§1.1), and the
-  // status line names every state. MATCH LEAVE replaces it once connected.
-  ui_section("ONLINE", px, pw, y);
-  y += 14;
+  } else if (drawn_page == UI_PAGE_ROOT) {
+  // One classic vertical action grammar. Status and version are secondary;
+  // every primary destination is a full-width row in stable order.
   {
     int st = g_cl.state;
     const char *status =
@@ -12475,24 +12610,82 @@ static void ui_menu(void) {
     char line[128];
     snprintf(line, sizeof line, "%s   %s:%d", status, g_cfg.mp_host, g_cfg.mp_port);
     ui_text(line, px + 16, y + 3, 1, C_DIM, 1);
-    y += 15;
+    y += 17;
+
+    if (ui_button("RESUME", px + 16, y, pw - 32, 18, click, cx, cy, 0))
+      ui_close_menu();
+    y += 23;
+
+    if (ui_button("SINGLEPLAYER", px + 16, y, pw - 32, 18, click, cx, cy, 0))
+      ui_route(UI_PAGE_MATCH);
+    y += 23;
+
     if (g_online) {
-      if (ui_button("LEAVE MATCH", px + 16, y, 130, 16, click, cx, cy, 1)) {
+      if (ui_button("LEAVE MATCH", px + 16, y, pw - 32, 18, click, cx, cy, 1)) {
+        g_ui_quit_arm = 0; g_ui_upd_arm = 0;
         leave_match(); ui_close_menu();
       }
     } else {
       int busy = st == NC_CONNECTING || st == NC_JOINING || st == NC_PLAYING;
-      if (ui_button(busy ? "CONNECTING" : "QUICK JOIN", px + 16, y, 130, 16,
+      if (ui_button(busy ? "CONNECTING" : "MULTIPLAYER", px + 16, y, pw - 32, 18,
                     click, cx, cy, 0) && !busy) {
+        g_ui_quit_arm = 0; g_ui_upd_arm = 0;
         quick_join(NULL);               // directory pick, direct-connect fallback
       }
     }
-    y += 22;
+    y += 23;
+    if (ui_button("SETTINGS", px + 16, y, pw - 32, 18, click, cx, cy, 0))
+      ui_route(UI_PAGE_SETTINGS);
+    y += 23;
+    if (ui_button("CONTROLS", px + 16, y, pw - 32, 18, click, cx, cy, 0))
+      ui_route(UI_PAGE_CONTROLS);
+    y += 23;
+
+    int ust = atomic_load(&g_upd_state);
+    int offer = ust == UPD_UPDATE || ust == UPD_RECUT;
+    const char *ulab = g_ui_upd_arm ? "CONFIRM UPDATE"
+                     : offer ? "APPLY UPDATE"
+                     : g_upd_have_old ? "ROLLBACK UPDATE" : "CHECK FOR UPDATES";
+    if (ui_button(ulab, px + 16, y, pw - 32, 18, click, cx, cy, offer)) {
+      g_ui_quit_arm = 0;
+      if (offer || g_upd_have_old) {
+        if (!g_ui_upd_arm) g_ui_upd_arm = 1;
+        else {
+          g_ui_upd_arm = 0;
+          config_write(g_cfg_path, &g_cfg);
+          int ok = offer ? upd_apply() : upd_rollback_now();
+          if (!ok) atomic_store(&g_upd_state, UPD_FAILED);
+        }
+      } else {
+        upd_check_start();
+      }
+    }
+    y += 23;
+
+    if (dev) {
+      if (ui_button("DEV TOOLS", px + 16, y, pw - 32, 18, click, cx, cy, 1))
+        ui_route(UI_PAGE_DEV);
+      y += 23;
+    }
+
+    if (ui_button(g_ui_quit_arm ? "CONFIRM QUIT" : "QUIT",
+                  px + 16, y, pw - 32, 18, click, cx, cy, 1)) {
+      g_ui_upd_arm = 0;
+      if (!g_ui_quit_arm) g_ui_quit_arm = 1;
+      else { config_write(g_cfg_path, &g_cfg); g_ui_quit = 1; }
+    }
+    y += 25;
+
+    char version[96];
+    upd_status_line(version, sizeof version);
+    ui_text(version, px + 16, y, 1, C_DIM, 1);
+    y += 8;
   }
 
+  } else if (drawn_page == UI_PAGE_SETTINGS) {
   ui_section("MOUSE", px, pw, y);
   y += 14;
-  // Both of these hand-inlined ui_param_row's body three rows above the MATCH tab
+  // Both of these hand-inlined ui_param_row's body three rows above Singleplayer
   // that already uses it, repeating the px+16 / px+130 / width-100 / px+240 /
   // y+15 layout constants the helper owns. Step 0.01 selects the same "%.2f".
   { param_def_t sd = {"", "SENSITIVITY", 0.35f, 0.05f, 2.0f, 0.01f};
@@ -12558,7 +12751,7 @@ static void ui_menu(void) {
     y = ui_param_row(&vd, &pct, DRAG_VOL, px, y, click, cx, cy);
     g_cfg.vol = pct * 0.01f;
   }
-  } else if (g_ui_tab == 1) {
+  } else if (drawn_page == UI_PAGE_CONTROLS) {
     // Gamepad: deadzones and aim feel on one page, the button layout on the
     // other. Everything is a plain row — the sliders and toggles ARE the
     // interface, no calibration theatre.
@@ -12634,7 +12827,7 @@ static void ui_menu(void) {
         }
       }
     }
-  } else if (g_ui_tab == 3) {
+  } else if (drawn_page == UI_PAGE_MATCH) {
     // Singleplayer setup: mode (deathmatch only for now), bot count and
     // difficulty, frag limit, player name, and a restart to apply it all
     // to a fresh match. Bots/difficulty/limit also apply live.
@@ -12680,10 +12873,10 @@ static void ui_menu(void) {
       ui_close_menu();
     }
     y += 16;   // past the button: `y` is what sizes the panel
-  } else {
+  } else if (drawn_page == UI_PAGE_DEV) {
     // DEV — the developer tuning workbench: every knob a PLAYER never touches
     // (movement feel, weapon feel). Lives behind `dev` so an install ships
-    // without it; keeping it one tab also keeps the player-facing menu
+    // without it; keeping it one page also keeps the player-facing menu
     // from reading like an engine debug panel.
     static const char *const DEVSUB[2] = {"MOVEMENT", "WEAPON"};
     ui_subsel(DEVSUB, 2, &g_ui_dev_sub, px, pw, y, click, cx, cy);
@@ -12750,84 +12943,36 @@ static void ui_menu(void) {
     }
   }
 
-  // QUIT is two presses everywhere: focus WRAPS, so on a pad a single slipped
-  // UP from the top row lands on QUIT and A would kill the session — and a
-  // confirm that only pads get would make the mouse the undocumented fast
-  // path. Any navigation, tab switch or menu close disarms it.
-  // ONE copy of the arm/confirm body (the two footer layouts only differ in
-  // x/w): the confirm semantics changing in one branch and not the other is a
-  // fast path nobody documented.
-  #define UI_QUIT_BTN(X, W) \
-    if (ui_button(g_ui_quit_arm ? "CONFIRM" : "QUIT", (X), fy, (W), 16, click, cx, cy, 1)) { \
-      if (!g_ui_quit_arm) { g_ui_quit_arm = 1; g_ui_upd_arm = 0; } \
-      else { config_write(g_cfg_path, &g_cfg); g_ui_quit = 1; } \
+  if (drawn_page == UI_PAGE_DEV) {
+    y += 8;
+    if (ui_button("RESET CURRENT", px + 16, y, pw - 32, 16, click, cx, cy, 0)) {
+      if (g_ui_dev_sub == 0)
+        for (int i = 0; i < MV_COUNT; i++) g_cfg.mv[i] = MV_DEF[i].def;
+      else
+        for (int i = 0; i < WP_COUNT; i++)
+          g_cfg.wp[g_ui_wpn][i] = WP_DEFAULTS[g_ui_wpn][i];
     }
-  // Close the panel under the content: everything below is the fixed footer
-  // block (version line, three buttons, grammar hint), so the height the tab
-  // wants is its own last row plus that block. Clamped so a pathological tab
-  // can neither collapse the panel nor run off a 360-unit screen.
+    y += 20;
+  }
+
+  // Every focused subpage owns exactly one visible way back. NAV_BACK and ESC
+  // route through the same bookkeeping without manufacturing extra controls.
+  if (drawn_page != UI_PAGE_ROOT) {
+    y += 8;
+    if (ui_button("BACK", px + 16, y, pw - 32, 16, click, cx, cy, 0))
+      ui_route(UI_PAGE_ROOT);
+    y += 18;
+  }
+
+  // Close the panel under its page content. The maximum is authored against
+  // 1280x720's 360-unit viewport; taller aspect ratios keep the same anchor.
   {
-    // Clamped by the BOTTOM, not by the height: bounding the height alone let
-    // a tab that starts lower still run off the screen, and on the tallest tab
-    // the clamp silently compressed the footer block instead of the panel.
-    float want = f_clamp((y - py) + UI_FOOTER_H, 150.0f, g_ui_vh - py - 4.0f);
-    ph_tab[g_ui_tab] = want;
+    float want = f_clamp((y - py) + UI_FOOTER_H, 150.0f,
+                         g_ui_vh - py - 4.0f);
+    ph_page[drawn_page] = want;
     ph = want;
     ui_rect_bottom(panel_mark, py + ph);
   }
-
-  float fy = py + ph - 30;
-  // The version line is PERMANENT and stateful, from frame 0 (design §15.1):
-  // the player must be able to see their version at all, and an
-  // asynchronously appearing row would shift every focus index under it. Only
-  // the TEXT changes; the button beside RESUME is likewise always present.
-  {
-    char ul[96];
-    upd_status_line(ul, sizeof ul);
-    ui_text(ul, px + 16, fy - 12, 1, C_DIM, 1);
-  }
-  if (dev && g_ui_tab == 4) {
-    if (ui_button("RESET", px + 16, fy, 84, 16, click, cx, cy, 0)) {
-      g_ui_quit_arm = 0; g_ui_upd_arm = 0;
-      if (g_ui_dev_sub == 0)
-        for (int i = 0; i < MV_COUNT; i++) g_cfg.mv[i] = MV_DEF[i].def;
-      else  // resets only the weapon currently being edited
-        for (int i = 0; i < WP_COUNT; i++) g_cfg.wp[g_ui_wpn][i] = WP_DEFAULTS[g_ui_wpn][i];
-    }
-    if (ui_button("RESUME", px + 108, fy, 84, 16, click, cx, cy, 0)) ui_close_menu();
-    // "CONFIRM", not "SURE?": the 5x7 font has no '?' glyph and drops it
-    // silently, so the armed state read as a statement instead of a question.
-    UI_QUIT_BTN(px + 200, 84)
-  } else {
-    if (ui_button("RESUME", px + 16, fy, 84, 16, click, cx, cy, 0)) ui_close_menu();
-    // Two-stage like QUIT: a single press must never end the session. What
-    // the press does follows the STATE: apply an offered update, roll back to
-    // <exe>.old when one exists, otherwise re-check. The apply itself runs
-    // synchronously — the player just asked to end this session.
-    {
-      int ust = atomic_load(&g_upd_state);
-      int offer = ust == UPD_UPDATE || ust == UPD_RECUT;
-      const char *ulab = g_ui_upd_arm ? "CONFIRM"
-                       : offer ? "UPDATE"
-                       : g_upd_have_old ? "ROLLBACK" : "RECHECK";
-      if (ui_button(ulab, px + 108, fy, 84, 16, click, cx, cy, offer)) {
-        g_ui_quit_arm = 0;
-        if (offer || g_upd_have_old) {
-          if (!g_ui_upd_arm) g_ui_upd_arm = 1;
-          else {
-            g_ui_upd_arm = 0;
-            config_write(g_cfg_path, &g_cfg);
-            int ok = offer ? upd_apply() : upd_rollback_now();
-            if (!ok) atomic_store(&g_upd_state, UPD_FAILED);
-          }
-        } else {
-          upd_check_start();
-        }
-      }
-    }
-    UI_QUIT_BTN(px + 200, 84)
-  }
-  #undef UI_QUIT_BTN
 
   // Hints: the menu tells the player its own grammar, and the line follows the
   // STATE — while a capture is armed, the grammar it advertises ("B BACK")
@@ -12853,11 +12998,13 @@ static void ui_menu(void) {
     if (g_nav_kbd)
       h = g_ui_name_edit ? "TYPE A-Z 0-9   ENTER DONE"
         : g_ui_quit_arm  ? "ENTER CONFIRM QUIT   ESC BACK"
-                         : "ARROWS MOVE   PGUP/PGDN TAB   ENTER OK   ESC BACK";
+        : g_ui_upd_arm   ? "ENTER CONFIRM UPDATE   ESC BACK"
+                         : "ARROWS MOVE   ENTER OK   LEFT/RIGHT ADJUST   ESC BACK";
     else
       h = g_ui_name_edit ? "TYPE ON KEYBOARD   A/B DONE"
         : g_ui_quit_arm  ? "A CONFIRM QUIT   B BACK"
-                         : "LB/RB TAB   A OK   L/R ADJUST   B BACK";
+        : g_ui_upd_arm   ? "A CONFIRM UPDATE   B BACK"
+                         : "A OK   L/R ADJUST   B BACK";
   } else if (g_ui_name_edit) {
     // Cursor mode: the accent-filled pill alone does not say typing works.
     h = "TYPE A-Z 0-9   ENTER DONE";
@@ -12873,7 +13020,7 @@ static void ui_menu(void) {
   }
 
   // The frame's focus-row census: wrap-around in next frame's preamble uses
-  // it, and a tab switch that shrank the list must not leave focus dangling.
+  // it, and a page/selector switch that shrank the list must not leave focus dangling.
   g_ui_nfocus_last = g_ui_nfocus;
   if (g_ui_focus >= g_ui_nfocus) g_ui_focus = g_ui_nfocus > 0 ? g_ui_nfocus - 1 : 0;
   g_nav_act = -1;
@@ -22298,6 +22445,8 @@ static void usage(void) {
        "                     weapon x reload station x press x first/third person\n"
        "  mapcheck N         regenerate N arenas; count coplanar same-facing faces\n"
        "  parity             24 player-vs-bot gameplay rows, ok/MISMATCH each\n"
+       "  bothear            authoritative shot/step hearing and investigation proof\n"
+       "  botweapon          bot weapon-choice/swap/cooldown hysteresis proof\n"
        "  tacstat N          bot tactics census: slides/crouch/pre-aim/cover/jumps\n"
        "  budget             scene/peak/max verts + drops (render a frame FIRST —\n"
        "                     it only accumulates while the scene is being built)\n"
@@ -22311,15 +22460,15 @@ static void usage(void) {
        "  padcurve           f(0..1) table for linear/standard/dynamic (proof)\n"
        "  padlook N          N ticks of right-stick look, yaw/pitch delta in deg\n"
        "menu/UI commands (uiframe and shot both run one UI logic+draw pass):\n"
-       "  menu               toggle the settings menu\n"
+       "  menu               toggle the pause menu\n"
        "  cursor X Y         set UI cursor (framebuffer px)\n"
        "  mdown / mup        press / release the UI mouse button\n"
        "  key TOKEN          feed a key token to an active rebind capture\n"
        "  nav DIR            queue pad navigation for the next uiframe/shot:\n"
-       "                     up down left right ok back tabl tabr\n"
-       "  dev on|off         show/hide the DEV tab (config key devmode, def off;\n"
-       "                     required before any DEV-tab rig)\n"
-       "  uistat             print menu state: tab/focus/padmode/rebind + pad cfg\n"
+       "                     up down left right ok back; tabl/tabr are ignored\n"
+       "  dev on|off         show/hide the DEV TOOLS root action (config key\n"
+       "                     devmode, default off; required before a DEV-page rig)\n"
+       "  uistat             print menu page/control/focus/modal state + pad cfg\n"
        "  uiframe            run one UI pass without a screenshot\n"
        "  appframe N         N frames through the real frame step (app_frame);\n"
        "                     with the menu open this runs 0 ticks — the pause\n"
@@ -22633,12 +22782,401 @@ static int next_on_off(const char *command) {
   exit(1);
 }
 
+static void bothear_emit_shot(int src, v3 pos) {
+  weapon_t w = {.cur = WPN_AR};
+  anim_t anim;
+  for (int i = 0; i < WPN_COUNT; i++) w.ammo[i] = WPN_DEF[i].mag;
+  anim_reset(&anim, pos, 0.0f);
+  gun_shoot(src, &w, pos, 0.0f, 0.0f, (v3){{0,0,0}}, 1, &g_rng_bot, &anim);
+}
+
+// A deterministic proof of the simulation channel. It stages only the bot,
+// match and collision inputs it needs, emits through the live writer and ticks
+// the live AI; none of g_events/audio is read.
+static void bothear_proof(void) {
+  bot_t saved_bot = g_bots[0];
+  player_t saved_player = g_players[1];
+  match_t saved_match = g_match;
+  solid_t saved_solids[MAX_SOLIDS];
+  event_t saved_event_buf[MAX_EVENTS];
+  unsigned char saved_humans[MAX_HUMANS];
+  memcpy(saved_solids, g_solids, sizeof saved_solids);
+  memcpy(saved_event_buf, g_events, sizeof saved_event_buf);
+  memcpy(saved_humans, g_humans_on, sizeof saved_humans);
+  int saved_num_solids = g_num_solids, saved_frozen = g_bots_frozen;
+  int saved_events = g_num_events;
+  long saved_tick = g_tick;
+  uint64_t saved_rng_bot = g_rng_bot;
+
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_bots_frozen = 0;
+  g_num_events = 0;
+  #define BOTHEAR_STAGE() do {                                               \
+    memset(g_humans_on, 0, sizeof g_humans_on);                              \
+    g_bots[0] = (bot_t){.pos = {{0,0,0}}, .prev_pos = {{0,0,0}},             \
+                         .target = {{0,0,8}}, .hp = PLAYER_HP, .alive = 1,    \
+                         .active = 1, .grounded = 1, .eye = EYE_STAND,       \
+                         .tgt = -1, .wp.cur = WPN_AR};                       \
+    for (int w = 0; w < WPN_COUNT; w++)                                      \
+      g_bots[0].wp.ammo[w] = WPN_DEF[w].mag;                                  \
+    anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw);                \
+  } while (0)
+
+  // A wall intersects this otherwise open shot. The accepted score is also a
+  // direct guard that the 0.55 attenuation is applied rather than bypassed.
+  g_num_solids = 1;
+  g_solids[0] = (solid_t){.min = {{4,0,-1}}, .max = {{6,3,1}}, .pen = 0};
+  BOTHEAR_STAGE();
+  g_humans_on[1] = 1;
+  g_players[1] = (player_t){.pos = {{10,0,0}}, .hp = PLAYER_HP, .alive = 1,
+                             .grounded = 1, .eye = EYE_STAND};
+  g_tick = 100;
+  bothear_emit_shot(ent_of_human(1), (v3){{10,1.0f,0}});
+  float yaw_before = g_bots[0].yaw;
+  g_tick++;
+  bot_tick(0);
+  bot_t *b = &g_bots[0];
+  const bot_skill_t *sk = &BOT_SKILL[g_cfg.sp_diff];
+  int shot = b->hear_tick == 100 && b->hear_kind == BOT_NOISE_SHOT &&
+             b->hear_score > 13.0f && b->hear_score < 13.4f;
+  float turn_delta = fabsf(wrap_pi(b->yaw - yaw_before));
+  int turn = turn_delta > 1e-4f;
+  int cap = turn_delta <= sk->turn * TICK_DT + 1e-4f;
+
+  // The living source is directly in the FOV but behind a wall. This proves
+  // that hearing does not assign a target and cannot cross the LOS trigger
+  // gate just because the sound itself was accepted.
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  g_num_solids = 1;
+  g_solids[0] = (solid_t){.min = {{-1,0,-6}}, .max = {{1,3,-4}}, .pen = 0};
+  BOTHEAR_STAGE();
+  g_humans_on[1] = 1;
+  g_players[1] = (player_t){.pos = {{0,0,-10}}, .hp = PLAYER_HP, .alive = 1,
+                             .grounded = 1, .eye = EYE_STAND};
+  g_tick = 150;
+  bothear_emit_shot(ent_of_human(1), (v3){{0,1.0f,-10}});
+  g_tick++;
+  bot_tick(0);
+  int nofire = g_bots[0].tgt == -1 && g_bots[0].react_t == 0 &&
+               g_match.shots[1] == 0 &&
+               g_bots[0].wp.ammo[WPN_AR] == WPN_DEF[WPN_AR].mag;
+
+  // The first several ticks are deliberately turn-only: the investigation
+  // movement gate must wait until the sound is within 60 degrees of view.
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  g_num_solids = 0;
+  BOTHEAR_STAGE();
+  g_tick = 200;
+  bothear_emit_shot(2, (v3){{10,1.0f,0}});
+  for (int i = 0; i < 32; i++) { g_tick++; bot_tick(0); }
+  int move = g_bots[0].pos.x > 0.02f;
+
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  BOTHEAR_STAGE();
+  g_tick = 300;
+  bothear_emit_shot(2, (v3){{35,1.0f,0}});
+  g_tick++;
+  bot_tick(0);
+  int shot_far = g_bots[0].hear_tick != 0;
+
+  // Footstep reach comes from the same pure source the animation contact uses.
+  // At one shared 8 m standoff, a full upright run is audible and a crouched
+  // run is not; a slow step at 4 m and an upright step beyond 11 m are quiet.
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  BOTHEAR_STAGE();
+  g_tick = 400;
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{8,0,0}},
+                 bot_step_noise_radius(g_cfg.mv[MV_RUN], 0.0f));
+  g_tick++;
+  bot_tick(0);
+  int step = g_bots[0].hear_tick == 400 &&
+             g_bots[0].hear_kind == BOT_NOISE_STEP;
+
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  BOTHEAR_STAGE();
+  g_tick = 420;
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{8,0,0}},
+                 bot_step_noise_radius(g_cfg.mv[MV_RUN], 1.0f));
+  g_tick++;
+  bot_tick(0);
+  int crouch = g_bots[0].hear_tick != 0;
+
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  BOTHEAR_STAGE();
+  g_tick = 440;
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{4,0,0}},
+                 bot_step_noise_radius(g_cfg.mv[MV_RUN] * 0.2f, 0.0f));
+  g_tick++;
+  bot_tick(0);
+  int slow_quiet = g_bots[0].hear_tick == 0;
+
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  BOTHEAR_STAGE();
+  g_tick = 460;
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{12,0,0}},
+                 bot_step_noise_radius(g_cfg.mv[MV_RUN], 0.0f));
+  g_tick++;
+  bot_tick(0);
+  int far = g_bots[0].hear_tick != 0;
+
+  // Repeated contacts from one source overwrite its store slot, but a weaker
+  // or merely similar score must not move the accepted memory through the
+  // 15-percent replacement hysteresis.
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  BOTHEAR_STAGE();
+  g_tick = 480;
+  float run_radius = bot_step_noise_radius(g_cfg.mv[MV_RUN], 0.0f);
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{6,0,0}}, run_radius);
+  g_tick++;
+  bot_tick(0);
+  v3 first_hear_pos = g_bots[0].hear_pos;
+  long first_hear_tick = g_bots[0].hear_tick;
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{6.4f,0,0}}, run_radius);
+  g_tick++;
+  bot_tick(0);
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{5.8f,0,0}}, run_radius);
+  g_tick++;
+  bot_tick(0);
+  int step_hysteresis = g_bots[0].hear_tick == first_hear_tick &&
+                        v3_len(v3_sub(g_bots[0].hear_pos, first_hear_pos)) < 1e-6f;
+
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  BOTHEAR_STAGE();
+  g_tick = 500;
+  bot_noise_emit(2, BOT_NOISE_STEP, (v3){{6,0,0}}, 11.0f);
+  bothear_emit_shot(3, (v3){{10,1.0f,0}});
+  g_tick++;
+  bot_tick(0);
+  int priority = g_bots[0].hear_kind == BOT_NOISE_SHOT;
+  long until = g_bots[0].hear_until;
+  v3 patrol_start = g_bots[0].pos;
+  g_bots[0].target = v3_add(g_bots[0].pos,
+                             (v3){{sinf(g_bots[0].yaw) * 8.0f, 0,
+                                   -cosf(g_bots[0].yaw) * 8.0f}});
+  g_tick = until + 1;
+  bot_tick(0);
+  int expiry = g_bots[0].hear_tick == 0 && g_bots[0].tgt < 0 &&
+               v3_len(v3_sub(g_bots[0].pos, patrol_start)) > 1e-4f;
+
+  const char *pk = priority ? "shot" : "step";
+  const char *ex = expiry ? "patrol" : "heard";
+
+  g_bots[0] = saved_bot;
+  g_players[1] = saved_player;
+  g_match = saved_match;
+  memcpy(g_solids, saved_solids, sizeof saved_solids);
+  memcpy(g_events, saved_event_buf, sizeof saved_event_buf);
+  memcpy(g_humans_on, saved_humans, sizeof saved_humans);
+  g_num_solids = saved_num_solids;
+  g_bots_frozen = saved_frozen;
+  g_num_events = saved_events;
+  g_tick = saved_tick;
+  g_rng_bot = saved_rng_bot;
+  #undef BOTHEAR_STAGE
+  int events_restored = g_num_events == saved_events &&
+                        memcmp(g_events, saved_event_buf, sizeof saved_event_buf) == 0;
+  printf("bothear shot=%d turn=%d move=%d nofire=%d step=%d crouch=%d far=%d priority=%s expiry=%s cap=%d\n",
+         shot, turn, move, nofire, step, crouch, far, pk, ex, cap);
+  if (!shot || !turn || !move || !nofire || shot_far || !step || crouch ||
+      !slow_quiet || far || !step_hysteresis || !priority || !expiry ||
+      !cap || !events_restored) exit(1);
+}
+
+// Deterministic weapon-policy proof. It exercises the production decision and
+// request helpers directly, then restores every staged simulation/event field.
+static void botweapon_proof(void) {
+  bot_t saved_bot = g_bots[0];
+  player_t saved_player = g_players[0];
+  match_t saved_match = g_match;
+  solid_t saved_solids[MAX_SOLIDS];
+  event_t saved_events[MAX_EVENTS];
+  unsigned char saved_humans[MAX_HUMANS];
+  int saved_num_solids = g_num_solids;
+  int saved_num_events = g_num_events;
+  int saved_frozen = g_bots_frozen;
+  long saved_tick = g_tick;
+  uint64_t saved_rng_bot = g_rng_bot;
+  memcpy(saved_solids, g_solids, sizeof saved_solids);
+  memcpy(saved_events, g_events, sizeof saved_events);
+  memcpy(saved_humans, g_humans_on, sizeof saved_humans);
+
+  g_tick = 100;
+  g_num_events = 0;
+  bot_t *b = &g_bots[0];
+  *b = (bot_t){.pos = {{3,0,4}}, .active = 1, .alive = 1, .grounded = 1,
+               .eye = EYE_STAND, .tgt = -1, .wp.cur = WPN_AR};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+
+  b->wp.ammo[WPN_AR] = 0;
+  bot_request_weapon(b, 0, bot_desired_weapon(b, 1, 10.0f, 0.0f));
+  const char *empty = WPN_DEF[b->wp.cur].prefix;
+
+  b->wp = (weapon_t){.cur = WPN_AR};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  bot_request_weapon(b, 0, bot_desired_weapon(b, 1, 24.0f, 0.0f));
+  const char *far = WPN_DEF[b->wp.cur].prefix;
+
+  b->wp = (weapon_t){.cur = WPN_SR};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  bot_request_weapon(b, 0, bot_desired_weapon(b, 1, 15.9f, 0.0f));
+  const char *near = WPN_DEF[b->wp.cur].prefix;
+
+  b->wp = (weapon_t){.cur = WPN_SR};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  bot_request_weapon(b, 0, bot_desired_weapon(b, 1, 24.0f, 5.1f));
+  const char *moving = WPN_DEF[b->wp.cur].prefix;
+
+  b->wp = (weapon_t){.cur = WPN_SR};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  b->hear_tick = g_tick;
+  b->hear_until = g_tick + 1;
+  bot_request_weapon(b, 0, bot_desired_weapon(b, 1, 24.0f, 0.0f));
+  const char *heard = WPN_DEF[b->wp.cur].prefix;
+
+  b->hear_tick = b->hear_until = 0;
+  b->wp = (weapon_t){.cur = WPN_AR, .switch_t = 1};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  int raise = !bot_request_weapon(b, 0, WPN_SR) && b->wp.cur == WPN_AR;
+
+  b->wp = (weapon_t){.cur = WPN_SR, .reload_t = 7, .reload_tac = 1,
+                      .dry_done = 1, .idx = 4};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  b->wp.cool[WPN_SR] = 17;
+  int swapped_away = bot_request_weapon(b, 0, WPN_AR);
+  int cancelled = g_num_events == 1 && g_events[0].type == EV_RELOAD_CANCEL &&
+                  g_events[0].src == 1 && g_events[0].a.x == b->pos.x &&
+                  g_events[0].a.y == b->pos.y && g_events[0].a.z == b->pos.z &&
+                  g_events[0].wpn == WPN_SR && b->wp.reload_t == 0 &&
+                  b->wp.reload_tac == 0 && b->wp.dry_done == 0 && b->wp.idx == 0;
+  b->wp.switch_t = 0;
+  int swapped_back = bot_request_weapon(b, 0, WPN_SR);
+  int cooldown = swapped_away && swapped_back && b->wp.cool[WPN_SR] == 17;
+
+  b->wp = (weapon_t){.cur = WPN_AR};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  int hysteresis = bot_desired_weapon(b, 1, 23.9f, 0.0f) == WPN_AR &&
+                   bot_desired_weapon(b, 1, 24.0f, 0.0f) == WPN_SR;
+  b->wp.cur = WPN_SR;
+  hysteresis = hysteresis && bot_desired_weapon(b, 1, 16.0f, 0.0f) == WPN_SR &&
+               bot_desired_weapon(b, 1, 15.9f, 0.0f) == WPN_AR;
+
+  // A policy-triggered SR swap is still raising on its next tick. Stage the
+  // live bot path at a distant visible target: unlike the player, this used to
+  // start ADS during the raise and collapse the weapon/IK blend.
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_humans_on[0] = 1;
+  g_players[0] = (player_t){.pos = {{0,0,-30}}, .hp = PLAYER_HP, .alive = 1,
+                             .grounded = 1, .eye = EYE_STAND};
+  g_num_solids = 0;
+  g_num_events = 0;
+  g_bots_frozen = 0;
+  *b = (bot_t){.pos = {{0,0,0}}, .hp = PLAYER_HP, .alive = 1, .active = 1,
+               .grounded = 1, .eye = EYE_STAND, .tgt = 0, .scan_t = 100,
+               .react_t = 2, .burst = 3,
+               .wp = {.cur = WPN_AR, .switch_t = 2}};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  bot_tick(0);
+  int ads_raise = b->wp.switch_t > 0 && b->wp.ads_lin == 0.0f && b->wp.ads_s == 0.0f;
+
+  // A real auditory investigation has no visible target and therefore
+  // engaging=0. Exercise the live policy call inside bot_tick: a loaded AR
+  // must replace the SR while the bot investigates, without manufacturing a
+  // target from the sound.
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_num_solids = 0;
+  g_num_events = 0;
+  *b = (bot_t){.pos = {{0,0,0}}, .hp = PLAYER_HP, .alive = 1, .active = 1,
+               .grounded = 1, .eye = EYE_STAND, .tgt = -1, .scan_t = 100,
+               .burst = 3, .hear_pos = {{0,0,-8}}, .hear_tick = g_tick - 1,
+               .hear_until = g_tick + 100, .hear_kind = BOT_NOISE_STEP,
+               .hear_score = 3.0f, .wp = {.cur = WPN_SR}};
+  for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
+  bot_tick(0);
+  int live_heard = b->tgt == -1 && b->wp.cur == WPN_AR &&
+                   b->wp.switch_t > 0 && b->swap_cd > 0;
+
+  // Emergency selection is a combat safety rule, not a policy preference: a
+  // visible threat and an empty current magazine must bypass the AI swap
+  // cooldown and change to the loaded weapon before reload can start.
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_match.nbots = 1;
+  g_humans_on[0] = 1;
+  g_players[0] = (player_t){.pos = {{0,0,-10}}, .hp = PLAYER_HP, .alive = 1,
+                             .grounded = 1, .eye = EYE_STAND};
+  g_num_solids = 0;
+  g_num_events = 0;
+  *b = (bot_t){.pos = {{0,0,0}}, .hp = PLAYER_HP, .alive = 1, .active = 1,
+               .grounded = 1, .eye = EYE_STAND, .tgt = 0, .scan_t = 100,
+               .react_t = 2, .burst = 3, .swap_cd = 100,
+               .wp = {.cur = WPN_AR}};
+  b->wp.ammo[WPN_AR] = 0;
+  b->wp.ammo[WPN_SR] = WPN_DEF[WPN_SR].mag;
+  b->wp.cool[WPN_AR] = 7;
+  b->wp.cool[WPN_SR] = 11;
+  bot_tick(0);
+  int live_emergency = b->wp.cur == WPN_SR && b->wp.switch_t > 0 &&
+                       b->wp.reload_t == 0 &&
+                       b->swap_cd == BOT_SWAP_COOLDOWN_TICKS &&
+                       b->wp.ammo[WPN_AR] == 0 &&
+                       b->wp.ammo[WPN_SR] == WPN_DEF[WPN_SR].mag &&
+                       b->wp.cool[WPN_AR] == 6 && b->wp.cool[WPN_SR] == 10;
+
+  // A close-range preference may not holster a loaded SR in favour of an
+  // empty AR. Drive the same visible-target bot_tick path rather than calling
+  // the pure selector in isolation.
+  memset(&g_match, 0, sizeof g_match);
+  g_match.nbots = 1;
+  g_num_events = 0;
+  *b = (bot_t){.pos = {{0,0,0}}, .hp = PLAYER_HP, .alive = 1, .active = 1,
+               .grounded = 1, .eye = EYE_STAND, .tgt = 0, .scan_t = 100,
+               .react_t = 2, .burst = 3, .wp = {.cur = WPN_SR}};
+  b->wp.ammo[WPN_AR] = 0;
+  b->wp.ammo[WPN_SR] = WPN_DEF[WPN_SR].mag;
+  b->wp.cool[WPN_SR] = 13;
+  bot_tick(0);
+  int live_loaded_sr = b->wp.cur == WPN_SR && b->wp.switch_t == 0 &&
+                       b->wp.reload_t == 0 && b->swap_cd == 0 &&
+                       b->wp.ammo[WPN_AR] == 0 &&
+                       b->wp.ammo[WPN_SR] == WPN_DEF[WPN_SR].mag &&
+                       b->wp.cool[WPN_SR] == 12;
+
+  g_bots[0] = saved_bot;
+  g_players[0] = saved_player;
+  g_match = saved_match;
+  memcpy(g_solids, saved_solids, sizeof saved_solids);
+  memcpy(g_events, saved_events, sizeof saved_events);
+  memcpy(g_humans_on, saved_humans, sizeof saved_humans);
+  g_num_solids = saved_num_solids;
+  g_num_events = saved_num_events;
+  g_bots_frozen = saved_frozen;
+  g_tick = saved_tick;
+  g_rng_bot = saved_rng_bot;
+  printf("botweapon empty=%s far=%s near=%s moving=%s heard=%s raise=%d "
+         "cooldown=%s hysteresis=%d\n", empty, far, near, moving, heard, raise,
+         cooldown ? "kept" : "lost", hysteresis);
+  if (strcmp(empty, "sr") || strcmp(far, "sr") || strcmp(near, "ar") ||
+      strcmp(moving, "ar") || strcmp(heard, "ar") || !raise || !cooldown ||
+      !hysteresis || !cancelled || !ads_raise || !live_heard ||
+      !live_emergency || !live_loaded_sr) exit(1);
+}
+
 static void run_script(char *script, sim_ctx_t *s) {
   g_tok_pushback = NULL;
   for (char *t = strtok(script, " \t\r\n;"); t; t = take_tok()) {
     if (!strcmp(t, "wait")) {
       long n = next_n();
       while (n-- > 0) sim_advance(s);
+    } else if (!strcmp(t, "bothear")) {
+      bothear_proof();
+    } else if (!strcmp(t, "botweapon")) {
+      botweapon_proof();
     } else if (t[0] == '+' || t[0] == '-') {
       s->held[action_from_name(t + 1)] = t[0] == '+';
     } else if (!strcmp(t, "tap")) {
@@ -22794,13 +23332,15 @@ static void run_script(char *script, sim_ctx_t *s) {
     } else if (!strcmp(t, "uistat")) {
       // qarm/nedit: the two MODAL states (armed QUIT confirm, name capture) —
       // without them the harness could only assert either by pixel-diffing.
-      printf("ui menu=%d tab=%d padsub=%d devsub=%d wpn=%d focus=%d/%d padmode=%d "
-             "rebind=%d rebindpad=%d qarm=%d nedit=%d dev=%d curve=%s "
+      printf("ui menu=%d tab=%d page=%s control=%s padsub=%d devsub=%d wpn=%d focus=%d/%d padmode=%d "
+             "rebind=%d rebindpad=%d qarm=%d uarm=%d nedit=%d dev=%d curve=%s "
              "dz=(%.2f %.2f) sens=%.0f "
              "adss=%.2f assist=%d inv=%d conn=%d\n",
-             g_menu_open, g_ui_tab, g_ui_pad_sub, g_ui_dev_sub, g_ui_wpn,
+             g_menu_open, g_ui_tab, ui_page_name(g_ui_page),
+             g_ui_control ? "gamepad" : "keyboard",
+             g_ui_pad_sub, g_ui_dev_sub, g_ui_wpn,
              g_ui_focus, g_ui_nfocus_last, g_ui_pad_mode, g_ui_rebind,
-             g_ui_rebind_pad, g_ui_quit_arm, g_ui_name_edit,
+             g_ui_rebind_pad, g_ui_quit_arm, g_ui_upd_arm, g_ui_name_edit,
              DEV_MENU && g_cfg.devmode, PAD_CURVE_OPTS[g_cfg.pad_curve],
              (double)g_cfg.pad[PAD_DZ_L], (double)g_cfg.pad[PAD_DZ_R],
              (double)g_cfg.pad[PAD_SENS],
@@ -23317,7 +23857,6 @@ static void run_script(char *script, sim_ctx_t *s) {
           int e = ent_of_human(h);
           g_match.kills[e] = g_match.deaths[e] = 0;
           g_match.shots[e] = g_match.hits[e] = 0;
-          g_match.last_fire[e] = 0;   // a stale tick reads as phantom fire
           snprintf(g_human_name[h], sizeof g_human_name[h], "HUM%d", h & 7);
           // (& 7: value-range for -Wformat-truncation; MAX_HUMANS is 8)
           player_spawn(&g_players[h]);
@@ -23327,7 +23866,6 @@ static void run_script(char *script, sim_ctx_t *s) {
           int e = ent_of_human(h);
           g_match.kills[e] = g_match.deaths[e] = 0;   // P1-70: leave clears
           g_match.shots[e] = g_match.hits[e] = 0;     // the score row too
-          g_match.last_fire[e] = 0;
         }
       }
       printf("humans %ld\n", n);
@@ -24070,18 +24608,30 @@ static void run_script(char *script, sim_ctx_t *s) {
       // part of the command: puppet mode, standing still, restored after.
       // Save EVERY field the staging overwrites — a restore that returns 3 of
       // 8 leaves a script's puppet drive silently parked for everything after.
-      int   was_pup = g_bots[0].puppet, was_frz = g_bots_frozen;
-      float was_speed = g_bots[0].pup_speed;
-      float was_mx = g_bots[0].pup_mx, was_mz = g_bots[0].pup_mz;
-      int   was_crouch = g_bots[0].pup_crouch, was_ready = g_bots[0].pup_ready;
-      float was_face = g_bots[0].pup_face;
+      typedef struct {
+        int puppet, crouch, jump, slide, ready;
+        float mx, mz, speed, face;
+      } flinch_drive_t;
+      flinch_drive_t was_drive[MAX_BOTS];
+      int was_frz = g_bots_frozen;
       g_bots_frozen = 0;
-      g_bots[0].puppet = 1;
-      g_bots[0].pup_speed = 0.0f;
-      g_bots[0].pup_mx = g_bots[0].pup_mz = 0.0f;
-      g_bots[0].pup_crouch = 0;
-      g_bots[0].pup_ready = 1;
-      g_bots[0].pup_face = g_bots[0].yaw;
+      // Match ticks and every pose solver must keep running, so botfreeze is
+      // not an isolation tool here. Puppet every bot instead: bot_tick still
+      // advances its body/animation, but no live AI can acquire and shoot the
+      // subject. The whole drive is saved/restored because `puppet off` keeps
+      // its old scripted inputs and this proof must not briefly revive them.
+      for (int bi = 0; bi < MAX_BOTS; bi++) {
+        bot_t *pb = &g_bots[bi];
+        was_drive[bi] = (flinch_drive_t){
+          pb->puppet, pb->pup_crouch, pb->pup_jump, pb->pup_slide, pb->pup_ready,
+          pb->pup_mx, pb->pup_mz, pb->pup_speed, pb->pup_face
+        };
+        pb->puppet = 1;
+        pb->pup_crouch = pb->pup_jump = pb->pup_slide = 0;
+        pb->pup_ready = 1;
+        pb->pup_mx = pb->pup_mz = pb->pup_speed = 0.0f;
+        pb->pup_face = pb->yaw;
+      }
       struct { const char *name; float dx, dy; } CASE[6] = {
         {"head",  0.00f, 1.66f}, {"chest", 0.00f, 1.30f},
         {"gut",   0.00f, 1.00f}, {"thigh", 0.00f, 0.62f},
@@ -24162,13 +24712,18 @@ static void run_script(char *script, sim_ctx_t *s) {
       // poisoned bot.
       b->anim.hit_k = b->anim.hit_s = b->anim.hit_w = 0.0f;
       anim_reset(&b->anim, b->pos, b->yaw);
-      g_bots[0].puppet = was_pup;
-      g_bots[0].pup_speed = was_speed;
-      g_bots[0].pup_mx = was_mx;
-      g_bots[0].pup_mz = was_mz;
-      g_bots[0].pup_crouch = was_crouch;
-      g_bots[0].pup_ready = was_ready;
-      g_bots[0].pup_face = was_face;
+      for (int bi = 0; bi < MAX_BOTS; bi++) {
+        bot_t *pb = &g_bots[bi];
+        pb->puppet = was_drive[bi].puppet;
+        pb->pup_crouch = was_drive[bi].crouch;
+        pb->pup_jump = was_drive[bi].jump;
+        pb->pup_slide = was_drive[bi].slide;
+        pb->pup_ready = was_drive[bi].ready;
+        pb->pup_mx = was_drive[bi].mx;
+        pb->pup_mz = was_drive[bi].mz;
+        pb->pup_speed = was_drive[bi].speed;
+        pb->pup_face = was_drive[bi].face;
+      }
       g_bots_frozen = was_frz;
     } else if (!strcmp(t, "ragx")) {
       // WHERE THE BODY ACTUALLY IS, measured on the geometry rather than on the
@@ -24536,10 +25091,8 @@ static void run_script(char *script, sim_ctx_t *s) {
     } else if (!strcmp(t, "hud")) {
       g_hud_visible = next_on_off("hud");
     } else if (!strcmp(t, "dev")) {
-      // Without this every DEV-tab rig would break SILENTLY once devmode
-      // defaulted to 0: `nav tabr` wraps mod ntabs, so four of them land back
-      // on GAME, uistat reports tab=0, and the script asserts against a
-      // perfectly plausible menu that is simply the wrong one.
+      // DEV remains a two-level gate: the runtime config exposes the Root
+      // action, while DEV_MENU stays the compile-time hard off switch.
       g_cfg.devmode = next_on_off("dev");
     } else if (!strcmp(t, "showfps")) {
       g_cfg.show_fps = next_on_off("showfps");
