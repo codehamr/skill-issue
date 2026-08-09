@@ -9493,8 +9493,7 @@ static void bot_puppet_tick(bot_t *b, int bi) {
 // of them every tick for a whole reload (98.8% of probes fail at 20 bots —
 // often no cover ring answers) made this path a quarter of all world traces
 // while a 12 m/s bot moves 10 cm/tick against the ring's 2.6 m radius.
-static int bot_cover_spot(const bot_t *b, v3 *out) {
-  v3 tp = ent_aimpoint(b->tgt);
+static int bot_cover_spot_point(const bot_t *b, v3 threat_point, v3 *out) {
   for (int r = 0; r < 2; r++) {          // nearest ring first: reachable beats ideal
     float rad = r ? 5.0f : 2.6f;
     for (int k = 0; k < 8; k++) {
@@ -9503,8 +9502,8 @@ static int bot_cover_spot(const bot_t *b, v3 *out) {
       if (fabsf(c.x) > ARENA_HALF - 1.0f || fabsf(c.z) > ARENA_HALF - 1.0f) continue;
       if (!aabb_fits(c, PLAYER_RADIUS, HEIGHT_STAND)) continue;
       v3 eo = {{c.x, c.y + EYE_STAND, c.z}};
-      if (v3_len(v3_sub(tp, eo)) < 0.5f) continue;
-      if (los_clear(eo, tp)) continue;  // still exposed
+      if (v3_len(v3_sub(threat_point, eo)) <= 0.5f) continue;
+      if (los_clear(eo, threat_point)) continue;  // still exposed
       *out = c;
       return 1;
     }
@@ -9512,9 +9511,102 @@ static int bot_cover_spot(const bot_t *b, v3 *out) {
   return 0;
 }
 
+static int bot_cover_spot(const bot_t *b, v3 *out) {
+  return bot_cover_spot_point(b, ent_aimpoint(b->tgt), out);
+}
+
 static v3 bot_belief_aimpoint(const bot_t *b) {
   return (v3){{b->belief_pos.x, b->belief_pos.y + EYE_STAND - ENT_CHEST_OFF,
                b->belief_pos.z}};
+}
+
+static v3 bot_search_clamped(v3 p) {
+  p.y = 0.0f;
+  p.x = f_clamp(p.x, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
+  p.z = f_clamp(p.z, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
+  return p;
+}
+
+static int bot_search_candidates(const bot_t *b, v3 cand[6]) {
+  v3 fwd = {{b->last_seen_vel.x, 0.0f, b->last_seen_vel.z}};
+  float sp2 = fwd.x * fwd.x + fwd.z * fwd.z;
+  if (sp2 > 0.25f * 0.25f) {
+    fwd = v3_scale(fwd, 1.0f / sqrtf(sp2));
+  } else {
+    fwd = (v3){{b->belief_pos.x - b->pos.x, 0.0f,
+                b->belief_pos.z - b->pos.z}};
+    float len2 = fwd.x * fwd.x + fwd.z * fwd.z;
+    fwd = len2 > 1e-6f ? v3_scale(fwd, 1.0f / sqrtf(len2))
+                       : (v3){{sinf(b->yaw), 0.0f, -cosf(b->yaw)}};
+  }
+  v3 left_vec = {{-fwd.z, 0.0f, fwd.x}};
+  v3 right_vec = {{fwd.z, 0.0f, -fwd.x}};
+  v3 first_side = b->search_dir >= 0 ? left_vec : right_vec;
+  v3 second_side = b->search_dir >= 0 ? right_vec : left_vec;
+  const float side_step = 4.0f;
+  const float close_step = 2.8f;
+  const float long_step = 5.6f;
+  cand[0] = b->belief_pos;
+  cand[1] = b->last_seen;
+  cand[2] = v3_add(b->last_seen, v3_scale(first_side, side_step));
+  cand[3] = v3_add(b->last_seen, v3_scale(second_side, side_step));
+  cand[4] = v3_add(b->last_seen, v3_scale(fwd, close_step));
+  cand[5] = v3_add(b->last_seen, v3_scale(fwd, long_step));
+  int n = 0;
+  for (int i = 0; i < 6; i++) {
+    cand[i] = bot_search_clamped(cand[i]);
+    if (aabb_fits(cand[i], PLAYER_RADIUS, HEIGHT_STAND)) n++;
+  }
+  return n;
+}
+
+static void bot_search_plan_next(bot_t *b, const bot_skill_t *sk) {
+  v3 cand[6];
+  bot_search_candidates(b, cand);
+  v3 threat_point = bot_belief_aimpoint(b);
+  v3 prev_dir = v3_sub(b->search_pos, b->pos);
+  prev_dir.y = 0.0f;
+  float prev_len2 = prev_dir.x * prev_dir.x + prev_dir.z * prev_dir.z;
+  int have_prev = prev_len2 > 0.25f;
+  if (have_prev) prev_dir = v3_scale(prev_dir, 1.0f / sqrtf(prev_len2));
+
+  int best_i = -1, los_calls = 0;
+  float best_score = -1.0e30f;
+  for (int i = 0; i < 6; i++) {
+    if (!aabb_fits(cand[i], PLAYER_RADIUS, HEIGHT_STAND)) continue;
+    v3 anchor_eye = {{cand[i].x, cand[i].y + EYE_STAND, cand[i].z}};
+    v3 to_threat = v3_sub(threat_point, anchor_eye);
+    float threat_d2 = v3_dot(to_threat, to_threat);
+    int opens_los = 0, has_cover = 0;
+    if (threat_d2 > 0.25f && los_calls < 16) {
+      opens_los = los_clear(anchor_eye, threat_point);
+      los_calls++;
+      has_cover = !opens_los;
+    }
+    v3 to_anchor = v3_sub(cand[i], b->pos);
+    float dist2 = to_anchor.x * to_anchor.x + to_anchor.z * to_anchor.z;
+    float novelty = 0.0f;
+    float anchor_len2 = to_anchor.x * to_anchor.x + to_anchor.z * to_anchor.z;
+    if (have_prev && anchor_len2 > 1e-6f) {
+      v3 nd = v3_scale((v3){{to_anchor.x, 0.0f, to_anchor.z}},
+                       1.0f / sqrtf(anchor_len2));
+      novelty = (1.0f - f_clamp(v3_dot(prev_dir, nd), -1.0f, 1.0f)) * 40.0f;
+    }
+    float score = (opens_los ? 1000.0f : 0.0f) + (has_cover ? 80.0f : 0.0f) +
+                  novelty - dist2 * 0.02f;
+    if (score > best_score) { best_score = score; best_i = i; }
+  }
+
+  if (best_i < 0) {
+    b->search_pos = bot_search_clamped(b->belief_pos);
+    b->search_t = sk->search_ticks;
+    b->search_index = 0;
+    return;
+  }
+  b->search_pos = cand[best_i];
+  b->search_t = sk->search_ticks;
+  b->search_index = (best_i + 1) % 6;
+  if (best_i == 2 || best_i == 3) b->search_dir = -b->search_dir;
 }
 
 static void bot_belief_clear(bot_t *b) {
@@ -9644,8 +9736,7 @@ static void bot_tick(int bi) {
         if (b->search_t > 0) b->search_t--;
         if (b->search_t <= 0) {
           b->belief = BOT_BELIEF_INVESTIGATE;
-          b->search_pos = b->belief_pos;
-          b->search_t = sk->search_ticks;
+          bot_search_plan_next(b, sk);
         }
       }
       if (b->lose_t >= sk->memory_ticks) {
@@ -9867,57 +9958,66 @@ static void bot_tick(int bi) {
     }
     pace = 1.0f;
   } else if (b->tgt >= 0) {
-    // Lost sight. Two things a human does here and a turret does not: keep the
-    // gun ON the spot the enemy will reappear from (pre-aim), and LEAN OUT to
-    // look instead of walking blindly into the open.
+    // Lost sight: aim and movement use only the stored belief/search memory.
     v3 tp = bot_belief_aimpoint(b);
-    float dx = tp.x - b->pos.x, dz = tp.z - b->pos.z;
-    float hl = sqrtf(dx * dx + dz * dz);
-    if (hl > 0.01f) {
-      v3 eo = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
-      // Pre-aim: yaw AND pitch already on the remembered chest height — the
-      // same standing-chest arithmetic ent_aimpoint uses, so the first frame
-      // the enemy steps out the bot is looking at them, not swinging. (It had
-      // drifted to a hand-written 1.35.)
+    v3 eo = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
+    float adx = tp.x - b->pos.x, adz = tp.z - b->pos.z;
+    float ahl = sqrtf(adx * adx + adz * adz);
+    if (ahl > 0.01f) {
       float aimy = tp.y - eo.y;
-      want_yaw = atan2f(dx, -dz) + b->fl_y * DEG2RAD;
-      want_pitch = f_clamp(atan2f(aimy, hl), -1.2f, 1.2f);
-      b->crouch = 0;
-      // Peek: probe from a step out to either side and lean toward whichever one
-      // opens the line. Beats charging the corner, and it is exactly the motion
-      // that makes a bot look like it is clearing an angle.
-      float px = -dz / hl, pz = dx / hl;  // lateral unit
-      int lean = 0;
-      if (hl < 22.0f) {
-        v3 tp2 = bot_belief_aimpoint(b);
-        for (int t2 = 0; t2 < 2 && !lean; t2++) {
-          int sgn = (b->peek_dir >= 0) == (t2 == 0) ? 1 : -1;
-          v3 probe = {{eo.x + px * 1.35f * (float)sgn, eo.y,
-                       eo.z + pz * 1.35f * (float)sgn}};
-          if (v3_len(v3_sub(tp2, probe)) > 0.4f && los_clear(probe, tp2)) {
-            lean = sgn;
-            b->peek_dir = sgn;
-          }
-        }
-      }
-      if (lean) {
-        wx = px * (float)lean;
-        wz = pz * (float)lean;
-        pace = 1.0f;
-        // ...and sometimes come out of it with a jump instead of a step: hard to
-        // track, and it is the "pops out around the corner" beat.
-        if (b->grounded && b->jump_cd == 0 && hl < 14.0f &&
-            rng_rangef(&g_rng_bot, 0.0f, 1.0f) < sk->tac * 0.10f) {
-          want_jump = 1;
-          b->jump_cd = (int)rng_rangef(&g_rng_bot, 300, 700);
-        }
-      } else {
-        wx = dx / hl;
-        wz = dz / hl;
-        pace = 1.0f;
-      }
+      want_yaw = atan2f(adx, -adz) + b->fl_y * DEG2RAD;
+      want_pitch = f_clamp(atan2f(aimy, ahl), -1.2f, 1.2f);
     }
     b->crouch = 0;
+
+    int hidden_need_cover = b->wp.reload_t > 0 || (b->hurt_t > 0 && b->hp < 45);
+    if (!hidden_need_cover) b->cov_valid = 0;
+    if (hidden_need_cover && !b->cov_valid && b->cov_retry == 0) {
+      b->cov_valid = bot_cover_spot_point(b, tp, &b->cov_p);
+      if (!b->cov_valid) b->cov_retry = 10;
+    }
+    b->in_cover = hidden_need_cover && b->cov_valid;
+    if (b->in_cover) {
+      float cdx = b->cov_p.x - b->pos.x, cdz = b->cov_p.z - b->pos.z;
+      float cl = sqrtf(cdx * cdx + cdz * cdz);
+      if (cl < 0.9f) {
+        b->cov_valid = 0;
+        b->in_cover = 0;
+        b->cov_retry = 10;
+      } else {
+        wx = cdx / cl;
+        wz = cdz / cl;
+        pace = 1.0f;
+      }
+    } else if (b->belief == BOT_BELIEF_OCCLUDED_HOLD) {
+      wx = wz = 0.0f;
+    } else {
+      float sdx = b->search_pos.x - b->pos.x;
+      float sdz = b->search_pos.z - b->pos.z;
+      float sl = sqrtf(sdx * sdx + sdz * sdz);
+      if (sl > 0.01f) want_yaw = atan2f(sdx, -sdz);
+      if (b->belief == BOT_BELIEF_INVESTIGATE) {
+        if (b->search_t > 0) b->search_t--;
+        if (sl < 0.9f || b->search_t <= 0) {
+          b->belief = BOT_BELIEF_SEARCH_SWEEP;
+          bot_search_plan_next(b, sk);
+        } else {
+          wx = sdx / sl;
+          wz = sdz / sl;
+          pace = 0.75f;
+        }
+      } else if (b->belief == BOT_BELIEF_SEARCH_SWEEP) {
+        if (sl < 0.9f) {
+          wx = wz = 0.0f;
+          if (b->search_t > 0) b->search_t--;
+          if (b->search_t <= 0) bot_search_plan_next(b, sk);
+        } else {
+          wx = sdx / sl;
+          wz = sdz / sl;
+          pace = 0.75f;
+        }
+      }
+    }
   } else if (b->hear_tick) {
     // An audible position is not a target: no aimpoint, no target assignment,
     // no combat trigger. Turn first, then walk the patrol pace to investigate.
@@ -10030,7 +10130,12 @@ static void bot_tick(int bi) {
   float hs = sqrtf(b->vel.x * b->vel.x + b->vel.z * b->vel.z);
   if (wx * wx + wz * wz > 0.01f && hs < 0.3f) b->stuck++;
   else b->stuck = 0;
-  if (engaging && b->stuck > 30) {  // strafing into a wall: go the other way
+  if (!engaging && b->tgt >= 0 && b->belief != BOT_BELIEF_VISIBLE &&
+      b->stuck > 30) {
+    bot_search_plan_next(b, sk);
+    b->belief = BOT_BELIEF_SEARCH_SWEEP;
+    b->stuck = 0;
+  } else if (engaging && b->stuck > 30) {  // strafing into a wall: go the other way
     b->strafe_dir = -b->strafe_dir;
     b->stuck = 0;
   }
@@ -23370,6 +23475,12 @@ static void botmemory_proof(void) {
   int after_loss = g_bots[0].tgt == 0 &&
                    g_bots[0].belief == BOT_BELIEF_OCCLUDED_HOLD &&
                    g_bots[0].lose_t > 0;
+  v3 loss_pos = g_bots[0].pos;
+  // Keep the LIVE target sealed away after the loss. Search assertions below
+  // must be about the remembered point, not an accidental flank on this fixture.
+  g_players[0].pos = (v3){{12, 0, -8}};
+  g_solids[1] = (solid_t){.min = {{10,0,-10}}, .max = {{14,3,-6}}, .pen = 0};
+  g_num_solids = 2;
   if (g_match.shots[1] != old_shots) hidden_fire = 1;
 
   for (int i = 1; i < 60; i++) {
@@ -23382,6 +23493,10 @@ static void botmemory_proof(void) {
                  (g_bots[0].belief == BOT_BELIEF_INVESTIGATE ||
                   g_bots[0].belief == BOT_BELIEF_SEARCH_SWEEP) &&
                  g_bots[0].lose_t >= 60;
+  int search_hold_still = v3_len(v3_sub(g_bots[0].pos, loss_pos)) < 0.20f;
+  int fixed_search_anchor =
+      v3_len(v3_sub(g_bots[0].search_pos, g_bots[0].last_seen)) > 0.50f &&
+      v3_len(v3_sub(g_bots[0].search_pos, g_bots[0].belief_pos)) > 0.50f;
 
   for (int i = 60; i < 300; i++) {
     g_tick++;
@@ -23441,11 +23556,14 @@ static void botmemory_proof(void) {
   g_rng_bot = saved_rng_bot;
   bothear_proof();
   printf("botmemory acquired=%d loss=%d t60=%d t300=%d reacquired=%d "
-         "retained=%d hidden_fire=%d crossfire=%d lose_t=%d\n",
+         "retained=%d hidden_fire=%d crossfire=%d holdstill=%d "
+         "searchanchor=%d lose_t=%d\n",
          acquired, after_loss, after_60, after_300, reacquired,
-         hidden_retained, hidden_fire, crossfire_stable, lose_t);
+         hidden_retained, hidden_fire, crossfire_stable, search_hold_still,
+         fixed_search_anchor, lose_t);
   if (!acquired || !after_loss || !after_60 || !after_300 || !reacquired ||
-      !hidden_retained || hidden_fire || !crossfire_stable) exit(1);
+      !hidden_retained || hidden_fire || !crossfire_stable ||
+      !search_hold_still || !fixed_search_anchor) exit(1);
 }
 
 static void botmemoryobserve_proof(void) {
