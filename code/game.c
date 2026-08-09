@@ -28452,13 +28452,132 @@ static void platform_vsync_changed(void) {
   if (g_swap_interval) g_swap_interval(g_cfg.vsync);
 }
 
-// --- Gamepad via XInput -----------------------------------------------------
-// Same discipline as the Linux side: the backend only FILLS g_pad; deadzone,
-// curve and button policy live in the shared core. XInput is reached by
-// LoadLibrary so the build keeps zero new link-time dependencies and a machine
-// without any xinput DLL simply has no pad. The struct is ABI from xinput.h,
-// hand-declared like the XI2 and WASAPI ones. This target is compile-checked
-// only in this container; the review contract is reading it against MSDN.
+// --- Gamepad via GameInput v0 + XInput -------------------------------------
+// Both native adapters produce the shared GameInput-shaped sample. GameInput
+// is the Win11 path for standard Bluetooth/HID gamepads; XInput remains the
+// optional fallback for older systems and Xbox-compatible drivers. Neither
+// adapter ever writes g_pad directly, so a failed read cannot leave a stale
+// button or stick level behind.
+typedef struct win_gi_game_input win_gi_game_input_t;
+typedef struct win_gi_reading win_gi_reading_t;
+typedef HRESULT (STDMETHODCALLTYPE *win_gi_qi_fn)(void *, REFIID, void **);
+typedef ULONG (STDMETHODCALLTYPE *win_gi_ref_fn)(void *);
+typedef void (STDMETHODCALLTYPE *win_gi_unused_fn)(void);
+
+typedef struct {
+  uint32_t buttons;
+  float leftTrigger, rightTrigger;
+  float leftThumbstickX, leftThumbstickY;
+  float rightThumbstickX, rightThumbstickY;
+} win_gi_gamepad_state_t;
+static_assert(sizeof(win_gi_gamepad_state_t) == 28, "GAMEINPUT v0 state ABI");
+
+typedef struct {
+  win_gi_qi_fn QueryInterface;
+  win_gi_ref_fn AddRef;
+  win_gi_ref_fn Release;
+  win_gi_unused_fn GetCurrentTimestamp;
+  HRESULT (STDMETHODCALLTYPE *GetCurrentReading)(win_gi_game_input_t *, DWORD,
+                                                  void *, win_gi_reading_t **);
+} win_gi_input_vtbl_t;
+struct win_gi_game_input { const win_gi_input_vtbl_t *lpVtbl; };
+static_assert(offsetof(win_gi_input_vtbl_t, GetCurrentReading) == 4 * sizeof(void *),
+              "GAMEINPUT v0 GetCurrentReading slot");
+
+typedef struct {
+  win_gi_qi_fn QueryInterface;
+  win_gi_ref_fn AddRef;
+  win_gi_ref_fn Release;
+  win_gi_unused_fn GetInputKind;
+  win_gi_unused_fn GetSequenceNumber;
+  win_gi_unused_fn GetTimestamp;
+  win_gi_unused_fn GetDevice;
+  win_gi_unused_fn GetRawReport;
+  win_gi_unused_fn GetControllerAxisCount;
+  win_gi_unused_fn GetControllerAxisState;
+  win_gi_unused_fn GetControllerButtonCount;
+  win_gi_unused_fn GetControllerButtonState;
+  win_gi_unused_fn GetControllerSwitchCount;
+  win_gi_unused_fn GetControllerSwitchState;
+  win_gi_unused_fn GetKeyCount;
+  win_gi_unused_fn GetKeyState;
+  win_gi_unused_fn GetMouseState;
+  win_gi_unused_fn GetTouchCount;
+  win_gi_unused_fn GetTouchState;
+  win_gi_unused_fn GetMotionState;
+  win_gi_unused_fn GetArcadeStickState;
+  win_gi_unused_fn GetFlightStickState;
+  bool (STDMETHODCALLTYPE *GetGamepadState)(win_gi_reading_t *,
+                                             win_gi_gamepad_state_t *);
+} win_gi_reading_vtbl_t;
+struct win_gi_reading { const win_gi_reading_vtbl_t *lpVtbl; };
+static_assert(offsetof(win_gi_reading_vtbl_t, GetGamepadState) == 22 * sizeof(void *),
+              "GAMEINPUT v0 GetGamepadState slot");
+
+static const IID WIN_GI_IID_V0 =
+  {0x11BE2A7E, 0x4254, 0x445A, {0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00, 0x69, 0x18}};
+#define WIN_GI_KIND_GAMEPAD 0x00040000u
+typedef HRESULT (WINAPI *pfn_GameInputInitialize)(REFIID, void **);
+typedef HRESULT (WINAPI *pfn_GameInputCreate)(win_gi_game_input_t **);
+static HMODULE g_gameinput_module;
+static win_gi_game_input_t *g_gameinput;
+static pfn_GameInputInitialize g_gameinput_initialize;
+static pfn_GameInputCreate g_gameinput_create;
+
+static void win_gameinput_load(void) {
+  HMODULE m = LoadLibraryExW(L"GameInput.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!m) return;  // Win11 inbox runtime is optional; XInput still works.
+  g_gameinput_initialize = (pfn_GameInputInitialize)(void *)
+    GetProcAddress(m, "GameInputInitialize");
+  g_gameinput_create = (pfn_GameInputCreate)(void *)
+    GetProcAddress(m, "GameInputCreate");
+  HRESULT hr = E_NOINTERFACE;
+  if (g_gameinput_initialize)
+    hr = g_gameinput_initialize(&WIN_GI_IID_V0, (void **)&g_gameinput);
+  if (FAILED(hr) && g_gameinput_create)
+    hr = g_gameinput_create(&g_gameinput);
+  if (FAILED(hr) || !g_gameinput) {
+    g_gameinput = NULL;
+    g_gameinput_initialize = NULL;
+    g_gameinput_create = NULL;
+    FreeLibrary(m);
+    return;
+  }
+  g_gameinput_module = m;
+}
+
+static int win_gameinput_pump(pad_state_t *out) {
+  if (!g_gameinput) return 0;
+  win_gi_reading_t *reading = NULL;
+  HRESULT hr = g_gameinput->lpVtbl->GetCurrentReading(
+    g_gameinput, WIN_GI_KIND_GAMEPAD, NULL, &reading);
+  if (FAILED(hr) || !reading) return 0;
+  win_gi_gamepad_state_t g = {0};
+  int ok = reading->lpVtbl->GetGamepadState(reading, &g) != 0;
+  if (ok) {
+    pad_standard_state_t sample = {
+      .connected = 1, .lx = g.leftThumbstickX, .ly = g.leftThumbstickY,
+      .rx = g.rightThumbstickX, .ry = g.rightThumbstickY,
+      .lt = g.leftTrigger, .rt = g.rightTrigger, .buttons = g.buttons,
+    };
+    pad_apply_standard(out, &sample);
+  }
+  reading->lpVtbl->Release(reading);
+  return ok;
+}
+
+static void win_gameinput_shutdown(void) {
+  if (g_gameinput) g_gameinput->lpVtbl->Release(g_gameinput);
+  g_gameinput = NULL;
+  if (g_gameinput_module) FreeLibrary(g_gameinput_module);
+  g_gameinput_module = NULL;
+  g_gameinput_initialize = NULL;
+  g_gameinput_create = NULL;
+}
+
+// XInput is reached by LoadLibrary so the build keeps zero new link-time
+// dependencies and a machine without either controller DLL simply has no pad.
+// The struct is ABI from xinput.h, hand-declared like the XI2 and WASAPI ones.
 typedef struct {
   WORD  wButtons;
   BYTE  bLeftTrigger, bRightTrigger;
@@ -28472,55 +28591,68 @@ static int    g_xi_slot = -1;
 static double g_xi_rescan;
 
 static void win_pad_load(void) {
+  win_gameinput_load();
   HMODULE m = LoadLibraryA("xinput1_4.dll");           // Win8+
   if (!m) m = LoadLibraryA("xinput9_1_0.dll");         // the OS-shipped fallback
   if (m) g_xi_get_state = (pfn_XInputGetState)(void *)GetProcAddress(m, "XInputGetState");
 }
 
-static void win_pad_pump(double now) {
-  if (!g_xi_get_state) return;
+static int win_xinput_pump(pad_state_t *out, double now) {
+  if (!g_xi_get_state) return 0;
   win_xi_state_t st;
   if (g_xi_slot < 0) {
     // Empty XInput slots are expensive to poll (a device enumeration inside
     // the call), so scan on a 2 s timer rather than every frame.
-    if (now < g_xi_rescan) return;
+    if (now < g_xi_rescan) return 0;
     g_xi_rescan = now + 2.0;
     for (DWORD i = 0; i < 4 && g_xi_slot < 0; i++)
       if (g_xi_get_state(i, &st) == 0 /* ERROR_SUCCESS */) g_xi_slot = (int)i;
-    if (g_xi_slot < 0) return;
+    if (g_xi_slot < 0) return 0;
   }
   if (g_xi_get_state((DWORD)g_xi_slot, &st) != 0) {
     g_xi_slot = -1;
-    memset(&g_pad, 0, sizeof g_pad);
     g_xi_rescan = now + 2.0;
-    return;
+    return 0;
   }
-  g_pad.connected = 1;
   const win_xi_gamepad_t *g = &st.Gamepad;
   // SHORT is -32768..32767: dividing by 32767 can exceed -1 by one part in
   // 32k, which the clamp eats. XInput's Y is already up-positive — the shared
   // convention — so no sign flip here (the evdev side does its own).
-  g_pad.lx = f_clamp((float)g->sThumbLX / 32767.0f, -1.0f, 1.0f);
-  g_pad.ly = f_clamp((float)g->sThumbLY / 32767.0f, -1.0f, 1.0f);
-  g_pad.rx = f_clamp((float)g->sThumbRX / 32767.0f, -1.0f, 1.0f);
-  g_pad.ry = f_clamp((float)g->sThumbRY / 32767.0f, -1.0f, 1.0f);
-  g_pad.lt = (float)g->bLeftTrigger / 255.0f;
-  g_pad.rt = (float)g->bRightTrigger / 255.0f;
+  uint32_t buttons = 0;
   const WORD b = g->wButtons;
-  g_pad.btn[PB_UP]     = (b & 0x0001) != 0;  // XINPUT_GAMEPAD_DPAD_UP...
-  g_pad.btn[PB_DOWN]   = (b & 0x0002) != 0;
-  g_pad.btn[PB_LEFT]   = (b & 0x0004) != 0;
-  g_pad.btn[PB_RIGHT]  = (b & 0x0008) != 0;
-  g_pad.btn[PB_START]  = (b & 0x0010) != 0;
-  g_pad.btn[PB_SELECT] = (b & 0x0020) != 0;
-  g_pad.btn[PB_L3]     = (b & 0x0040) != 0;
-  g_pad.btn[PB_R3]     = (b & 0x0080) != 0;
-  g_pad.btn[PB_LB]     = (b & 0x0100) != 0;
-  g_pad.btn[PB_RB]     = (b & 0x0200) != 0;
-  g_pad.btn[PB_A]      = (b & 0x1000) != 0;
-  g_pad.btn[PB_B]      = (b & 0x2000) != 0;
-  g_pad.btn[PB_X]      = (b & 0x4000) != 0;
-  g_pad.btn[PB_Y]      = (b & 0x8000) != 0;
+  if (b & 0x0001) buttons |= PAD_STANDARD_UP;
+  if (b & 0x0002) buttons |= PAD_STANDARD_DOWN;
+  if (b & 0x0004) buttons |= PAD_STANDARD_LEFT;
+  if (b & 0x0008) buttons |= PAD_STANDARD_RIGHT;
+  if (b & 0x0010) buttons |= PAD_STANDARD_MENU;
+  if (b & 0x0020) buttons |= PAD_STANDARD_VIEW;
+  if (b & 0x0040) buttons |= PAD_STANDARD_L3;
+  if (b & 0x0080) buttons |= PAD_STANDARD_R3;
+  if (b & 0x0100) buttons |= PAD_STANDARD_LB;
+  if (b & 0x0200) buttons |= PAD_STANDARD_RB;
+  if (b & 0x1000) buttons |= PAD_STANDARD_A;
+  if (b & 0x2000) buttons |= PAD_STANDARD_B;
+  if (b & 0x4000) buttons |= PAD_STANDARD_X;
+  if (b & 0x8000) buttons |= PAD_STANDARD_Y;
+  pad_standard_state_t sample = {
+    .connected = 1,
+    .lx = (float)g->sThumbLX / 32767.0f,
+    .ly = (float)g->sThumbLY / 32767.0f,
+    .rx = (float)g->sThumbRX / 32767.0f,
+    .ry = (float)g->sThumbRY / 32767.0f,
+    .lt = (float)g->bLeftTrigger / 255.0f,
+    .rt = (float)g->bRightTrigger / 255.0f,
+    .buttons = buttons,
+  };
+  pad_apply_standard(out, &sample);
+  return 1;
+}
+
+static void win_pad_pump(double now) {
+  pad_state_t gameinput = {0}, xinput = {0};
+  int gameinput_valid = win_gameinput_pump(&gameinput);
+  int xinput_valid = gameinput_valid ? 0 : win_xinput_pump(&xinput, now);
+  pad_mux_apply(&g_pad, &gameinput, gameinput_valid, &xinput, xinput_valid);
 }
 
 // --- WASAPI output: shared mode, event-driven, ~20 ms buffer. -------------
@@ -29189,6 +29321,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     WaitForSingleObject(g_audio_h, 800);
     CloseHandle(g_audio_h);
   }
+  win_gameinput_shutdown();
   return 0;
 }
 
