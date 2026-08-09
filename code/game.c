@@ -26524,9 +26524,22 @@ typedef BOOL  (WINAPI *pfn_wglSwapIntervalEXT)(int);
 // --- UDP socket backend, Winsock half (design §6.10, -lws2_32) ---
 #include <winsock2.h>
 #include <ws2tcpip.h>
-static int net_udp_open(int port) {
+// Winsock has to be up before ANY ws2_32 call, and getaddrinfo is one of them.
+// This lived inside net_udp_open, which reads as "init before the first socket"
+// and is wrong by one call: the client's first network operation is a RESOLVE,
+// not a socket. quick_join resolves mp_host before anything is opened, so on
+// Windows getaddrinfo returned WSANOTINITIALISED, net_resolve returned 0,
+// start_connect returned 0 without touching g_cl, and QUICK JOIN sat at OFFLINE
+// having sent not one packet — while every Linux client connected fine, because
+// getaddrinfo needs no initialization there. One initializer, and every entry
+// into this backend calls it.
+static int net_wsa_init(void) {
   static int inited = 0;
-  if (!inited) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return -1; inited = 1; }
+  if (!inited) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return 0; inited = 1; }
+  return 1;
+}
+static int net_udp_open(int port) {
+  if (!net_wsa_init()) return -1;
   SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
   if (s == INVALID_SOCKET) return -1;
   u_long nb = 1;
@@ -26558,6 +26571,7 @@ static int net_udp_recv(int fd, uint32_t *ip, uint16_t *port, void *b, int cap) 
   return r;
 }
 static uint32_t net_resolve(const char *host) {
+  if (!net_wsa_init()) return 0;             // getaddrinfo IS a ws2_32 call
   struct addrinfo hints = {0}, *res = NULL;
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
