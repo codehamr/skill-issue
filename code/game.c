@@ -23975,6 +23975,18 @@ static void padbackend_expect(int ok, const char *name, int *cases) {
   }
 }
 
+static void padbackend_expect_standard_button(pad_state_t *out, uint32_t bit,
+                                              pad_btn_t expected,
+                                              const char *name, int *cases) {
+  pad_apply_standard(out, &(pad_standard_state_t){
+    .connected = 1, .buttons = bit,
+  });
+  int one_hot = out->connected;
+  for (int b = 0; b < PB_COUNT; b++)
+    if (out->btn[b] != (b == (int)expected)) one_hot = 0;
+  padbackend_expect(one_hot, name, cases);
+}
+
 // Native Windows adapters are intentionally absent from this Linux harness,
 // so this exercises the portable mapping and mux contract through exactly the
 // interfaces they will use.
@@ -24006,22 +24018,20 @@ static void padbackend_proof(void) {
   });
   padbackend_expect(out.lt == 0.0f && out.rt == 1.0f, "trigger-bounds", &cases);
 
-  static const struct { uint32_t bit; pad_btn_t button; } buttons[] = {
-    {0x0001u, PB_START},  {0x0002u, PB_SELECT}, {0x0004u, PB_A},
-    {0x0008u, PB_B},      {0x0010u, PB_X},      {0x0020u, PB_Y},
-    {0x0040u, PB_UP},     {0x0080u, PB_DOWN},   {0x0100u, PB_LEFT},
-    {0x0200u, PB_RIGHT},  {0x0400u, PB_LB},     {0x0800u, PB_RB},
-    {0x1000u, PB_L3},     {0x2000u, PB_R3},
-  };
-  for (size_t i = 0; i < sizeof buttons / sizeof buttons[0]; i++) {
-    pad_apply_standard(&out, &(pad_standard_state_t){
-      .connected = 1, .buttons = buttons[i].bit,
-    });
-    int one_hot = out.connected;
-    for (int b = 0; b < PB_COUNT; b++)
-      if (out.btn[b] != (b == (int)buttons[i].button)) one_hot = 0;
-    padbackend_expect(one_hot, "one-hot-button", &cases);
-  }
+  padbackend_expect_standard_button(&out, 0x0001u, PB_START,  "menu-start",  &cases);
+  padbackend_expect_standard_button(&out, 0x0002u, PB_SELECT, "view-select", &cases);
+  padbackend_expect_standard_button(&out, 0x0004u, PB_A,      "a",           &cases);
+  padbackend_expect_standard_button(&out, 0x0008u, PB_B,      "b",           &cases);
+  padbackend_expect_standard_button(&out, 0x0010u, PB_X,      "x",           &cases);
+  padbackend_expect_standard_button(&out, 0x0020u, PB_Y,      "y",           &cases);
+  padbackend_expect_standard_button(&out, 0x0040u, PB_UP,     "dpad-up",     &cases);
+  padbackend_expect_standard_button(&out, 0x0080u, PB_DOWN,   "dpad-down",   &cases);
+  padbackend_expect_standard_button(&out, 0x0100u, PB_LEFT,   "dpad-left",   &cases);
+  padbackend_expect_standard_button(&out, 0x0200u, PB_RIGHT,  "dpad-right",  &cases);
+  padbackend_expect_standard_button(&out, 0x0400u, PB_LB,     "lb",          &cases);
+  padbackend_expect_standard_button(&out, 0x0800u, PB_RB,     "rb",          &cases);
+  padbackend_expect_standard_button(&out, 0x1000u, PB_L3,     "l3",          &cases);
+  padbackend_expect_standard_button(&out, 0x2000u, PB_R3,     "r3",          &cases);
 
   gameinput = (pad_state_t){.connected = 1, .lx = 0.25f, .ly = 0.5f,
                              .rx = 0.75f, .ry = 1.0f, .lt = 0.2f, .rt = 0.3f,
