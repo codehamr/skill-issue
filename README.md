@@ -44,6 +44,13 @@ silently. Linux needs glibc ≥ 2.38 (Ubuntu 23.10+ / Debian 13+ / SteamOS 3.7+)
 Gamepads work too (raw stick input, aim assist, full menu navigation). Rebind
 anything in the settings menu; it also has a live-tuning DEV tab.
 
+On Windows 11, standard Bluetooth/HID gamepads use the Windows GameInput path
+with XInput as the fallback for Xbox-compatible devices. Pair the controller in
+Windows first; the game consumes the controller state that Windows exposes and
+does not perform Bluetooth pairing itself. Exotic raw HID devices and composite
+controllers such as split Joy-Cons are not promised or composed into one pad by
+the game.
+
 ### Multiplayer
 
 `Esc → GAME → ONLINE → QUICK JOIN` connects to the configured server, keeps you
