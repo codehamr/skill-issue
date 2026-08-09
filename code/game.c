@@ -834,6 +834,92 @@ typedef struct {
 } pad_state_t;
 static pad_state_t g_pad;
 
+// Portable GameInput-shaped sample. Platform adapters write this one logical
+// vocabulary; the shared mapper below is the only place native button masks
+// become the game's pad_state_t contract.
+typedef struct {
+  int connected;
+  float lx, ly, rx, ry;
+  float lt, rt;
+  uint32_t buttons;
+} pad_standard_state_t;
+
+enum {
+  PAD_STANDARD_MENU  = 0x0001u, PAD_STANDARD_VIEW  = 0x0002u,
+  PAD_STANDARD_A     = 0x0004u, PAD_STANDARD_B     = 0x0008u,
+  PAD_STANDARD_X     = 0x0010u, PAD_STANDARD_Y     = 0x0020u,
+  PAD_STANDARD_UP    = 0x0040u, PAD_STANDARD_DOWN  = 0x0080u,
+  PAD_STANDARD_LEFT  = 0x0100u, PAD_STANDARD_RIGHT = 0x0200u,
+  PAD_STANDARD_LB    = 0x0400u, PAD_STANDARD_RB    = 0x0800u,
+  PAD_STANDARD_L3    = 0x1000u, PAD_STANDARD_R3    = 0x2000u,
+};
+
+static void pad_apply_standard(pad_state_t *dst, const pad_standard_state_t *src) {
+  static const struct { uint32_t bit; pad_btn_t button; } button_map[] = {
+    {PAD_STANDARD_MENU, PB_START}, {PAD_STANDARD_VIEW, PB_SELECT},
+    {PAD_STANDARD_A, PB_A},        {PAD_STANDARD_B, PB_B},
+    {PAD_STANDARD_X, PB_X},        {PAD_STANDARD_Y, PB_Y},
+    {PAD_STANDARD_UP, PB_UP},      {PAD_STANDARD_DOWN, PB_DOWN},
+    {PAD_STANDARD_LEFT, PB_LEFT},  {PAD_STANDARD_RIGHT, PB_RIGHT},
+    {PAD_STANDARD_LB, PB_LB},      {PAD_STANDARD_RB, PB_RB},
+    {PAD_STANDARD_L3, PB_L3},      {PAD_STANDARD_R3, PB_R3},
+  };
+  memset(dst, 0, sizeof *dst);
+  if (!src->connected) return;
+  dst->connected = 1;
+  dst->lx = f_clamp(src->lx, -1.0f, 1.0f);
+  dst->ly = f_clamp(src->ly, -1.0f, 1.0f);
+  dst->rx = f_clamp(src->rx, -1.0f, 1.0f);
+  dst->ry = f_clamp(src->ry, -1.0f, 1.0f);
+  dst->lt = f_clamp(src->lt, 0.0f, 1.0f);
+  dst->rt = f_clamp(src->rt, 0.0f, 1.0f);
+  for (size_t i = 0; i < sizeof button_map / sizeof button_map[0]; i++)
+    dst->btn[button_map[i].button] = (src->buttons & button_map[i].bit) != 0;
+}
+
+static void pad_mux_apply(pad_state_t *dst, const pad_state_t *gameinput,
+                          int gameinput_valid, const pad_state_t *xinput,
+                          int xinput_valid) {
+  if (gameinput_valid && gameinput) *dst = *gameinput;
+  else if (xinput_valid && xinput) *dst = *xinput;
+  else memset(dst, 0, sizeof *dst);
+}
+
+// XInput's ABI packet is represented separately so its native mask/range
+// conversion can be tested by the Linux harness instead of living untested in
+// the Windows-only polling loop.
+typedef struct {
+  uint16_t buttons;
+  uint8_t lt, rt;
+  int16_t lx, ly, rx, ry;
+} pad_xinput_raw_t;
+
+static void pad_apply_xinput(pad_state_t *dst, const pad_xinput_raw_t *raw) {
+  uint32_t buttons = 0;
+  const uint16_t b = raw->buttons;
+  if (b & 0x0001u) buttons |= PAD_STANDARD_UP;
+  if (b & 0x0002u) buttons |= PAD_STANDARD_DOWN;
+  if (b & 0x0004u) buttons |= PAD_STANDARD_LEFT;
+  if (b & 0x0008u) buttons |= PAD_STANDARD_RIGHT;
+  if (b & 0x0010u) buttons |= PAD_STANDARD_MENU;
+  if (b & 0x0020u) buttons |= PAD_STANDARD_VIEW;
+  if (b & 0x0040u) buttons |= PAD_STANDARD_L3;
+  if (b & 0x0080u) buttons |= PAD_STANDARD_R3;
+  if (b & 0x0100u) buttons |= PAD_STANDARD_LB;
+  if (b & 0x0200u) buttons |= PAD_STANDARD_RB;
+  if (b & 0x1000u) buttons |= PAD_STANDARD_A;
+  if (b & 0x2000u) buttons |= PAD_STANDARD_B;
+  if (b & 0x4000u) buttons |= PAD_STANDARD_X;
+  if (b & 0x8000u) buttons |= PAD_STANDARD_Y;
+  pad_apply_standard(dst, &(pad_standard_state_t){
+    .connected = 1,
+    .lx = (float)raw->lx / 32767.0f, .ly = (float)raw->ly / 32767.0f,
+    .rx = (float)raw->rx / 32767.0f, .ry = (float)raw->ry / 32767.0f,
+    .lt = (float)raw->lt / 255.0f, .rt = (float)raw->rt / 255.0f,
+    .buttons = buttons,
+  });
+}
+
 // A gamepad NODE exists but the game may not open it. Set by the Linux scan
 // when a node whose sysfs capabilities say "gamepad" refuses open()/grab:
 // that is what Steam Input's device hiding looks like from outside (it holds
@@ -22816,6 +22902,7 @@ static void usage(void) {
        "  bothear            authoritative shot/step hearing and investigation proof\n"
        "  botweapon          bot weapon-choice/swap/cooldown hysteresis proof\n"
        "  botmemory          bot line-of-sight memory proof\n"
+       "  padbackend         normalized gamepad mapper/mux proof\n"
        "  tacstat N          bot tactics census incl. belief memory/search/reacq\n"
        "  budget             scene/peak/max verts + drops (render a frame FIRST —\n"
        "                     it only accumulates while the scene is being built)\n"
@@ -23902,6 +23989,144 @@ static uint32_t netloop_report_hash(void) {
   return w.bad ? 0 : proof_hash_bytes(2166136261u, buf, w.at);
 }
 
+static int padbackend_state_equal(const pad_state_t *a, const pad_state_t *b) {
+  if (a->connected != b->connected || a->lx != b->lx || a->ly != b->ly ||
+      a->rx != b->rx || a->ry != b->ry || a->lt != b->lt || a->rt != b->rt)
+    return 0;
+  for (int i = 0; i < PB_COUNT; i++)
+    if (a->btn[i] != b->btn[i]) return 0;
+  return 1;
+}
+
+static int padbackend_state_neutral(const pad_state_t *p) {
+  return padbackend_state_equal(p, &(pad_state_t){0});
+}
+
+static void padbackend_expect(int ok, const char *name, int *cases) {
+  (*cases)++;
+  if (!ok) {
+    fprintf(stderr, "padbackend FAIL %s\n", name);
+    exit(1);
+  }
+}
+
+static void padbackend_expect_standard_button(pad_state_t *out, uint32_t bit,
+                                              pad_btn_t expected,
+                                              const char *name, int *cases) {
+  pad_apply_standard(out, &(pad_standard_state_t){
+    .connected = 1, .buttons = bit,
+  });
+  int one_hot = out->connected;
+  for (int b = 0; b < PB_COUNT; b++)
+    if (out->btn[b] != (b == (int)expected)) one_hot = 0;
+  padbackend_expect(one_hot, name, cases);
+}
+
+static void padbackend_expect_xinput_button(pad_state_t *out, uint16_t bit,
+                                             pad_btn_t expected,
+                                             const char *name, int *cases) {
+  pad_apply_xinput(out, &(pad_xinput_raw_t){.buttons = bit});
+  int one_hot = out->connected;
+  for (int b = 0; b < PB_COUNT; b++)
+    if (out->btn[b] != (b == (int)expected)) one_hot = 0;
+  padbackend_expect(one_hot, name, cases);
+}
+
+// Native Windows adapters are intentionally absent from this Linux harness,
+// so this exercises the portable mapping and mux contract through exactly the
+// interfaces they will use.
+static void padbackend_proof(void) {
+  int cases = 0;
+  pad_state_t gameinput = {0}, xinput = {0}, out = {0};
+  pad_standard_state_t sample = {
+    .connected = 1, .lx = 0.5f, .ly = -0.25f, .rx = -0.75f, .ry = 1.0f,
+    .buttons = 0x0004u,
+  };
+
+  pad_apply_standard(&gameinput, &sample);
+  pad_mux_apply(&out, &gameinput, 1, NULL, 0);
+  padbackend_expect(out.connected && out.lx == 0.5f && out.ly == -0.25f &&
+                    out.rx == -0.75f && out.ry == 1.0f && out.btn[PB_A],
+                    "normal-a-stick", &cases);
+
+  pad_apply_standard(&out, &(pad_standard_state_t){0});
+  padbackend_expect(padbackend_state_neutral(&out), "zero", &cases);
+
+  pad_apply_standard(&out, &(pad_standard_state_t){
+    .connected = 1, .lx = -2.0f, .ly = 2.0f, .rx = -1.0f, .ry = 1.0f,
+  });
+  padbackend_expect(out.lx == -1.0f && out.ly == 1.0f &&
+                    out.rx == -1.0f && out.ry == 1.0f, "stick-bounds", &cases);
+
+  pad_apply_standard(&out, &(pad_standard_state_t){
+    .connected = 1, .lt = -0.5f, .rt = 1.5f,
+  });
+  padbackend_expect(out.lt == 0.0f && out.rt == 1.0f, "trigger-bounds", &cases);
+
+  padbackend_expect_standard_button(&out, 0x0001u, PB_START,  "menu-start",  &cases);
+  padbackend_expect_standard_button(&out, 0x0002u, PB_SELECT, "view-select", &cases);
+  padbackend_expect_standard_button(&out, 0x0004u, PB_A,      "a",           &cases);
+  padbackend_expect_standard_button(&out, 0x0008u, PB_B,      "b",           &cases);
+  padbackend_expect_standard_button(&out, 0x0010u, PB_X,      "x",           &cases);
+  padbackend_expect_standard_button(&out, 0x0020u, PB_Y,      "y",           &cases);
+  padbackend_expect_standard_button(&out, 0x0040u, PB_UP,     "dpad-up",     &cases);
+  padbackend_expect_standard_button(&out, 0x0080u, PB_DOWN,   "dpad-down",   &cases);
+  padbackend_expect_standard_button(&out, 0x0100u, PB_LEFT,   "dpad-left",   &cases);
+  padbackend_expect_standard_button(&out, 0x0200u, PB_RIGHT,  "dpad-right",  &cases);
+  padbackend_expect_standard_button(&out, 0x0400u, PB_LB,     "lb",          &cases);
+  padbackend_expect_standard_button(&out, 0x0800u, PB_RB,     "rb",          &cases);
+  padbackend_expect_standard_button(&out, 0x1000u, PB_L3,     "l3",          &cases);
+  padbackend_expect_standard_button(&out, 0x2000u, PB_R3,     "r3",          &cases);
+
+  pad_apply_xinput(&out, &(pad_xinput_raw_t){
+    .lx = -32768, .ly = 0, .rx = 32767, .ry = -16384,
+    .lt = 0, .rt = 255,
+  });
+  padbackend_expect(out.lx == -1.0f && out.ly == 0.0f && out.rx == 1.0f &&
+                    out.ry < -0.49f && out.ry > -0.51f && out.lt == 0.0f &&
+                    out.rt == 1.0f, "xinput-ranges", &cases);
+  padbackend_expect_xinput_button(&out, 0x0001u, PB_UP, "xi-dpad-up", &cases);
+  padbackend_expect_xinput_button(&out, 0x0002u, PB_DOWN, "xi-dpad-down", &cases);
+  padbackend_expect_xinput_button(&out, 0x0004u, PB_LEFT, "xi-dpad-left", &cases);
+  padbackend_expect_xinput_button(&out, 0x0008u, PB_RIGHT, "xi-dpad-right", &cases);
+  padbackend_expect_xinput_button(&out, 0x0010u, PB_START, "xi-start", &cases);
+  padbackend_expect_xinput_button(&out, 0x0020u, PB_SELECT, "xi-select", &cases);
+  padbackend_expect_xinput_button(&out, 0x0040u, PB_L3, "xi-l3", &cases);
+  padbackend_expect_xinput_button(&out, 0x0080u, PB_R3, "xi-r3", &cases);
+  padbackend_expect_xinput_button(&out, 0x0100u, PB_LB, "xi-lb", &cases);
+  padbackend_expect_xinput_button(&out, 0x0200u, PB_RB, "xi-rb", &cases);
+  padbackend_expect_xinput_button(&out, 0x1000u, PB_A, "xi-a", &cases);
+  padbackend_expect_xinput_button(&out, 0x2000u, PB_B, "xi-b", &cases);
+  padbackend_expect_xinput_button(&out, 0x4000u, PB_X, "xi-x", &cases);
+  padbackend_expect_xinput_button(&out, 0x8000u, PB_Y, "xi-y", &cases);
+
+  gameinput = (pad_state_t){.connected = 1, .lx = 0.25f, .ly = 0.5f,
+                             .rx = 0.75f, .ry = 1.0f, .lt = 0.2f, .rt = 0.3f,
+                             .btn = {[PB_A] = 1}};
+  xinput = (pad_state_t){.connected = 1, .lx = -0.25f, .ly = -0.5f,
+                          .rx = -0.75f, .ry = -1.0f, .lt = 0.8f, .rt = 0.9f,
+                          .btn = {[PB_B] = 1}};
+  pad_mux_apply(&out, &gameinput, 1, &xinput, 1);
+  padbackend_expect(padbackend_state_equal(&out, &gameinput), "gameinput-priority", &cases);
+
+  pad_mux_apply(&out, &gameinput, 0, &xinput, 1);
+  padbackend_expect(padbackend_state_equal(&out, &xinput), "xinput-fallback", &cases);
+
+  pad_mux_apply(&out, &gameinput, 0, &xinput, 0);
+  padbackend_expect(padbackend_state_neutral(&out), "both-invalid", &cases);
+
+  gameinput = (pad_state_t){.connected = 1, .lx = 1.0f, .ly = -1.0f,
+                             .rx = 0.5f, .ry = -0.5f, .lt = 0.1f, .rt = 0.2f,
+                             .btn = {[PB_A] = 1, [PB_LB] = 1}};
+  xinput = (pad_state_t){.connected = 1, .lx = -1.0f, .ly = 1.0f,
+                          .rx = -0.5f, .ry = 0.5f, .lt = 0.9f, .rt = 0.8f,
+                          .btn = {[PB_B] = 1, [PB_RB] = 1}};
+  pad_mux_apply(&out, &gameinput, 1, &xinput, 1);
+  padbackend_expect(padbackend_state_equal(&out, &gameinput), "no-field-merge", &cases);
+
+  printf("padbackend ok cases=%d\n", cases);
+}
+
 static void run_script(char *script, sim_ctx_t *s) {
   g_tok_pushback = NULL;
   for (char *t = strtok(script, " \t\r\n;"); t; t = take_tok()) {
@@ -23916,6 +24141,8 @@ static void run_script(char *script, sim_ctx_t *s) {
       botmemory_proof();
     } else if (!strcmp(t, "botmemoryobserve")) {
       botmemoryobserve_proof();
+    } else if (!strcmp(t, "padbackend")) {
+      padbackend_proof();
     } else if (t[0] == '+' || t[0] == '-') {
       s->held[action_from_name(t + 1)] = t[0] == '+';
     } else if (!strcmp(t, "tap")) {
@@ -28292,13 +28519,132 @@ static void platform_vsync_changed(void) {
   if (g_swap_interval) g_swap_interval(g_cfg.vsync);
 }
 
-// --- Gamepad via XInput -----------------------------------------------------
-// Same discipline as the Linux side: the backend only FILLS g_pad; deadzone,
-// curve and button policy live in the shared core. XInput is reached by
-// LoadLibrary so the build keeps zero new link-time dependencies and a machine
-// without any xinput DLL simply has no pad. The struct is ABI from xinput.h,
-// hand-declared like the XI2 and WASAPI ones. This target is compile-checked
-// only in this container; the review contract is reading it against MSDN.
+// --- Gamepad via GameInput v0 + XInput -------------------------------------
+// Both native adapters produce the shared GameInput-shaped sample. GameInput
+// is the Win11 path for standard Bluetooth/HID gamepads; XInput remains the
+// optional fallback for older systems and Xbox-compatible drivers. Neither
+// adapter ever writes g_pad directly, so a failed read cannot leave a stale
+// button or stick level behind.
+typedef struct win_gi_game_input win_gi_game_input_t;
+typedef struct win_gi_reading win_gi_reading_t;
+typedef HRESULT (STDMETHODCALLTYPE *win_gi_qi_fn)(void *, REFIID, void **);
+typedef ULONG (STDMETHODCALLTYPE *win_gi_ref_fn)(void *);
+typedef void (STDMETHODCALLTYPE *win_gi_unused_fn)(void);
+
+typedef struct {
+  uint32_t buttons;
+  float leftTrigger, rightTrigger;
+  float leftThumbstickX, leftThumbstickY;
+  float rightThumbstickX, rightThumbstickY;
+} win_gi_gamepad_state_t;
+static_assert(sizeof(win_gi_gamepad_state_t) == 28, "GAMEINPUT v0 state ABI");
+
+typedef struct {
+  win_gi_qi_fn QueryInterface;
+  win_gi_ref_fn AddRef;
+  win_gi_ref_fn Release;
+  win_gi_unused_fn GetCurrentTimestamp;
+  HRESULT (STDMETHODCALLTYPE *GetCurrentReading)(win_gi_game_input_t *, DWORD,
+                                                  void *, win_gi_reading_t **);
+} win_gi_input_vtbl_t;
+struct win_gi_game_input { const win_gi_input_vtbl_t *lpVtbl; };
+static_assert(offsetof(win_gi_input_vtbl_t, GetCurrentReading) == 4 * sizeof(void *),
+              "GAMEINPUT v0 GetCurrentReading slot");
+
+typedef struct {
+  win_gi_qi_fn QueryInterface;
+  win_gi_ref_fn AddRef;
+  win_gi_ref_fn Release;
+  win_gi_unused_fn GetInputKind;
+  win_gi_unused_fn GetSequenceNumber;
+  win_gi_unused_fn GetTimestamp;
+  win_gi_unused_fn GetDevice;
+  win_gi_unused_fn GetRawReport;
+  win_gi_unused_fn GetControllerAxisCount;
+  win_gi_unused_fn GetControllerAxisState;
+  win_gi_unused_fn GetControllerButtonCount;
+  win_gi_unused_fn GetControllerButtonState;
+  win_gi_unused_fn GetControllerSwitchCount;
+  win_gi_unused_fn GetControllerSwitchState;
+  win_gi_unused_fn GetKeyCount;
+  win_gi_unused_fn GetKeyState;
+  win_gi_unused_fn GetMouseState;
+  win_gi_unused_fn GetTouchCount;
+  win_gi_unused_fn GetTouchState;
+  win_gi_unused_fn GetMotionState;
+  win_gi_unused_fn GetArcadeStickState;
+  win_gi_unused_fn GetFlightStickState;
+  bool (STDMETHODCALLTYPE *GetGamepadState)(win_gi_reading_t *,
+                                             win_gi_gamepad_state_t *);
+} win_gi_reading_vtbl_t;
+struct win_gi_reading { const win_gi_reading_vtbl_t *lpVtbl; };
+static_assert(offsetof(win_gi_reading_vtbl_t, GetGamepadState) == 22 * sizeof(void *),
+              "GAMEINPUT v0 GetGamepadState slot");
+
+static const IID WIN_GI_IID_V0 =
+  {0x11BE2A7E, 0x4254, 0x445A, {0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00, 0x69, 0x18}};
+#define WIN_GI_KIND_GAMEPAD 0x00040000u
+typedef HRESULT (WINAPI *pfn_GameInputInitialize)(REFIID, void **);
+typedef HRESULT (WINAPI *pfn_GameInputCreate)(win_gi_game_input_t **);
+static HMODULE g_gameinput_module;
+static win_gi_game_input_t *g_gameinput;
+static pfn_GameInputInitialize g_gameinput_initialize;
+static pfn_GameInputCreate g_gameinput_create;
+
+static void win_gameinput_load(void) {
+  HMODULE m = LoadLibraryExW(L"GameInput.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!m) return;  // Win11 inbox runtime is optional; XInput still works.
+  g_gameinput_initialize = (pfn_GameInputInitialize)(void *)
+    GetProcAddress(m, "GameInputInitialize");
+  g_gameinput_create = (pfn_GameInputCreate)(void *)
+    GetProcAddress(m, "GameInputCreate");
+  HRESULT hr = E_NOINTERFACE;
+  if (g_gameinput_initialize)
+    hr = g_gameinput_initialize(&WIN_GI_IID_V0, (void **)&g_gameinput);
+  if (FAILED(hr) && g_gameinput_create)
+    hr = g_gameinput_create(&g_gameinput);
+  if (FAILED(hr) || !g_gameinput) {
+    g_gameinput = NULL;
+    g_gameinput_initialize = NULL;
+    g_gameinput_create = NULL;
+    FreeLibrary(m);
+    return;
+  }
+  g_gameinput_module = m;
+}
+
+static int win_gameinput_pump(pad_state_t *out) {
+  if (!g_gameinput) return 0;
+  win_gi_reading_t *reading = NULL;
+  HRESULT hr = g_gameinput->lpVtbl->GetCurrentReading(
+    g_gameinput, WIN_GI_KIND_GAMEPAD, NULL, &reading);
+  if (FAILED(hr) || !reading) return 0;
+  win_gi_gamepad_state_t g = {0};
+  int ok = reading->lpVtbl->GetGamepadState(reading, &g) != 0;
+  if (ok) {
+    pad_standard_state_t sample = {
+      .connected = 1, .lx = g.leftThumbstickX, .ly = g.leftThumbstickY,
+      .rx = g.rightThumbstickX, .ry = g.rightThumbstickY,
+      .lt = g.leftTrigger, .rt = g.rightTrigger, .buttons = g.buttons,
+    };
+    pad_apply_standard(out, &sample);
+  }
+  reading->lpVtbl->Release(reading);
+  return ok;
+}
+
+static void win_gameinput_shutdown(void) {
+  if (g_gameinput) g_gameinput->lpVtbl->Release(g_gameinput);
+  g_gameinput = NULL;
+  if (g_gameinput_module) FreeLibrary(g_gameinput_module);
+  g_gameinput_module = NULL;
+  g_gameinput_initialize = NULL;
+  g_gameinput_create = NULL;
+}
+
+// XInput is reached by LoadLibrary so the build keeps zero new link-time
+// dependencies and a machine without either controller DLL simply has no pad.
+// The struct is ABI from xinput.h, hand-declared like the XI2 and WASAPI ones.
 typedef struct {
   WORD  wButtons;
   BYTE  bLeftTrigger, bRightTrigger;
@@ -28306,61 +28652,52 @@ typedef struct {
 } win_xi_gamepad_t;
 typedef struct { DWORD dwPacketNumber; win_xi_gamepad_t Gamepad; } win_xi_state_t;
 static_assert(sizeof(win_xi_state_t) == 16, "XINPUT_STATE ABI");
+static_assert(sizeof(win_xi_gamepad_t) == sizeof(pad_xinput_raw_t), "XINPUT raw sample ABI");
 typedef DWORD (WINAPI *pfn_XInputGetState)(DWORD, win_xi_state_t *);
 static pfn_XInputGetState g_xi_get_state;
 static int    g_xi_slot = -1;
 static double g_xi_rescan;
 
 static void win_pad_load(void) {
+  win_gameinput_load();
   HMODULE m = LoadLibraryA("xinput1_4.dll");           // Win8+
   if (!m) m = LoadLibraryA("xinput9_1_0.dll");         // the OS-shipped fallback
   if (m) g_xi_get_state = (pfn_XInputGetState)(void *)GetProcAddress(m, "XInputGetState");
 }
 
-static void win_pad_pump(double now) {
-  if (!g_xi_get_state) return;
+static int win_xinput_pump(pad_state_t *out, double now) {
+  if (!g_xi_get_state) return 0;
   win_xi_state_t st;
   if (g_xi_slot < 0) {
     // Empty XInput slots are expensive to poll (a device enumeration inside
     // the call), so scan on a 2 s timer rather than every frame.
-    if (now < g_xi_rescan) return;
+    if (now < g_xi_rescan) return 0;
     g_xi_rescan = now + 2.0;
     for (DWORD i = 0; i < 4 && g_xi_slot < 0; i++)
       if (g_xi_get_state(i, &st) == 0 /* ERROR_SUCCESS */) g_xi_slot = (int)i;
-    if (g_xi_slot < 0) return;
+    if (g_xi_slot < 0) return 0;
   }
   if (g_xi_get_state((DWORD)g_xi_slot, &st) != 0) {
     g_xi_slot = -1;
-    memset(&g_pad, 0, sizeof g_pad);
     g_xi_rescan = now + 2.0;
-    return;
+    return 0;
   }
-  g_pad.connected = 1;
   const win_xi_gamepad_t *g = &st.Gamepad;
-  // SHORT is -32768..32767: dividing by 32767 can exceed -1 by one part in
-  // 32k, which the clamp eats. XInput's Y is already up-positive — the shared
-  // convention — so no sign flip here (the evdev side does its own).
-  g_pad.lx = f_clamp((float)g->sThumbLX / 32767.0f, -1.0f, 1.0f);
-  g_pad.ly = f_clamp((float)g->sThumbLY / 32767.0f, -1.0f, 1.0f);
-  g_pad.rx = f_clamp((float)g->sThumbRX / 32767.0f, -1.0f, 1.0f);
-  g_pad.ry = f_clamp((float)g->sThumbRY / 32767.0f, -1.0f, 1.0f);
-  g_pad.lt = (float)g->bLeftTrigger / 255.0f;
-  g_pad.rt = (float)g->bRightTrigger / 255.0f;
-  const WORD b = g->wButtons;
-  g_pad.btn[PB_UP]     = (b & 0x0001) != 0;  // XINPUT_GAMEPAD_DPAD_UP...
-  g_pad.btn[PB_DOWN]   = (b & 0x0002) != 0;
-  g_pad.btn[PB_LEFT]   = (b & 0x0004) != 0;
-  g_pad.btn[PB_RIGHT]  = (b & 0x0008) != 0;
-  g_pad.btn[PB_START]  = (b & 0x0010) != 0;
-  g_pad.btn[PB_SELECT] = (b & 0x0020) != 0;
-  g_pad.btn[PB_L3]     = (b & 0x0040) != 0;
-  g_pad.btn[PB_R3]     = (b & 0x0080) != 0;
-  g_pad.btn[PB_LB]     = (b & 0x0100) != 0;
-  g_pad.btn[PB_RB]     = (b & 0x0200) != 0;
-  g_pad.btn[PB_A]      = (b & 0x1000) != 0;
-  g_pad.btn[PB_B]      = (b & 0x2000) != 0;
-  g_pad.btn[PB_X]      = (b & 0x4000) != 0;
-  g_pad.btn[PB_Y]      = (b & 0x8000) != 0;
+  // SHORT is -32768..32767; pad_apply_xinput clamps the one-step negative
+  // overshoot. XInput Y is already up-positive, matching the shared contract.
+  pad_apply_xinput(out, &(pad_xinput_raw_t){
+    .buttons = g->wButtons, .lt = g->bLeftTrigger, .rt = g->bRightTrigger,
+    .lx = g->sThumbLX, .ly = g->sThumbLY,
+    .rx = g->sThumbRX, .ry = g->sThumbRY,
+  });
+  return 1;
+}
+
+static void win_pad_pump(double now) {
+  pad_state_t gameinput = {0}, xinput = {0};
+  int gameinput_valid = win_gameinput_pump(&gameinput);
+  int xinput_valid = gameinput_valid ? 0 : win_xinput_pump(&xinput, now);
+  pad_mux_apply(&g_pad, &gameinput, gameinput_valid, &xinput, xinput_valid);
 }
 
 // --- WASAPI output: shared mode, event-driven, ~20 ms buffer. -------------
@@ -29029,6 +29366,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     WaitForSingleObject(g_audio_h, 800);
     CloseHandle(g_audio_h);
   }
+  win_gameinput_shutdown();
   return 0;
 }
 
