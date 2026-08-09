@@ -695,17 +695,16 @@ static int g_server;
 // Server parameters COME FROM ARGV, not from the config (§8.3): argv is the
 // interface systemd needs anyway, and it deletes the config-trap quartet
 // (parser switch, emit list, unknown-key deletion, live slider for a
-// bind-time value). cap_public <= cap_hard is CHECKED at startup — an
-// invariant that holds nowhere by itself. cap_hard deliberately ABOVE
-// fighters: a friend code may both displace the last bot AND stretch the
-// arena (§1.3).
+// bind-time value). 1 <= cap_public <= cap_friends <= MAX_HUMANS is CHECKED at
+// startup — a chain that holds nowhere by itself, and whose upper end is the
+// one the old cap_hard=10 quietly violated (the binary has no ninth human).
 [[maybe_unused]] static struct {   // consumed by the Linux server half only
-  int port, fighters, cap_public, cap_hard, skill, fraglimit;
+  int port, cap_bots, cap_public, cap_friends, skill, fraglimit;
   long ticks;          // 0 = run forever; N = exit after N ticks (test/RSS runs)
   const char *dir_host;  // --dir-host: heartbeat here so Quick Join finds us
   int  dir_port;
   int  directory;      // --directory: run as the instance directory instead
-} g_srv = {NET_PORT_DEF, 8, 6, 10, 1, 12, 0, NULL, NET_PORT_DEF, 0};
+} g_srv = {NET_PORT_DEF, 2, 6, 8, 1, 12, 0, NULL, NET_PORT_DEF, 0};
 
 // WHICH entity is "me" — the one identity that is allowed to differ per
 // process (design §4.2): 0 in singleplayer, the own id on a networked client,
@@ -765,10 +764,13 @@ static const param_def_t SP_FRAG_DEF = {"sp_fraglimit", "FRAG LIMIT", 30, 1, 100
 // exactly how a deadzone ends up existing twice with one copy subtly wrong.
 // ---------------------------------------------------------------------------
 
-// Developer menu gate. 0 hides the DEV tab (movement/weapon tuning) for a
-// release build; the config keys keep parsing so a tuned config stays valid.
-// Overridable from the build line (-DDEV_MENU=0) so a release build is a flag,
-// not a source edit.
+// Developer menu gate, the HARD half: 0 removes the DEV tab (movement/weapon
+// tuning) from the build entirely, whatever the config says. Overridable from
+// the build line (-DDEV_MENU=0) so a release build is a flag, not a source
+// edit. The SOFT half is `g_cfg.devmode` (config key `devmode`, harness `dev
+// on|off`), default 0 — the tab is opt-in per install and needs no rebuild.
+// Either way the tuning config keys keep parsing, so a tuned config stays
+// valid on a binary that cannot show the tab.
 #ifndef DEV_MENU
 #define DEV_MENU 1
 #endif
@@ -904,6 +906,7 @@ typedef struct {
   int   sp_frag;             // frag limit, range in SP_FRAG_DEF
   char  name[12];            // player name; glyph policy lives in name_glyph
   int   third_person;        // camera: 0 = first person, 1 = shoulder cam
+  int   devmode;             // show the DEV tab; hard-gated by DEV_MENU, def 0
   float mv[MV_COUNT];        // movement tuning, see MV_DEF
   float wp[WPN_COUNT][WP_COUNT];  // per-weapon tuning, see WP_DEF/WPN_DEF
   float pad[PAD_COUNT];      // gamepad feel, see PAD_DEF
@@ -1013,9 +1016,10 @@ static void config_emit(FILE *f, const config_t *c) {
     "fps_cap %d\n"
     "show_fps %d\n"
     "msaa %d\n"
-    "third_person %d\n",
+    "third_person %d\n"
+    "devmode %d\n",
     (double)c->sense, (double)c->fov, c->vsync, c->fps_cap, c->show_fps, c->msaa,
-    c->third_person);
+    c->third_person, c->devmode);
   fprintf(f, "%s %.2f\n", VOL_DEF.key, (double)c->vol);
   fprintf(f, "sp_bots %d\nsp_difficulty %d\nsp_fraglimit %d\nplayer_name %s\n",
           c->sp_bots, c->sp_diff, c->sp_frag, c->name);
@@ -1183,6 +1187,12 @@ static void config_load_or_create(const char *path, config_t *c) {
     }
     else if (!strcmp(key, "third_person")) {
       c->third_person = parse_long(val, c->third_person) ? 1 : 0;
+    }
+    // The DEV tab's runtime opt-in. It stays a config key with no menu toggle
+    // on purpose: a knob that can switch itself on from inside the menu is one
+    // stray click away from a player standing in the tuning workbench.
+    else if (!strcmp(key, "devmode")) {
+      c->devmode = parse_long(val, c->devmode) ? 1 : 0;
     }
     else if (!strcmp(key, VOL_DEF.key)) {
       c->vol = parse_float(val, c->vol, VOL_DEF.lo, VOL_DEF.hi);
@@ -4804,7 +4814,11 @@ typedef struct {
 // map seed, NP_LEAVE exists, and the entity record's weapon field is rejected
 // rather than masked. A version-1 peer trips the PROTO check on byte 0 and is
 // told so, which is the whole reason this number is hand-maintained.
-#define NET_PROTO 2
+// 3: the snapshot carries the EVENT SECTION (§6.5) after the entity list, and
+// the input packet's event-ack field is finally read. A version-2 client would
+// parse the entity list correctly and then read the event count as the start of
+// nothing — exactly the silent misinterpretation this number exists to prevent.
+#define NET_PROTO 3
 // Floors on UNVERIFIED requests, so the answer to one is always smaller than
 // the request was (§7.1) and neither responder can be pointed at a forged
 // source address. 16 against the 7-byte COOKIE; 704 against the INSTANCES
@@ -4920,6 +4934,36 @@ typedef struct {
   int16_t  lean;           // -1..1
 } net_ent_t;
 
+// --- The event channel (§6.5) ---------------------------------------------
+// Every event carries its sim tick and a monotone id; the client acks the
+// highest id it has seen on every input packet; the server resends everything
+// above that ack for ~200 ms; the client drops any id <= its high-water mark.
+// Without this the server simulated shots nobody could see: a client's OWN shot
+// is predicted with ev_push suppressed (g_predicting), so the muzzle flash, the
+// report, the tracer, the impact and the hitmarker can only ever arrive as
+// server events. There were none — the server dropped its whole event list
+// every tick and the snapshot had no room for one.
+//
+// EV_STEP/EV_LAND are deliberately NOT on the wire: they are pushed by each
+// client's own animation solver from its own contact edge, so sending them
+// would play every footstep twice.
+//
+// The payload is the quantized event_t, one fixed record. a/b both go through
+// the position quantizer: b is a direction or a normal for some types, and cm
+// resolution on a unit vector (0.01) is finer than any of its consumers.
+// 16 records x 31 B = 496 B on top of the entity list's ~600 B, which keeps the
+// datagram inside a 1400 B MTU at the roster ceiling. 36 ticks is 300 ms of
+// resend window — one and a half of the design's 200 ms, so a client on a 150 ms
+// link still gets a second chance at every event.
+#define NET_EV_SNAP_MAX   16     // records per snapshot; the rest ride the resend
+#define NET_EV_RESEND_TCK 36     // ~300 ms at 120 Hz, then it ages out
+typedef struct {
+  uint32_t id;
+  uint16_t dt;              // ticks between the event and the snapshot it rides
+  uint8_t  type, src, dst, wpn, k;
+  int16_t  i, ax, ay, az, bx, by, bz, f, g, pen;
+} net_ev_t;
+
 static int16_t net_q_pos(float m)  { return (int16_t)lrintf(f_clamp(m, -327.0f, 327.0f) * 100.0f); }
 [[maybe_unused]] static float   net_dq_pos(int16_t q){ return (float)q * 0.01f; }
 static int16_t net_q_vel(float v)  { return (int16_t)lrintf(f_clamp(v, -327.0f, 327.0f) * 100.0f); }
@@ -4933,6 +4977,49 @@ static void net_ent_encode(np_wr *w, const net_ent_t *e) {
   np_w16(w, (uint16_t)e->vx); np_w16(w, (uint16_t)e->vy); np_w16(w, (uint16_t)e->vz);
   np_w16(w, (uint16_t)e->yaw); np_w16(w, (uint16_t)e->pitch);
   np_w16(w, (uint16_t)e->lean);
+}
+static void net_ev_encode(np_wr *w, const net_ev_t *e) {
+  np_w32(w, e->id); np_w16(w, e->dt);
+  np_w8(w, e->type); np_w8(w, e->src); np_w8(w, e->dst);
+  np_w8(w, e->wpn);  np_w8(w, e->k);
+  np_w16(w, (uint16_t)e->i);
+  np_w16(w, (uint16_t)e->ax); np_w16(w, (uint16_t)e->ay); np_w16(w, (uint16_t)e->az);
+  np_w16(w, (uint16_t)e->bx); np_w16(w, (uint16_t)e->by); np_w16(w, (uint16_t)e->bz);
+  np_w16(w, (uint16_t)e->f);  np_w16(w, (uint16_t)e->g);  np_w16(w, (uint16_t)e->pen);
+}
+// Every field is read through the bounds-checked cursor; `type` is clamped to
+// the defined range on USE (net_ev_to_live), never trusted as an array index
+// here — a hostile server is still a decoder input like any other.
+static int net_ev_decode(np_rd *r, net_ev_t *e) {
+  e->id = np_r32(r); e->dt = np_r16(r);
+  e->type = np_r8(r); e->src = np_r8(r); e->dst = np_r8(r);
+  e->wpn = np_r8(r);  e->k = np_r8(r);
+  e->i = (int16_t)np_r16(r);
+  e->ax = (int16_t)np_r16(r); e->ay = (int16_t)np_r16(r); e->az = (int16_t)np_r16(r);
+  e->bx = (int16_t)np_r16(r); e->by = (int16_t)np_r16(r); e->bz = (int16_t)np_r16(r);
+  e->f = (int16_t)np_r16(r);  e->g = (int16_t)np_r16(r);  e->pen = (int16_t)np_r16(r);
+  return !r->bad;
+}
+static void net_ev_from_live(net_ev_t *n, const event_t *e, uint32_t id, uint16_t dt) {
+  n->id = id; n->dt = dt;
+  n->type = (uint8_t)e->type;
+  n->src = (uint8_t)(e->src < 0 ? 0xFF : e->src);
+  n->dst = (uint8_t)(e->dst < 0 ? 0xFF : e->dst);
+  n->wpn = (uint8_t)e->wpn; n->k = (uint8_t)e->k;
+  n->i = (int16_t)(e->i < -32768 ? -32768 : e->i > 32767 ? 32767 : e->i);
+  n->ax = net_q_pos(e->a.x); n->ay = net_q_pos(e->a.y); n->az = net_q_pos(e->a.z);
+  n->bx = net_q_pos(e->b.x); n->by = net_q_pos(e->b.y); n->bz = net_q_pos(e->b.z);
+  n->f = net_q_pos(e->f); n->g = net_q_wish(e->g); n->pen = net_q_pos(e->pen);
+}
+static void net_ev_to_live(event_t *e, const net_ev_t *n) {
+  *e = (event_t){0};
+  e->type = (ev_type_t)(n->type > EV_LAND ? EV_IMPACT : n->type);
+  e->src = n->src == 0xFF ? -1 : n->src;
+  e->dst = n->dst == 0xFF ? -1 : n->dst;
+  e->wpn = n->wpn; e->k = n->k; e->i = n->i;
+  e->a = (v3){{net_dq_pos(n->ax), net_dq_pos(n->ay), net_dq_pos(n->az)}};
+  e->b = (v3){{net_dq_pos(n->bx), net_dq_pos(n->by), net_dq_pos(n->bz)}};
+  e->f = net_dq_pos(n->f); e->g = net_dq_wish(n->g); e->pen = net_dq_pos(n->pen);
 }
 static int net_ent_decode(np_rd *r, net_ent_t *e) {
   e->id = np_r8(r); e->flags = np_r8(r);
@@ -7819,22 +7906,29 @@ static v3 ent_pos(int e) {
   return h >= 0 ? g_players[h].pos : g_bots[e - 1].pos;
 }
 
-// Fill / cap decisions (§1.3/§1.4). A joining human either displaces a bot
-// (keeping the fighter count constant — the bot retires at its NEXT respawn,
-// never mid-life, §1.4) or grows the arena, bounded by two caps. cap_public is
-// how far Quick Join fills with strangers; cap_hard is how far a friend CODE
-// may stretch it. The invariant cap_public <= cap_hard holds nowhere by
-// itself, so it is checked at the server, and cap_hard sits ABOVE the fighter
-// count on purpose (a Discord four-stack must fit).
-typedef enum { NF_REJECT, NF_DISPLACE_BOT, NF_GROW } net_fill_t;
-[[maybe_unused]] static net_fill_t net_fill_decision(int humans, int bots, int is_code,
-                                    int fighters, int cap_public, int cap_hard) {
-  int cap = is_code ? cap_hard : cap_public;
-  if (humans >= cap) return NF_REJECT;          // this door is full
-  if (bots > 0 && humans + bots >= fighters)    // at the fighter count: a human
-    return NF_DISPLACE_BOT;                      // takes a bot's slot, count held
-  if (humans + bots < cap_hard) return NF_GROW; // room to grow the arena
-  return NF_REJECT;
+// Fill / cap decisions (§1.3/§1.4). THREE numbers, each readable on its own:
+// cap_bots is how many bots the arena may hold, cap_public how large it may
+// grow through the public door (humans AND bots together), cap_friends how far
+// a friend invite may stretch it. The arena is NOT a constant fighter count —
+// it grows with the humans, and the bot target is a pure function of them.
+//
+// "Bots yield first" is deliberately NOT a branch: it falls out of the bot
+// target shrinking as humans arrive. The predecessor spent a three-valued enum
+// (reject / displace-bot / grow) on saying the same thing, and needed the
+// caller to keep bots and humans consistent to say it correctly.
+//
+// Bots pad only up to cap_public, never up to cap_friends: the headroom above
+// cap_public exists for a Discord four-stack, and a bot sitting in it is
+// exactly the "the third friend cannot get in" failure §1.3 argued against.
+// §1.4 is untouched by both — the surplus bot retires at its NEXT respawn.
+[[maybe_unused]] static int net_bot_target(int humans, int cap_public, int cap_bots) {
+  int room = cap_public - humans;
+  if (room > cap_bots) room = cap_bots;
+  return room < 0 ? 0 : room;
+}
+[[maybe_unused]] static int net_join_ok(int humans, int is_friend,
+                                        int cap_public, int cap_friends) {
+  return humans < (is_friend ? cap_friends : cap_public);
 }
 
 // Friend codes (§1.5): a 6-glyph pointer, NOT a secret. Its OWN alphabet —
@@ -7912,7 +8006,31 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
 
 // SNAPSHOT (§6.3): header + one record per live entity. Returns bytes written,
 // or 0 if the buffer was too small (a real snapshot at 8 fighters is ~230 B).
-[[maybe_unused]] static size_t net_snapshot_build(unsigned char *buf, size_t cap, uint32_t last_input_tick) {
+// The server's outbound event log (§6.5): every event the sim pushed, stamped
+// with a monotone id and the tick it happened on. Entries stay until every
+// client has acked them or they age past the resend window, so a lost snapshot
+// costs a repeat, not a missing kill sound. 128 against a measured ev_peak of
+// ~10 per tick is four resend windows of headroom.
+#define NET_EVLOG 128
+typedef struct { uint32_t id, tick; event_t e; } srv_ev_t;
+static srv_ev_t g_srv_evlog[NET_EVLOG];
+static int      g_srv_evlog_head, g_srv_evlog_n;
+static uint32_t g_srv_ev_next = 1;      // id 0 means "client has acked nothing"
+
+// Called once per server tick, BEFORE the sim's event list is drained.
+[[maybe_unused]] static void net_ev_capture(void) {
+  for (int i = 0; i < g_num_events; i++) {
+    ev_type_t t = g_events[i].type;
+    if (t == EV_STEP || t == EV_LAND) continue;   // each client makes its own
+    g_srv_evlog[g_srv_evlog_head] =
+        (srv_ev_t){g_srv_ev_next++, (uint32_t)g_tick, g_events[i]};
+    g_srv_evlog_head = (g_srv_evlog_head + 1) % NET_EVLOG;
+    if (g_srv_evlog_n < NET_EVLOG) g_srv_evlog_n++;
+  }
+}
+
+[[maybe_unused]] static size_t net_snapshot_build(unsigned char *buf, size_t cap, uint32_t last_input_tick,
+                                                  uint32_t ev_ack) {
   np_wr w = {buf, cap, 0, 0};
   np_w16(&w, NET_PROTO);
   np_w8(&w, NP_SNAPSHOT);
@@ -7935,8 +8053,38 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
     net_ent_encode(&w, &ne);
     cnt++;
   }
+  // Events above this client's ack, oldest first (§6.5). Capped per snapshot so
+  // one busy tick cannot blow the datagram past the MTU — the remainder simply
+  // rides the next one, which is the same resend path a lost packet takes.
+  // SELECT NEWEST-FIRST, EMIT OLDEST-FIRST. Selecting oldest-first looks like
+  // the obvious reading of "resend everything above the ack", and it head-of-
+  // line blocks: the cap fills with unacked old records every snapshot, and
+  // anything newer waits for an ack that is itself one RTT away. Measured on
+  // localhost with two bots, a client firing 30 rounds heard 21 of them; the
+  // nine it lost were the newest, i.e. exactly the shots it had just taken.
+  // The client dedups on id, so what matters inside one datagram is only that
+  // ids ASCEND — §6.5's "grouped by tick in push order" — which the second
+  // loop restores.
+  size_t ev_at = w.at;
+  np_w8(&w, 0);
+  int pick[NET_EV_SNAP_MAX], nev = 0;
+  for (int k = g_srv_evlog_n - 1; k >= 0 && nev < NET_EV_SNAP_MAX; k--) {
+    int idx = (g_srv_evlog_head - g_srv_evlog_n + k + 2 * NET_EVLOG) % NET_EVLOG;
+    const srv_ev_t *s = &g_srv_evlog[idx];
+    if ((int32_t)(s->id - ev_ack) <= 0) continue;        // already acknowledged
+    uint32_t age = (uint32_t)g_tick - s->tick;
+    if (age > NET_EV_RESEND_TCK) continue;               // outside the window
+    pick[nev++] = idx;
+  }
+  for (int k = nev - 1; k >= 0; k--) {                   // ascending ids again
+    const srv_ev_t *s = &g_srv_evlog[pick[k]];
+    net_ev_t ne;
+    net_ev_from_live(&ne, &s->e, s->id, (uint16_t)((uint32_t)g_tick - s->tick));
+    net_ev_encode(&w, &ne);
+  }
   if (w.bad) return 0;
   buf[cnt_at] = (uint8_t)cnt;
+  buf[ev_at]  = (uint8_t)nev;
   return w.at;
 }
 
@@ -7947,7 +8095,8 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
 [[maybe_unused]] static int net_snapshot_read(const unsigned char *buf, size_t len, uint32_t *server_tick,
                              uint32_t *last_input_tick, uint32_t *world,
                              uint32_t *seed,
-                             net_ent_t *out, int out_cap, int *complete) {
+                             net_ent_t *out, int out_cap, int *complete,
+                             net_ev_t *evs, int ev_cap, int *ev_cnt) {
   np_rd r = {buf, len, 0, 0};
   if (np_r16(&r) != NET_PROTO) return -1;
   if (np_r8(&r) != NP_SNAPSHOT) return -1;
@@ -7966,6 +8115,23 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
   // exactly like "everyone after this left", and a caller that reads absence
   // as departure would retire them, up to and including the local player.
   if (complete) *complete = (got == cnt);
+  // The event section (§6.5). A truncated one costs the events it cut, never a
+  // wild read, and never the entity list above it — which is why the roster's
+  // completeness flag is decided BEFORE this runs.
+  if (ev_cnt) *ev_cnt = 0;
+  if (evs && ev_cap > 0) {
+    int ec = np_r8(&r);
+    if (!r.bad) {
+      if (ec > ev_cap) ec = ev_cap;
+      int eg = 0;
+      for (int i = 0; i < ec; i++) {
+        net_ev_t ne;
+        if (!net_ev_decode(&r, &ne)) break;
+        evs[eg++] = ne;
+      }
+      if (ev_cnt) *ev_cnt = eg;
+    }
+  }
   if (server_tick) *server_tick = st;
   if (last_input_tick) *last_input_tick = li;
   if (world) *world = wh;
@@ -10175,6 +10341,13 @@ static void player_tick(player_t *p, const int held[IN_COUNT]) {
   for (int h = 0; h < MAX_HUMANS; h++)
     if (g_humans_on[h])
       player_present_tick(&g_players[h], ent_of_human(h));
+  // The outbound event log (§6.5) is filled HERE, in the one world tick every
+  // caller shares, and not in the server's own entry point: each caller drains
+  // g_events at its own moment — the harness at the end of sim_advance, the
+  // server right after its tick — so a capture anywhere else sees an empty list
+  // for somebody. On a client nothing ever reads the log; the copy is ~10
+  // records against a full sim tick.
+  net_ev_capture();
 }
 
 // One SERVER tick (§3.1): the same world tick plus the PER-TICK event drain —
@@ -10187,7 +10360,7 @@ static void player_tick(player_t *p, const int held[IN_COUNT]) {
   static const int no_held[IN_COUNT] = {0};
   player_tick(&g_players[0], held ? held : no_held);
   net_hist_record();
-  g_num_events = 0;
+  g_num_events = 0;      // player_tick already captured them into the log (§6.5)
 }
 
 // ---------------------------------------------------------------------------
@@ -10205,6 +10378,7 @@ typedef struct {
   int      human;                 // human slot (1..MAX_HUMANS-1); 0 while unjoined
   uint32_t last_recv_ms;          // idle-timeout clock
   uint32_t last_input_tick;       // tag the snapshot with the last input applied
+  uint32_t ev_high;               // highest event id this client has acked (§6.5)
 } net_conn_t;
 static net_conn_t g_conns[MAX_HUMANS];
 static int g_srv_fd = -1;
@@ -10216,15 +10390,15 @@ static int net_conn_find(uint32_t ip, uint16_t port) {
   return -1;
 }
 
-// Keep the fighter count constant (§1.3): the server's bot target is fighters
-// minus the humans present, so a joining human genuinely DISPLACES a bot
-// rather than adding to the count. match_tick reads sp_bots each tick, so this
-// is all it takes — the displaced bot retires at the next fill pass.
+// The bot target is a pure function of the humans present (§1.3): bots pad the
+// arena up to cap_public, at most cap_bots of them. A joining human therefore
+// displaces a bot without anyone deciding to — the target simply shrinks.
+// match_tick reads sp_bots each tick, so this is all it takes; the surplus bot
+// retires at the next fill pass, i.e. at its next respawn (§1.4).
 static void net_srv_rebalance(void) {
   int humans = 0;
   for (int h = 0; h < MAX_HUMANS; h++) if (g_humans_on[h]) humans++;
-  int want = g_srv.fighters - humans;
-  g_cfg.sp_bots = want < 0 ? 0 : want > MAX_BOTS ? MAX_BOTS : want;
+  g_cfg.sp_bots = net_bot_target(humans, g_srv.cap_public, g_srv.cap_bots);
 }
 
 // Assign a free human slot to a newly joined client, honouring the fill caps
@@ -10241,9 +10415,8 @@ static int net_srv_admit(uint32_t ip, uint16_t port, const char *name) {
   for (int i = 0; i < MAX_HUMANS; i++)
     if (g_conns[i].used && g_conns[i].ip == ip) same++;
   if (same >= NET_JOIN_PER_HOST) return -1;
-  net_fill_t act = net_fill_decision(humans, g_match.nbots, /*is_code*/0,
-                                     g_srv.fighters, g_srv.cap_public, g_srv.cap_hard);
-  if (act == NF_REJECT) return -1;
+  if (!net_join_ok(humans, /*is_friend*/0, g_srv.cap_public, g_srv.cap_friends))
+    return -1;
   int h = -1;
   for (int i = 1; i < MAX_HUMANS; i++) if (!g_humans_on[i]) { h = i; break; }
   if (h < 0) return -1;
@@ -10335,8 +10508,11 @@ static void net_srv_packet(const unsigned char *b, int n, uint32_t ip, uint16_t 
     if (conn < 0) return;                   // unknown source: ignore
     g_conns[conn].last_recv_ms = net_now_ms();
     int h = g_conns[conn].human;
-    np_r32(&r);   // event-ack slot (§6.5): reserved, always 0 — read to
-                  // advance the cursor, stored nowhere until a reader exists
+    // Event ack (§6.5): the highest event id the client has applied. Compared
+    // as a SIGNED difference so a reordered datagram carrying an older ack
+    // cannot walk the high-water mark backwards and resend a kill sound.
+    uint32_t ack = np_r32(&r);
+    if ((int32_t)(ack - g_conns[conn].ev_high) > 0) g_conns[conn].ev_high = ack;
     int cnt = np_r8(&r);
     if (cnt > NET_IN_MAX) cnt = NET_IN_MAX;
     // Input budget (§6.7): drop the excess oldest-first, count it.
@@ -10389,7 +10565,8 @@ static void net_srv_packet(const unsigned char *b, int n, uint32_t ip, uint16_t 
   for (int i = 0; i < MAX_HUMANS; i++) {
     if (!g_conns[i].used) continue;
     static unsigned char snap[2048];
-    size_t len = net_snapshot_build(snap, sizeof snap, g_conns[i].last_input_tick);
+    size_t len = net_snapshot_build(snap, sizeof snap, g_conns[i].last_input_tick,
+                                    g_conns[i].ev_high);
     if (len) net_udp_send(g_srv_fd, g_conns[i].ip, g_conns[i].port, snap, (int)len);
   }
 }
@@ -10408,7 +10585,7 @@ static int net_srv_client_count(void) {
 #define NET_DIR_PER_HOST 8   // rows one source IP may hold (see net_dir_heartbeat)
 typedef struct {
   uint32_t ip; uint16_t port;
-  uint8_t humans, bots, cap_public, cap_hard;
+  uint8_t humans, bots, cap_public, cap_friends;
   uint16_t proto;
   char code[7];
   uint32_t last_ms;
@@ -10420,7 +10597,7 @@ static net_inst_t g_dir[NET_DIR_MAX];
                               int n, uint32_t now) {
   np_rd r = {b, (size_t)n, 3, 0};   // skip proto+type already read by caller
   uint16_t port = np_r16(&r);
-  uint8_t humans = np_r8(&r), bots = np_r8(&r), cp = np_r8(&r), ch = np_r8(&r);
+  uint8_t humans = np_r8(&r), bots = np_r8(&r), cp = np_r8(&r), cf = np_r8(&r);
   uint16_t proto = np_r16(&r);
   char code[7] = {0};
   for (int i = 0; i < 6; i++) code[i] = (char)np_r8(&r);
@@ -10441,7 +10618,7 @@ static net_inst_t g_dir[NET_DIR_MAX];
   if (slot < 0 && mine >= NET_DIR_PER_HOST) return;
   if (slot < 0) slot = free;
   if (slot < 0) return;             // table full
-  g_dir[slot] = (net_inst_t){ip, port, humans, bots, cp, ch, proto, {0}, now};
+  g_dir[slot] = (net_inst_t){ip, port, humans, bots, cp, cf, proto, {0}, now};
   memcpy(g_dir[slot].code, code, 7);
 }
 [[maybe_unused]] static void net_dir_expire(uint32_t now) {
@@ -10463,7 +10640,7 @@ static net_inst_t g_dir[NET_DIR_MAX];
     if (!g_dir[i].last_ms) continue;
     np_w32(&w, g_dir[i].ip); np_w16(&w, g_dir[i].port);
     np_w8(&w, g_dir[i].humans); np_w8(&w, g_dir[i].bots);
-    np_w8(&w, g_dir[i].cap_public); np_w8(&w, g_dir[i].cap_hard);
+    np_w8(&w, g_dir[i].cap_public); np_w8(&w, g_dir[i].cap_friends);
     np_w16(&w, g_dir[i].proto);
     for (int k = 0; k < 6; k++) np_w8(&w, (uint8_t)g_dir[i].code[k]);
     total += g_dir[i].humans;
@@ -10487,10 +10664,12 @@ typedef struct {
   uint32_t   server_tick;            // newest snapshot's server tick
   uint32_t   ack_input_tick;         // last input the server had applied (reconcile anchor)
   uint32_t   world;                  // server's world hash (arena check)
-  // Event-ack field of the input packet (§6.5). RESERVED: the event channel it
-  // would acknowledge does not exist yet, so this is always 0 — it is kept
-  // because it is part of the wire layout, not because anything reads it.
+  // Event high-water mark (§6.5): the highest event id applied. Sent on every
+  // input packet as the ack, and the dedup filter for the server's resends —
+  // an event that arrives twice must not play its sound twice.
   uint32_t   ev_high;
+  uint8_t    spawn_seq;              // last seen for our own entity (respawn edge)
+  int        have_spawn_seq;
   char       name[12];
   int        reject;                 // last REJECT reason, 0 = none
   int        synced;                 // first authoritative fix received?
@@ -10500,6 +10679,7 @@ typedef struct {
 static net_client_t g_cl;
 static int g_cl_corrections;         // reconciliation count, for the proof
 static float g_cl_worst_err_mm;
+static int g_cl_ev_applied, g_cl_ev_dupes;   // event channel, for the proof
 static void net_cl_send_input(uint16_t buttons, float yaw, float pitch,
                               float wx, float wy);   // defined below
 
@@ -10578,8 +10758,10 @@ static void net_cl_apply_ent(const net_ent_t *e) {
 static void net_cl_snapshot(const unsigned char *b, int n) {
   uint32_t st, li, wh, sd;
   net_ent_t es[MAX_ENTS];
-  int full = 0;
-  int cnt = net_snapshot_read(b, (size_t)n, &st, &li, &wh, &sd, es, MAX_ENTS, &full);
+  net_ev_t  evs[NET_EV_SNAP_MAX];
+  int full = 0, nev = 0;
+  int cnt = net_snapshot_read(b, (size_t)n, &st, &li, &wh, &sd, es, MAX_ENTS, &full,
+                              evs, NET_EV_SNAP_MAX, &nev);
   if (cnt < 0) return;
   if (st < g_cl.server_tick) return;         // stale/out-of-order: drop
   g_cl.server_tick = st;
@@ -10657,17 +10839,37 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
     // bleed the small residual toward auth, so the view never pops (§6.6).
     float cdx = auth.x - p->pos.x, cdz = auth.z - p->pos.z;
     float cur_err = sqrtf(cdx * cdx + cdz * cdz);
+    // A RESPAWN is the only thing that may move the player's AIM. Everything
+    // else here corrects POSITION. Taking the server's yaw/pitch on every
+    // correction meant the view snapped back to where it was pointing one RTT
+    // ago on every hitch or dropped packet — invisible on localhost, a violent
+    // mouse yank over a real link. The angles are the client's to begin with:
+    // it sends them, the server only validates them (§6.8), so the snapshot
+    // echo of our own aim carries no information we do not already have.
+    int respawned = g_cl.have_spawn_seq && es[i].spawn_seq != g_cl.spawn_seq;
+    g_cl.spawn_seq = es[i].spawn_seq;
+    g_cl.have_spawn_seq = 1;
     if (!synced || cur_err > 2.0f || !alive || !p->alive) {
       if (!synced) {
+        // SPAWN THE LOCAL SLOT BEFORE ADOPTING THE SERVER'S STATE. Until this
+        // instant the player was entity 0 (the local match); g_players[h] for
+        // the slot the server assigned is still the zeroed struct — magazines
+        // included. Everything the client predicts out of it therefore started
+        // EMPTY: the HUD counter read 0/30, the predicted weapon_tick dry-fired
+        // every trigger pull and the viewmodel never cycled, while the server
+        // fired a full magazine and reported it. player_spawn is pure (no RNG,
+        // no world query), so calling it here costs nothing and desyncs nothing.
         // First authoritative fix: NOW switch the camera/audio to the server
-        // instance (§1.1). Carry the local match's look direction over (the
-        // player was in slot 0 until this instant) so the view does not snap.
-        p->yaw = g_players[0].yaw; p->pitch = g_players[0].pitch;
+        // instance (§1.1). Carry the local match's look direction over so the
+        // view does not snap — read BEFORE the spawn, which memsets the struct.
+        float carry_yaw = g_players[0].yaw, carry_pitch = g_players[0].pitch;
+        player_spawn(p);
+        p->yaw = carry_yaw; p->pitch = carry_pitch;
         g_local_ent = g_cl.my_ent;
         g_online = 1;
       }
       p->pos = p->prev_pos = auth; p->vel = avel;
-      p->yaw = net_dq_yaw(es[i].yaw); p->pitch = net_dq_pitch(es[i].pitch);
+      if (respawned) { p->yaw = net_dq_yaw(es[i].yaw); p->pitch = net_dq_pitch(es[i].pitch); }
       anim_reset(&g_player_anim[h], auth, p->yaw);
       g_cl.synced = 1;
     } else {
@@ -10678,6 +10880,23 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
     p->grounded = (es[i].flags >> 1) & 1;
     p->crouched = (es[i].flags >> 2) & 1; p->sliding = (es[i].flags >> 3) & 1;
     p->wp.cur = es[i].weapon;
+  }
+  // EVENTS LAST, and only once the entities are current: vfx_on_event anchors
+  // tracers and flashes on the shooter, and the killfeed names entities that
+  // must already exist. Records arrive in id order (the server walks its log
+  // oldest-first), which IS push order across ticks — the order g_vfx_wpn's
+  // latch and the kill burst's same-tick rule depend on.
+  //
+  // Applied through ev_push like any local event, so audio, VFX, hitmarker,
+  // killfeed and the harness printer all see one channel and not two. Anything
+  // at or below the high-water mark is a resend of something already played.
+  for (int k = 0; k < nev; k++) {
+    if ((int32_t)(evs[k].id - g_cl.ev_high) <= 0) { g_cl_ev_dupes++; continue; }
+    event_t e;
+    net_ev_to_live(&e, &evs[k]);
+    ev_push(e);
+    g_cl.ev_high = evs[k].id;
+    g_cl_ev_applied++;
   }
 }
 
@@ -10761,10 +10980,10 @@ static int net_query_directory(uint32_t dir_ip, uint16_t dir_port,
     int cnt = np_r8(&r);
     for (int i = 0; i < cnt; i++) {
       uint32_t iip = np_r32(&r); uint16_t iport = np_r16(&r);
-      uint8_t hm = np_r8(&r), bt = np_r8(&r), cp = np_r8(&r), ch = np_r8(&r);
+      uint8_t hm = np_r8(&r), bt = np_r8(&r), cp = np_r8(&r), cf = np_r8(&r);
       uint16_t proto = np_r16(&r);
       char ic[7] = {0}; for (int k = 0; k < 6; k++) ic[k] = (char)np_r8(&r);
-      (void)bt; (void)ch;
+      (void)bt; (void)cf;
       if (r.bad || proto != NET_PROTO) break;
       total += hm;
       if (code && code[0]) {                 // join by code: exact match
@@ -12082,7 +12301,17 @@ static void ui_subsel(const char *const *opts, int n, int *idx, float px,
 static void ui_menu(void) {
   static int prev_down;
   static float pmx = -1e9f, pmy;
-  int ntabs = DEV_MENU ? 5 : 4;
+  // DEV is a RUNTIME opt-in: `devmode 1` in the config (or `dev on` in the
+  // harness), with the compile-time DEV_MENU as a hard OFF override for a
+  // release build. Default off, so a player never meets the tuning workbench
+  // and a developer needs no rebuild. `dev` is read once here and used
+  // everywhere below — a second `DEV_MENU && g_cfg.devmode` is exactly the
+  // drift that lets the tab strip and the footer disagree.
+  int dev = DEV_MENU && g_cfg.devmode;
+  int ntabs = dev ? 5 : 4;
+  // Parked on DEV when it goes away (config reload, `dev off`): every tab
+  // index below is bounded by ntabs, but g_ui_tab itself is not.
+  if (g_ui_tab >= ntabs) g_ui_tab = 0;
 
   // Pad navigation first, so the layout below already reflects the tab and
   // focus these events produced. UP/DOWN/LB/RB move immediately; OK/LEFT/RIGHT
@@ -12182,7 +12411,7 @@ static void ui_menu(void) {
   else if (label && g_online)    ui_text("LIVE", px + 16, py + 13, 1, 0.95f, 0.35f, 0.30f, 0.95f);
 
   // Tab strip. Player-facing tabs first; DEV is the tuning workbench and wears
-  // a subdued warning tint — DEV_MENU 0 removes it entirely for release.
+  // a subdued warning tint — `devmode 0` (or DEV_MENU 0) removes it entirely.
   // "KEYBOARD", not "CONTROLS": next to GAMEPAD the two categories overlap
   // and a controller player hunting the button remap opens the wrong tab.
   static const char *const TAB_LABEL[5] = {"GAME", "GAMEPAD", "KEYBOARD", "MATCH", "DEV"};
@@ -12453,8 +12682,8 @@ static void ui_menu(void) {
     y += 16;   // past the button: `y` is what sizes the panel
   } else {
     // DEV — the developer tuning workbench: every knob a PLAYER never touches
-    // (movement feel, weapon feel). Lives behind DEV_MENU so a release build
-    // ships without it; keeping it one tab also keeps the player-facing menu
+    // (movement feel, weapon feel). Lives behind `dev` so an install ships
+    // without it; keeping it one tab also keeps the player-facing menu
     // from reading like an engine debug panel.
     static const char *const DEVSUB[2] = {"MOVEMENT", "WEAPON"};
     ui_subsel(DEVSUB, 2, &g_ui_dev_sub, px, pw, y, click, cx, cy);
@@ -12557,7 +12786,7 @@ static void ui_menu(void) {
     upd_status_line(ul, sizeof ul);
     ui_text(ul, px + 16, fy - 12, 1, C_DIM, 1);
   }
-  if (DEV_MENU && g_ui_tab == 4) {
+  if (dev && g_ui_tab == 4) {
     if (ui_button("RESET", px + 16, fy, 84, 16, click, cx, cy, 0)) {
       g_ui_quit_arm = 0; g_ui_upd_arm = 0;
       if (g_ui_dev_sub == 0)
@@ -21991,8 +22220,10 @@ static void usage(void) {
        "  --connect H[:P]    join a server on host H (port P, else mp_port)\n"
        "                     while the local match runs until the first snapshot\n"
        "  --server           dedicated server: sim only, no GL/audio/window.\n"
-       "                     with --port N --fighters N --cap-public N\n"
-       "                     --cap-hard N --skill 0|1|2 --fraglimit N and\n"
+       "                     with --port N --cap-bots N (bots in the arena)\n"
+       "                     --cap-public N (arena size, public door)\n"
+       "                     --cap-friends N (how far an invite stretches it)\n"
+       "                     --skill 0|1|2 --fraglimit N and\n"
        "                     --ticks N (exit after N ticks; 0 = run forever)\n"
        "                     --dir-host H --dir-port N register with a directory\n"
        "  --directory        instance directory for Quick Join: tracks server\n"
@@ -22086,6 +22317,8 @@ static void usage(void) {
        "  key TOKEN          feed a key token to an active rebind capture\n"
        "  nav DIR            queue pad navigation for the next uiframe/shot:\n"
        "                     up down left right ok back tabl tabr\n"
+       "  dev on|off         show/hide the DEV tab (config key devmode, def off;\n"
+       "                     required before any DEV-tab rig)\n"
        "  uistat             print menu state: tab/focus/padmode/rebind + pad cfg\n"
        "  uiframe            run one UI pass without a screenshot\n"
        "  appframe N         N frames through the real frame step (app_frame);\n"
@@ -22108,9 +22341,13 @@ static void usage(void) {
        "  netloop N          N ticks through sim_advance vs the server loop's\n"
        "                     tick body from one saved state; prints MISMATCH\n"
        "                     with the first divergent tick, or ok\n"
-       "  netclient H P N    headless client: connect to a --server on H:P,\n"
-       "                     drive N input ticks, print handshake + reconcile\n"
-       "                     stats (localhost end-to-end, no GL)\n"
+       "  netclient H P N [ACTS]  headless client: connect to a --server on\n"
+       "                     H:P, drive N input ticks holding ACTS (comma-\n"
+       "                     separated action names, default forward), print\n"
+       "                     handshake + reconcile + event-channel stats\n"
+       "                     (localhost end-to-end, no GL). `fire` in ACTS must\n"
+       "                     move ev_applied: that is the server's shot coming\n"
+       "                     back as an event (§6.5)\n"
        "  netstat            print the server digest line (the SAME function\n"
        "                     the --server mode prints every 10 s)\n"
        "  humans N           set the human roster to N (slots 1+ spawn idle;\n"
@@ -22564,7 +22801,7 @@ static void run_script(char *script, sim_ctx_t *s) {
              g_menu_open, g_ui_tab, g_ui_pad_sub, g_ui_dev_sub, g_ui_wpn,
              g_ui_focus, g_ui_nfocus_last, g_ui_pad_mode, g_ui_rebind,
              g_ui_rebind_pad, g_ui_quit_arm, g_ui_name_edit,
-             DEV_MENU, PAD_CURVE_OPTS[g_cfg.pad_curve],
+             DEV_MENU && g_cfg.devmode, PAD_CURVE_OPTS[g_cfg.pad_curve],
              (double)g_cfg.pad[PAD_DZ_L], (double)g_cfg.pad[PAD_DZ_R],
              (double)g_cfg.pad[PAD_SENS],
              (double)g_cfg.pad[PAD_ADS_SENS], g_cfg.pad_assist,
@@ -22724,13 +22961,22 @@ static void run_script(char *script, sim_ctx_t *s) {
       // double-spawning VFX or double-counting a kill. Output moves (worst
       // error in mm), so it is a proof, not a ritual.
       long n = next_n();
+      // Capture INSIDE the loop: the harness drains its event list every
+      // advance, so capturing once at the end sees one tick's worth and the
+      // section round-trips empty — a proof that passes without proving.
       for (long i = 0; i < n; i++) sim_advance(s);
       static unsigned char snap[2048];
-      size_t len = net_snapshot_build(snap, sizeof snap, (uint32_t)g_tick);
+      // ev_ack 0 = "this client has acknowledged nothing", so every event still
+      // inside the resend window rides along and the section is exercised.
+      size_t len = net_snapshot_build(snap, sizeof snap, (uint32_t)g_tick, 0);
       net_ent_t a[MAX_ENTS], b[MAX_ENTS];
+      net_ev_t ea[NET_EV_SNAP_MAX], eb[NET_EV_SNAP_MAX];
       uint32_t st, li, wh;
-      int na = net_snapshot_read(snap, len, &st, &li, &wh, NULL, a, MAX_ENTS, NULL);
-      int nb = net_snapshot_read(snap, len, NULL, NULL, NULL, NULL, b, MAX_ENTS, NULL);
+      int nea = 0, neb = 0;
+      int na = net_snapshot_read(snap, len, &st, &li, &wh, NULL, a, MAX_ENTS, NULL,
+                                 ea, NET_EV_SNAP_MAX, &nea);
+      int nb = net_snapshot_read(snap, len, NULL, NULL, NULL, NULL, b, MAX_ENTS, NULL,
+                                 eb, NET_EV_SNAP_MAX, &neb);
       float worst_mm = 0.0f;
       int mism = na != nb, live = 0;
       ENT_FOREACH(e) {
@@ -22746,9 +22992,16 @@ static void run_script(char *script, sim_ctx_t *s) {
       }
       for (int j = 0; j < na && !mism; j++)
         if (a[j].id != b[j].id || a[j].x != b[j].x || a[j].hp != b[j].hp) mism = 1;
-      printf("netpredict n=%ld ents=%d bytes=%zu server_tick=%u world=%08x "
+      // The event section round-trips too, and identically on the second read —
+      // the ids are what the client dedups on, so an unstable id is a resend
+      // that plays its sound twice.
+      if (nea != neb) mism = 1;
+      for (int j = 0; j < nea && !mism; j++)
+        if (ea[j].id != eb[j].id || ea[j].type != eb[j].type ||
+            ea[j].ax != eb[j].ax || ea[j].src != eb[j].src) mism = 1;
+      printf("netpredict n=%ld ents=%d evs=%d bytes=%zu server_tick=%u world=%08x "
              "dedup=%s worst_pos=%.2fmm\n",
-             n, live, len, st, wh, mism ? "MISMATCH" : "stable", (double)worst_mm);
+             n, live, nea, len, st, wh, mism ? "MISMATCH" : "stable", (double)worst_mm);
     } else if (!strcmp(t, "netlagcomp")) {
       // Rewind the target N ticks into the past and prove the shot HITS with
       // compensation and MISSES without — both halves, plus the residual
@@ -22846,30 +23099,42 @@ static void run_script(char *script, sim_ctx_t *s) {
              "(counting plants, CLAUDE.md's cadence rule)\n",
              n, stride, plants_full, plants_dec);
     } else if (!strcmp(t, "netfill")) {
-      // §1.3/§1.4 invariants proven over a join/leave timeline: fighter count
-      // stays constant while displacing bots, a public join never passes
-      // cap_public, a CODE join may pass cap_public but never cap_hard, and
-      // the cap invariant holds. Pure decision logic, no sockets.
-      int fighters = g_srv.fighters, cp = g_srv.cap_public, ch = g_srv.cap_hard;
-      int humans = 1, bots = fighters - 1;        // start: 1 human, rest bots
-      int max_public = 0, max_hard = 0, count_breaks = 0, over_hard = 0;
-      // stream of public joins, then two code joins
-      const int seq[] = {0, 0, 0, 0, 0, 0, 1, 1, 1};  // 0 public, 1 code
+      // §1.3/§1.4 over a join/leave timeline: a public join never passes
+      // cap_public, a FRIEND join may pass it but never cap_friends, bots pad
+      // to cap_public and never past cap_bots, and — the half a fixed-count
+      // model cannot express — the bots COME BACK when the humans leave.
+      // Pure decision logic, no sockets.
+      int cb = g_srv.cap_bots, cp = g_srv.cap_public, cf = g_srv.cap_friends;
+      int humans = 0, bots = net_bot_target(0, cp, cb);   // empty server
+      int bots_empty = bots;
+      int max_public = 0, max_friend = 0, max_arena = bots;
+      int over_public = 0, over_friend = 0, bots_over = 0, arena_over = 0;
+      // 8 strangers knock, then 3 friends, then everyone but one leaves: the
+      // leave tail is what proves the refill, so it is not optional.
+      const int seq[] = {0,0,0,0,0,0,0,0, 1,1,1, -1,-1,-1,-1,-1,-1,-1};
       for (int i = 0; i < (int)(sizeof seq / sizeof seq[0]); i++) {
-        net_fill_t a = net_fill_decision(humans, bots, seq[i], fighters, cp, ch);
-        if (a == NF_DISPLACE_BOT) { humans++; if (bots > 0) bots--; }
-        else if (a == NF_GROW)    { humans++; }
-        // NF_REJECT: nothing changes
-        if (!seq[i] && humans > cp) count_breaks++;   // public passed cap_public
-        if (humans > ch) over_hard++;                 // anyone passed cap_hard
-        if (humans > max_public && !seq[i]) max_public = humans;
-        if (humans > max_hard) max_hard = humans;
+        if (seq[i] < 0) { if (humans > 0) humans--; }
+        else if (net_join_ok(humans, seq[i], cp, cf)) humans++;
+        bots = net_bot_target(humans, cp, cb);   // the one rule, every step
+        if (seq[i] == 0 && humans > cp) over_public++;
+        if (humans > cf) over_friend++;
+        if (bots > cb || bots < 0) bots_over++;
+        // The arena may only exceed the public deckel through friend headroom,
+        // i.e. by humans — never because a bot sat in a friend's seat.
+        if (humans + bots > cp && bots > 0) arena_over++;
+        if (seq[i] == 0 && humans > max_public) max_public = humans;
+        if (humans > max_friend) max_friend = humans;
+        if (humans + bots > max_arena) max_arena = humans + bots;
       }
-      printf("netfill fighters=%d cap_public=%d cap_hard=%d inv(cp<=ch)=%s "
-             "public_max_humans=%d code_max_humans=%d public_over_public=%d "
-             "any_over_hard=%d\n",
-             fighters, cp, ch, cp <= ch ? "ok" : "FAIL",
-             max_public, max_hard, count_breaks, over_hard);
+      int inv = cp >= 1 && cp <= cf && cf <= MAX_HUMANS;
+      printf("netfill cap_bots=%d cap_public=%d cap_friends=%d "
+             "inv(1<=cp<=cf<=%d)=%s public_max=%d friend_max=%d arena_max=%d "
+             "over_public=%d over_friends=%d bots_over=%d arena_over=%d "
+             "bots_empty=%d bots_refill=%d\n",
+             cb, cp, cf, MAX_HUMANS, inv ? "ok" : "FAIL",
+             max_public, max_friend, max_arena,
+             over_public, over_friend, bots_over, arena_over,
+             bots_empty, bots);
     } else if (!strcmp(t, "netcode")) {
       // §1.5 / netcode proof: the alphabet has no ambiguous glyphs, a
       // one-character typo is rejected by the checksum, and the code survives
@@ -22915,6 +23180,38 @@ static void run_script(char *script, sim_ctx_t *s) {
       const char *host = next_tok();
       int port = (int)next_n();
       long nticks = next_n();
+      // Optional ACTS: comma-separated script action names held for the whole
+      // run, e.g. "fire" or "forward,fire,ads"; default "forward", which is
+      // what this proof used to hardcode. That hole is exactly why a server
+      // simulating shots no client could see or hear shipped: nothing in the
+      // battery had ever pulled a trigger over the wire.
+      //
+      // Peeked and pushed back like opt_n, and only accepted when EVERY comma
+      // part is a known action — otherwise `netclient H P 60; pos` would eat
+      // the next command. Unknown names are not fatal here for the same reason.
+      int held[IN_COUNT] = {0};
+      char *at = take_tok();
+      int got_acts = 0;
+      if (at) {
+        int tmp[IN_COUNT] = {0}, ok = 1;
+        char buf[128];
+        snprintf(buf, sizeof buf, "%s", at);
+        for (char *p = buf, *q = buf; ok; q++) {
+          if (*q == ',' || !*q) {
+            int last = !*q;
+            *q = 0;
+            int a = -1;
+            for (int k = 0; k < IN_COUNT; k++)
+              if (!strcmp(p, ACTION_DEF[k].script)) a = k;
+            if (a < 0) ok = 0; else tmp[a] = 1;
+            p = q + 1;
+            if (last) break;
+          }
+        }
+        if (ok) { memcpy(held, tmp, sizeof held); got_acts = 1; }
+        else g_tok_pushback = at;
+      }
+      if (!got_acts) held[IN_FWD] = 1;       // the historical default
       uint32_t ip = net_resolve(host);
       if (!ip) { printf("netclient resolve FAIL %s\n", host); }
       else {
@@ -22934,20 +23231,46 @@ static void run_script(char *script, sim_ctx_t *s) {
           // Drive input at ~120 Hz wall-clock, predict locally, let snapshots
           // reconcile. Simple forward-walk input so motion actually happens.
           g_cl_corrections = 0; g_cl_worst_err_mm = 0.0f;
-          int held[IN_COUNT] = {0};
-          held[IN_FWD] = 1;                    // walk forward the whole time
+          g_cl_ev_applied = 0; g_cl_ev_dupes = 0;
           int h = human_of_ent(g_cl.my_ent);
+          // CLOCK-LOCKED TO TICK_DT, not a free-running nanosleep. The rig used
+          // to sleep a flat 8 ms per iteration and then do its work, so it
+          // predicted fewer sim ticks per second than the server simulated and
+          // every rate comparison came out skewed — a client that predicted a
+          // whole magazine while the server had fired two thirds of one looked
+          // like lost events until this was ruled out. The real client cannot
+          // have this bug: app_frame accumulates real time and runs exactly one
+          // predicted tick per TICK_DT, which is what this now mirrors.
+          struct timespec next;
+          clock_gettime(CLOCK_MONOTONIC, &next);
           for (long i = 0; i < nticks; i++) {
             player_t *p = h >= 0 ? &g_players[h] : &g_players[0];
             net_cl_tick(held, 0.0f, 1.0f, p->yaw, p->pitch);   // predict + send
             net_cl_poll();                     // recv snapshots -> reconcile
-            struct timespec ts = {0, 8000000L}; nanosleep(&ts, NULL);  // ~120 Hz
+            next.tv_nsec += (long)(1e9 / TICK_HZ);
+            while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
           }
           v3 fp = h >= 0 ? g_players[h].pos : (v3){{0,0,0}};
-          printf("netclient CONNECTED ent=%d world=%08x server_tick=%u "
-                 "corrections=%d worst_err=%.1fmm pos=(%.2f %.2f %.2f) reject=%d\n",
-                 g_cl.my_ent, g_cl.world, g_cl.server_tick, g_cl_corrections,
-                 (double)g_cl_worst_err_mm, (double)fp.x, (double)fp.y,
+          // ev_applied counts events the SERVER sent and this client accepted;
+          // ev_dupes counts resends the high-water mark rejected. Firing with
+          // `fire` in ACTS must move ev_applied — a zero there is the server
+          // simulating shots in silence, which is what §6.5 exists to prevent.
+          char actbuf[96] = {0};
+          for (int k = 0; k < IN_COUNT; k++)
+            if (held[k]) {
+              if (actbuf[0]) strncat(actbuf, ",", sizeof actbuf - strlen(actbuf) - 1);
+              strncat(actbuf, ACTION_DEF[k].script, sizeof actbuf - strlen(actbuf) - 1);
+            }
+          printf("netclient CONNECTED ent=%d acts=%s world=%08x server_tick=%u "
+                 "corrections=%d worst_err=%.1fmm ev_applied=%d ev_dupes=%d "
+                 "ev_high=%u hp=%d alive=%d pred_ammo=%d pos=(%.2f %.2f %.2f) reject=%d\n",
+                 g_cl.my_ent, actbuf, g_cl.world, g_cl.server_tick, g_cl_corrections,
+                 (double)g_cl_worst_err_mm, g_cl_ev_applied, g_cl_ev_dupes,
+                 g_cl.ev_high,
+                 h >= 0 ? g_players[h].hp : -1, h >= 0 ? g_players[h].alive : -1,
+                 h >= 0 ? g_players[h].wp.ammo[g_players[h].wp.cur] : -1,
+                 (double)fp.x, (double)fp.y,
                  (double)fp.z, g_cl.reject);
         }
         net_cl_disconnect();
@@ -24212,6 +24535,12 @@ static void run_script(char *script, sim_ctx_t *s) {
       }
     } else if (!strcmp(t, "hud")) {
       g_hud_visible = next_on_off("hud");
+    } else if (!strcmp(t, "dev")) {
+      // Without this every DEV-tab rig would break SILENTLY once devmode
+      // defaulted to 0: `nav tabr` wraps mod ntabs, so four of them land back
+      // on GAME, uistat reports tab=0, and the script asserts against a
+      // perfectly plausible menu that is simply the wrong one.
+      g_cfg.devmode = next_on_off("dev");
     } else if (!strcmp(t, "showfps")) {
       g_cfg.show_fps = next_on_off("showfps");
     } else if (!strcmp(t, "bots")) {
@@ -26301,14 +26630,17 @@ static int directory_main(void) {
 }
 
 static int server_main(uint32_t seed) {
-  // cap invariant (§1.3) — checked, because it holds nowhere by itself
-  if (g_srv.cap_public > g_srv.cap_hard) {
-    fprintf(stderr, "server: --cap-public (%d) must be <= --cap-hard (%d)\n",
-            g_srv.cap_public, g_srv.cap_hard);
+  // The cap chain (§1.3) — checked, because it holds nowhere by itself. The
+  // upper end is not cosmetic: cap_friends above MAX_HUMANS promises a slot
+  // net_srv_admit can never hand out, which is what the old cap_hard=10 did.
+  if (g_srv.cap_public < 1 || g_srv.cap_public > g_srv.cap_friends ||
+      g_srv.cap_friends > MAX_HUMANS) {
+    fprintf(stderr, "server: need 1 <= --cap-public (%d) <= --cap-friends (%d) <= %d\n",
+            g_srv.cap_public, g_srv.cap_friends, MAX_HUMANS);
     return 1;
   }
-  if (g_srv.fighters < 1 || g_srv.fighters > MAX_BOTS) {
-    fprintf(stderr, "server: --fighters out of range 1..%d\n", MAX_BOTS);
+  if (g_srv.cap_bots < 0 || g_srv.cap_bots > MAX_BOTS) {
+    fprintf(stderr, "server: --cap-bots out of range 0..%d\n", MAX_BOTS);
     return 1;
   }
   // No humans until a join; there is no "me" on a server. g_headless stays 0:
@@ -26319,7 +26651,7 @@ static int server_main(uint32_t seed) {
   // Match parameters from argv, not from config (§8.3). Until the match_t
   // migration (§8.1, with the snapshot work), sp_* is the one authoritative
   // copy the sim reads each tick — the server just writes it once here.
-  g_cfg.sp_bots = g_srv.fighters;
+  g_cfg.sp_bots = net_bot_target(0, g_srv.cap_public, g_srv.cap_bots);
   g_cfg.sp_diff = g_srv.skill < 0 ? 0 : g_srv.skill > 2 ? 2 : g_srv.skill;
   g_cfg.sp_frag = g_srv.fraglimit;
   signal(SIGINT, srv_sig);
@@ -26332,8 +26664,10 @@ static int server_main(uint32_t seed) {
     fprintf(stderr, "server: cannot bind UDP port %d (in use?)\n", g_srv.port);
     return 1;
   }
-  fprintf(stderr, "server: port %d, %d fighters, skill %d, fraglimit %d, UDP live\n",
-          g_srv.port, g_srv.fighters, g_cfg.sp_diff, g_cfg.sp_frag);
+  fprintf(stderr, "server: port %d, caps %d bots / %d public / %d friends, "
+                  "skill %d, fraglimit %d, UDP live\n",
+          g_srv.port, g_srv.cap_bots, g_srv.cap_public, g_srv.cap_friends,
+          g_cfg.sp_diff, g_cfg.sp_frag);
   // Fixed 120 Hz on the absolute clock: sleep-until beats sleep-for (no
   // drift), and the backlog is MEASURED (worst `behind` goes into the
   // digest) instead of silently eaten. ~13 µs of sim per tick, 0.16% of a
@@ -26362,7 +26696,7 @@ static int server_main(uint32_t seed) {
       np_w16(&w, NET_PROTO); np_w8(&w, NP_HEARTBEAT);
       np_w16(&w, (uint16_t)g_srv.port);
       np_w8(&w, (uint8_t)nh); np_w8(&w, (uint8_t)g_match.nbots);
-      np_w8(&w, (uint8_t)g_srv.cap_public); np_w8(&w, (uint8_t)g_srv.cap_hard);
+      np_w8(&w, (uint8_t)g_srv.cap_public); np_w8(&w, (uint8_t)g_srv.cap_friends);
       np_w16(&w, NET_PROTO);
       for (int k = 0; k < 6; k++) np_w8(&w, (uint8_t)code[k]);
       net_udp_send(g_srv_fd, dir_ip, (uint16_t)g_srv.dir_port, hb, (int)w.at);
@@ -26418,9 +26752,9 @@ int main(int argc, char **argv) {
     else if (arg && !strcmp(a, "--dir-host"))   g_srv.dir_host = argv[++i];
     else if (arg && !strcmp(a, "--dir-port"))   g_srv.dir_port = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--port"))       g_srv.port = atoi(argv[++i]);
-    else if (arg && !strcmp(a, "--fighters"))   g_srv.fighters = atoi(argv[++i]);
-    else if (arg && !strcmp(a, "--cap-public")) g_srv.cap_public = atoi(argv[++i]);
-    else if (arg && !strcmp(a, "--cap-hard"))   g_srv.cap_hard = atoi(argv[++i]);
+    else if (arg && !strcmp(a, "--cap-bots"))    g_srv.cap_bots = atoi(argv[++i]);
+    else if (arg && !strcmp(a, "--cap-public"))  g_srv.cap_public = atoi(argv[++i]);
+    else if (arg && !strcmp(a, "--cap-friends")) g_srv.cap_friends = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--skill"))      g_srv.skill = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--fraglimit"))  g_srv.fraglimit = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--ticks"))      g_srv.ticks = atol(argv[++i]);

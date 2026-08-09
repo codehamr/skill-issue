@@ -133,7 +133,7 @@ deploy: $(DEPLOY_BIN)
 # systemd on the VPS (EnvironmentFile=, so every GAME_* key reaches ExecStart)
 # and /bin/sh. That only holds while every value is a single unquoted token,
 # which is why the knobs are one key each instead of one SERVER_OPTS string:
-# "--fighters 8" is one word to make, two to sh and a third thing to systemd.
+# "--cap-public 6" is one word to make, two to sh and a third thing to systemd.
 #
 # Nothing is placed on the VPS by hand and no secret exists anywhere:
 # `server-start` ships binary + env + unit, `server-kill` removes all of them
@@ -190,7 +190,7 @@ server-start: build/game-x86_64
 	@# The GAME_* block is copied out of the FILE, not out of make's variables:
 	@# that way adding a knob means editing .env and the unit, and nothing here
 	@# needs to learn the key names. Consequence worth knowing — a command-line
-	@# `make server-start GAME_FIGHTERS=4` does nothing; edit .env instead.
+	@# `make server-start GAME_CAP_BOTS=4` does nothing; edit .env instead.
 	@grep '^GAME_' .env > build/server.env
 	@scp -q $< build/server.env build/game@.service $(SERVER_HOST):/tmp/
 	@ssh $(SERVER_HOST) 'set -e; \
