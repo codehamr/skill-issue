@@ -7822,16 +7822,24 @@ typedef struct {
   float rec_comp;            // 0..1 how much of its own recoil it pulls back out
   int   burst_lo, burst_hi;  // shots per burst
   float pause_lo, pause_hi;  // ms between bursts
+  int   memory_ticks, hold_ticks, search_ticks;
   // (movement is NOT a difficulty knob: every tier moves on the player's numbers,
   //  and there is no aim LEAD either — see the aiming code for why)
   float tac;                 // 0..1 how often it slides / peeks / jumps out
 } bot_skill_t;
 
+typedef enum {
+  BOT_BELIEF_VISIBLE,
+  BOT_BELIEF_OCCLUDED_HOLD,
+  BOT_BELIEF_INVESTIGATE,
+  BOT_BELIEF_SEARCH_SWEEP
+} bot_belief_state_t;
+
 static const bot_skill_t BOT_SKILL[3] = {
-  //  react  err0  err1  settle turn  reco  burst   pause      tac
-  { 480, 9.0f, 4.2f, 1300, 3.5f, 0.20f, 2, 4,  550, 950, 0.25f },
-  { 300, 6.5f, 2.6f,  950, 5.5f, 0.60f, 3, 6,  380, 700, 0.60f },
-  { 180, 4.0f, 0.7f,  700, 8.5f, 0.92f, 4, 8,  240, 480, 1.00f },
+  //  react  err0  err1  settle turn  reco  burst   pause      mem hold search tac
+  { 480, 9.0f, 4.2f, 1300, 3.5f, 0.20f, 2, 4,  550, 950, 360, 42, 216, 0.25f },
+  { 300, 6.5f, 2.6f,  950, 5.5f, 0.60f, 3, 6,  380, 700, 540, 60, 312, 0.60f },
+  { 180, 4.0f, 0.7f,  700, 8.5f, 0.92f, 4, 8,  240, 480, 720, 78, 432, 1.00f },
 };
 
 struct bot_t {
@@ -7857,6 +7865,13 @@ struct bot_t {
   int   tgt;                           // current enemy entity id, -1 = none
   int   lose_t;                        // ticks since the target was last seen
   v3    last_seen;                     // where the target was last spotted
+  bot_belief_state_t belief;
+  v3    last_seen_vel;
+  v3    belief_pos;
+  float belief_radius;
+  long  last_seen_tick;
+  v3    search_pos;
+  int   search_index, search_dir, search_t, reacquire_count;
   int   react_t;                       // ticks until the first shot may leave
   int   scan_t;                        // ticks until the next target rescan
   int   burst, pause_t;                // trigger discipline (a skill trait)
@@ -8279,7 +8294,17 @@ static void bot_spawn(int bi) {
   b->eye = EYE_STAND;
   b->yaw = b->prev_yaw = rng_rangef(&g_rng_bot, -3.14f, 3.14f);
   b->pup_face = b->yaw;  // a surviving puppet faces its spawn, not yaw 0
+  b->belief = BOT_BELIEF_VISIBLE;
   b->tgt = -1;
+  b->last_seen_vel = (v3){{0, 0, 0}};
+  b->belief_pos = (v3){{0, 0, 0}};
+  b->belief_radius = 0.0f;
+  b->last_seen_tick = 0;
+  b->search_pos = (v3){{0, 0, 0}};
+  b->search_index = 0;
+  b->search_dir = 1;
+  b->search_t = 0;
+  b->reacquire_count = 0;
   b->wp.cur = WPN_AR;
   for (int w = 0; w < WPN_COUNT; w++) b->wp.ammo[w] = WPN_DEF[w].mag;
   b->burst = 3;
@@ -8858,6 +8883,13 @@ static void ent_damage(int ent, int dmg, int part, int src, v3 from, v3 at) {
     // top of it — storing the eye point made a bot revealed by an unseen
     // shooter pre-aim ~1.6 m over their head until first LOS corrected it.
     b->last_seen = ent_pos(src);   // one copy; was a g_bots OOB for human ids
+    b->belief = BOT_BELIEF_OCCLUDED_HOLD;
+    b->last_seen_vel = (v3){{0, 0, 0}};
+    b->belief_pos = b->last_seen;
+    b->belief_radius = 0.20f;
+    b->last_seen_tick = g_tick;
+    b->search_pos = b->last_seen;
+    b->search_t = 0;
     b->err = BOT_SKILL[g_cfg.sp_diff].err0;
     b->react_t = (int)(BOT_SKILL[g_cfg.sp_diff].react_ms * 0.6f *
                        (float)TICK_HZ / 1000.0f);
@@ -9455,6 +9487,58 @@ static int bot_cover_spot(const bot_t *b, v3 *out) {
   return 0;
 }
 
+static v3 bot_belief_aimpoint(const bot_t *b) {
+  return (v3){{b->belief_pos.x, b->belief_pos.y + EYE_STAND - ENT_CHEST_OFF,
+               b->belief_pos.z}};
+}
+
+static void bot_belief_clear(bot_t *b) {
+  b->belief = BOT_BELIEF_VISIBLE;
+  b->last_seen_vel = (v3){{0, 0, 0}};
+  b->belief_pos = (v3){{0, 0, 0}};
+  b->belief_radius = 0.0f;
+  b->last_seen_tick = 0;
+  b->search_pos = (v3){{0, 0, 0}};
+  b->search_index = 0;
+  b->search_dir = 1;
+  b->search_t = 0;
+  b->reacquire_count = 0;
+}
+
+static void bot_belief_observe(bot_t *b, int e) {
+  v3 pos = ent_pos(e);
+  v3 vel = {{0, 0, 0}};
+  if (b->last_seen_tick > 0 && g_tick > b->last_seen_tick) {
+    float inv_dt = 1.0f / ((float)(g_tick - b->last_seen_tick) * TICK_DT);
+    vel.x = (pos.x - b->belief_pos.x) * inv_dt;
+    vel.z = (pos.z - b->belief_pos.z) * inv_dt;
+    float speed = sqrtf(vel.x * vel.x + vel.z * vel.z);
+    float max_speed = g_cfg.mv[MV_RUN];
+    if (speed > max_speed && speed > 1e-6f) {
+      float s = max_speed / speed;
+      vel.x *= s;
+      vel.z *= s;
+    }
+  }
+  b->belief = BOT_BELIEF_VISIBLE;
+  b->last_seen_vel = vel;
+  b->belief_pos = pos;
+  b->belief_radius = 0.20f;
+  b->last_seen_tick = g_tick;
+  b->search_pos = pos;
+  b->search_t = 0;
+  b->lose_t = 0;
+}
+
+static void bot_belief_predict(bot_t *b) {
+  float speed = sqrtf(b->last_seen_vel.x * b->last_seen_vel.x +
+                      b->last_seen_vel.z * b->last_seen_vel.z);
+  b->belief_pos.x += b->last_seen_vel.x * TICK_DT;
+  b->belief_pos.z += b->last_seen_vel.z * TICK_DT;
+  b->belief_radius += 0.015f + speed * TICK_DT * 0.20f;
+  if (b->belief_radius > 4.5f) b->belief_radius = 4.5f;
+}
+
 static void bot_tick(int bi) {
   bot_t *b = &g_bots[bi];
   const bot_skill_t *sk = &BOT_SKILL[g_cfg.sp_diff];
@@ -9505,12 +9589,15 @@ static void bot_tick(int bi) {
   int see = b->tgt >= 0 && ent_alive(b->tgt) &&
             bot_can_see(b, b->tgt, &tdist);
   if (see) {
-    b->lose_t = 0;
+    bot_belief_observe(b, b->tgt);
     b->last_seen = ent_pos(b->tgt);
   } else if (b->tgt >= 0) {
+    if (b->belief == BOT_BELIEF_VISIBLE) b->belief = BOT_BELIEF_OCCLUDED_HOLD;
+    bot_belief_predict(b);
     if (!ent_alive(b->tgt) || ++b->lose_t > BOT_MEMORY_TICKS) {
       b->tgt = -1;
       b->lose_t = 0;
+      bot_belief_clear(b);
     }
   }
   if (--b->scan_t <= 0) {
@@ -9541,12 +9628,16 @@ static void bot_tick(int bi) {
     // closer — no frantic flip-flopping between two visible enemies.
     if (best >= 0 && best != b->tgt && (!see || best_d < tdist * 0.5f)) {
       b->tgt = best;
+      bot_belief_clear(b);
       b->lose_t = 0;
       b->err = sk->err0;
       b->react_t = (int)(sk->react_ms * rng_rangef(&g_rng_bot, 0.85f, 1.25f) *
                          (float)TICK_HZ / 1000.0f);
       see = bot_can_see(b, b->tgt, &tdist);
-      if (see) b->last_seen = ent_pos(b->tgt);
+      if (see) {
+        bot_belief_observe(b, b->tgt);
+        b->last_seen = ent_pos(b->tgt);
+      }
     }
   }
 
@@ -9731,13 +9822,15 @@ static void bot_tick(int bi) {
     float hl = sqrtf(dx * dx + dz * dz);
     if (hl < 1.2f) {
       b->tgt = -1;
+      bot_belief_clear(b);
     } else {
       v3 eo = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
+      v3 tp = bot_belief_aimpoint(b);
       // Pre-aim: yaw AND pitch already on the remembered chest height — the
       // same standing-chest arithmetic ent_aimpoint uses, so the first frame
       // the enemy steps out the bot is looking at them, not swinging. (It had
       // drifted to a hand-written 1.35.)
-      float aimy = b->last_seen.y + (EYE_STAND - ENT_CHEST_OFF) - eo.y;
+      float aimy = tp.y - eo.y;
       want_yaw = atan2f(dx, -dz) + b->fl_y * DEG2RAD;
       want_pitch = f_clamp(atan2f(aimy, hl), -1.2f, 1.2f);
       b->crouch = 0;
@@ -9747,7 +9840,7 @@ static void bot_tick(int bi) {
       float px = -dz / hl, pz = dx / hl;  // lateral unit
       int lean = 0;
       if (hl < 22.0f) {
-        v3 tp2 = ent_aimpoint(b->tgt);  // loop-invariant: neither side moves it
+        v3 tp2 = bot_belief_aimpoint(b);
         for (int t2 = 0; t2 < 2 && !lean; t2++) {
           int sgn = (b->peek_dir >= 0) == (t2 == 0) ? 1 : -1;
           v3 probe = {{eo.x + px * 1.35f * (float)sgn, eo.y,
