@@ -125,100 +125,139 @@ deploy: $(DEPLOY_BIN)
 	scp $(DEPLOY_BIN) $(DEPLOY_HOST):game
 	ssh $(DEPLOY_HOST) chmod +x game
 
-# Dedicated server on the VPS (docs/OPS.md, design §3): `make server-start`
-# builds the x86_64 binary, stops whatever runs there, ships it and starts it
-# detached; `make server-kill` stops it again. Both are idempotent.
-# `plaxtoris` is an ssh config Host entry, like DEPLOY_HOST above — the address
-# and key live there, not here. Every knob is overridable on the command line:
-#   make server-start SERVER_PORT=31416 SERVER_OPTS="--fighters 4 --skill 2"
+# Dedicated server on the VPS (docs/OPS.md, design §3).
 #
-# systemd (tools/game@.service) is the PRODUCTION path — it restarts on crash
-# and survives a reboot, which these two targets deliberately do not. They are
-# the iteration loop: one command from a source edit to a running server.
-SERVER_HOST ?= plaxtoris
-SERVER_DIR  ?= /opt/skill-issue
-SERVER_PORT ?= 31415
-SERVER_OPTS ?= --fighters 8 --cap-public 6 --cap-hard 10 --skill 1 --fraglimit 12
-SERVER_BIN  := $(SERVER_DIR)/game
-SERVER_LOG  := $(SERVER_DIR)/server.log
-SERVER_CFG  := $(SERVER_DIR)/server.cfg
-# The server parses hostile UDP from the open internet, so it does NOT get to
-# be root just because ssh arrives as root. This is the DynamicUser=true /
-# NoNewPrivileges=true / ProtectSystem=strict half of tools/game@.service,
-# which these targets otherwise bypass entirely:
+# `.env` in the repo root is the SINGLE source of truth, and it is gitignored:
+# where the server runs, on which ports, with which gameplay knobs. THREE
+# parsers read that one file without conversion — make (the -include below),
+# systemd on the VPS (EnvironmentFile=, so every GAME_* key reaches ExecStart)
+# and /bin/sh. That only holds while every value is a single unquoted token,
+# which is why the knobs are one key each instead of one SERVER_OPTS string:
+# "--fighters 8" is one word to make, two to sh and a third thing to systemd.
 #
-#   - setpriv, not runuser: it drops the ids and EXECS the binary in place, so
-#     there is exactly one process and /proc/PID/exe still identifies it
-#     exactly (runuser keeps a PAM parent in the tree, which the scan below
-#     would not match and server-kill would leave behind).
-#   - --no-new-privs makes every setuid binary on the box useless to anything
-#     the server could be talked into executing.
-#   - root owns the directory, the binary and the config, group-readable by
-#     the service account (750/640). A compromised server can therefore not
-#     rewrite the binary it will be restarted from — write access to its own
-#     directory is exactly how a remote-code bug becomes persistence.
-#   - the log fd is opened by the root shell BEFORE the drop, so the server
-#     writes through a descriptor it could never have opened itself.
+# Nothing is placed on the VPS by hand and no secret exists anywhere:
+# `server-start` ships binary + env + unit, `server-kill` removes all of them
+# again, and the ssh identity is the `plaxtoris` Host entry in the mounted
+# ~/.ssh/config — exactly like DEPLOY_HOST above. That is also why the server
+# deploy is NOT a GitHub job: a runner would need host and key as repo secrets,
+# i.e. a second copy of this file. release.yml ships the CLIENT, .env + this
+# Makefile ship the SERVER, and .git/hooks/post-commit fires the second one.
 #
-# The config is deliberately an EMPTY file, recreated on every start, not the
-# config.cfg the game writes for itself. Until the §8.1 g_cfg->match_t
-# migration lands, the sim reads movement and weapon values out of g_cfg, and a
-# server whose values drift from a client's makes that client mispredict every
-# tick. Empty == compiled-in defaults == what every stock client runs, and a
-# read-only config is a value that cannot drift. Server match parameters come
-# from ARGV anyway (§8.3), so nothing is lost.
-#
-# NET_PORT_DEF > 1024 is load-bearing here: an unprivileged process can bind it.
-SERVER_USER ?= skill-issue
+# systemd owns the process (tools/game@.service): restart on crash, reboot
+# survival, DynamicUser privilege drop, journald. These targets only install
+# and (re)start it — which is why they no longer carry a PID scan for the happy
+# path, a useradd, a setpriv line, a chown/chmod ladder or a log file. The one
+# thing that survived is SERVER_PIDS, and only for server-kill (see there).
+-include .env
+SERVER_HOST  ?= plaxtoris
+SERVER_DIR   ?= /opt/skill-issue
+SERVER_ETC   ?= /etc/skill-issue
+SERVER_PORTS ?= 27015
+# One systemd instance per port. The comma keeps the .env value single-token;
+# the FIRST port is what server-check probes and what the join line prints.
+COMMA            := ,
+SERVER_PORT_LIST := $(subst $(COMMA), ,$(SERVER_PORTS))
+SERVER_PORT      := $(firstword $(SERVER_PORT_LIST))
+SERVER_UNITS     := $(patsubst %,game@%,$(SERVER_PORT_LIST))
+# Recursive on purpose: the lookup runs only in the targets that print or probe
+# the address, not on every make invocation.
+SERVER_ADDR       = $(shell ssh -G $(SERVER_HOST) 2>/dev/null | awk '/^hostname /{print $$2}')
 
 # Identity of "our server process" is the EXECUTABLE, read from /proc/PID/exe —
-# not a pgrep -f pattern. Two reasons, both bugs that a pattern actually has:
+# not a pgrep -f pattern. Two reasons, both bugs a pattern actually has:
 # `pgrep -f "game --server"` matches the ssh command line carrying that very
 # pattern (it kills its own shell), and it would also match any unrelated
-# process on this host whose arguments happen to contain the string. The
-# readlink comparison is exact, self-match-free and catches instances on other
-# ports too. The trailing * absorbs the " (deleted)" the kernel appends after
-# the binary has been replaced under a still-running process.
-SERVER_PIDS = for p in /proc/[0-9]*; do case "$$(readlink $$p/exe 2>/dev/null)" in $(SERVER_BIN)*) echo $${p\#\#*/};; esac; done
+# process whose arguments happen to contain the string. The trailing * absorbs
+# the " (deleted)" the kernel appends after the binary has been replaced under
+# a still-running process. systemd owns the units, so this exists for exactly
+# one job now: server-kill purging a leftover no unit knows about — started by
+# hand, or by an older Makefile.
+SERVER_PIDS = for p in /proc/[0-9]*; do case "$$(readlink $$p/exe 2>/dev/null)" in $(SERVER_DIR)/game*) echo $${p\#\#*/};; esac; done
 
+# Install and (re)start; idempotent, and it works on a bare VPS. The stop +
+# wants-symlink sweep BEFORE enabling is what makes SERVER_PORTS authoritative:
+# drop a port from .env and its instance is gone, not orphaned on the box.
+# The binary is installed as .new and renamed into place — rename(2) over a
+# running executable is legal, a write into it is ETXTBSY.
 server-start: build/game-x86_64
-	@test "$$(od -An -tx1 -j18 -N2 build/game-x86_64 | tr -d ' ')" = "3e00" || \
-	  { echo "build/game-x86_64 is not x86_64 — refusing to deploy"; exit 1; }
-	@$(MAKE) --no-print-directory server-kill
-	@ssh $(SERVER_HOST) 'set -e; mkdir -p $(SERVER_DIR); \
-	  id -u $(SERVER_USER) >/dev/null 2>&1 || \
-	    useradd --system --no-create-home --shell /usr/sbin/nologin $(SERVER_USER); \
-	  chown root:$(SERVER_USER) $(SERVER_DIR); chmod 750 $(SERVER_DIR)'
-	scp build/game-x86_64 $(SERVER_HOST):$(SERVER_BIN)
+	@test "$$(od -An -tx1 -j18 -N2 $< | tr -d ' ')" = "3e00" || \
+	  { echo "$< is not x86_64 — refusing to deploy"; exit 1; }
+	@grep -q "$$(printf '\r')" .env && \
+	  { echo ".env has CRLF line endings — make and systemd both mis-parse them."; \
+	    echo "fix: sed -i 's/\r$$//' .env"; exit 1; } || true
+	@sed -e 's|@DIR@|$(SERVER_DIR)|g' -e 's|@ETC@|$(SERVER_ETC)|g' \
+	  tools/game@.service > build/game@.service
+	@# The GAME_* block is copied out of the FILE, not out of make's variables:
+	@# that way adding a knob means editing .env and the unit, and nothing here
+	@# needs to learn the key names. Consequence worth knowing — a command-line
+	@# `make server-start GAME_FIGHTERS=4` does nothing; edit .env instead.
+	@grep '^GAME_' .env > build/server.env
+	@scp -q $< build/server.env build/game@.service $(SERVER_HOST):/tmp/
 	@ssh $(SERVER_HOST) 'set -e; \
-	  chown root:$(SERVER_USER) $(SERVER_BIN); chmod 750 $(SERVER_BIN); \
-	  : > $(SERVER_CFG); chown root:$(SERVER_USER) $(SERVER_CFG); chmod 640 $(SERVER_CFG); \
-	  if ldd $(SERVER_BIN) | grep -q "not found"; then \
+	  systemctl stop "game@*" 2>/dev/null || true; \
+	  rm -f /etc/systemd/system/multi-user.target.wants/game@*.service; \
+	  install -d $(SERVER_DIR) $(SERVER_ETC); \
+	  install -m755 /tmp/game-x86_64 $(SERVER_DIR)/game.new; \
+	  mv -f $(SERVER_DIR)/game.new $(SERVER_DIR)/game; \
+	  install -m644 /tmp/server.env $(SERVER_ETC)/server.env; \
+	  install -m644 /tmp/game@.service /etc/systemd/system/game@.service; \
+	  rm -f /tmp/game-x86_64 /tmp/server.env /tmp/game@.service; \
+	  if ldd $(SERVER_DIR)/game | grep -q "not found"; then \
 	    echo "$(SERVER_HOST) is missing the ELF NEEDED libs (the server touches"; \
 	    echo "none of them, but the loader resolves them before main):"; \
-	    ldd $(SERVER_BIN) | grep "not found"; \
+	    ldd $(SERVER_DIR)/game | grep "not found"; \
 	    echo "fix: apt-get install -y libx11-6 libegl1 libgl1"; exit 1; fi; \
-	  cd $(SERVER_DIR); \
-	  setsid setpriv --reuid=$(SERVER_USER) --regid=$(SERVER_USER) --clear-groups \
-	    --no-new-privs $(SERVER_BIN) --server --config $(SERVER_CFG) \
-	    --port $(SERVER_PORT) $(SERVER_OPTS) \
-	    >$(SERVER_LOG) 2>&1 </dev/null & \
-	  sleep 2; \
-	  pids=$$($(SERVER_PIDS)); \
-	  if [ -z "$$pids" ]; then echo "server FAILED to start:"; cat $(SERVER_LOG); exit 1; fi; \
-	  sed -n 1,2p $(SERVER_LOG); \
-	  echo "server up: pid $$pids as $$(ps -o user= -p $$pids), port $(SERVER_PORT)/udp, log $(SERVER_LOG)"'
-	@echo "join with: ./build/game --connect $$(ssh -G $(SERVER_HOST) 2>/dev/null | awk '/^hostname /{print $$2}'):$(SERVER_PORT)"
+	  systemctl daemon-reload; \
+	  systemctl reset-failed $(SERVER_UNITS) 2>/dev/null || true; \
+	  systemctl enable --now $(SERVER_UNITS) 2>&1 | grep -v "^Created symlink" || true; \
+	  systemctl is-active $(SERVER_UNITS) | tr "\n" " "; echo "$(SERVER_UNITS)"'
+	@$(MAKE) --no-print-directory server-check
 
+# Two probes, deliberately different. The loopback one runs the server's OWN
+# binary as a headless client and proves the SERVER — hard gate. The external
+# one proves the PATH and only warns, because the provider firewall is a second
+# firewall outside this Makefile's reach (measured: a UDP port without an
+# explicit Hetzner Cloud rule never reaches the host at all, docs/OPS.md).
+# netclient prints its verdict and exits 0 either way, so both are grep gates,
+# never exit-code gates. The external client MUST be the x86_64 build under
+# qemu: an aarch64 client generates a different arena and is refused with
+# reject=5 NR_WORLD — the check would fail on a perfectly healthy server.
+server-check: build/game-x86_64
+	@ssh -n $(SERVER_HOST) '$(SERVER_DIR)/game --config /dev/null \
+	    --do "netclient 127.0.0.1 $(SERVER_PORT) 120"' 2>/dev/null | grep CONNECTED || \
+	  { echo "FAIL: game@$(SERVER_PORT) does not answer on loopback"; exit 1; }
+	@qemu-x86_64-static $< --config /dev/null \
+	    --do "netclient $(SERVER_ADDR) $(SERVER_PORT) 120" 2>/dev/null | grep -q CONNECTED && \
+	  echo "public path ok" || \
+	  echo "WARNING: $(SERVER_ADDR):$(SERVER_PORT)/udp unreachable from here — open the port in the provider firewall"
+	@echo "join with: ./build/game --connect $(SERVER_ADDR):$(SERVER_PORT)"
+
+# Stop without uninstalling — the counterpart to server-kill's purge.
+server-stop:
+	@ssh $(SERVER_HOST) 'systemctl stop "game@*" 2>/dev/null || true; \
+	  echo "stopped $(SERVER_UNITS) on $(SERVER_HOST) (install kept)"'
+
+# Purge: units, enable-symlinks, binary, env, state, any leftover process no
+# unit owns, and the static `skill-issue` account the pre-systemd version of
+# this Makefile created with useradd (DynamicUser needs none, so a persistent
+# uid on the box is now by definition a leftover). Leaves the VPS as it was
+# before the first server-start — and the kill runs BEFORE the rm, or
+# /proc/PID/exe no longer matches anything.
 server-kill:
-	@ssh $(SERVER_HOST) 'pids=$$($(SERVER_PIDS)); \
-	  if [ -z "$$pids" ]; then echo "no skill-issue server running on $(SERVER_HOST)"; exit 0; fi; \
-	  kill $$pids 2>/dev/null || true; \
-	  i=0; while [ $$i -lt 20 ]; do \
-	    [ -z "$$($(SERVER_PIDS))" ] && break; sleep 0.5; i=$$((i+1)); done; \
+	@ssh $(SERVER_HOST) 'systemctl stop "game@*" 2>/dev/null || true; \
+	  systemctl disable "game@*" 2>/dev/null || true; \
+	  systemctl reset-failed "game@*" 2>/dev/null || true; \
+	  rm -f /etc/systemd/system/game@.service \
+	        /etc/systemd/system/multi-user.target.wants/game@*.service; \
+	  systemctl daemon-reload; \
+	  pids=$$($(SERVER_PIDS)); [ -n "$$pids" ] && kill -9 $$pids 2>/dev/null; \
+	  rm -rf $(SERVER_DIR) $(SERVER_ETC) /var/lib/skill-issue /var/lib/private/skill-issue; \
+	  userdel skill-issue 2>/dev/null || true; \
 	  left=$$($(SERVER_PIDS)); \
-	  if [ -n "$$left" ]; then kill -9 $$left 2>/dev/null || true; sleep 0.5; fi; \
-	  echo "stopped skill-issue server on $(SERVER_HOST) (pid $$pids)"'
+	  echo "purged unit+binary+env+state on $(SERVER_HOST)$${left:+ (STILL RUNNING: $$left)}"'
+
+server-log:
+	@ssh -t $(SERVER_HOST) 'journalctl -u "game@$(SERVER_PORT)" -n 40 -f'
 
 # build/ carries a Dropbox-ignore NTFS attribute on the folder itself —
 # delete its contents, never the folder, or the attribute is lost.
@@ -231,4 +270,5 @@ init:
 	git push --force origin main
 	@echo "Git history reset to single 'init' commit"
 
-.PHONY: all clean deploy server-start server-kill init
+.PHONY: all clean deploy init \
+        server-start server-check server-stop server-kill server-log
