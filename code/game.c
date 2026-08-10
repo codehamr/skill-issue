@@ -17065,6 +17065,12 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
       // where it breaks out TO is the weapon's own published trigger contact
       // point, not a tuned sweep. See fig_trig_pt.
       float sweep = FSW[f], reach = 0.0f;
+      // HEEL grip: the fingers hold the FAR FLANK, they do not crest the top.
+      // Reference (CoD4/BO2 first-person frames): from the eye you see the
+      // back of the hand and at most the first knuckles — full 155-190 deg
+      // wraps put fingertips over the rail into the sight line's neighborhood
+      // and read as claws. 0.70 ends the tips just past the far mid-line.
+      if (style == 2) sweep *= 0.66f;
       int aimed = style == 1 && f == 3 && trig_pt != NULL && !slid;
       // The whole hand squeezes, not just the index. Tiny — 3 degrees — but it
       // is three digits' worth of screen area moving together, where the index
@@ -17343,9 +17349,13 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
       // handguard surface (same HAND_BITE philosophy as the wrap). The
       // bearing stays off the fingers' own arc so the two chains never run
       // parallel on a shared flank (the z-fight class).
-      tb2 = hand_pt(gc, ga, e1, e2, 0.0500f, -side * 0.80f, gr + 0.0072f);
-      tb3 = hand_pt(gc, ga, e1, e2, 0.0770f, -side * 0.66f, gr + 0.0054f);
-      tb4 = hand_pt(gc, ga, e1, e2, 0.0990f, -side * 0.56f, gr + 0.0034f);
+      // Stations end WITH the handguard (the grip point moved forward, so a
+      // 99 mm thumb ran off the fore-end onto the bare barrel), and the whole
+      // digit stays LOW on the near flank — in the reference frames no digit
+      // ever breaks the handguard's top silhouette.
+      tb2 = hand_pt(gc, ga, e1, e2, 0.0420f, -side * 0.84f, gr + 0.0070f);
+      tb3 = hand_pt(gc, ga, e1, e2, 0.0560f, -side * 0.76f, gr + 0.0052f);
+      tb4 = hand_pt(gc, ga, e1, e2, 0.0660f, -side * 0.70f, gr + 0.0033f);
     } else {
       tb2 = hand_pt(gc, ga, e1, e2, 0.0455f, -side * 0.62f * TWRAP, gr + 0.0092f);
       tb3 = hand_pt(gc, ga, e1, e2, 0.0430f, -side * 1.28f * TWRAP, gr + 0.0079f);
@@ -17650,7 +17660,7 @@ static const float GUN_HOLD[2][3][7] = {
   // digit was buried to a third of its girth and the four of them read as small
   // blobs stuck to the side of the grip instead of as a hand closed round it.
   { { 0.0f, -0.0500f,  -0.0078f, 0.0130f,  0.0f, 0.921f,  0.386f },   // AR grip
-    { 0.0f,  0.0190f,   0.2680f, 0.0130f,  0.0f, 0.0f,    1.0f   },   // AR fore-end
+    { 0.0f,  0.0190f,   0.3050f, 0.0127f,  0.0f, 0.0f,    1.0f   },   // AR fore-end
     // The magazine. A hand wraps its NARROW axis, so the radius is the small
     // half-extent of the mag chain at that station, not its 19 mm depth.
     // High on the magazine, right under the magwell, not at its middle. The
@@ -17668,7 +17678,7 @@ static const float GUN_HOLD[2][3][7] = {
     { 0.0f, -0.0640f,   0.1010f, 0.0124f,  0.0f, 0.959f,  0.283f } }, // AR mag
   // 10.4-14.1 mm measured the same way; 12.6 is the mean over the finger row.
   { { 0.0f, -0.0510f,  -0.0444f, 0.0126f,  0.0f, 0.900f,  0.436f },   // SR grip
-    { 0.0f,  0.0130f,   0.1780f, 0.0121f,  0.0f, 0.0f,    1.0f   },   // SR fore-end
+    { 0.0f,  0.0130f,   0.2080f, 0.0121f,  0.0f, 0.0f,    1.0f   },   // SR fore-end
     // The sniper changes a magazine too now. Its box is straighter and wider
     // than the AR's (a .308 case is nearly parallel where a 5.56 curve is not),
     // so the hold is higher up the body, right under the magwell, and the axis
@@ -21171,7 +21181,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // under the handguard, not on its left flank.
       v3 br = h == 0
         ? v3_add(v3_scale(gx, 0.34f), v3_add(v3_scale(gy, 0.16f), v3_scale(gz, -0.92f)))
-        : v3_add(v3_scale(gx, -0.20f), v3_scale(gy, -0.975f));
+        : v3_add(v3_scale(gx, -0.55f), v3_scale(gy, -0.84f));
       // On the magazine the arm comes from the left and FORWARD instead of from
       // below, which is what turns the travel into a reach rather than a slide.
       if (h == 1 && mgv > 0.0f)
@@ -21215,7 +21225,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // nothing is `axo`: sliding the wrist BACK along the grip axis tilts the
       // palm's own axis rearward, so the forearm leaves at the right angle
       // without the wrist doing any of the work. Now 18.5 / 48.8 / 97.8 / 72.
-      float lift = h == 0 ? 0.0700f : 0.0720f;
+      float lift = h == 0 ? 0.0700f : 0.0660f;
       // How far DOWN the grip axis the wrist sits. On a pistol grip this is
       // what decides whether the arm comes from below or from behind: the
       // knuckle row is at axial 0 by construction, so a wrist 20 mm down the
@@ -21280,7 +21290,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       v3 bx = v3_sub(hd[h].ga, v3_scale(pd, v3_dot(hd[h].ga, pd)));
       bx = v3_dot(bx, bx) > 1e-8f ? v3_norm(bx) : v3_norm(v3_cross(pd, gx));
       v3 bn = v3_norm(v3_cross(pd, bx));            // out of the palm
-      float ext = (h == 0 ? 18.0f : 12.0f) * DEG2RAD;
+      float ext = (h == 0 ? 18.0f : 10.0f) * DEG2RAD;
       float dev = (h == 0 ? 15.0f : -6.0f) * DEG2RAD;
       v3 back = v3_rot_axis(v3_scale(pd, -1.0f), bx, hd[h].side * ext);
       back = v3_norm(v3_rot_axis(back, bn, hd[h].side * dev));
@@ -21291,7 +21301,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // work was supposed to cure. A shoulder is behind the weapon, not under
       // it, so the arm has to carry a rearward component that no rotation of the
       // palm's own axis can produce.
-      back = v3_norm(v3_add(back, v3_scale(gz, h == 0 ? -0.16f : -0.06f)));
+      back = v3_norm(v3_add(back, v3_scale(gz, h == 0 ? -0.16f : -0.30f)));
       g_vm_hdbg[h].bend_deg = acosf(f_clamp(v3_dot(v3_scale(pd, -1.0f), back),
                                             -1.0f, 1.0f)) / DEG2RAD;
       g_vm_hdbg[h].bore_deg = acosf(f_clamp(fabsf(v3_dot(back, gz)),
