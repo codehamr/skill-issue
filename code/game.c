@@ -34,7 +34,9 @@
 // Shared core: config (config.cfg next to the executable), seeded procedural
 // map (AABB solids), fixed-timestep player sim (120 Hz) with render
 // interpolation, GL 3.3 core renderer (one static VBO for the world, one
-// dynamic VBO for the HUD), 5x7 bitmap font for the FPS counter.
+// dynamic VBO for the HUD), and the "GRATICULE" UI: a procedural SDF
+// typeface (Hershey-simplex skeletons baked to a distance atlas at GL init)
+// plus rounded-panel/capsule/ruler primitives, all in the one HUD batch.
 //
 // C23 gotcha (verified in-container): MinGW-w64 stddef.h lacks unreachable();
 // constexpr/nullptr/typed enums work on both compilers. #embed needs GCC 15.
@@ -12108,60 +12110,327 @@ static const char *SKY_FS =
   "  oCol = vec4(tonemap(sky_env(dir, 1.0)), 1.0);\n"
   "}\n";
 
+// Frosted-glass menu backdrop: an attribute-less fullscreen triangle and one
+// dual-Kawase tap, ping-ponged a few times at quarter resolution — the
+// logarithmic-cost blur every modern menu uses, in two tiny shaders.
+static const char *BLUR_VS =
+  "#version 330 core\n"
+  "out vec2 vUV;\n"
+  "void main(){ vec2 p = vec2(gl_VertexID==1?3.0:-1.0, gl_VertexID==2?3.0:-1.0);\n"
+  "  vUV = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }\n";
+static const char *BLUR_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; uniform sampler2D uTex; uniform vec2 uPix;\n"
+  "out vec4 oCol;\n"
+  "void main(){\n"
+  "  vec3 c = texture(uTex, vUV).rgb * 4.0;\n"
+  "  c += texture(uTex, vUV + uPix).rgb;\n"
+  "  c += texture(uTex, vUV - uPix).rgb;\n"
+  "  c += texture(uTex, vUV + vec2(uPix.x, -uPix.y)).rgb;\n"
+  "  c += texture(uTex, vUV - vec2(uPix.x, -uPix.y)).rgb;\n"
+  "  oCol = vec4(c / 8.0, 1.0); }\n";
+
 static const char *HUD_VS =
   "#version 330 core\n"
   "layout(location=0) in vec2 aPos;\n"   // pixels, origin top-left
   "layout(location=1) in vec2 aUV;\n"
   "layout(location=2) in vec4 aCol;\n"
+  "layout(location=3) in float aMode;\n" // <1 = SDF threshold, >=2 = raw alpha
   "uniform vec2 uScreen;\n"
-  "out vec2 vUV; out vec4 vCol;\n"
-  "void main(){ vUV=aUV; vCol=aCol;\n"
+  "out vec2 vUV; out vec4 vCol; out float vMode;\n"
+  "void main(){ vUV=aUV; vCol=aCol; vMode=aMode;\n"
   "  gl_Position=vec4(2.0*aPos.x/uScreen.x-1.0, 1.0-2.0*aPos.y/uScreen.y, 0.0, 1.0); }\n";
 
-// uImg selects what the bound texture MEANS: 0 = font atlas (coverage in .r,
-// tinted by the vertex colour), 1 = an image (RGB straight through, tinted for
-// the scope's slight glass warmth). One shader, two consumers.
+// uImg selects what the bound texture MEANS: 0 = the glyph atlas, 1 = an image
+// (RGB straight through, tinted for the scope's slight glass warmth).
+// The atlas stores 1 - distance-to-stroke-skeleton (normalized over HF_DMAX
+// px), so aMode < 1 IS the stroke weight: thresholding closer to 1 gives a
+// thinner stroke, closer to 0 a bolder one — every text weight, outline and
+// pick-thickness comes out of ONE atlas in ONE draw call. aMode >= 2 bypasses
+// the threshold and uses the texel as raw alpha (solid slot, soft glow slot).
 static const char *HUD_FS =
   "#version 330 core\n"
-  "in vec2 vUV; in vec4 vCol; uniform sampler2D uTex; uniform int uImg;\n"
+  "in vec2 vUV; in vec4 vCol; in float vMode;\n"
+  "uniform sampler2D uTex; uniform int uImg;\n"
   "out vec4 oCol;\n"
   "void main(){\n"
-  "  if (uImg == 1) oCol = vec4(texture(uTex, vUV).rgb * vCol.rgb, vCol.a);\n"
-  "  else oCol = vec4(vCol.rgb, vCol.a * texture(uTex, vUV).r); }\n";
+  "  if (uImg == 1) { oCol = vec4(texture(uTex, vUV).rgb * vCol.rgb, vCol.a); return; }\n"
+  "  float v = texture(uTex, vUV).r;\n"
+  "  float a;\n"
+  "  if (vMode >= 2.0) a = v;\n"
+  "  else { float w = max(fwidth(v), 1e-4); a = smoothstep(vMode - w, vMode + w, v); }\n"
+  "  oCol = vec4(vCol.rgb, vCol.a * a); }\n";
 
-// 5x7 glyphs, one byte per row (5 low bits, MSB = leftmost column).
-// Atlas order: 0-9, A-Z, then . : - + < > [ ] / % and a solid block ('#').
-static const uint8_t FONT_5X7[47][7] = {
-  {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
-  {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
-  {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
-  {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
-  {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
-  {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
-  {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, {0x1C,0x12,0x11,0x11,0x11,0x12,0x1C},
-  {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
-  {0x0E,0x11,0x10,0x10,0x13,0x11,0x0F}, {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
-  {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}, {0x07,0x02,0x02,0x02,0x02,0x12,0x0C},
-  {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
-  {0x11,0x1B,0x15,0x15,0x15,0x11,0x11}, {0x11,0x11,0x19,0x15,0x13,0x11,0x11},
-  {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
-  {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
-  {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
-  {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
-  {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}, {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
-  {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
-  {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}, {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00},
-  {0x00,0x00,0x00,0x0E,0x00,0x00,0x00}, {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
-  {0x02,0x04,0x08,0x10,0x08,0x04,0x02}, {0x08,0x04,0x02,0x01,0x02,0x04,0x08},
-  {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E}, {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
-  {0x01,0x01,0x02,0x04,0x08,0x10,0x10}, {0x19,0x19,0x02,0x04,0x08,0x13,0x13},
-  {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F},
+// ---------------------------------------------------------------------------
+// "RANGE SANS" — the UI typeface, procedural like everything else in this
+// game. Glyph skeletons are the public-domain Hershey simplex strokes
+// (A.V. Hershey, US NBS); at GL init they are rendered into a single-channel
+// distance atlas: each texel stores 1 - d/HF_DMAX where d is the distance to
+// the nearest stroke segment in atlas pixels. The HUD shader thresholds that
+// field per VERTEX (aMode), so the stroke weight — regular, bold, hairline —
+// is picked at draw time out of ONE atlas in ONE draw call, and the round
+// capsule cross-section gives the face its geometric-grotesk terminals.
+// CAPS-only by design (the brand voice); lowercase input folds to capitals.
+// Layout: [0]=vertex-pair count (pen-ups included), [1]=advance, then x,y
+// pairs (y-up, baseline 0, cap height 21); -1,-1 lifts the pen.
+// ---------------------------------------------------------------------------
+static const int8_t HF_SIMPLEX[95][112] = {
+  /* 32 ' ' */ {0,16},
+  /* 33 '!' */ {8,10,5,21,5,7,-1,-1,5,2,4,1,5,0,6,1,5,2},
+  /* 34 '"' */ {5,16,4,21,4,14,-1,-1,12,21,12,14},
+  /* 35 '#' */ {11,21,11,25,4,-7,-1,-1,17,25,10,-7,-1,-1,4,12,18,12,-1,-1,3,6,17,6},
+  /* 36 '$' */ {26,20,8,25,8,-4,-1,-1,12,25,12,-4,-1,-1,17,18,15,20,12,21,8,21,5,20,3,18,3,16,4,14,5,13,7,12,13,
+    10,15,9,16,8,17,6,17,3,15,1,12,0,8,0,5,1,3,3},
+  /* 37 '%' */ {31,24,21,21,3,0,-1,-1,8,21,10,19,10,17,9,15,7,14,5,14,3,16,3,18,4,20,6,21,8,21,10,20,13,19,16,19,
+    19,20,21,21,-1,-1,17,7,15,6,14,4,14,2,16,0,18,0,20,1,21,3,21,5,19,7,17,7},
+  /* 38 '&' */ {34,26,23,12,23,13,22,14,21,14,20,13,19,11,17,6,15,3,13,1,11,0,7,0,5,1,4,2,3,4,3,6,4,8,5,9,12,13,
+    13,14,14,16,14,18,13,20,11,21,9,20,8,18,8,16,9,13,11,10,16,3,18,1,20,0,22,0,23,1,23,2},
+  /* 39 ''' */ {7,10,5,19,4,20,5,21,6,20,6,18,5,16,4,15},
+  /* 40 '(' */ {10,14,11,25,9,23,7,20,5,16,4,11,4,7,5,2,7,-2,9,-5,11,-7},
+  /* 41 ')' */ {10,14,3,25,5,23,7,20,9,16,10,11,10,7,9,2,7,-2,5,-5,3,-7},
+  /* 42 */ {8,16,8,21,8,9,-1,-1,3,18,13,12,-1,-1,13,18,3,12},
+  /* 43 '+' */ {5,26,13,18,13,0,-1,-1,4,9,22,9},
+  /* 44 ',' */ {8,10,6,1,5,0,4,1,5,2,6,1,6,-1,5,-3,4,-4},
+  /* 45 '-' */ {2,26,4,9,22,9},
+  /* 46 '.' */ {5,10,5,2,4,1,5,0,6,1,5,2},
+  /* 47 '/' */ {2,22,20,25,2,-7},
+  /* 48 '0' */ {17,20,9,21,6,20,4,17,3,12,3,9,4,4,6,1,9,0,11,0,14,1,16,4,17,9,17,12,16,17,14,20,11,21,9,21},
+  /* 49 '1' */ {4,20,6,17,8,18,11,21,11,0},
+  /* 50 '2' */ {14,20,4,16,4,17,5,19,6,20,8,21,12,21,14,20,15,19,16,17,16,15,15,13,13,10,3,0,17,0},
+  /* 51 '3' */ {15,20,5,21,16,21,10,13,13,13,15,12,16,11,17,8,17,6,16,3,14,1,11,0,8,0,5,1,4,2,3,4},
+  /* 52 '4' */ {6,20,13,21,3,7,18,7,-1,-1,13,21,13,0},
+  /* 53 '5' */ {17,20,15,21,5,21,4,12,5,13,8,14,11,14,14,13,16,11,17,8,17,6,16,3,14,1,11,0,8,0,5,1,4,2,3,4},
+  /* 54 '6' */ {23,20,16,18,15,20,12,21,10,21,7,20,5,17,4,12,4,7,5,3,7,1,10,0,11,0,14,1,16,3,17,6,17,7,16,10,14,
+    12,11,13,10,13,7,12,5,10,4,7},
+  /* 55 '7' */ {5,20,17,21,7,0,-1,-1,3,21,17,21},
+  /* 56 '8' */ {29,20,8,21,5,20,4,18,4,16,5,14,7,13,11,12,14,11,16,9,17,7,17,4,16,2,15,1,12,0,8,0,5,1,4,2,3,4,3,
+    7,4,9,6,11,9,12,13,13,15,14,16,16,16,18,15,20,12,21,8,21},
+  /* 57 '9' */ {23,20,16,14,15,11,13,9,10,8,9,8,6,9,4,11,3,14,3,15,4,18,6,20,9,21,10,21,13,20,15,18,16,14,16,9,
+    15,4,13,1,10,0,8,0,5,1,4,3},
+  /* 58 ':' */ {11,10,5,14,4,13,5,12,6,13,5,14,-1,-1,5,2,4,1,5,0,6,1,5,2},
+  /* 59 ';' */ {14,10,5,14,4,13,5,12,6,13,5,14,-1,-1,6,1,5,0,4,1,5,2,6,1,6,-1,5,-3,4,-4},
+  /* 60 '<' */ {3,24,20,18,4,9,20,0},
+  /* 61 '=' */ {5,26,4,12,22,12,-1,-1,4,6,22,6},
+  /* 62 '>' */ {3,24,4,18,20,9,4,0},
+  /* 63 '?' */ {20,18,3,16,3,17,4,19,5,20,7,21,11,21,13,20,14,19,15,17,15,15,14,13,13,12,9,10,9,7,-1,-1,9,2,8,1,
+    9,0,10,1,9,2},
+  /* 64 '@' */ {55,27,18,13,17,15,15,16,12,16,10,15,9,14,8,11,8,8,9,6,11,5,14,5,16,6,17,8,-1,-1,12,16,10,14,9,11,
+    9,8,10,6,11,5,-1,-1,18,16,17,8,17,6,19,5,21,5,23,7,24,10,24,12,23,15,22,17,20,19,18,20,15,21,12,
+    21,9,20,7,19,5,17,4,15,3,12,3,9,4,6,5,4,7,2,9,1,12,0,15,0,18,1,20,2,21,3,-1,-1,19,16,18,8,18,6,
+    19,5},
+  /* 65 'A' */ {8,18,9,21,1,0,-1,-1,9,21,17,0,-1,-1,4,7,14,7},
+  /* 66 'B' */ {23,21,4,21,4,0,-1,-1,4,21,13,21,16,20,17,19,18,17,18,15,17,13,16,12,13,11,-1,-1,4,11,13,11,16,10,
+    17,9,18,7,18,4,17,2,16,1,13,0,4,0},
+  /* 67 'C' */ {18,21,18,16,17,18,15,20,13,21,9,21,7,20,5,18,4,16,3,13,3,8,4,5,5,3,7,1,9,0,13,0,15,1,17,3,18,5},
+  /* 68 'D' */ {15,21,4,21,4,0,-1,-1,4,21,11,21,14,20,16,18,17,16,18,13,18,8,17,5,16,3,14,1,11,0,4,0},
+  /* 69 'E' */ {11,19,4,21,4,0,-1,-1,4,21,17,21,-1,-1,4,11,12,11,-1,-1,4,0,17,0},
+  /* 70 'F' */ {8,18,4,21,4,0,-1,-1,4,21,17,21,-1,-1,4,11,12,11},
+  /* 71 'G' */ {22,21,18,16,17,18,15,20,13,21,9,21,7,20,5,18,4,16,3,13,3,8,4,5,5,3,7,1,9,0,13,0,15,1,17,3,18,5,
+    18,8,-1,-1,13,8,18,8},
+  /* 72 'H' */ {8,22,4,21,4,0,-1,-1,18,21,18,0,-1,-1,4,11,18,11},
+  /* 73 'I' */ {2,8,4,21,4,0},
+  /* 74 'J' */ {10,16,12,21,12,5,11,2,10,1,8,0,6,0,4,1,3,2,2,5,2,7},
+  /* 75 'K' */ {8,21,4,21,4,0,-1,-1,18,21,4,7,-1,-1,9,12,18,0},
+  /* 76 'L' */ {5,17,4,21,4,0,-1,-1,4,0,16,0},
+  /* 77 'M' */ {11,24,4,21,4,0,-1,-1,4,21,12,0,-1,-1,20,21,12,0,-1,-1,20,21,20,0},
+  /* 78 'N' */ {8,22,4,21,4,0,-1,-1,4,21,18,0,-1,-1,18,21,18,0},
+  /* 79 'O' */ {21,22,9,21,7,20,5,18,4,16,3,13,3,8,4,5,5,3,7,1,9,0,13,0,15,1,17,3,18,5,19,8,19,13,18,16,17,18,15,
+    20,13,21,9,21},
+  /* 80 'P' */ {13,21,4,21,4,0,-1,-1,4,21,13,21,16,20,17,19,18,17,18,14,17,12,16,11,13,10,4,10},
+  /* 81 'Q' */ {24,22,9,21,7,20,5,18,4,16,3,13,3,8,4,5,5,3,7,1,9,0,13,0,15,1,17,3,18,5,19,8,19,13,18,16,17,18,15,
+    20,13,21,9,21,-1,-1,12,4,18,-2},
+  /* 82 'R' */ {16,21,4,21,4,0,-1,-1,4,21,13,21,16,20,17,19,18,17,18,15,17,13,16,12,13,11,4,11,-1,-1,11,11,18,0},
+  /* 83 'S' */ {20,20,17,18,15,20,12,21,8,21,5,20,3,18,3,16,4,14,5,13,7,12,13,10,15,9,16,8,17,6,17,3,15,1,12,0,8,
+    0,5,1,3,3},
+  /* 84 'T' */ {5,16,8,21,8,0,-1,-1,1,21,15,21},
+  /* 85 'U' */ {10,22,4,21,4,6,5,3,7,1,10,0,12,0,15,1,17,3,18,6,18,21},
+  /* 86 'V' */ {5,18,1,21,9,0,-1,-1,17,21,9,0},
+  /* 87 'W' */ {11,24,2,21,7,0,-1,-1,12,21,7,0,-1,-1,12,21,17,0,-1,-1,22,21,17,0},
+  /* 88 'X' */ {5,20,3,21,17,0,-1,-1,17,21,3,0},
+  /* 89 'Y' */ {6,18,1,21,9,11,9,0,-1,-1,17,21,9,11},
+  /* 90 'Z' */ {8,20,17,21,3,0,-1,-1,3,21,17,21,-1,-1,3,0,17,0},
+  /* 91 '[' */ {11,14,4,25,4,-7,-1,-1,5,25,5,-7,-1,-1,4,25,11,25,-1,-1,4,-7,11,-7},
+  /* 92 */ {2,14,0,21,14,-3},
+  /* 93 ']' */ {11,14,9,25,9,-7,-1,-1,10,25,10,-7,-1,-1,3,25,10,25,-1,-1,3,-7,10,-7},
+  /* 94 '^' */ {10,16,6,15,8,18,10,15,-1,-1,3,12,8,17,13,12,-1,-1,8,17,8,0},
+  /* 95 '_' */ {2,16,0,-2,16,-2},
+  /* 96 '`' */ {7,10,6,21,5,20,4,18,4,16,5,15,6,16,5,17},
+  /* 97 'a' */ {17,19,15,14,15,0,-1,-1,15,11,13,13,11,14,8,14,6,13,4,11,3,8,3,6,4,3,6,1,8,0,11,0,13,1,15,3},
+  /* 98 'b' */ {17,19,4,21,4,0,-1,-1,4,11,6,13,8,14,11,14,13,13,15,11,16,8,16,6,15,3,13,1,11,0,8,0,6,1,4,3},
+  /* 99 'c' */ {14,18,15,11,13,13,11,14,8,14,6,13,4,11,3,8,3,6,4,3,6,1,8,0,11,0,13,1,15,3},
+  /* 100 'd' */ {17,19,15,21,15,0,-1,-1,15,11,13,13,11,14,8,14,6,13,4,11,3,8,3,6,4,3,6,1,8,0,11,0,13,1,15,3},
+  /* 101 'e' */ {17,18,3,8,15,8,15,10,14,12,13,13,11,14,8,14,6,13,4,11,3,8,3,6,4,3,6,1,8,0,11,0,13,1,15,3},
+  /* 102 'f' */ {8,12,10,21,8,21,6,20,5,17,5,0,-1,-1,2,14,9,14},
+  /* 103 'g' */ {22,19,15,14,15,-2,14,-5,13,-6,11,-7,8,-7,6,-6,-1,-1,15,11,13,13,11,14,8,14,6,13,4,11,3,8,3,6,4,3,
+    6,1,8,0,11,0,13,1,15,3},
+  /* 104 'h' */ {10,19,4,21,4,0,-1,-1,4,10,7,13,9,14,12,14,14,13,15,10,15,0},
+  /* 105 'i' */ {8,8,3,21,4,20,5,21,4,22,3,21,-1,-1,4,14,4,0},
+  /* 106 'j' */ {11,10,5,21,6,20,7,21,6,22,5,21,-1,-1,6,14,6,-3,5,-6,3,-7,1,-7},
+  /* 107 'k' */ {8,17,4,21,4,0,-1,-1,14,14,4,4,-1,-1,8,8,15,0},
+  /* 108 'l' */ {2,8,4,21,4,0},
+  /* 109 'm' */ {18,30,4,14,4,0,-1,-1,4,10,7,13,9,14,12,14,14,13,15,10,15,0,-1,-1,15,10,18,13,20,14,23,14,25,13,
+    26,10,26,0},
+  /* 110 'n' */ {10,19,4,14,4,0,-1,-1,4,10,7,13,9,14,12,14,14,13,15,10,15,0},
+  /* 111 'o' */ {17,19,8,14,6,13,4,11,3,8,3,6,4,3,6,1,8,0,11,0,13,1,15,3,16,6,16,8,15,11,13,13,11,14,8,14},
+  /* 112 'p' */ {17,19,4,14,4,-7,-1,-1,4,11,6,13,8,14,11,14,13,13,15,11,16,8,16,6,15,3,13,1,11,0,8,0,6,1,4,3},
+  /* 113 'q' */ {17,19,15,14,15,-7,-1,-1,15,11,13,13,11,14,8,14,6,13,4,11,3,8,3,6,4,3,6,1,8,0,11,0,13,1,15,3},
+  /* 114 'r' */ {8,13,4,14,4,0,-1,-1,4,8,5,11,7,13,9,14,12,14},
+  /* 115 's' */ {17,17,14,11,13,13,10,14,7,14,4,13,3,11,4,9,6,8,11,7,13,6,14,4,14,3,13,1,10,0,7,0,4,1,3,3},
+  /* 116 't' */ {8,12,5,21,5,4,6,1,8,0,10,0,-1,-1,2,14,9,14},
+  /* 117 'u' */ {10,19,4,14,4,4,5,1,7,0,10,0,12,1,15,4,-1,-1,15,14,15,0},
+  /* 118 'v' */ {5,16,2,14,8,0,-1,-1,14,14,8,0},
+  /* 119 'w' */ {11,22,3,14,7,0,-1,-1,11,14,7,0,-1,-1,11,14,15,0,-1,-1,19,14,15,0},
+  /* 120 'x' */ {5,17,3,14,14,0,-1,-1,14,14,3,0},
+  /* 121 'y' */ {9,16,2,14,8,0,-1,-1,14,14,8,0,6,-4,4,-6,2,-7,1,-7},
+  /* 122 'z' */ {8,17,14,14,3,0,-1,-1,3,14,14,14,-1,-1,3,0,14,0},
+  /* 123 '{' */ {39,14,9,25,7,24,6,23,5,21,5,19,6,17,7,16,8,14,8,12,6,10,-1,-1,7,24,6,22,6,20,7,18,8,17,9,15,9,13,
+    8,11,4,9,8,7,9,5,9,3,8,1,7,0,6,-2,6,-4,7,-6,-1,-1,6,8,8,6,8,4,7,2,6,1,5,-1,5,-3,6,-5,7,-6,9,-7},
+  /* 124 '|' */ {2,8,4,25,4,-7},
+  /* 125 '}' */ {39,14,5,25,7,24,8,23,9,21,9,19,8,17,7,16,6,14,6,12,8,10,-1,-1,7,24,8,22,8,20,7,18,6,17,5,15,5,13,
+    6,11,10,9,6,7,5,5,5,3,6,1,7,0,8,-2,8,-4,7,-6,-1,-1,8,8,6,6,6,4,7,2,8,1,9,-1,9,-3,8,-5,7,-6,5,-7},
+  /* 126 '~' */ {23,24,3,6,3,8,4,11,6,12,8,12,10,11,14,8,16,7,18,7,20,8,21,10,-1,-1,3,8,4,10,6,11,8,11,10,10,14,7,
+    16,6,18,6,20,7,21,10,21,12},
 };
-#define FONT_GLYPHS  47
-#define GLYPH_SOLID  46              // the '#' block, used for filled rects
-#define FONT_SLOT_W  6               // 5 px glyph + 1 px pad in the atlas
-#define FONT_TEX_W   (FONT_GLYPHS * FONT_SLOT_W)
-#define FONT_TEX_H   8
+
+// Icon strokes in the same format, addressed as string bytes \x01..\x05:
+// chevron (list marker), AR and SR (killfeed weapon glyphs), headshot, and a
+// middle dot. Same skeleton-distance treatment, so they inherit the stroke
+// weight of the text they sit in.
+static const int8_t HF_EXTRA[5][32] = {
+  /* \x01 chevron  */ {3,14, 4,16,11,10,4,4},
+  /* \x02 AR       */ {12,30, 1,6,4,10,28,10,-1,-1,9,10,8,5,-1,-1,14,10,13,4,-1,-1,21,10,21,14},
+  /* \x03 SR       */ {15,31, 1,6,4,10,29,10,-1,-1,9,10,8,5,-1,-1,12,13,19,13,-1,-1,13,13,13,10,-1,-1,18,13,18,10},
+  /* \x04 headshot */ {14,16, 13,15,12,18,8,20,4,18,3,15,4,12,8,10,12,12,13,15,-1,-1,2,4,4,7,12,7,14,4},
+  /* \x05 mid dot  */ {2,10, 5,9,5,9},
+};
+
+#define HF_ASCII   95
+#define HF_ICONS   5
+#define HF_GLYPHS  (HF_ASCII + HF_ICONS)   // stroke glyphs
+#define HF_SOLID   HF_GLYPHS               // all-255 cell: solid fills
+#define HF_SOFT    (HF_GLYPHS + 1)         // radial falloff cell: glow/shadow
+#define HF_CELLS   (HF_GLYPHS + 2)
+#define HF_COLS    16
+#define HF_ROWS    ((HF_CELLS + HF_COLS - 1) / HF_COLS)
+#define HF_CELL    72                      // atlas cell size, px
+#define HF_TEX_W   (HF_COLS * HF_CELL)
+#define HF_TEX_H   (HF_ROWS * HF_CELL)
+#define HF_PX      1.6f                    // atlas px per font unit
+#define HF_DMAX    10.0f                   // encoded distance range, atlas px
+#define HF_BASE    50.0f                   // baseline row inside a cell
+#define HF_MARG    10.0f                   // ink origin inset inside a cell
+#define HF_CAP     21.0f                   // cap height in font units
+
+// Text weights are SDF thresholds: 1 - stroke_radius_px/HF_DMAX. Lower =
+// bolder. UIM_RAW bypasses the field (solid slot, soft glow slot).
+#define TXT_REG    0.76f
+#define TXT_BOLD   0.66f
+#define TXT_BLACK  0.56f
+#define UIM_RAW    2.0f
+
+typedef struct {                 // per-glyph metrics, filled by font_bake
+  float adv;                     // advance, font units (digits: tabular)
+  float qx0, qy0, qx1, qy1;      // quad extents, font units (ink + spill)
+  float u0, v0, u1, v1;          // atlas UVs of exactly that quad
+} hf_gm_t;
+static hf_gm_t g_hfm[HF_GLYPHS];
+static float g_hf_solid_u, g_hf_solid_v;   // centre texel of the solid cell
+static float g_hf_soft[4];                 // u0 v0 u1 v1 of the soft cell
+
+static const int8_t *hf_glyph_data(int gi) {
+  return gi < HF_ASCII ? HF_SIMPLEX[gi] : HF_EXTRA[gi - HF_ASCII];
+}
+
+static float hf_seg_dist(float px, float py, float ax, float ay,
+                         float bx, float by) {
+  float dx = bx - ax, dy = by - ay;
+  float l2 = dx * dx + dy * dy;
+  float t = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  float ex = ax + t * dx - px, ey = ay + t * dy - py;
+  return sqrtf(ex * ex + ey * ey);
+}
+
+static void font_bake(uint8_t *atlas) {
+  memset(atlas, 0, (size_t)HF_TEX_W * HF_TEX_H);
+  const float spill = HF_DMAX / HF_PX;   // how far the field reaches, font units
+  for (int gi = 0; gi < HF_GLYPHS; gi++) {
+    const int8_t *d = hf_glyph_data(gi);
+    int n = d[0];
+    int cx = (gi % HF_COLS) * HF_CELL, cy = (gi / HF_COLS) * HF_CELL;
+    hf_gm_t *m = &g_hfm[gi];
+    memset(m, 0, sizeof *m);
+    m->adv = (float)d[1];
+    if (gi >= 16 && gi <= 25) m->adv = 22.0f;   // tabular digits '0'..'9'
+    if (n == 0) continue;                       // space: advance only
+    float ix0 = 127, iy0 = 127, ix1 = -127, iy1 = -127;
+    for (int i = 0; i < n; i++) {
+      float px = d[2 + 2 * i], py = d[3 + 2 * i];
+      if (px == -1 && py == -1) continue;
+      if (px < ix0) ix0 = px;
+      if (px > ix1) ix1 = px;
+      if (py < iy0) iy0 = py;
+      if (py > iy1) iy1 = py;
+    }
+    m->qx0 = ix0 - spill; m->qx1 = ix1 + spill;
+    m->qy0 = iy0 - spill; m->qy1 = iy1 + spill;
+    int ax0 = cx + (int)floorf(HF_MARG + m->qx0 * HF_PX);
+    int ax1 = cx + (int)ceilf(HF_MARG + m->qx1 * HF_PX);
+    int ay0 = cy + (int)floorf(HF_BASE - m->qy1 * HF_PX);
+    int ay1 = cy + (int)ceilf(HF_BASE - m->qy0 * HF_PX);
+    if (ax0 < cx) ax0 = cx;
+    if (ay0 < cy) ay0 = cy;
+    if (ax1 > cx + HF_CELL) ax1 = cx + HF_CELL;
+    if (ay1 > cy + HF_CELL) ay1 = cy + HF_CELL;
+    for (int y = ay0; y < ay1; y++)
+      for (int x = ax0; x < ax1; x++) {
+        float fx = ((float)x + 0.5f - (float)cx - HF_MARG) / HF_PX;
+        float fy = (HF_BASE - ((float)y + 0.5f - (float)cy)) / HF_PX;
+        float dmin = 1e9f;
+        float lx = 0, ly = 0;
+        int pen = 0;
+        for (int i = 0; i < n; i++) {
+          float sx = d[2 + 2 * i], sy = d[3 + 2 * i];
+          if (sx == -1 && sy == -1) { pen = 0; continue; }
+          if (pen) {
+            float sd = hf_seg_dist(fx, fy, lx, ly, sx, sy);
+            if (sd < dmin) dmin = sd;
+          }
+          lx = sx; ly = sy; pen = 1;
+        }
+        float v = 1.0f - dmin * HF_PX / HF_DMAX;
+        if (v > 0) atlas[y * HF_TEX_W + x] = (uint8_t)(v * 255.0f + 0.5f);
+      }
+    m->u0 = ((float)cx + HF_MARG + m->qx0 * HF_PX) / (float)HF_TEX_W;
+    m->u1 = ((float)cx + HF_MARG + m->qx1 * HF_PX) / (float)HF_TEX_W;
+    m->v0 = ((float)cy + HF_BASE - m->qy1 * HF_PX) / (float)HF_TEX_H;
+    m->v1 = ((float)cy + HF_BASE - m->qy0 * HF_PX) / (float)HF_TEX_H;
+  }
+  {  // solid cell: every UI rect/line/disk samples its centre texel
+    int cx = (HF_SOLID % HF_COLS) * HF_CELL, cy = (HF_SOLID / HF_COLS) * HF_CELL;
+    for (int y = 0; y < HF_CELL; y++)
+      for (int x = 0; x < HF_CELL; x++)
+        atlas[(cy + y) * HF_TEX_W + cx + x] = 255;
+    g_hf_solid_u = ((float)cx + HF_CELL * 0.5f) / (float)HF_TEX_W;
+    g_hf_solid_v = ((float)cy + HF_CELL * 0.5f) / (float)HF_TEX_H;
+  }
+  {  // soft cell: quadratic radial falloff — one quad = one glow/shadow sprite
+    int cx = (HF_SOFT % HF_COLS) * HF_CELL, cy = (HF_SOFT / HF_COLS) * HF_CELL;
+    float half = HF_CELL * 0.5f, rmax = half - 1.0f;
+    for (int y = 0; y < HF_CELL; y++)
+      for (int x = 0; x < HF_CELL; x++) {
+        float dx = (float)x + 0.5f - half, dy = (float)y + 0.5f - half;
+        float v = 1.0f - sqrtf(dx * dx + dy * dy) / rmax;
+        if (v < 0) v = 0;
+        atlas[(cy + y) * HF_TEX_W + cx + x] = (uint8_t)(v * v * 255.0f + 0.5f);
+      }
+    g_hf_soft[0] = ((float)cx + 1.0f) / (float)HF_TEX_W;
+    g_hf_soft[1] = ((float)cy + 1.0f) / (float)HF_TEX_H;
+    g_hf_soft[2] = ((float)cx + HF_CELL - 1.0f) / (float)HF_TEX_W;
+    g_hf_soft[3] = ((float)cy + HF_CELL - 1.0f) / (float)HF_TEX_H;
+  }
+}
 
 static float g_scope_r, g_scope_cx, g_scope_cy;  // scope disc, derived per frame
 static int g_hud_visible = 1;  // harness capture switch; menus remain visible
@@ -12198,6 +12467,10 @@ typedef struct {
   GLuint present_fbo;               // frame destination: 0 on Windows, harness FBO on Linux
   GLuint msaa_fbo, msaa_rb[2];      // multisampled scene target, msaa_fbo 0 = MSAA off
   int    msaa_cfg, msaa_w, msaa_h;  // setting/size the MSAA target was built for
+  GLuint blur_fbo[2], blur_tex[2];  // quarter-res ping-pong: the frosted menu
+  GLuint prog_blur;                 // dual-Kawase tap (see ui_menu_backdrop)
+  GLint  u_blur_tex, u_blur_px;
+  int    blur_w, blur_h;            // size the blur chain was built for
 } renderer_t;
 
 static renderer_t R;
@@ -12399,6 +12672,9 @@ static void renderer_init(int width, int height) {
   R.u_screen = glGetUniformLocation(R.prog_hud, "uScreen");
   R.u_tex = glGetUniformLocation(R.prog_hud, "uTex");
   R.u_img = glGetUniformLocation(R.prog_hud, "uImg");
+  R.prog_blur = gl_program(BLUR_VS, BLUR_FS);
+  R.u_blur_tex = glGetUniformLocation(R.prog_blur, "uTex");
+  R.u_blur_px = glGetUniformLocation(R.prog_blur, "uPix");
   R.u_sky_fwd = glGetUniformLocation(R.prog_sky, "uFwd");
   R.u_sky_right = glGetUniformLocation(R.prog_sky, "uRight");
   R.u_sky_up = glGetUniformLocation(R.prog_sky, "uUp");
@@ -12428,25 +12704,27 @@ static void renderer_init(int width, int height) {
   glGenBuffers(1, &R.vbo_hud);
   glBindVertexArray(R.vao_hud);
   glBindBuffer(GL_ARRAY_BUFFER, R.vbo_hud);
-  GLsizei hs = 8 * sizeof(float);  // x y u v r g b a
+  GLsizei hs = 9 * sizeof(float);  // x y u v r g b a mode
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, hs, (void *)0);
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, hs, (void *)(2 * sizeof(float)));
   glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, hs, (void *)(4 * sizeof(float)));
+  glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, hs, (void *)(8 * sizeof(float)));
   glEnableVertexAttribArray(0);
   glEnableVertexAttribArray(1);
   glEnableVertexAttribArray(2);
+  glEnableVertexAttribArray(3);
 
-  uint8_t atlas[FONT_TEX_H][FONT_TEX_W] = {0};
-  for (int g = 0; g < FONT_GLYPHS; g++)
-    for (int y = 0; y < 7; y++)
-      for (int x = 0; x < 5; x++)
-        if (FONT_5X7[g][y] & (0x10 >> x)) atlas[y][g * FONT_SLOT_W + x] = 255;
+  // The distance atlas is baked on the CPU at startup (~half a megabyte of
+  // BSS, written once). LINEAR filtering is what makes the field usable: the
+  // shader thresholds the bilinear-interpolated distance, not texel steps.
+  static uint8_t hf_atlas[HF_TEX_H][HF_TEX_W];
+  font_bake(&hf_atlas[0][0]);
   glGenTextures(1, &R.font_tex);
   glBindTexture(GL_TEXTURE_2D, R.font_tex);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, FONT_TEX_W, FONT_TEX_H, 0, GL_RED_CORE, GL_UNSIGNED_BYTE, atlas);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, HF_TEX_W, HF_TEX_H, 0, GL_RED_CORE, GL_UNSIGNED_BYTE, hf_atlas);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -12510,14 +12788,10 @@ static void renderer_init(int width, int height) {
 }
 
 static int glyph_index(char ch) {
-  if (ch >= '0' && ch <= '9') return ch - '0';
-  if (ch >= 'a' && ch <= 'z') ch -= 32;
-  if (ch >= 'A' && ch <= 'Z') return 10 + ch - 'A';
-  switch (ch) {
-    case '.': return 36; case ':': return 37; case '-': return 38; case '+': return 39;
-    case '<': return 40; case '>': return 41; case '[': return 42; case ']': return 43;
-    case '/': return 44; case '%': return 45; case '#': return GLYPH_SOLID;
-  }
+  unsigned char c = (unsigned char)ch;
+  if (c >= 'a' && c <= 'z') c -= 32;           // CAPS-only brand voice
+  if (c >= 32 && c < 127) return (int)c - 32;  // printable ASCII
+  if (c >= 1 && c <= HF_ICONS) return HF_ASCII + (int)c - 1;  // \x01.. icons
   return -1;
 }
 
@@ -12525,22 +12799,36 @@ static int glyph_index(char ch) {
 // UI batch — all HUD/menu drawing accumulates into one vertex buffer and is
 // drawn with a single call. Coordinates are "virtual pixels": a 360-unit-tall
 // space scaled by an integer factor, so the layout is resolution-independent
-// and stays crisp.
+// and stays crisp. Vertices carry x y u v r g b a mode — mode is the SDF
+// threshold (text weight) or UIM_RAW (solid/soft cells), see HUD_FS.
 // ---------------------------------------------------------------------------
 
-#define UI_MAX_VERTS 12288  // sized for a full 21-row scoreboard + HUD + menu
-static float g_ui_vb[UI_MAX_VERTS * 8];
+#define UI_MAX_VERTS 24576  // raised for the GRATICULE UI (rounded panels,
+// glow sprites, SDF text). Still a SILENT per-vertex drop past the ceiling
+// (P0-7): `budget` prints ui_peak/ui_drops — re-measure at the worst case,
+// a 28-row MAX_ENTS scoreboard + killfeed + menu, after adding geometry.
+static float g_ui_vb[UI_MAX_VERTS * 9];
 static int   g_ui_nverts;
-// This ceiling had NO proof (P0-7): an overflowing HUD does not crash, it
-// simply stops drawing — a scoreboard that quietly ends after row N looks
-// exactly like a match with N players. `budget` prints peak and drops now.
-// The board is ENT_FOREACH over MAX_ENTS, so the worst case is 28 rows, not
-// the 21 the ceiling above was sized against — re-measure it there.
 static int   g_ui_peak;
 static long  g_ui_drops;
 static float g_uis = 1;      // virtual->real pixel scale
 static float g_ui_vw = 640;  // virtual screen size in those units...
 static float g_ui_vh = 360;  // ...and the height is NOT always 360
+static float g_ui_mode = UIM_RAW;  // batch state, set by every primitive
+
+// Presentation-side motion clock. dt is the RENDERED frame's dt (clamped by
+// app_frame); the harness never writes it, so uiframe/shot advance a fixed
+// 1/60 step and screenshots stay deterministic. Sim state never reads this.
+static float g_ui_dt = 1.0f / 60.0f;
+[[maybe_unused]] static float g_ui_time;
+[[maybe_unused]] static float ui_smooth(float cur, float target, float speed) {
+  return target + (cur - target) * expf(-speed * g_ui_dt);
+}
+[[maybe_unused]] static float ui_easeout(float t) {
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  float it = 1.0f - t;
+  return 1.0f - it * it * it;
+}
 
 // The integer HUD scale, in ONE place. ui_begin caches it for the UI layer;
 // the scope-disc placement in vm_build recomputes it from R.height (it runs
@@ -12565,10 +12853,11 @@ static void ui_begin(void) {
 
 static void ui_push(float x, float y, float u, float v, const float c[4]) {
   if (g_ui_nverts >= UI_MAX_VERTS) { g_ui_drops++; return; }
-  float *p = g_ui_vb + (size_t)g_ui_nverts++ * 8;
+  float *p = g_ui_vb + (size_t)g_ui_nverts++ * 9;
   p[0] = x * g_uis; p[1] = y * g_uis;
   p[2] = u; p[3] = v;
   p[4] = c[0]; p[5] = c[1]; p[6] = c[2]; p[7] = c[3];
+  p[8] = g_ui_mode;
 }
 
 static void ui_quad(float x, float y, float w, float h,
@@ -12579,30 +12868,24 @@ static void ui_quad(float x, float y, float w, float h,
 
 static void ui_rect(float x, float y, float w, float h,
                     float r, float g, float b, float a) {
-  float u = ((float)(GLYPH_SOLID * FONT_SLOT_W) + 2.5f) / FONT_TEX_W;
-  float v = 3.5f / FONT_TEX_H;
+  g_ui_mode = UIM_RAW;
+  float u = g_hf_solid_u, v = g_hf_solid_v;
   ui_quad(x, y, w, h, u, v, u, v, (float[4]){r, g, b, a});
 }
 
 // A panel whose height depends on its own content cannot be drawn last —
 // immediate mode paints in insertion order and it would cover what it frames.
-// So the quad goes down first and its BOTTOM EDGE is rewritten once the rows
-// have been laid out. ui_quad's vertex order is
-//   (x,y) (x+w,y) (x+w,y+h) | (x,y) (x+w,y+h) (x,y+h)
-// so exactly the last three carry the bottom edge.
-static int ui_mark(void) { return g_ui_nverts; }
-static void ui_rect_bottom(int mark, float ybot) {
-  if (mark < 0 || mark + 6 > g_ui_nverts) return;   // dropped: nothing to patch
-  float *p = g_ui_vb + (size_t)mark * 8;
-  p[2 * 8 + 1] = p[4 * 8 + 1] = p[5 * 8 + 1] = ybot * g_uis;
-}
+// The flat-quad era solved that by patching the panel quad's bottom edge in
+// place (ui_mark/ui_rect_bottom); a rounded panel has no single bottom edge,
+// so the menu now caches each page's measured height ACROSS frames instead —
+// see the ph_page comment in ui_menu.
 
 // Crisp line at any angle: an oriented quad (MSAA smooths the edges) — for
 // HUD marks that must not look like stepped pixel art.
 static void ui_line(float x0, float y0, float x1, float y1, float hw,
                     float r, float g, float b, float a) {
-  float u = ((float)(GLYPH_SOLID * FONT_SLOT_W) + 2.5f) / FONT_TEX_W;
-  float v = 3.5f / FONT_TEX_H;
+  g_ui_mode = UIM_RAW;
+  float u = g_hf_solid_u, v = g_hf_solid_v;
   float dx = x1 - x0, dy = y1 - y0;
   float l = sqrtf(dx * dx + dy * dy);
   if (l < 1e-4f) return;
@@ -12616,46 +12899,245 @@ static void ui_line(float x0, float y0, float x1, float y1, float hw,
   ui_push(x0 - px, y0 - py, u, v, c);
 }
 
-// Filled circle — the round red dot, which sits dead centre of the ADS view and
-// is therefore the one HUD element whose facets a player can count. 32 segments.
-#define UI_DISK_SEGS 32
-static void ui_disk(float cx, float cy, float rad,
-                    float r, float g, float b, float a) {
-  float u = ((float)(GLYPH_SOLID * FONT_SLOT_W) + 2.5f) / FONT_TEX_W;
-  float v = 3.5f / FONT_TEX_H;
-  const float c[4] = {r, g, b, a};
-  for (int i = 0; i < UI_DISK_SEGS; i++) {
-    float a0 = (float)i * 6.2831853f / UI_DISK_SEGS,
-          a1 = (float)(i + 1) * 6.2831853f / UI_DISK_SEGS;
+static void ui_diskn(float cx, float cy, float rad, int segs, const float c[4]) {
+  g_ui_mode = UIM_RAW;
+  float u = g_hf_solid_u, v = g_hf_solid_v;
+  for (int i = 0; i < segs; i++) {
+    float a0 = (float)i * 6.2831853f / (float)segs,
+          a1 = (float)(i + 1) * 6.2831853f / (float)segs;
     ui_push(cx, cy, u, v, c);
     ui_push(cx + cosf(a0) * rad, cy + sinf(a0) * rad, u, v, c);
     ui_push(cx + cosf(a1) * rad, cy + sinf(a1) * rad, u, v, c);
   }
 }
 
-static void ui_text(const char *t, float x, float y, float scale,
+// Filled circle — the round red dot, which sits dead centre of the ADS view and
+// is therefore the one HUD element whose facets a player can count. 32 segments.
+#define UI_DISK_SEGS 32
+static void ui_disk(float cx, float cy, float rad,
                     float r, float g, float b, float a) {
-  float c[4] = {r, g, b, a};
-  for (; *t; t++) {
-    int gi = glyph_index(*t);
-    if (gi >= 0) {
-      float u0 = (float)(gi * FONT_SLOT_W) / FONT_TEX_W;
-      float u1 = (float)(gi * FONT_SLOT_W + 5) / FONT_TEX_W;
-      ui_quad(x, y, 5 * scale, 7 * scale, u0, 0, u1, 7.0f / FONT_TEX_H, c);
-    }
-    x += 6 * scale;
+  ui_diskn(cx, cy, rad, UI_DISK_SEGS, (float[4]){r, g, b, a});
+}
+
+// Thick stroke with round caps — the GRATICULE mark language (crosshair arms,
+// hitmarker, damage wedges) is capsules, not boxes.
+[[maybe_unused]] static void ui_capsule(float x0, float y0, float x1, float y1,
+                                        float hw, float r, float g, float b, float a) {
+  ui_line(x0, y0, x1, y1, hw, r, g, b, a);
+  const float c[4] = {r, g, b, a};
+  ui_diskn(x0, y0, hw, 8, c);
+  ui_diskn(x1, y1, hw, 8, c);
+}
+
+static void ui_arc_seg(float cx, float cy, float rad, float a0, float a1,
+                       float hw, const float c[4]) {
+  int segs = (int)(fabsf(a1 - a0) * 9.0f) + 2;
+  if (segs > 48) segs = 48;
+  g_ui_mode = UIM_RAW;
+  float u = g_hf_solid_u, v = g_hf_solid_v;
+  float pa = a0;
+  for (int i = 1; i <= segs; i++) {
+    float na = a0 + (a1 - a0) * (float)i / (float)segs;
+    float p0x = cx + cosf(pa) * (rad - hw), p0y = cy + sinf(pa) * (rad - hw);
+    float p1x = cx + cosf(pa) * (rad + hw), p1y = cy + sinf(pa) * (rad + hw);
+    float n0x = cx + cosf(na) * (rad - hw), n0y = cy + sinf(na) * (rad - hw);
+    float n1x = cx + cosf(na) * (rad + hw), n1y = cy + sinf(na) * (rad + hw);
+    ui_push(p0x, p0y, u, v, c); ui_push(p1x, p1y, u, v, c); ui_push(n1x, n1y, u, v, c);
+    ui_push(p0x, p0y, u, v, c); ui_push(n1x, n1y, u, v, c); ui_push(n0x, n0y, u, v, c);
+    pa = na;
   }
 }
 
+[[maybe_unused]] static void ui_arc(float cx, float cy, float rad, float a0, float a1,
+                                    float hw, float r, float g, float b, float a) {
+  const float c[4] = {r, g, b, a};
+  ui_arc_seg(cx, cy, rad, a0, a1, hw, c);
+  ui_diskn(cx + cosf(a0) * rad, cy + sinf(a0) * rad, hw, 8, c);
+  ui_diskn(cx + cosf(a1) * rad, cy + sinf(a1) * rad, hw, 8, c);
+}
+
+// Vertical gradient fill — per-vertex color makes this free.
+[[maybe_unused]] static void ui_vgrad(float x, float y, float w, float h,
+                                      const float ct[4], const float cb[4]) {
+  g_ui_mode = UIM_RAW;
+  float u = g_hf_solid_u, v = g_hf_solid_v;
+  ui_push(x, y, u, v, ct);     ui_push(x + w, y, u, v, ct);     ui_push(x + w, y + h, u, v, cb);
+  ui_push(x, y, u, v, ct);     ui_push(x + w, y + h, u, v, cb); ui_push(x, y + h, u, v, cb);
+}
+
+// Horizontal gradient fill — the side edges of vignettes need it.
+[[maybe_unused]] static void ui_hgrad(float x, float y, float w, float h,
+                                      const float cl[4], const float cr[4]) {
+  g_ui_mode = UIM_RAW;
+  float u = g_hf_solid_u, v = g_hf_solid_v;
+  ui_push(x, y, u, v, cl);     ui_push(x + w, y, u, v, cr);     ui_push(x + w, y + h, u, v, cr);
+  ui_push(x, y, u, v, cl);     ui_push(x + w, y + h, u, v, cr); ui_push(x, y + h, u, v, cl);
+}
+
+static void ui_rr_col(float y0, float yy, float h, const float ct[4],
+                      const float cb[4], float out[4]) {
+  float t = h > 0 ? (yy - y0) / h : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  for (int i = 0; i < 4; i++) out[i] = ct[i] + (cb[i] - ct[i]) * t;
+}
+
+#define UI_RR_SEGS 5
+static void ui_rr_corner(float ccx, float ccy, float rad, float base, float y0,
+                         float h, const float ct[4], const float cb[4]) {
+  float u = g_hf_solid_u, v = g_hf_solid_v;
+  float cc[4];
+  ui_rr_col(y0, ccy, h, ct, cb, cc);
+  for (int i = 0; i < UI_RR_SEGS; i++) {
+    float a0 = base + 1.5707963f * (float)i / UI_RR_SEGS;
+    float a1 = base + 1.5707963f * (float)(i + 1) / UI_RR_SEGS;
+    float p0x = ccx + cosf(a0) * rad, p0y = ccy + sinf(a0) * rad;
+    float p1x = ccx + cosf(a1) * rad, p1y = ccy + sinf(a1) * rad;
+    float c0[4], c1[4];
+    ui_rr_col(y0, p0y, h, ct, cb, c0);
+    ui_rr_col(y0, p1y, h, ct, cb, c1);
+    ui_push(ccx, ccy, u, v, cc);
+    ui_push(p0x, p0y, u, v, c0);
+    ui_push(p1x, p1y, u, v, c1);
+  }
+}
+
+// Rounded rectangle with an optional vertical gradient: three slabs + four
+// corner fans. The GRATICULE panel/chip/row shape.
+static void ui_rrect_c(float x, float y, float w, float h, float rad,
+                       const float ct[4], const float cb[4]) {
+  g_ui_mode = UIM_RAW;
+  float u = g_hf_solid_u, v = g_hf_solid_v;
+  if (rad > w * 0.5f) rad = w * 0.5f;
+  if (rad > h * 0.5f) rad = h * 0.5f;
+  if (rad < 0.5f) {
+    ui_push(x, y, u, v, ct);     ui_push(x + w, y, u, v, ct);     ui_push(x + w, y + h, u, v, cb);
+    ui_push(x, y, u, v, ct);     ui_push(x + w, y + h, u, v, cb); ui_push(x, y + h, u, v, cb);
+    return;
+  }
+  float ca[4], cz[4];
+  ui_rr_col(y, y + rad, h, ct, cb, ca);
+  ui_rr_col(y, y + h - rad, h, ct, cb, cz);
+  // middle slab, full width
+  ui_push(x, y + rad, u, v, ca);         ui_push(x + w, y + rad, u, v, ca);
+  ui_push(x + w, y + h - rad, u, v, cz);
+  ui_push(x, y + rad, u, v, ca);         ui_push(x + w, y + h - rad, u, v, cz);
+  ui_push(x, y + h - rad, u, v, cz);
+  // top and bottom slabs between the corners
+  ui_push(x + rad, y, u, v, ct);         ui_push(x + w - rad, y, u, v, ct);
+  ui_push(x + w - rad, y + rad, u, v, ca);
+  ui_push(x + rad, y, u, v, ct);         ui_push(x + w - rad, y + rad, u, v, ca);
+  ui_push(x + rad, y + rad, u, v, ca);
+  ui_push(x + rad, y + h - rad, u, v, cz); ui_push(x + w - rad, y + h - rad, u, v, cz);
+  ui_push(x + w - rad, y + h, u, v, cb);
+  ui_push(x + rad, y + h - rad, u, v, cz); ui_push(x + w - rad, y + h, u, v, cb);
+  ui_push(x + rad, y + h, u, v, cb);
+  ui_rr_corner(x + rad, y + rad, rad, 3.14159265f, y, h, ct, cb);          // TL
+  ui_rr_corner(x + w - rad, y + rad, rad, 4.71238898f, y, h, ct, cb);      // TR
+  ui_rr_corner(x + w - rad, y + h - rad, rad, 0.0f, y, h, ct, cb);         // BR
+  ui_rr_corner(x + rad, y + h - rad, rad, 1.5707963f, y, h, ct, cb);       // BL
+}
+
+[[maybe_unused]] static void ui_rrect(float x, float y, float w, float h, float rad,
+                                      float r, float g, float b, float a) {
+  const float c[4] = {r, g, b, a};
+  ui_rrect_c(x, y, w, h, rad, c, c);
+}
+
+// Hairline border along a rounded-rect path (stroke centred on the path).
+[[maybe_unused]] static void ui_rrect_line(float x, float y, float w, float h,
+                                           float rad, float hw,
+                                           float r, float g, float b, float a) {
+  if (rad > w * 0.5f) rad = w * 0.5f;
+  if (rad > h * 0.5f) rad = h * 0.5f;
+  const float c[4] = {r, g, b, a};
+  ui_rect(x + rad, y - hw, w - 2 * rad, 2 * hw, r, g, b, a);
+  ui_rect(x + rad, y + h - hw, w - 2 * rad, 2 * hw, r, g, b, a);
+  ui_rect(x - hw, y + rad, 2 * hw, h - 2 * rad, r, g, b, a);
+  ui_rect(x + w - hw, y + rad, 2 * hw, h - 2 * rad, r, g, b, a);
+  if (rad > 0.5f) {
+    ui_arc_seg(x + rad, y + rad, rad, 3.14159265f, 4.71238898f, hw, c);
+    ui_arc_seg(x + w - rad, y + rad, rad, 4.71238898f, 6.28318531f, hw, c);
+    ui_arc_seg(x + w - rad, y + h - rad, rad, 0.0f, 1.5707963f, hw, c);
+    ui_arc_seg(x + rad, y + h - rad, rad, 1.5707963f, 3.14159265f, hw, c);
+  }
+}
+
+// The GRATICULE surface, in ONE place: a near-flat cold slab with a crisp
+// hairline — hard, technical, no soft shadow. Every HUD cluster and menu
+// panel is this shape; `a` scales the whole thing (HUD runs it quieter).
+[[maybe_unused]] static void ui_panel(float x, float y, float w, float h,
+                                      float rad, float a) {
+  ui_rrect_c(x, y, w, h, rad,
+             (float[4]){0.043f, 0.051f, 0.063f, 0.90f * a},
+             (float[4]){0.024f, 0.028f, 0.035f, 0.94f * a});
+  ui_rrect_line(x, y, w, h, rad, 0.5f, 0.941f, 0.957f, 0.973f, 0.13f * a);
+}
+
+// One quad = one soft radial sprite (the atlas soft cell, raw alpha):
+// glow behind accents, shadows under panels.
+[[maybe_unused]] static void ui_glow(float cx, float cy, float rad,
+                                     float r, float g, float b, float a) {
+  g_ui_mode = UIM_RAW;
+  ui_quad(cx - rad, cy - rad, 2 * rad, 2 * rad,
+          g_hf_soft[0], g_hf_soft[1], g_hf_soft[2], g_hf_soft[3],
+          (float[4]){r, g, b, a});
+}
+
+// RANGE SANS text. y is the CAP TOP (the old 5x7 convention); scale 1 sets a
+// 7-unit cap height. Letters are proportional, digits tabular (fixed advance,
+// ink centred). thr is the weight (TXT_REG/TXT_BOLD/TXT_BLACK), track adds
+// letterspacing in virtual px per glyph.
+static void ui_text_ex(const char *t, float x, float y, float scale,
+                       float thr, float track, const float c[4]) {
+  float f = scale * (7.0f / HF_CAP);
+  g_ui_mode = thr;
+  for (; *t; t++) {
+    int gi = glyph_index(*t);
+    if (gi >= 0 && gi < HF_GLYPHS) {
+      const hf_gm_t *m = &g_hfm[gi];
+      if (m->qx1 > m->qx0) {
+        float ox = (m->adv - (float)hf_glyph_data(gi)[1]) * 0.5f;
+        ui_quad(x + (ox + m->qx0) * f, y + (HF_CAP - m->qy1) * f,
+                (m->qx1 - m->qx0) * f, (m->qy1 - m->qy0) * f,
+                m->u0, m->v0, m->u1, m->v1, c);
+      }
+      x += m->adv * f + track;
+    } else {
+      x += 16.0f * f + track;
+    }
+  }
+  g_ui_mode = UIM_RAW;
+}
+
+static void ui_text(const char *t, float x, float y, float scale,
+                    float r, float g, float b, float a) {
+  ui_text_ex(t, x, y, scale, TXT_REG, 0, (float[4]){r, g, b, a});
+}
+
+[[maybe_unused]] static void ui_textb(const char *t, float x, float y, float scale,
+                                      float r, float g, float b, float a) {
+  ui_text_ex(t, x, y, scale, TXT_BOLD, 0, (float[4]){r, g, b, a});
+}
+
+static float ui_text_width_tr(const char *t, float scale, float track) {
+  float f = scale * (7.0f / HF_CAP), w = 0;
+  int n = 0;
+  for (; *t; t++, n++) {
+    int gi = glyph_index(*t);
+    w += (gi >= 0 && gi < HF_GLYPHS ? g_hfm[gi].adv : 16.0f) * f;
+  }
+  return n ? w + (float)(n - 1) * track : 0;
+}
+
 static float ui_text_width(const char *t, float scale) {
-  return (float)strlen(t) * 6 * scale - scale;
+  return ui_text_width_tr(t, scale, 0);
 }
 
 static void ui_flush(void) {
   if (g_ui_nverts > g_ui_peak) g_ui_peak = g_ui_nverts;
   if (!g_ui_nverts) return;
   glBindBuffer(GL_ARRAY_BUFFER, R.vbo_hud);
-  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(g_ui_nverts * 8 * sizeof(float)),
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(g_ui_nverts * 9 * sizeof(float)),
                g_ui_vb, GL_STREAM_DRAW);
   glDrawArrays(GL_TRIANGLES, 0, g_ui_nverts);
 }
@@ -12666,11 +13148,27 @@ static void ui_flush(void) {
 // and captured key tokens for rebinding; everything else lives here.
 // ---------------------------------------------------------------------------
 
-#define C_TEXT   0.92f, 0.92f, 0.90f
-#define C_DIM    0.52f, 0.53f, 0.55f
-#define C_ACCENT 1.00f, 0.66f, 0.28f
+// GRATICULE palette, cooled (display space — UI colors bypass the tonemap).
+// Monochrome discipline: near-black INK panels, cool white BONE data, and
+// exactly three signal hues — BLAZE strictly for self/CTA/focus, SIGNAL for
+// remote humans, THREAT for danger. Everything else is white at an alpha.
+#define C_INK    0.031f, 0.039f, 0.051f
+#define C_SMOKE  0.078f, 0.094f, 0.118f
+#define C_BONE   0.941f, 0.957f, 0.973f
+#define C_HAZE   0.541f, 0.580f, 0.643f
+#define C_BLAZE  1.000f, 0.549f, 0.102f
+#define C_SIGNAL 0.310f, 0.765f, 0.910f
+#define C_THREAT 1.000f, 0.294f, 0.227f
+// Legacy role names, kept as the one copy every widget already reads:
+#define C_TEXT   C_BONE
+#define C_DIM    C_HAZE
+#define C_ACCENT C_BLAZE
+// Wrap a comma-triple palette macro + alpha into the float[4] the _c
+// primitives take: C4(C_BLAZE, 0.8f).
+#define C4(...) ((float[4]){__VA_ARGS__})
 
 static int   g_menu_open;
+static int   g_ui_backdrop;   // frosted blur layer was painted this frame
 [[maybe_unused]] static const char *g_connect_host;   // --connect HOST[:PORT] (CLI, Linux)
 static const char *g_boot_connect;   // native_main kicks the join after start
 static int  start_connect(const char *host, int port);   // begin a join
@@ -12718,6 +13216,7 @@ static void nav_push(int ev) {
 static int g_ui_focus;         // focused row within the active page
 static int g_ui_nfocus;        // rows registered this frame...
 static int g_ui_nfocus_last;   // ...and last frame (wrap-around runs pre-layout)
+static float g_focus_sx, g_focus_sy, g_focus_sw, g_focus_sh;  // ring glide state
 static int g_ui_pad_mode;      // last menu input was the pad: focus ring, no cursor
 static int g_nav_act = -1;     // OK/LEFT/RIGHT pending for the focused row
 
@@ -12781,6 +13280,7 @@ static void ui_route(ui_page_t page) {
   g_ui_focus = 0;
   g_ui_quit_arm = 0;
   g_ui_upd_arm = 0;
+  g_focus_sw = 0;   // the focus ring snaps to its new page, no cross-page glide
 }
 
 // The pause reaches the audio timeline too (see g_audio_pause at the mixer):
@@ -12865,10 +13365,22 @@ static int ui_focus_row(float x, float y, float w, float h) {
   int fid = g_ui_nfocus++;
   int foc = fid == g_ui_focus;
   if (foc && g_ui_pad_mode) {
-    ui_rect(x - 2, y - 1, w + 4, 1, C_ACCENT, 0.9f);
-    ui_rect(x - 2, y + h, w + 4, 1, C_ACCENT, 0.9f);
-    ui_rect(x - 2, y, 1, h, C_ACCENT, 0.9f);
-    ui_rect(x + w + 1, y, 1, h, C_ACCENT, 0.9f);
+    // The ring GLIDES: its rect is smoothed toward the focused row on the
+    // presentation clock (fixed-step in the harness), which is what makes pad
+    // navigation read as one cursor moving instead of four rects teleporting.
+    // Drawn under the row's own content — this call happens first in a row.
+    if (g_focus_sw <= 0) {
+      g_focus_sx = x; g_focus_sy = y; g_focus_sw = w; g_focus_sh = h;
+    }
+    g_focus_sx = ui_smooth(g_focus_sx, x, 24);
+    g_focus_sy = ui_smooth(g_focus_sy, y, 24);
+    g_focus_sw = ui_smooth(g_focus_sw, w, 24);
+    g_focus_sh = ui_smooth(g_focus_sh, h, 24);
+    ui_rrect_c(g_focus_sx - 3, g_focus_sy - 1.5f, g_focus_sw + 6, g_focus_sh + 3, 0,
+               C4(C_BLAZE, 0.10f), C4(C_BLAZE, 0.05f));
+    ui_rrect_line(g_focus_sx - 3, g_focus_sy - 1.5f, g_focus_sw + 6, g_focus_sh + 3,
+                  0, 0.5f, C_BLAZE, 0.85f);
+    ui_rect(g_focus_sx - 3, g_focus_sy - 1.5f, 2, g_focus_sh + 3, C_BLAZE, 0.95f);
   }
   return foc;
 }
@@ -12886,10 +13398,13 @@ static float ui_slider(int id, float x, float y, float w, float v,
   if (g_ui_drag == id) v = lo + f_clamp((cx - x) / w, 0, 1) * (hi - lo);
   float t = f_clamp((v - lo) / (hi - lo), 0, 1);
   float ky = y + 6;
-  ui_rect(x, ky - 1, w, 2, 1, 1, 1, 0.16f);
-  ui_rect(x, ky - 1, t * w, 2, C_ACCENT, 0.9f);
-  if (g_ui_drag == id || hot) ui_rect(x + t * w - 2, ky - 6, 4, 11, C_ACCENT, 1);
-  else                        ui_rect(x + t * w - 2, ky - 6, 4, 11, 0.85f, 0.85f, 0.83f, 1);
+  // Hard track: hairline with quarter ticks, BLAZE fill, a square knob.
+  ui_rect(x, ky - 0.7f, w, 1.4f, C_BONE, 0.14f);
+  for (int i = 1; i < 4; i++)
+    ui_rect(x + w * 0.25f * (float)i, ky - 2.6f, 1, 2, C_BONE, 0.18f);
+  ui_rect(x, ky - 0.7f, t * w, 1.4f, C_BLAZE, 0.9f);
+  if (g_ui_drag == id || hot) ui_rect(x + t * w - 2, ky - 5, 4, 10, C_BLAZE, 1);
+  else                        ui_rect(x + t * w - 1.7f, ky - 4.5f, 3.4f, 9, C_BONE, 0.95f);
   return v;
 }
 
@@ -12911,15 +13426,16 @@ static int ui_cycle(const char *label, const char *const *opts, int n, int *idx,
     float w = ui_text_width(opts[i], 1);
     if (w > bw) bw = w;
   }
-  bw += 14;
+  bw += 16;
   float bx = px + pw - 16 - bw;
   int hot = cx >= bx && cx <= bx + bw && cy >= y + 1 && cy <= y + 13;
-  ui_rect(bx, y + 1, bw, 12, 1, 1, 1, hot ? 0.14f : 0.07f);
+  ui_rrect_c(bx, y + 1, bw, 12, 1, C4(1, 1, 1, hot ? 0.16f : 0.07f),
+             C4(1, 1, 1, hot ? 0.12f : 0.05f));
   // Dim is the OFF look, not the index-0 look: a cycle of real alternatives
   // (LINEAR/STANDARD/DYNAMIC, EASY/NORMAL/HARD) has no "off" state, and its
   // first option rendering as disabled reads as a bug.
   if (strcmp(tok, "OFF") != 0)
-    ui_text(tok, bx + (bw - ui_text_width(tok, 1)) * 0.5f, y + 4, 1, C_ACCENT, 1);
+    ui_textb(tok, bx + (bw - ui_text_width(tok, 1)) * 0.5f, y + 4, 1, C_BONE, 1);
   else
     ui_text(tok, bx + (bw - ui_text_width(tok, 1)) * 0.5f, y + 4, 1, C_DIM, 1);
   if (click && hot && g_ui_rebind < 0) { *idx = (*idx + 1) % n; return 1; }
@@ -12955,32 +13471,59 @@ static int ui_pill(const char *label, const char *tok, float px, float pw,
   float bx = px + pw - 16 - bw;
   int hot = cx >= bx && cx <= bx + bw && cy >= y + 1 && cy <= y + 13;
   if (active) {
-    ui_rect(bx, y + 1, bw, 12, C_ACCENT, 0.95f);
-    ui_text(tok, bx + 6, y + 4, 1, 0.08f, 0.07f, 0.06f, 1);
+    // An armed capture breathes BLAZE — a live socket, not a filled box.
+    float bl = 0.75f + 0.25f * sinf(g_ui_time * 6.0f);
+    ui_rrect_c(bx, y + 1, bw, 12, 1, C4(C_BLAZE, 0.95f * bl), C4(C_BLAZE, 0.80f * bl));
+    ui_textb(tok, bx + 6, y + 4, 1, 0.10f, 0.07f, 0.03f, 1);
   } else {
-    ui_rect(bx, y + 1, bw, 12, 1, 1, 1, hot ? 0.14f : 0.07f);
+    ui_rrect_c(bx, y + 1, bw, 12, 1, C4(1, 1, 1, hot ? 0.16f : 0.07f),
+               C4(1, 1, 1, hot ? 0.12f : 0.05f));
     ui_text(tok, bx + 6, y + 4, 1, C_TEXT, 1);
   }
   return (click && hot && g_ui_rebind < 0 && !g_ui_drag) ||
          ui_nav_take(foc, NAV_OK);
 }
 
+// Action row: left-aligned label with a chevron marker, quiet until hot —
+// the direct-action-list grammar (never tiles). Hot goes stark WHITE with
+// black text — the coldest, hardest state the palette has, reserved for
+// "this will happen if you press"; danger keeps THREAT.
 static int ui_button(const char *label, float x, float y, float w, float h,
                      int click, float cx, float cy, int danger) {
   int foc = ui_focus_row(x, y, w, h);
   int hot = cx >= x && cx <= x + w && cy >= y && cy <= y + h;
-  if (danger) ui_rect(x, y, w, h, 0.75f, 0.25f, 0.20f, hot ? 0.85f : 0.35f);
-  else        ui_rect(x, y, w, h, C_ACCENT, hot ? 0.90f : 0.30f);
-  float tw = ui_text_width(label, 1);
-  if (hot) ui_text(label, x + (w - tw) * 0.5f, y + (h - 7) * 0.5f, 1, 0.08f, 0.07f, 0.06f, 1);
-  else     ui_text(label, x + (w - tw) * 0.5f, y + (h - 7) * 0.5f, 1, C_TEXT, 1);
+  float ty = y + (h - 7) * 0.5f;
+  if (hot) {
+    if (danger) {
+      ui_rrect_c(x, y, w, h, 1, C4(C_THREAT, 0.95f), C4(0.85f, 0.20f, 0.15f, 0.95f));
+      ui_text("\x01", x + 8, ty, 1, 1, 1, 1, 0.9f);
+      ui_textb(label, x + 17, ty, 1, 1, 1, 1, 1);
+    } else {
+      ui_rrect_c(x, y, w, h, 1, C4(0.96f, 0.97f, 0.98f, 0.96f),
+                 C4(0.86f, 0.89f, 0.92f, 0.96f));
+      ui_text("\x01", x + 8, ty, 1, 0.05f, 0.06f, 0.08f, 0.9f);
+      ui_textb(label, x + 17, ty, 1, 0.03f, 0.04f, 0.05f, 1);
+    }
+  } else {
+    ui_rrect_c(x, y, w, h, 1, C4(1, 1, 1, 0.045f), C4(1, 1, 1, 0.03f));
+    if (danger) {
+      ui_rect(x, y, 2, h, C_THREAT, 0.8f);
+      ui_text("\x01", x + 8, ty, 1, C_THREAT, 0.75f);
+      ui_text(label, x + 17, ty, 1, C_TEXT, 0.92f);
+    } else {
+      ui_text("\x01", x + 8, ty, 1, C_HAZE, 0.8f);
+      ui_text(label, x + 17, ty, 1, C_TEXT, 0.92f);
+    }
+  }
   return (click && hot && g_ui_rebind < 0) || ui_nav_take(foc, NAV_OK);
 }
 
+// Section eyebrow: small, wide-tracked, cool — a label and one hairline.
+// Structure whispers; only data and focus get color.
 static void ui_section(const char *title, float px, float pw, float y) {
-  ui_text(title, px + 16, y, 1, C_ACCENT, 1);
-  ui_rect(px + 16 + ui_text_width(title, 1) + 6, y + 3,
-          pw - 32 - ui_text_width(title, 1) - 6, 1, 1, 1, 1, 0.10f);
+  ui_text_ex(title, px + 16, y - 1, 0.8f, TXT_BOLD, 2.2f, C4(C_HAZE, 0.95f));
+  float tw = ui_text_width_tr(title, 0.8f, 2.2f);
+  ui_rect(px + 16 + tw + 8, y + 2, pw - 32 - tw - 8, 1, C_BONE, 0.10f);
 }
 
 // One tuning-parameter row: label, slider over the def's range, value.
@@ -12988,12 +13531,12 @@ static void ui_section(const char *title, float px, float pw, float y) {
 static float ui_param_row(const param_def_t *d, float *val, int drag_id,
                           float px, float y, int click, float cx, float cy) {
   char buf[16];
-  int foc = ui_focus_row(px + 10, y - 1, 280, 15);
+  int foc = ui_focus_row(px + 10, y - 1, 320, 15);
   int touched = 0;
   if (ui_nav_take(foc, NAV_LEFT))  { *val = f_clamp(*val - d->step, d->lo, d->hi); touched = 1; }
   if (ui_nav_take(foc, NAV_RIGHT)) { *val = f_clamp(*val + d->step, d->lo, d->hi); touched = 1; }
   ui_text(d->label, px + 16, y + 3, 1, C_TEXT, 1);
-  float v = ui_slider(drag_id, px + 130, y, 100, *val, d->lo, d->hi, click, cx, cy);
+  float v = ui_slider(drag_id, px + 150, y, 140, *val, d->lo, d->hi, click, cx, cy);
   // Snap to the step grid ONLY on interaction. Unconditionally, merely OPENING
   // the menu rewrote every drawn row — a hand-edited `sense 0.004` (legal to
   // the parser, whose range is deliberately wider than the slider's) rounded
@@ -13005,7 +13548,8 @@ static float ui_param_row(const param_def_t *d, float *val, int drag_id,
   if (g_ui_drag == drag_id || touched) *val = roundf(v / st) * st;
   snprintf(buf, sizeof buf, st < 0.099f ? "%.2f" : st < 1.0f ? "%.1f" : "%.0f",
            (double)*val);
-  ui_text(buf, px + 240, y + 3, 1, C_DIM, 1);
+  // ONE value column: right-aligned on the chip edge every other row uses.
+  ui_text(buf, px + 324 - ui_text_width(buf, 1), y + 3, 1, C_DIM, 1);
   return y + 15;
 }
 
@@ -13036,13 +13580,22 @@ static void ui_subsel(const char *const *opts, int n, int *idx, float px,
   if (ui_nav_take(foc, NAV_RIGHT) || ui_nav_take(foc, NAV_OK))
     *idx = (*idx + 1) % n;
   float selw = (pw - 32) / (float)n;
+  // Segmented control: one quiet container, the selected cell stark WHITE
+  // with black bold text — same hard state grammar as the buttons.
+  ui_rrect_c(px + 16, y - 1, pw - 32, 15, 1, C4(0, 0, 0, 0.30f), C4(0, 0, 0, 0.22f));
   for (int i = 0; i < n; i++) {
     float sx = px + 16 + (float)i * selw;
     int hot = cx >= sx && cx <= sx + selw && cy >= y && cy <= y + 13;
-    if (*idx == i) ui_rect(sx, y, selw, 13, C_ACCENT, 0.55f);
-    else           ui_rect(sx, y, selw, 13, 1, 1, 1, hot ? 0.14f : 0.06f);
     float lw = ui_text_width(opts[i], 1);
-    ui_text(opts[i], sx + (selw - lw) * 0.5f, y + 3, 1, C_TEXT, 1);
+    if (*idx == i) {
+      ui_rrect_c(sx + 1, y, selw - 2, 13, 1, C4(0.96f, 0.97f, 0.98f, 0.96f),
+                 C4(0.86f, 0.89f, 0.92f, 0.96f));
+      ui_textb(opts[i], sx + (selw - lw) * 0.5f, y + 3, 1, 0.03f, 0.04f, 0.05f, 1);
+    } else {
+      if (hot) ui_rrect_c(sx + 1, y, selw - 2, 13, 1, C4(1, 1, 1, 0.10f),
+                          C4(1, 1, 1, 0.07f));
+      ui_text(opts[i], sx + (selw - lw) * 0.5f, y + 3, 1, C_HAZE, 1);
+    }
     if (click && hot && g_ui_rebind < 0 && !g_ui_drag) *idx = i;
   }
 }
@@ -13105,7 +13658,15 @@ static void ui_menu(void) {
   g_ui_tab = (int)g_ui_page;
   char buf[16];
 
-  ui_rect(0, 0, g_ui_vw, g_ui_vh, 0, 0, 0, 0.45f);  // dim the world
+  // §9.7: only a PAUSING session dims the world — a networked session keeps
+  // world and HUD readable behind the panel (you are standing in the open).
+  // Over the frosted backdrop (drawn by ui_menu_backdrop when available) a
+  // graded scrim seats the panel; without blur the scrim carries it alone.
+  if (session_pauses()) {
+    float base = g_ui_backdrop ? 0.20f : 0.45f;
+    ui_vgrad(0, 0, g_ui_vw, g_ui_vh, C4(0.016f, 0.024f, 0.043f, base + 0.12f),
+             C4(0.016f, 0.024f, 0.043f, base));
+  }
 
   // Every page shares one top anchor. Short pages end where their content ends;
   // the dense binding pages use the full authored height without moving the
@@ -13113,23 +13674,36 @@ static void ui_menu(void) {
   #define UI_FOOTER_H 24.0f
   #define UI_PANEL_MAX 348.0f
   #define UI_BIND_ROW  14.0f   // see the keyboard binding page's loop
+  // Self-sizing across FRAMES now, not within one: a rounded panel cannot be
+  // bottom-patched the way the old flat quad was (ui_rect_bottom rewrote three
+  // vertices; ui_panel is a hundred). The height cache is per page and the
+  // layout is stable per state, so the worst case is one frame of lag after a
+  // row appears — invisible, and the hit-tests never read ph.
   static float ph_page[UI_PAGE_COUNT] = {276, 210, 286, 344, 344};
   ui_page_t drawn_page = g_ui_page;
-  float pw = 320, px = g_ui_vw * 0.5f - pw * 0.5f;
+  float pw = 340, px = g_ui_vw * 0.5f - pw * 0.5f;
   float ph = ph_page[drawn_page];
   // THE TOP IS ANCHORED, ONLY THE BOTTOM MOVES. Centring each page's own height
   // would slide the title by up to 118 px. The anchor is the tallest page's
   // centring, so the chrome is nailed down and a short page simply ends sooner.
   float py = (g_ui_vh - UI_PANEL_MAX) * 0.5f;
   if (py < 6) py = 6;
-  int panel_mark = ui_mark();
-  ui_rect(px, py, pw, ph, 0.07f, 0.08f, 0.09f, 0.95f);
-  ui_rect(px, py, pw, 2, C_ACCENT, 1);
+  ui_panel(px, py, pw, ph, 0, 1);
   static const char *const PAGE_TITLE[UI_PAGE_COUNT] = {
     "PAUSE MENU", "SINGLEPLAYER", "SETTINGS", "CONTROLS", "DEV TOOLS"
   };
-  const char *title = PAGE_TITLE[drawn_page];
-  ui_text(title, px + (pw - ui_text_width(title, 2)) * 0.5f, py + 10, 2, C_TEXT, 1);
+  if (drawn_page == UI_PAGE_ROOT) {
+    // ROOT wears the wordmark, not a "PAUSE MENU" caption — the menu IS the
+    // game's face (it is also the boot screen).
+    ui_text_ex("SKILL", px + 16, py + 8, 2.4f, TXT_BLACK, 1.0f, C4(C_BONE, 1));
+    float sw2 = ui_text_width_tr("SKILL", 2.4f, 1.0f);
+    ui_text_ex("ISSUE", px + 16 + sw2 + 7, py + 8, 2.4f, TXT_BLACK, 1.0f, C4(C_BLAZE, 1));
+    ui_rect(px + 16, py + 30, pw - 32, 1, C_BONE, 0.16f);
+  } else {
+    const char *title = PAGE_TITLE[drawn_page];
+    ui_textb(title, px + 16, py + 9, 1.6f, C_BONE, 1);
+    ui_rect(px + 16, py + 28, pw - 32, 1, C_BONE, 0.14f);
+  }
   // The label reads the SAME predicate the tick does (§9.7), so it can never
   // say PAUSED while the world ticks or LIVE while it is frozen. A networked
   // session shows LIVE where PAUSED would be — the same key means "the world
@@ -13140,8 +13714,19 @@ static void ui_menu(void) {
 #ifndef _WIN32
   label = !g_headless;   // a proof shot carries no label at all
 #endif
-  if (label && session_pauses()) ui_text("PAUSED", px + 16, py + 13, 1, C_ACCENT, 0.9f);
-  else if (label && g_online)    ui_text("LIVE", px + 16, py + 13, 1, 0.95f, 0.35f, 0.30f, 0.95f);
+  if (label && session_pauses()) {
+    float lw2 = ui_text_width_tr("PAUSED", 0.85f, 1.2f);
+    ui_rrect_line(px + pw - 24 - lw2, py + 9, lw2 + 12, 12, 0, 0.5f, C_BLAZE, 0.7f);
+    ui_text_ex("PAUSED", px + pw - 18 - lw2, py + 12, 0.85f, TXT_REG, 1.2f,
+               C4(C_BLAZE, 0.95f));
+  } else if (label && g_online) {
+    float lw2 = ui_text_width_tr("LIVE", 0.85f, 1.2f);
+    float bl = 0.7f + 0.3f * sinf(g_ui_time * 4.0f);
+    ui_rrect_c(px + pw - 24 - lw2 - 8, py + 9, lw2 + 20, 12, 0,
+               C4(C_THREAT, 0.9f), C4(0.80f, 0.18f, 0.13f, 0.9f));
+    ui_diskn(px + pw - 24 - lw2 - 1, py + 15, 2, 10, C4(1, 1, 1, bl));
+    ui_textb("LIVE", px + pw - 18 - lw2 + 2, py + 12, 0.85f, 1, 1, 1, 1);
+  }
 
   float y = py + 34;
   if (drawn_page == UI_PAGE_CONTROLS) {
@@ -13150,7 +13735,7 @@ static void ui_menu(void) {
     y += 18;
   }
   if (drawn_page == UI_PAGE_CONTROLS && g_ui_control == 0) {
-  ui_section("KEYBOARD + MOUSE", px, pw, y);
+  ui_section("BINDINGS", px, pw, y);
   y += 14;
   // UI_BIND_ROW, not the 15 every other list uses: IN_COUNT rows plus the
   // header and Back/hint block do not fit a 360-unit screen at 15, and what
@@ -13159,6 +13744,8 @@ static void ui_menu(void) {
   // rebinding last. 14 fits both bind pages with the tightest one (GAMEPAD ->
   // BUTTONS, which also carries the local selector) landing 1 px clear.
   for (int i = 0; i < IN_COUNT; i++, y += UI_BIND_ROW) {
+    // zebra bridges the dead middle between label and key chip
+    if ((i & 1) == 0) ui_rect(px + 12, y, pw - 24, 13, C_BONE, 0.03f);
     int armed = g_ui_rebind == i && !g_ui_rebind_pad;
     const char *tok = armed ? "PRESS KEY" : g_cfg.bind[i];
     if (ui_pill(ACTION_DEF[i].label, tok, px, pw, y, armed, 0, click, cx, cy)) {
@@ -13181,10 +13768,15 @@ static void ui_menu(void) {
                                  g_cl.reject == NR_WORLD ? "ARENA MISMATCH" :
                                  "SERVER UNREACHABLE") :
                                 "OFFLINE";
-    char line[128];
-    snprintf(line, sizeof line, "%s   %s:%d", status, g_cfg.mp_host, g_cfg.mp_port);
-    ui_text(line, px + 16, y + 3, 1, C_DIM, 1);
-    y += 17;
+    // No standing status line, no endpoint — that was noise. The one state
+    // the player must not miss (a join FAILING) shows as one quiet line;
+    // everything else lives in the MULTIPLAYER button's own label.
+    if (!g_online && st == NC_FAILED) {
+      ui_text_ex(status, px + 16, y + 2, 0.85f, TXT_REG, 0.8f, C4(C_THREAT, 0.9f));
+      y += 13;
+    } else {
+      y += 4;
+    }
 
     if (ui_button("RESUME", px + 16, y, pw - 32, 18, click, cx, cy, 0))
       ui_close_menu();
@@ -13215,14 +13807,18 @@ static void ui_menu(void) {
       ui_route(UI_PAGE_CONTROLS);
     y += 23;
 
+    // No CHECK FOR UPDATES row: the game checks by itself at start
+    // (upd_check_start in both native mains). A row exists only when there
+    // is something to DO — apply an offered update, or roll one back.
     int ust = atomic_load(&g_upd_state);
     int offer = ust == UPD_UPDATE || ust == UPD_RECUT;
-    const char *ulab = g_ui_upd_arm ? "CONFIRM UPDATE"
-                     : offer ? "APPLY UPDATE"
-                     : g_upd_have_old ? "ROLLBACK UPDATE" : "CHECK FOR UPDATES";
-    if (ui_button(ulab, px + 16, y, pw - 32, 18, click, cx, cy, offer)) {
-      g_ui_quit_arm = 0;
-      if (offer || g_upd_have_old) {
+    if (offer || g_upd_have_old) {
+      const char *ulab = g_ui_upd_arm ? "CONFIRM UPDATE"
+                       : offer ? "APPLY UPDATE" : "ROLLBACK UPDATE";
+      if (g_ui_upd_arm)
+        ui_rrect_c(px + 16, y, pw - 32, 18, 1, C4(C_BLAZE, 0.28f), C4(C_BLAZE, 0.18f));
+      if (ui_button(ulab, px + 16, y, pw - 32, 18, click, cx, cy, offer)) {
+        g_ui_quit_arm = 0;
         if (!g_ui_upd_arm) g_ui_upd_arm = 1;
         else {
           g_ui_upd_arm = 0;
@@ -13230,11 +13826,9 @@ static void ui_menu(void) {
           int ok = offer ? upd_apply() : upd_rollback_now();
           if (!ok) atomic_store(&g_upd_state, UPD_FAILED);
         }
-      } else {
-        upd_check_start();
       }
+      y += 23;
     }
-    y += 23;
 
     if (dev) {
       if (ui_button("DEV TOOLS", px + 16, y, pw - 32, 18, click, cx, cy, 1))
@@ -13242,18 +13836,31 @@ static void ui_menu(void) {
       y += 23;
     }
 
+    // The armed state is visible on the ROW, not only in its label: a
+    // destructive two-press must not depend on where the hover happens
+    // to be (fill first, button whisper over it, hairline on top).
+    if (g_ui_quit_arm)
+      ui_rrect_c(px + 16, y, pw - 32, 18, 1, C4(C_THREAT, 0.30f), C4(C_THREAT, 0.20f));
     if (ui_button(g_ui_quit_arm ? "CONFIRM QUIT" : "QUIT",
                   px + 16, y, pw - 32, 18, click, cx, cy, 1)) {
       g_ui_upd_arm = 0;
       if (!g_ui_quit_arm) g_ui_quit_arm = 1;
       else { config_write(g_cfg_path, &g_cfg); g_ui_quit = 1; }
     }
+    if (g_ui_quit_arm)
+      ui_rrect_line(px + 16, y, pw - 32, 18, 0, 0.6f, C_THREAT, 0.85f);
     y += 25;
 
-    char version[96];
-    upd_status_line(version, sizeof version);
-    ui_text(version, px + 16, y, 1, C_DIM, 1);
-    y += 8;
+    // Version as pure metadata: tiny, dim, one token. A failed update is the
+    // only state that may speak up here.
+    ui_text_ex("V " BUILD_VERSION, px + 16, y + 1, 0.7f, TXT_REG, 1.0f,
+               C4(C_HAZE, 0.5f));
+    if (ust == UPD_FAILED) {
+      const char *uf = "UPDATE FAILED";
+      ui_text_ex(uf, px + 324 - ui_text_width_tr(uf, 0.7f, 1.0f), y + 1, 0.7f,
+                 TXT_REG, 1.0f, C4(C_THREAT, 0.8f));
+    }
+    y += 7;
   }
 
   } else if (drawn_page == UI_PAGE_SETTINGS) {
@@ -13276,7 +13883,7 @@ static void ui_menu(void) {
 
   // FPS cap: 30..500 in steps of 10; the right end of the track means OFF.
   // Not a param row (the OFF sentinel), so it registers its focus row itself.
-  int capfoc = ui_focus_row(px + 10, y - 1, 280, 15);
+  int capfoc = ui_focus_row(px + 10, y - 1, 320, 15);
   ui_text("FPS CAP", px + 16, y + 3, 1, C_TEXT, 1);
   float cap = g_cfg.fps_cap ? (float)g_cfg.fps_cap : 510.0f;
   // A preserved out-of-range value (fps_cap 700 parses fine) enters the
@@ -13288,7 +13895,7 @@ static void ui_menu(void) {
   if (ui_nav_take(capfoc, NAV_LEFT))  { cap -= 10; captouch = 1; }
   if (ui_nav_take(capfoc, NAV_RIGHT)) { cap += 10; captouch = 1; }
   cap = f_clamp(cap, 30, 510);
-  cap = ui_slider(DRAG_CAP, px + 130, y, 100, cap, 30, 510, click, cx, cy);
+  cap = ui_slider(DRAG_CAP, px + 150, y, 140, cap, 30, 510, click, cx, cy);
   // Written back only on interaction — same rule as ui_param_row's snap: a
   // hand-edited fps_cap 700 (the parser allows up to 1000) must not become
   // OFF because the menu was merely opened over it.
@@ -13296,7 +13903,7 @@ static void ui_menu(void) {
     g_cfg.fps_cap = cap >= 505 ? 0 : (int)(roundf(cap / 10) * 10);
   if (g_cfg.fps_cap) snprintf(buf, sizeof buf, "%d", g_cfg.fps_cap);
   else               snprintf(buf, sizeof buf, "OFF");
-  ui_text(buf, px + 240, y + 3, 1, C_DIM, 1);
+  ui_text(buf, px + 324 - ui_text_width(buf, 1), y + 3, 1, C_DIM, 1);
   y += 15;
 
   // MSAA applies on the next frame via the lazy rebuild in msaa_update.
@@ -13386,13 +13993,17 @@ static void ui_menu(void) {
       // rather than beside it: ui_section rules off to the panel edge, so a
       // right-aligned warning was struck through by its own separator and then
       // clipped by the panel.
-      ui_section(g_pad.connected  ? "BUTTONS - MOVE+AIM ON STICKS"
+      ui_section(g_pad.connected  ? "BUTTONS"
                  : g_pad_denied   ? "BUTTONS - PAD HELD BY STEAM"
                                   : "BUTTONS - NO PAD DETECTED",
                  px, pw, y);
       y += 14;
-      for (int k = 0; k < IN_COUNT; k++, y += UI_BIND_ROW) {
+      // The four movement rows are GONE from this page, not merely last:
+      // the stick moves you, and four dead "--" chips read as a broken
+      // screen. Hand-binding movement buttons stays possible in the config.
+      for (int k = 0; k < IN_COUNT - 4; k++, y += UI_BIND_ROW) {
         int i = PAD_ROW[k];
+        if ((k & 1) == 0) ui_rect(px + 12, y, pw - 24, 13, C_BONE, 0.03f);
         int armed = g_ui_rebind == i && g_ui_rebind_pad;
         const char *tok = armed ? "PRESS BTN" : pad_disp(g_cfg.padbind[i]);
         if (ui_pill(ACTION_DEF[i].label, tok, px, pw, y, armed, 0, click, cx, cy)) {
@@ -13400,16 +14011,24 @@ static void ui_menu(void) {
           g_ui_rebind_pad = 1;
         }
       }
+      y += 2;
+      ui_text_ex("MOVE + AIM LIVE ON THE STICKS", px + 16, y, 0.8f, TXT_REG, 1.0f,
+                 C4(C_HAZE, 0.8f));
+      y += 10;
     }
   } else if (drawn_page == UI_PAGE_MATCH) {
     // Singleplayer setup: mode (deathmatch only for now), bot count and
     // difficulty, frag limit, player name, and a restart to apply it all
     // to a fresh match. Bots/difficulty/limit also apply live.
-    ui_section("SINGLEPLAYER", px, pw, y);
+    ui_section("MATCH", px, pw, y);
     y += 14;
     ui_text("MODE", px + 16, y + 3, 1, C_TEXT, 1);
-    ui_text("DEATHMATCH", px + pw - 16 - ui_text_width("DEATHMATCH", 1), y + 3,
-            1, C_ACCENT, 1);
+    {  // every enum value wears the chip, even a read-only one
+      float mw2 = ui_text_width("DEATHMATCH", 1) + 16;
+      ui_rrect_c(px + pw - 16 - mw2, y + 1, mw2, 12, 1, C4(1, 1, 1, 0.07f),
+                 C4(1, 1, 1, 0.05f));
+      ui_textb("DEATHMATCH", px + pw - 16 - mw2 + 8, y + 4, 1, C_BONE, 1);
+    }
     y += 15;
     {
       float v = (float)g_cfg.sp_bots;
@@ -13538,14 +14157,15 @@ static void ui_menu(void) {
     y += 18;
   }
 
-  // Close the panel under its page content. The maximum is authored against
-  // 1280x720's 360-unit viewport; taller aspect ratios keep the same anchor.
+  // Close the panel under its page content: store this frame's measured
+  // height for the NEXT frame's rounded panel (see the cache comment above).
+  // The maximum is authored against 1280x720's 360-unit viewport; taller
+  // aspect ratios keep the same anchor.
   {
     float want = f_clamp((y - py) + UI_FOOTER_H, 150.0f,
                          g_ui_vh - py - 4.0f);
     ph_page[drawn_page] = want;
     ph = want;
-    ui_rect_bottom(panel_mark, py + ph);
   }
 
   // Hints: the menu tells the player its own grammar, and the line follows the
@@ -13578,19 +14198,54 @@ static void ui_menu(void) {
       h = g_ui_name_edit ? "TYPE ON KEYBOARD   A/B DONE"
         : g_ui_quit_arm  ? "A CONFIRM QUIT   B BACK"
         : g_ui_upd_arm   ? "A CONFIRM UPDATE   B BACK"
-                         : "A OK   L/R ADJUST   B BACK";
+                         : "A OK   < > ADJUST   B BACK";
   } else if (g_ui_name_edit) {
     // Cursor mode: the accent-filled pill alone does not say typing works.
     h = "TYPE A-Z 0-9   ENTER DONE";
+  } else {
+    // The footer band exists on EVERY frame — an empty reserved strip reads
+    // as a layout mistake, and the grammar chip doubles as the exit sign.
+    h = g_ui_quit_arm ? "CLICK AGAIN CONFIRMS QUIT   ESC BACK"
+      : g_ui_upd_arm  ? "CLICK AGAIN CONFIRMS UPDATE   ESC BACK"
+                      : "ESC BACK";
   }
-  if (h) ui_text(h, px + (pw - ui_text_width(h, 1)) * 0.5f, py + ph - 12, 1, C_DIM, 1);
+  if (h) {
+    // The hint line renders as key CHIPS, split on the triple-space grouping
+    // the strings already carry — the wording stays the single copy above.
+    char tmp[128];
+    snprintf(tmp, sizeof tmp, "%s", h);
+    const char *part[6];
+    int np = 0;
+    char *cur2 = tmp;
+    while (np < 6 && cur2) {
+      part[np++] = cur2;
+      char *sep = strstr(cur2, "   ");
+      if (sep) { *sep = '\0'; cur2 = sep + 3; } else cur2 = NULL;
+    }
+    float cwd[6], tw_all = 0;
+    for (int i = 0; i < np; i++) {
+      cwd[i] = ui_text_width(part[i], 0.9f) + 12;
+      tw_all += cwd[i] + (i ? 6.0f : 0.0f);
+    }
+    float hx = px + (pw - tw_all) * 0.5f, hy = py + ph - 17;
+    for (int i = 0; i < np; i++) {
+      ui_rrect_c(hx, hy, cwd[i], 13, 1, C4(0, 0, 0, 0.30f), C4(0, 0, 0, 0.22f));
+      ui_text(part[i], hx + 6, hy + 3, 0.9f, C_HAZE, 1);
+      hx += cwd[i] + 6;
+    }
+  }
   if (!g_ui_pad_mode) {
-    // Software cursor (crosshair) — the hardware cursor stays hidden so
+    // Software cursor — a graticule cross with an open centre, so the pixel
+    // under the point stays visible. Hardware cursor stays hidden so
     // screenshots and Windows behave identically.
-    ui_rect(cx - 4, cy - 0.5f, 9, 1.4f, 0, 0, 0, 0.8f);
-    ui_rect(cx - 0.5f, cy - 4, 1.4f, 9, 0, 0, 0, 0.8f);
-    ui_rect(cx - 3.5f, cy, 8, 0.7f, 1, 1, 1, 1);
-    ui_rect(cx, cy - 3.5f, 0.7f, 8, 1, 1, 1, 1);
+    for (int i = 0; i < 4; i++) {
+      float dx = (i == 0) - (i == 1), dy = (i == 2) - (i == 3);
+      ui_capsule(cx + dx * 2.0f, cy + dy * 2.0f, cx + dx * 6.0f, cy + dy * 6.0f,
+                 1.1f, 0, 0, 0, 0.8f);
+      ui_capsule(cx + dx * 2.0f, cy + dy * 2.0f, cx + dx * 6.0f, cy + dy * 6.0f,
+                 0.6f, 1, 1, 1, 1);
+    }
+    ui_disk(cx, cy, 0.8f, 1, 1, 1, 0.95f);
   }
 
   // The frame's focus-row census: wrap-around in next frame's preamble uses
@@ -13627,77 +14282,85 @@ static void ui_scoreboard(void) {
   // player is most often looking for. Bound the list to what fits and SAY what
   // was left out; a silently truncated board reads as a board with fewer
   // players in the match.
-  float top = g_match.over ? 64.0f : 24.0f;
+  float top = g_match.over ? 96.0f : 24.0f;
   int fit = (int)((g_ui_vh - top - 12.0f - 46.0f) / 11.0f);
   if (fit < 1) fit = 1;
   int shown = n < fit ? n : fit;
   int hidden = n - shown;
-  float pw = 252, ph = 38 + (float)shown * 11 + 8 + (hidden ? 10.0f : 0.0f);
+  float pw = 300, ph = 42 + (float)shown * 11 + 8 + (hidden ? 10.0f : 0.0f);
   float px = g_ui_vw * 0.5f - pw * 0.5f;
   // Centred on the REAL virtual height — 180 is only the centre when the
   // height is a multiple of 360 (the same trap the settings panel documents:
   // the Deck's 800 px viewport is 400 virtual units tall).
   float py = g_ui_vh * 0.5f - ph * 0.5f;
   if (py < top) py = top;
-  ui_rect(px, py, pw, ph, 0.05f, 0.06f, 0.08f, 0.88f);
-  ui_rect(px, py, pw, 2, C_ACCENT, 1);
-  ui_text("DEATHMATCH", px + 12, py + 8, 1, C_TEXT, 1);
+  ui_panel(px, py, pw, ph, 0, 1);
+  ui_textb("DEATHMATCH", px + 12, py + 9, 1.2f, C_BONE, 1);
   char sub[28];
-  // "N PLAYERS  M BOTS" makes 1-human-vs-7-bots legible instead of sad (§1.4):
+  // "N PLAYERS · M BOTS" makes 1-human-vs-7-bots legible instead of sad (§1.4):
   // the player knows exactly what he fights, and a second human arriving is an
   // event. In a networked session the instance code sits on the line below
   // (added in the UI phase); here the composition is what matters.
   int nh = 0, nb = 0;
   ENT_FOREACH(e) { if (human_of_ent(e) >= 0) nh++; else nb++; }
-  if (nh > 1) snprintf(sub, sizeof sub, "%d PLAYERS  %d BOTS", nh & 63, nb & 63);
+  if (nh > 1) snprintf(sub, sizeof sub, "%d PLAYERS \x05 %d BOTS", nh & 63, nb & 63);
   else        snprintf(sub, sizeof sub, "FIRST TO %d", g_cfg.sp_frag);
-  ui_text(sub, px + pw - 12 - ui_text_width(sub, 1), py + 8, 1, C_DIM, 1);
-  float y = py + 22;
-  float xn = px + 12, xk = px + 132, xd = px + 158, xkd = px + 184, xa = px + 216;
-  ui_text("K", xk, y, 1, C_DIM, 1);
-  ui_text("D", xd, y, 1, C_DIM, 1);
-  ui_text("K/D", xkd, y, 1, C_DIM, 1);
-  ui_text("ACC", xa, y, 1, C_DIM, 1);
-  y += 9;
-  ui_rect(px + 8, y, pw - 16, 1, 1, 1, 1, 0.12f);
-  y += 3;
+  ui_text_ex(sub, px + pw - 12 - ui_text_width_tr(sub, 0.9f, 0.8f), py + 10, 0.9f,
+             TXT_REG, 0.8f, C4(C_HAZE, 1));
+  ui_rect(px + 12, py + 24, pw - 24, 1, C_BONE, 0.14f);
+  float y = py + 30;
+  float xn = px + 34, xk = px + 172, xd = px + 200, xkd = px + 228, xa = px + 264;
+  ui_text_ex("K", xk, y, 0.85f, TXT_REG, 0.8f, C4(C_HAZE, 1));
+  ui_text_ex("D", xd, y, 0.85f, TXT_REG, 0.8f, C4(C_HAZE, 1));
+  ui_text_ex("K/D", xkd, y, 0.85f, TXT_REG, 0.8f, C4(C_HAZE, 1));
+  ui_text_ex("ACC", xa, y, 0.85f, TXT_REG, 0.8f, C4(C_HAZE, 1));
+  y += 10;
   // A human is MARKED, not a bot (§1.4): there are one or two humans and twenty
-  // bot names, so the rarer mark reads as a badge. '>' is the only leading
-  // glyph the 5x7 font carries; other humans are marked AND tinted, the local
-  // player keeps his highlight bar.
+  // bot names, so the rarer mark reads as a badge — the chevron glyph, tinted;
+  // other humans go SIGNAL, the local player keeps his BLAZE highlight bar.
+  // Rank numbers make the sort readable at a glance.
   int humans_present = nh;   // the same walk two lines up; one count, not two
   for (int i = 0; i < shown; i++) {
     int e = idx[i];
     char buf[16];
     int is_human = human_of_ent(e) >= 0;
     int marked = is_human && humans_present > 1;   // only mark when it means smth
-    float nx = xn + (marked ? 6.0f : 0.0f);
     if (e == g_local_ent) {
-      ui_rect(px + 4, y - 1, pw - 8, 10, C_ACCENT, 0.14f);
-      if (marked) ui_text(">", xn, y, 1, C_ACCENT, 1);
-      ui_text(ent_name(e), nx, y, 1, C_ACCENT, 1);
+      ui_rrect_c(px + 6, y - 2, pw - 12, 11, 0,
+                 C4(C_BLAZE, 0.16f), C4(C_BLAZE, 0.10f));
+      ui_rect(px + 6, y - 2, 2, 11, C_BLAZE, 0.95f);
+    } else if ((i & 1) == 0) {
+      ui_rect(px + 6, y - 2, pw - 12, 11, C_BONE, 0.03f);
+    }
+    snprintf(buf, sizeof buf, "%d", i + 1);
+    ui_text_ex(buf, px + 26 - ui_text_width(buf, 0.9f), y + 0.5f, 0.9f, TXT_REG, 0,
+               e == g_local_ent ? C4(C_BLAZE, 1) : C4(C_HAZE, 0.8f));
+    float nx = xn + (marked ? 8.0f : 0.0f);
+    if (e == g_local_ent) {
+      if (marked) ui_text("\x01", xn, y, 1, C_BLAZE, 1);
+      ui_textb(ent_name(e), nx, y, 1, C_BLAZE, 1);
     } else if (marked) {
-      ui_text(">", xn, y, 1, 0.55f, 0.80f, 1.0f, 1);
-      ui_text(ent_name(e), nx, y, 1, 0.70f, 0.88f, 1.0f, 1);
+      ui_text("\x01", xn, y, 1, C_SIGNAL, 1);
+      ui_text(ent_name(e), nx, y, 1, C_SIGNAL, 1);
     } else {
-      ui_text(ent_name(e), xn, y, 1, C_TEXT, 1);
+      ui_text(ent_name(e), xn, y, 1, C_BONE, 1);
     }
     snprintf(buf, sizeof buf, "%d", g_match.kills[e]);
-    ui_text(buf, xk, y, 1, C_TEXT, 1);
+    ui_textb(buf, xk, y, 1, C_BONE, 1);
     snprintf(buf, sizeof buf, "%d", g_match.deaths[e]);
-    ui_text(buf, xd, y, 1, C_TEXT, 1);
+    ui_text(buf, xd, y, 1, C_HAZE, 1);
     snprintf(buf, sizeof buf, "%.1f", (double)g_match.kills[e] /
              (double)(g_match.deaths[e] ? g_match.deaths[e] : 1));
-    ui_text(buf, xkd, y, 1, C_DIM, 1);
+    ui_text(buf, xkd, y, 1, C_HAZE, 1);
     snprintf(buf, sizeof buf, "%d%%", g_match.shots[e] ?
              g_match.hits[e] * 100 / g_match.shots[e] : 0);
-    ui_text(buf, xa, y, 1, C_DIM, 1);
+    ui_text(buf, xa, y, 1, C_HAZE, 1);
     y += 11;
   }
   if (hidden) {
     char more[24];
     snprintf(more, sizeof more, "+%d MORE", hidden);
-    ui_text(more, px + 12, y, 1, C_DIM, 1);
+    ui_text(more, px + 12, y + 1, 0.9f, C_HAZE, 1);
   }
 }
 
@@ -13734,6 +14397,96 @@ static void msaa_update(void) {
     R.msaa_fbo = 0;
   }
   glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
+}
+
+// Quarter-res ping-pong chain for the frosted menu backdrop — lazily rebuilt
+// on size change, exactly like the MSAA target. blur_fbo[0] == 0 means "no
+// blur": ui_menu falls back to its heavier scrim, never to a broken frame.
+static void blur_update(void) {
+  int bw = R.width / 4, bh = R.height / 4;
+  if (bw < 8) bw = 8;
+  if (bh < 8) bh = 8;
+  if (R.blur_fbo[0] && R.blur_w == bw && R.blur_h == bh) return;
+  if (R.blur_fbo[0]) {
+    glDeleteFramebuffers(2, R.blur_fbo);
+    glDeleteTextures(2, R.blur_tex);
+    R.blur_fbo[0] = R.blur_fbo[1] = 0;
+  }
+  R.blur_w = bw;
+  R.blur_h = bh;
+  glGenTextures(2, R.blur_tex);
+  glGenFramebuffers(2, R.blur_fbo);
+  for (int i = 0; i < 2; i++) {
+    glBindTexture(GL_TEXTURE_2D, R.blur_tex[i]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, bw, bh, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[i]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           R.blur_tex[i], 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+      glDeleteFramebuffers(2, R.blur_fbo);
+      glDeleteTextures(2, R.blur_tex);
+      R.blur_fbo[0] = R.blur_fbo[1] = 0;
+      break;
+    }
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
+  glBindTexture(GL_TEXTURE_2D, R.font_tex);
+}
+
+// Frosted-glass backdrop for the PAUSING menu (§9.7: a networked session
+// never gets one): flush the HUD batch, resolve the scene into the present
+// buffer, pull it down to quarter res, run four growing dual-Kawase taps,
+// and paint the result back as one full-screen image quad — then hand GL
+// state back to the UI batch. Fails soft to the scrim.
+static void ui_menu_backdrop(void) {
+  g_ui_backdrop = 0;
+  blur_update();
+  if (!R.blur_fbo[0] || !R.blur_fbo[1]) return;
+  ui_flush();
+  if (R.msaa_fbo) {   // resolve what has been drawn so far (also final-safe)
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, R.msaa_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.present_fbo);
+    glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.width, R.height,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  }
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, R.present_fbo);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.blur_fbo[0]);
+  glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.blur_w, R.blur_h,
+                    GL_COLOR_BUFFER_BIT, GL_LINEAR);
+  glDisable(GL_BLEND);
+  glUseProgram(R.prog_blur);
+  glUniform1i(R.u_blur_tex, 0);
+  glBindVertexArray(R.vao_sky);   // attribute-less fullscreen triangle
+  glViewport(0, 0, R.blur_w, R.blur_h);
+  int src = 0;
+  for (int i = 0; i < 4; i++) {
+    glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1 - src]);
+    glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
+    glUniform2f(R.u_blur_px, (float)(i + 1) / (float)R.blur_w,
+                (float)(i + 1) / (float)R.blur_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    src = 1 - src;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, R.msaa_fbo ? R.msaa_fbo : R.present_fbo);
+  glViewport(0, 0, R.width, R.height);
+  glEnable(GL_BLEND);
+  glUseProgram(R.prog_hud);
+  glBindVertexArray(R.vao_hud);
+  glUniform1i(R.u_img, 1);
+  glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
+  ui_begin();
+  // The scene's v axis runs bottom-up, the HUD's top-down: v is flipped.
+  // Tinted slightly cool and dim — glass takes light, the scope learned that.
+  ui_quad(0, 0, g_ui_vw, g_ui_vh, 0, 1, 1, 0, (float[4]){0.82f, 0.85f, 0.90f, 1.0f});
+  ui_flush();
+  glUniform1i(R.u_img, 0);
+  glBindTexture(GL_TEXTURE_2D, R.font_tex);
+  ui_begin();
+  g_ui_backdrop = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -20987,6 +21740,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
   }
 
   // HUD + menu: everything batches into one buffer, one draw call.
+  g_ui_time += g_ui_dt;   // presentation clock (pulses, glides); never sim-read
   glDisable(GL_DEPTH_TEST);
   glDisable(GL_CULL_FACE);
   glEnable(GL_BLEND);
@@ -21081,9 +21835,9 @@ static void render_frame(const player_t *p, float alpha, int fps,
   if (g_cfg.show_fps) {
     char text[16];
     snprintf(text, sizeof text, "%d FPS", fps);
-    float tx = g_ui_vw - ui_text_width(text, 1) - 6;
-    ui_text(text, tx + 1, 7, 1, 0.05f, 0.05f, 0.06f, 0.9f);
-    ui_text(text, tx, 6, 1, 0.95f, 0.95f, 0.95f, 1);
+    float tx = g_ui_vw - ui_text_width_tr(text, 0.75f, 0.6f) - 7;
+    ui_text_ex(text, tx + 0.6f, 6.6f, 0.75f, TXT_REG, 0.6f, C4(0.03f, 0.04f, 0.05f, 0.6f));
+    ui_text_ex(text, tx, 6, 0.75f, TXT_REG, 0.6f, C4(C_HAZE, 0.8f));
   }
   if (!g_menu_open && !cam_free && !g_vmorb.on) {
     float ccx = g_ui_vw * 0.5f, ccy = g_ui_vh * 0.5f;
@@ -21093,31 +21847,25 @@ static void render_frame(const player_t *p, float alpha, int fps,
     // A scoped rifle has no business showing a hip crosshair: the reticle in the
     // glass IS the aim, and two aiming marks on one screen is worse than either.
     // It goes the moment the rifle starts coming up, not half way through.
-    // 0.95, NOT 0.5, AND THE DOT FADES IN OVER THE SAME BAND. The hip crosshair
-    // used to vanish at ads 0.5 and the HUD dot only appear at ads 0.95, and the
-    // ramp measured 22 ticks: that is EIGHT TICKS — 67 ms — with no aiming mark
-    // anywhere on screen, on the way up AND on the way down, i.e. ~136 ms of
-    // every aim cycle. Verified by counting saturated pixels in a 120x120 centre
-    // box across the ramp: 0 px at ticks 11, 14 and 18. They now cross-fade over
-    // the last quarter of the ramp so the two overlap instead of handing off
-    // through a hole. The SNIPER keeps 0.02 — its reticle lives in the scope
-    // disc and two aiming marks on one screen is worse than either.
+    // 0.95, NOT 0.5, AND THE DOT FADES IN OVER THE SAME BAND (67 ms of blind
+    // gap, measured — see the red-dot comment below). The SNIPER keeps 0.02.
     float ch_hide = p->wp.cur == WPN_SR ? 0.02f : 0.95f;
     if ((ads < ch_hide || third) && in_play) {  // 3rd person: crosshair even in ADS
-      // 2.5x on the honest cone projection — pure readability, the true cone
-      // at these spread values would move the gap by only a few pixels.
-      // ...plus the HIT KICK, so the reticle reacts to LANDING a round and not
-      // only to firing one. Everything else on this element is spread, which is
-      // a decision the player made a tick ago; this is the consequence.
+      // 2.5x on the honest cone projection — pure readability — plus the HIT
+      // KICK, so the reticle reacts to LANDING a round and not only to firing
+      // one. Everything else on this element is spread, which is a decision
+      // the player made a tick ago; this is the consequence. Drawn as capsules
+      // now: round caps are the GRATICULE stroke language.
       float gap = 3.0f + tanf(weapon_spread(p) * DEG2RAD) / tanf(fovy * 0.5f) * 450.0f
                 + g_ch_kick;
       float a = 1.0f - ads / ch_hide;
+      const float armlen = 4.6f;
       for (int i = 0; i < 4; i++) {
         float dx = (i == 0) - (i == 1), dy = (i == 2) - (i == 3);
-        float x = ccx + dx * gap - (dx ? 0 : 0.6f) + (dx > 0 ? 0 : dx * 4);
-        float y = ccy + dy * gap - (dy ? 0 : 0.6f) + (dy > 0 ? 0 : dy * 4);
-        ui_rect(x - 0.2f, y - 0.2f, dx ? 4.4f : 1.6f, dy ? 4.4f : 1.6f, 0, 0, 0, 0.55f * a);
-        ui_rect(x, y, dx ? 4 : 1.2f, dy ? 4 : 1.2f, 0.95f, 0.95f, 0.95f, a);
+        float x0 = ccx + dx * gap, y0 = ccy + dy * gap;
+        float x1 = ccx + dx * (gap + armlen), y1 = ccy + dy * (gap + armlen);
+        ui_capsule(x0, y0, x1, y1, 1.15f, 0.02f, 0.03f, 0.04f, 0.50f * a);
+        ui_capsule(x0, y0, x1, y1, 0.62f, C_BONE, 0.97f * a);
       }
     }
     // Sight picture once snapped in, exactly point-of-aim — the AR's red dot only.
@@ -21126,243 +21874,322 @@ static void render_frame(const player_t *p, float alpha, int fps,
     // drawn on top of it. Two reticles at once, one of them not even in the glass.
     float dot_a = f_clamp((ads - 0.78f) / 0.17f, 0.0f, 1.0f);
     if (dot_a > 0.0f && in_play && !third && p->wp.cur != WPN_SR) {
-      // Three rings: a wide soft bloom, a mid falloff and a saturated core. One
-      // 0.9 px core under a 0.22-alpha halo measured as a dim faceted smudge.
-      // ...and 1.25 vu of core rather than 1.0: at the 720p integer scale of 2
-      // the old dot was a 6.4 px circle where 2 MOA at this FOV is about 8 px.
-      ui_disk(ccx, ccy, 3.4f, 1.0f, 0.12f, 0.05f, 0.20f * dot_a);
+      // A soft radial bloom (the atlas soft cell) under a mid falloff and a
+      // saturated core. One 0.9 px core under a 0.22-alpha halo measured as a
+      // dim faceted smudge; 1.25 vu of core rather than 1.0: at the 720p
+      // integer scale of 2 the old dot was 6.4 px where 2 MOA is about 8 px.
+      ui_glow(ccx, ccy, 4.6f, 1.0f, 0.12f, 0.05f, 0.38f * dot_a);
       ui_disk(ccx, ccy, 2.0f, 1.0f, 0.14f, 0.05f, 0.45f * dot_a);
       ui_disk(ccx, ccy, 1.25f, 1.0f, 0.22f, 0.10f, 0.98f * dot_a);
     }
-    // THE HITMARKER. Four diagonal strokes, and four things about it are the
-    // lessons rather than the tuning.
-    //
-    // IT POPS AND SETTLES. It used to be a constant 72 px for nine of every ten
-    // ticks with a single one-tick hole, so four AR hits in a burst read as ONE
-    // continuous mark while the audio gave four separate ticks. Radius and alpha
-    // are both driven off g_hitmark_t now: it is born 1.75x oversized, collapses
-    // over three ticks, and fades over the last third. That gives a distinct
-    // beat per round even when a new hit re-arms mid-life.
-    //
-    // THE OUTLINE IS CONCENTRIC, NOT A DROP SHADOW. The old dark stroke was
-    // offset 0.4 vu with hw 0.9 against a 0.55 core, i.e. 0.7 px of protection
-    // on one side and none on the other — measured, the white core fell from
-    // +2.62 stops on a dark torso to +0.34 stops when its own impact spark was
-    // behind it. A symmetric 1.25 vu border means the core is read against the
-    // BORDER instead of against whatever happens to be behind it.
-    //
-    // A KILL IS BRIGHTER, NOT JUST REDDER. A saturated red at full value has a
-    // luminance of 84/255, so the old (1.0, 0.15, 0.15) core measured +0.39
-    // stops at 8 m and MINUS 0.99 stops at 1.5 m — the most important event in
-    // the game was drawn darker than the burst it was confirming, with 56% of
-    // its own footprint sitting on brighter pixels. The hue moves into the
-    // OUTLINE and the core stays high-value, which is the same idiom
-    // SFX_HEAD_DUCK uses on the audio side: a variant must read as SHARPER, not
-    // merely as louder, or the two axes collapse into one knob.
-    //
-    // THE HEAD AXIS IS A LAYER. A second, smaller X inside the first, exactly as
-    // sfx_head_sig lays one signature on whichever base ran.
+    // THE HITMARKER. Four diagonal strokes; the levers are the lessons:
+    // it POPS AND SETTLES off g_hitmark_t (a distinct beat per round, even
+    // re-armed mid-life); the outline is CONCENTRIC, not a drop shadow (the
+    // core is read against its border, not against its own impact spark);
+    // a KILL IS BRIGHTER, NOT JUST REDDER (hue moves into the outline, the
+    // core stays high-value — "sharper, not louder", same idiom as
+    // SFX_HEAD_DUCK); the HEAD axis is a LAYER outside the base strokes.
+    // Strokes start at 4.4 vu so the marker frames the aim point instead of
+    // covering it; capsules give the strokes the round GRATICULE caps.
     if (g_hitmark_t > 0) {
       int kill = g_hitmark_kind >= HM_KILL, head = g_hitmark_kind & 1;
       float span = (float)(kill ? KILLMARK_TICKS : HITMARK_TICKS);
       float e = (float)g_hitmark_t / span;        // 1 at birth -> 0 at death
-      // DEZENT, WEITER, LEICHTER. The first version won its contrast argument and
-      // then overshot the other way: a 1.75x pop on 0.62 vu strokes with a 1.32 vu
-      // outline is a mark that ARRIVES rather than one that confirms, and it sat
-      // close enough to the centre to compete with the reticle it is drawn over.
-      // Three separate levers, and they are separate on purpose:
-      //   - the strokes START further out (4.4 vu against 2.6), so the marker
-      //     frames the aim point instead of covering it and the inner end can
-      //     never walk into the AR dot's 3.4 vu bloom disk at peak scale;
-      //   - they are THINNER (0.34 / 0.28 vu against 0.62 / 0.50) with a 0.42 vu
-      //     outline instead of 0.70 — still a real concentric border, which is
-      //     what stopped the core being read against its own spark, but a hairline
-      //     rather than a slab;
-      //   - the pop is 1.28x rather than 1.75x and the alpha tops out at 0.82,
-      //     so it reads as a tick rather than a flash. The KILL keeps the whole
-      //     ladder it earned — brighter core, red in the outline, longer strokes,
-      //     longer life — it is simply drawn with a finer pen.
       float pop = 1.0f + 0.28f * e * e * e * e;
-      float a = f_clamp(e * 3.0f, 0.0f, 1.0f) * (kill ? 0.92f : 0.82f);
+      float a = f_clamp(e * 3.0f, 0.0f, 1.0f) * (kill ? 0.95f : 0.88f);
       float in = 4.4f * pop, out = (kill ? 11.4f : 9.0f) * pop;
       float r  = 1.0f, g = kill ? 0.74f : 0.96f, b = kill ? 0.64f : 0.96f;
       float orr = kill ? 0.78f : 0.0f, og = kill ? 0.05f : 0.0f, ob = kill ? 0.03f : 0.0f;
       float k = 0.7071f;
       for (int pass = 0; pass < (head ? 2 : 1); pass++) {
-        // The head layer moves OUTSIDE the base now rather than inside it. Inside,
-        // a second short X at 0.9-2.3 vu sat on top of the reticle; outside it
-        // reads as a longer, doubled stroke — the same "sharper, not louder"
-        // idiom, and it leaves the middle of the screen alone.
         float i0 = pass ? (out + 1.5f) : in, o0 = pass ? (out + 4.2f) : out;
         float w  = pass ? 0.28f : 0.34f;
         for (int sx = -1; sx <= 1; sx += 2)
           for (int sy = -1; sy <= 1; sy += 2) {
-            ui_line(ccx + (float)sx * i0 * k, ccy + (float)sy * i0 * k,
-                    ccx + (float)sx * o0 * k, ccy + (float)sy * o0 * k,
-                    w + 0.42f, orr, og, ob, 0.72f * a);
-            ui_line(ccx + (float)sx * i0 * k, ccy + (float)sy * i0 * k,
-                    ccx + (float)sx * o0 * k, ccy + (float)sy * o0 * k,
-                    w, r, g, b, a);
+            ui_capsule(ccx + (float)sx * i0 * k, ccy + (float)sy * i0 * k,
+                       ccx + (float)sx * o0 * k, ccy + (float)sy * o0 * k,
+                       w + 0.55f, orr, og, ob, 0.72f * a);
+            ui_capsule(ccx + (float)sx * i0 * k, ccy + (float)sy * i0 * k,
+                       ccx + (float)sx * o0 * k, ccy + (float)sy * o0 * k,
+                       w, r, g, b, a);
           }
       }
     }
     if (in_play) {
-      // Ammo + weapon name bottom-right, reload blink above.
-      char am[24];
-      snprintf(am, sizeof am, "%d/%d", p->wp.ammo[p->wp.cur], WPN_DEF[p->wp.cur].mag);
-      float ax = g_ui_vw - ui_text_width(am, 2) - 10;
-      // Low-ammo escalation, the health number's own idiom mirrored: white at
-      // full, bleeding toward red through the last quarter of the magazine,
-      // full red at 0. Running dry mid-burst is the commonest way in the game
-      // to run out (the dry-click latch exists for it) and the counter is the
-      // one element that can say so BEFORE it happens.
-      float a01 = f_clamp((float)p->wp.ammo[p->wp.cur] /
-                          (0.25f * (float)WPN_DEF[p->wp.cur].mag), 0.0f, 1.0f);
-      float agb = 0.28f + 0.65f * a01;
-      ui_text(am, ax + 1, g_ui_vh - 24, 2, 0.05f, 0.05f, 0.06f, 0.9f);
-      ui_text(am, ax, g_ui_vh - 25, 2, 0.95f, agb, agb, 1);
-      ui_text(WPN_DEF[p->wp.cur].name,
-              g_ui_vw - ui_text_width(WPN_DEF[p->wp.cur].name, 1) - 10, g_ui_vh - 36, 1,
-              0.75f, 0.76f, 0.74f, 1);
-      if (p->wp.reload_t > 0 && (p->wp.reload_t / 15) % 2 == 0)
-        ui_text("RELOADING", g_ui_vw - ui_text_width("RELOADING", 1) - 10, g_ui_vh - 46, 1,
-                1.0f, 0.66f, 0.28f, 1);
-
-      // Health bottom-left: number + thin bar, bleeding toward red as it drops.
-      char hps[8];
-      snprintf(hps, sizeof hps, "%d", p->hp);
-      float hp01 = (float)p->hp / PLAYER_HP;
-      float gb = 0.25f + 0.70f * hp01;
-      ui_text(hps, 11, g_ui_vh - 24, 2, 0.05f, 0.05f, 0.06f, 0.9f);
-      ui_text(hps, 10, g_ui_vh - 25, 2, 0.95f, gb, gb, 1);
-      ui_rect(10, g_ui_vh - 11, 70, 3, 1, 1, 1, 0.15f);
-      ui_rect(10, g_ui_vh - 11, 70.0f * hp01, 3, 0.95f, gb, gb, 0.95f);
+      // Ammo, bottom-right: a broadcast chip — weapon glyph + name up top,
+      // the round count as the hero numeral, the magazine as graduation
+      // ticks. Low ammo bleeds the numeral and the ticks toward THREAT over
+      // the last quarter of the magazine: running dry mid-burst is the
+      // commonest way to run out and the counter is the one element that can
+      // say so BEFORE it happens.
+      {
+        // Subtle by default: a slim, quiet cluster — the numeral carries it,
+        // the slab is barely there (modern minimal HUD discipline).
+        const float bw2 = 96, bh = 34;
+        float bx = g_ui_vw - 14 - bw2, by = g_ui_vh - 14 - bh;
+        ui_rrect_c(bx, by, bw2, bh, 0, C4(0, 0, 0, 0.34f), C4(0, 0, 0, 0.44f));
+        int mag = WPN_DEF[p->wp.cur].mag, cur = p->wp.ammo[p->wp.cur];
+        float a01 = f_clamp((float)cur / (0.25f * (float)mag), 0.0f, 1.0f);
+        float cr = 0.941f + (1.000f - 0.941f) * (1 - a01);
+        float cg = 0.957f + (0.294f - 0.957f) * (1 - a01);
+        float cb2 = 0.973f + (0.227f - 0.973f) * (1 - a01);
+        ui_text_ex(p->wp.cur == WPN_SR ? "\x03" : "\x02", bx + 8, by + 2.5f,
+                   0.95f, TXT_REG, 0, C4(C_HAZE, 0.85f));
+        ui_text_ex(WPN_DEF[p->wp.cur].name, bx + 20, by + 4.5f, 0.65f, TXT_REG, 1.4f,
+                   C4(C_HAZE, 0.85f));
+        char am[16];
+        snprintf(am, sizeof am, "%d", cur);
+        char mg[16];
+        snprintf(mg, sizeof mg, "/%d", mag);
+        float mgw = ui_text_width(mg, 0.8f);
+        float amw = ui_text_width(am, 1.7f);
+        ui_text_ex(am, bx + bw2 - 8 - mgw - 2 - amw, by + 11, 1.7f, TXT_BOLD, 0,
+                   C4(cr, cg, cb2, 0.95f));
+        ui_text(mg, bx + bw2 - 8 - mgw, by + 18, 0.8f, C_HAZE, 0.9f);
+        float tx0 = bx + 8, tw = bw2 - 16, ty = by + bh - 7;
+        if (p->wp.reload_t > 0) {
+          // The magazine row becomes the reload progress capsule, and the
+          // label takes the eyebrow slot. Soft blink, not a hard strobe.
+          int tot = p->wp.reload_tac ? WPN_DEF[p->wp.cur].reload_tac_ticks
+                                     : WPN_DEF[p->wp.cur].reload_ticks;
+          float pr = f_clamp(1.0f - (float)p->wp.reload_t / (float)(tot > 0 ? tot : 1),
+                             0.0f, 1.0f);
+          float bl = (p->wp.reload_t / 15) % 2 == 0 ? 1.0f : 0.55f;
+          ui_text_ex("RELOADING",
+                     bx + bw2 - 8 - ui_text_width_tr("RELOADING", 0.65f, 1.4f),
+                     by + 4.5f, 0.65f, TXT_REG, 1.4f, C4(C_BLAZE, bl));
+          ui_rect(tx0, ty, tw, 2, C_BONE, 0.10f);
+          ui_rect(tx0, ty, tw * pr, 2, C_BLAZE, 0.95f);
+        } else {
+          // Graduated in fives — a counted instrument strip, not a dashed line.
+          float gapp = mag > 12 ? 1.0f : 2.0f;
+          int groups = mag > 12 ? (mag - 1) / 5 : 0;
+          float sw = (tw - (float)(mag - 1) * gapp - (float)groups * 2.0f) / (float)mag;
+          float sx2 = tx0;
+          for (int i = 0; i < mag; i++) {
+            if (i && mag > 12 && i % 5 == 0) sx2 += 2.0f;
+            if (i < cur) ui_rect(sx2, ty, sw, 2, cr, cg, cb2, 0.85f);
+            else         ui_rect(sx2, ty, sw, 2, C_BONE, 0.09f);
+            sx2 += sw + gapp;
+          }
+        }
+      }
+      // Health, bottom-left: the mirror chip. The bar keeps a GHOST — the
+      // chunk just lost trails behind for a beat (presentation state only,
+      // smoothed on g_ui_dt), which is what makes damage READ as an amount.
+      {
+        const float bw2 = 78, bh = 34, bx = 14;
+        float by = g_ui_vh - 14 - bh;
+        ui_rrect_c(bx, by, bw2, bh, 0, C4(0, 0, 0, 0.34f), C4(0, 0, 0, 0.44f));
+        float hp01 = f_clamp((float)p->hp / PLAYER_HP, 0.0f, 1.0f);
+        static float ghost;
+        if (hp01 >= ghost) ghost = hp01;
+        else ghost = ui_smooth(ghost, hp01, 2.4f);
+        float tt = 1.0f - hp01;
+        float cr = 0.941f + (1.000f - 0.941f) * tt;
+        float cg = 0.957f + (0.294f - 0.957f) * tt;
+        float cb2 = 0.973f + (0.227f - 0.973f) * tt;
+        ui_text_ex("HP", bx + 8, by + 4.5f, 0.65f, TXT_REG, 1.4f, C4(C_HAZE, 0.85f));
+        char hps[8];
+        snprintf(hps, sizeof hps, "%d", p->hp);
+        float pulse = p->hp <= 25 ? 0.72f + 0.28f * sinf(g_ui_time * 7.0f) : 0.95f;
+        ui_text_ex(hps, bx + 8, by + 11, 1.7f, TXT_BOLD, 0, C4(cr, cg, cb2, pulse));
+        float tx0 = bx + 8, tw = bw2 - 16, ty = by + bh - 7;
+        ui_rect(tx0, ty, tw, 2, C_BONE, 0.10f);
+        if (ghost > hp01)
+          ui_rect(tx0 + tw * hp01, ty, tw * (ghost - hp01), 2, C_BONE, 0.50f);
+        ui_rect(tx0, ty, tw * hp01, 2, cr, cg, cb2, 0.85f);
+      }
+      // Low-HP vignette: a breathing THREAT edge, gradient so it never
+      // reads as a solid frame over the game.
+      if (p->hp <= 25) {
+        // A whisper, not a lava filter: the pulsing THREAT number in the
+        // panel carries the state; the edge only echoes it.
+        float va = (0.5f + 0.5f * sinf(g_ui_time * 7.0f)) * 0.09f + 0.05f;
+        ui_vgrad(0, 0, g_ui_vw, 24, C4(C_THREAT, va), C4(C_THREAT, 0));
+        ui_vgrad(0, g_ui_vh - 24, g_ui_vw, 24, C4(C_THREAT, 0), C4(C_THREAT, va));
+        ui_hgrad(0, 0, 24, g_ui_vh, C4(C_THREAT, va), C4(C_THREAT, 0));
+        ui_hgrad(g_ui_vw - 24, 0, 24, g_ui_vh, C4(C_THREAT, 0), C4(C_THREAT, va));
+      }
     }
 
-    // Incoming damage: a brief red edge wash plus a chevron toward the
-    // shooter, so getting hit is readable without being a screen takeover.
+    // Incoming damage: a brief THREAT edge wash (gradients, not slabs) plus
+    // one ARC per live attacker — an arc IS a direction at a glance, and the
+    // chords fade toward the wedge ends so it has no hard corner.
     if (g_dmg_t > 0 && p->alive) {
       float k = (float)g_dmg_t / DMG_TICKS;
-      ui_rect(0, 0, g_ui_vw, 22, 0.75f, 0.08f, 0.06f, 0.22f * k);
-      ui_rect(0, g_ui_vh - 22, g_ui_vw, 22, 0.75f, 0.08f, 0.06f, 0.22f * k);
-      ui_rect(0, 22, 22, g_ui_vh - 44, 0.75f, 0.08f, 0.06f, 0.22f * k);
-      ui_rect(g_ui_vw - 22, 22, 22, g_ui_vh - 44, 0.75f, 0.08f, 0.06f, 0.22f * k);
+      ui_vgrad(0, 0, g_ui_vw, 22, C4(C_THREAT, 0.22f * k), C4(C_THREAT, 0));
+      ui_vgrad(0, g_ui_vh - 22, g_ui_vw, 22, C4(C_THREAT, 0), C4(C_THREAT, 0.22f * k));
+      ui_hgrad(0, 0, 22, g_ui_vh, C4(C_THREAT, 0.22f * k), C4(C_THREAT, 0));
+      ui_hgrad(g_ui_vw - 22, 0, 22, g_ui_vh, C4(C_THREAT, 0), C4(C_THREAT, 0.22f * k));
     }
-    // ...and one ARC per live attacker, at the same radius the single tick used.
-    // A 40-degree wedge rather than a 28x3 px straight line: a tangent tick has
-    // to be READ before it can be pointed at, while an arc IS a direction at a
-    // glance, and eight short chords per arc keep it a curve at any HUD scale.
     for (int di = 0; di < DMG_SLOTS && p->alive; di++) {
       if (g_dmg[di].life <= 0) continue;
       float dk = (float)g_dmg[di].life / DMG_TICKS;
       float ddx = g_dmg[di].from.x - feet.x, ddz = g_dmg[di].from.z - feet.z;
       float rel = atan2f(ddx, -ddz) - yaw;
-      const float R0 = 34.0f, HALF = 0.35f;      // 40 deg of arc
+      const float R0 = 46.0f, HALF = 0.35f;      // 40 deg of arc
       for (int seg = 0; seg < 8; seg++) {
         float a0 = rel - HALF + (2.0f * HALF) * (float)seg / 8.0f;
         float a1 = rel - HALF + (2.0f * HALF) * (float)(seg + 1) / 8.0f;
-        // Fade toward the ends so the wedge has no hard corner — a chord that
-        // simply stops reads as a bracket rather than as a heading.
         float m = 1.0f - fabsf((float)seg - 3.5f) / 4.6f;
         ui_line(ccx + sinf(a0) * R0, ccy - cosf(a0) * R0,
                 ccx + sinf(a1) * R0, ccy - cosf(a1) * R0,
-                1.6f, 0.05f, 0.01f, 0.01f, 0.55f * dk * m);
+                2.5f, 0.05f, 0.01f, 0.01f, 0.50f * dk * m);
         ui_line(ccx + sinf(a0) * R0, ccy - cosf(a0) * R0,
                 ccx + sinf(a1) * R0, ccy - cosf(a1) * R0,
-                0.9f, 0.98f, 0.20f, 0.14f, 0.92f * dk * m);
+                1.7f, C_THREAT, 0.95f * dk * m);
       }
     }
 
-    // THE RUNNING SCORE, above the feed: your frags against your best RIVAL.
-    // Two numbers and a slash — the whole match state a player needs mid-fight —
-    // pulsed on your own kill so a kill is visible PROGRESS and not just a row
-    // that scrolls away. The scan starts at 1: including the player, the
-    // moment you took the lead the HUD read "N/N" for the rest of the match —
-    // the margin, the one thing the second number is for, vanished exactly in
-    // the state a challenge-run player is in most of the time.
-    {
-      // "me" is g_local_ent, and the rival scan SKIPS that id rather than
-      // index 0 — skipping 0 with a local id != 0 counts our own kills as the
-      // lead and the margin reads N/N forever.
+    // THE SCORELINE, top centre: my frags against my best RIVAL — the whole
+    // match state a player needs mid-fight — plus a frag-limit progress
+    // hairline. My number pulses on my own kill, growing DOWN from a fixed
+    // cap line: a HUD element that moves when you score is a bug, not a pop.
+    // "me" is g_local_ent and the rival scan SKIPS that id rather than
+    // index 0 — skipping 0 with a local id != 0 counts our own kills as the
+    // lead and the margin reads N:N forever. Hidden once the match is over:
+    // the winner hero owns the top centre then.
+    if (!g_match.over) {
       int me = g_local_ent >= 0 ? g_match.kills[g_local_ent] : 0, lead = 0;
       for (int i = 0; i < MAX_ENTS; i++)
         if (i != g_local_ent && g_match.kills[i] > lead) lead = g_match.kills[i];
-      char sc[24];
-      snprintf(sc, sizeof sc, "%d/%d", me, lead);
+      char msc[8], lsc[8];
+      snprintf(msc, sizeof msc, "%d", me);
+      snprintf(lsc, sizeof lsc, "%d", lead);
       float pk = g_score_pop > 0 ? (float)g_score_pop / SCORE_POP_TICKS : 0.0f;
-      float ssc = 2.0f + pk * pk;                    // 3 -> 2 over the pulse
-      float sw2 = ui_text_width(sc, ssc);
-      // BELOW the FPS counter, which also lives top-right and is drawn first.
-      // The pulse grows the text DOWNWARD from a fixed baseline for the same
-      // reason: a centred scale would walk it back into the counter on every
-      // kill, and a HUD element that moves when you score is a bug, not a pop.
-      ui_text(sc, g_ui_vw - 8 - sw2 + 1, 18, ssc, 0.05f, 0.05f, 0.06f, 0.85f);
-      ui_text(sc, g_ui_vw - 8 - sw2, 17, ssc,
-              me >= lead && me > 0 ? 1.0f : 0.95f,
-              me >= lead && me > 0 ? 0.80f : 0.95f,
-              me >= lead && me > 0 ? 0.35f : 0.93f, 1.0f);
+      float ms = 1.1f + 0.35f * pk * pk;
+      float mw = ui_text_width(msc, ms), lw = ui_text_width(lsc, 1.1f);
+      char ft[12];
+      snprintf(ft, sizeof ft, "FT %d", g_cfg.sp_frag);
+      float ftw = ui_text_width_tr(ft, 0.6f, 0.8f);
+      const float sep = 9, pad = 10;
+      float cw = mw + sep + lw + pad + ftw + 8 + 2 * pad;
+      float chx = ccx - cw * 0.5f, chy = 6;
+      ui_rrect_c(chx, chy, cw, 18, 0, C4(0, 0, 0, 0.38f), C4(0, 0, 0, 0.46f));
+      int ahead = me >= lead && me > 0;
+      ui_text_ex(msc, chx + pad, chy + 4, ms, TXT_BOLD, 0,
+                 ahead ? C4(C_BLAZE, 0.95f) : C4(C_BONE, 0.95f));
+      ui_text_ex(":", chx + pad + mw + sep * 0.5f - 1.2f, chy + 4, 1.1f,
+                 TXT_REG, 0, C4(C_HAZE, 0.7f));
+      ui_text_ex(lsc, chx + pad + mw + sep, chy + 4, 1.1f, TXT_BOLD, 0,
+                 lead > me ? C4(C_THREAT, 0.9f) : C4(C_HAZE, 0.95f));
+      // the match goal lives ON the instrument, not one TAB away
+      ui_text_ex(ft, chx + cw - pad - ftw, chy + 6.5f, 0.6f, TXT_REG, 0.8f,
+                 C4(C_HAZE, 0.7f));
+      float lim = (float)g_cfg.sp_frag;
+      if (lim > 0) {
+        float p1 = f_clamp((float)me / lim, 0, 1), p2 = f_clamp((float)lead / lim, 0, 1);
+        ui_rect(chx + 3, chy + 15.5f, cw - 6, 1.5f, C_BONE, 0.10f);
+        ui_rect(chx + 3, chy + 15.5f, (cw - 6) * p2, 1.5f, C_THREAT, 0.75f);
+        ui_rect(chx + 3, chy + 15.5f, (cw - 6) * p1, 1.5f, C_BLAZE, 0.9f);
+      }
     }
-    // ...and the multi-kill banner, under the crosshair rather than over it.
+    // ...and the multi-kill banner, under the crosshair rather than over it,
+    // with a soft glow and a small entrance pop.
     if (g_streak_t > 0 && g_streak_n >= 2) {
       static const char *NM[5] = {"DOUBLE KILL", "TRIPLE KILL", "QUAD KILL",
                                   "PENTA KILL", "RAMPAGE"};
       const char *nm = NM[g_streak_n - 2 < 4 ? g_streak_n - 2 : 4];
       float ba = f_clamp((float)g_streak_t / 40.0f, 0.0f, 1.0f);
-      float bw = ui_text_width(nm, 1);
-      ui_text(nm, ccx - bw * 0.5f + 1, ccy + 27, 1, 0.05f, 0.03f, 0.02f, 0.8f * ba);
-      ui_text(nm, ccx - bw * 0.5f, ccy + 26, 1, 1.0f, 0.72f, 0.24f, ba);
+      float pop2 = 1.0f + 0.18f *
+                   f_clamp(((float)g_streak_t - (STREAK_TICKS - 8)) / 8.0f, 0.0f, 1.0f);
+      float bs = 1.0f * pop2;
+      float bw = ui_text_width_tr(nm, bs, 1.6f);
+      ui_text_ex(nm, ccx - bw * 0.5f + 1, ccy + 27, bs, TXT_BOLD, 1.6f,
+                 C4(0.05f, 0.03f, 0.02f, 0.8f * ba));
+      ui_text_ex(nm, ccx - bw * 0.5f, ccy + 26, bs, TXT_BOLD, 1.6f, C4(C_BLAZE, ba));
     }
 
-    // Kill feed top-right: newest first, quiet colors, fades out. The
-    // player's rows get the accent (killer) / red (victim) treatment.
-    float fy = 40;
-    for (int i = 0; i < KILLFEED_N; i++) {
-      if (g_feed[i].life <= 0) continue;
-      float fa = g_feed[i].life > 60 ? 1.0f : (float)g_feed[i].life / 60.0f;
-      const char *kn = ent_name(g_feed[i].src), *vn = ent_name(g_feed[i].dst);
-      float x2 = g_ui_vw - 8 - ui_text_width(vn, 1);
-      float x1 = x2 - 14;
-      float x0 = x1 - 8 - ui_text_width(kn, 1);
-      ui_rect(x0 - 5, fy - 2, g_ui_vw - 4 - (x0 - 5), 11, 0, 0, 0, 0.32f * fa);
-      // A remote human in the killfeed is tinted like the local player is —
-      // the "never disguised" promise the plan makes at three screens (§1.4).
-      int src_h = human_of_ent(g_feed[i].src) > 0;   // >0: a remote human
-      int dst_h = human_of_ent(g_feed[i].dst) > 0;
-      if (g_feed[i].src == g_local_ent) ui_text(kn, x0, fy, 1, C_ACCENT, fa);
-      else if (src_h)         ui_text(kn, x0, fy, 1, 0.70f, 0.88f, 1.0f, fa);
-      else                    ui_text(kn, x0, fy, 1, C_TEXT, fa);
-      if (g_feed[i].hs) ui_text(">", x1, fy, 1, 0.95f, 0.20f, 0.15f, fa);
-      else              ui_text(">", x1, fy, 1, C_DIM, fa);
-      if (g_feed[i].dst == g_local_ent) ui_text(vn, x2, fy, 1, 0.95f, 0.35f, 0.30f, fa);
-      else if (dst_h)         ui_text(vn, x2, fy, 1, 0.70f, 0.88f, 1.0f, fa);
-      else                    ui_text(vn, x2, fy, 1, 0.78f, 0.79f, 0.77f, fa);
-      fy += 12;
+    // Kill feed top-right: chips that slide in from the right edge, newest
+    // first. Grammar: KILLER > [headshot] VICTIM. A remote human is tinted
+    // SIGNAL wherever the local player would be BLAZE — the "never
+    // disguised" promise the plan makes at three screens (§1.4). Rows the
+    // local player is IN get the wash treatment.
+    {
+      float fy = 32;
+      for (int i = 0; i < KILLFEED_N; i++) {
+        if (g_feed[i].life <= 0) continue;
+        float fa = g_feed[i].life > 60 ? 1.0f : (float)g_feed[i].life / 60.0f;
+        float tin = ui_easeout(
+            f_clamp((float)(KILLFEED_TICKS - g_feed[i].life) / 7.0f, 0.0f, 1.0f));
+        float slide = (1.0f - tin) * 24.0f;
+        const char *kn = ent_name(g_feed[i].src), *vn = ent_name(g_feed[i].dst);
+        int meK = g_feed[i].src == g_local_ent, meD = g_feed[i].dst == g_local_ent;
+        int src_h = human_of_ent(g_feed[i].src) > 0;   // >0: a remote human
+        int dst_h = human_of_ent(g_feed[i].dst) > 0;
+        float knw = ui_text_width(kn, 0.9f), vnw = ui_text_width(vn, 0.9f);
+        float chev = ui_text_width("\x01", 0.9f);
+        float hsw = g_feed[i].hs ? ui_text_width("\x04", 0.9f) + 3 : 0;
+        const float rowh = 11;
+        float rw = 7 + knw + 4 + chev + 3 + hsw + vnw + 7;
+        float rx0 = g_ui_vw - 8 - rw + slide;
+        if (meD)
+          ui_rrect_c(rx0, fy, rw, rowh, 1, C4(0.30f, 0.07f, 0.05f, 0.55f * fa),
+                     C4(0.20f, 0.04f, 0.03f, 0.60f * fa));
+        else
+          ui_rrect_c(rx0, fy, rw, rowh, 1, C4(0.024f, 0.031f, 0.043f, 0.48f * fa),
+                     C4(0.016f, 0.020f, 0.030f, 0.55f * fa));
+        if (meK) ui_rect(rx0, fy, 2, rowh, C_BLAZE, 0.9f * fa);
+        float tx = rx0 + 7, ty2 = fy + 2.5f;
+        if (meK)        ui_text(kn, tx, ty2, 0.9f, C_BLAZE, fa);
+        else if (src_h) ui_text(kn, tx, ty2, 0.9f, C_SIGNAL, fa);
+        else            ui_text(kn, tx, ty2, 0.9f, C_BONE, 0.92f * fa);
+        tx += knw + 4;
+        ui_text("\x01", tx, ty2, 0.9f, C_HAZE, 0.85f * fa);
+        tx += chev + 3;
+        if (g_feed[i].hs) { ui_text("\x04", tx, ty2, 0.9f, C_THREAT, fa); tx += hsw; }
+        if (meD)        ui_text(vn, tx, ty2, 0.9f, C_THREAT, fa);
+        else if (dst_h) ui_text(vn, tx, ty2, 0.9f, C_SIGNAL, fa);
+        else            ui_text(vn, tx, ty2, 0.9f, C_HAZE, 0.95f * fa);
+        fy += rowh + 2;
+      }
     }
 
-    // Death screen: tint, who did it, respawn countdown.
+    // Death screen: the world stays visible; a scrim pulls the eye to the
+    // lower third where the broadcast caption sits, and the respawn is a
+    // progress capsule instead of a decimal readout.
     if (!p->alive && !g_match.over) {
-      ui_rect(0, 0, g_ui_vw, g_ui_vh, 0.20f, 0.02f, 0.02f, 0.34f);
-      const char *d1 = "YOU DIED";
-      float w1 = ui_text_width(d1, 3);
-      ui_text(d1, ccx - w1 * 0.5f + 1, 119, 3, 0.05f, 0.02f, 0.02f, 0.9f);
-      ui_text(d1, ccx - w1 * 0.5f, 118, 3, 0.95f, 0.30f, 0.24f, 1);
-      char d2[32];
-      snprintf(d2, sizeof d2, "KILLED BY %s", ent_name(g_match.last_killer));
-      ui_text(d2, ccx - ui_text_width(d2, 1) * 0.5f, 148, 1, C_TEXT, 0.9f);
-      snprintf(d2, sizeof d2, "RESPAWN IN %.1f", (double)p->respawn_t / TICK_HZ);
-      ui_text(d2, ccx - ui_text_width(d2, 1) * 0.5f, 160, 1, C_DIM, 1);
+      // The death frame is STAGED: an INK scrim from both edges controls
+      // whatever the corpse camera happens to face, so the caption never
+      // stands on raw mud. World desaturation would need a post pass; the
+      // scrim buys ~the same control for six vertices.
+      ui_rect(0, 0, g_ui_vw, g_ui_vh, 0.04f, 0.03f, 0.04f, 0.30f);
+      ui_vgrad(0, 0, g_ui_vw, g_ui_vh * 0.40f, C4(0, 0, 0, 0.55f), C4(0, 0, 0, 0));
+      ui_vgrad(0, g_ui_vh * 0.42f, g_ui_vw, g_ui_vh * 0.58f,
+               C4(0, 0, 0, 0), C4(0, 0, 0, 0.72f));
+      float dy0 = g_ui_vh * 0.56f;
+      const char *d1 = "ELIMINATED";
+      float w1 = ui_text_width_tr(d1, 2.6f, 2.0f);
+      ui_text_ex(d1, ccx - w1 * 0.5f + 1, dy0 + 1, 2.6f, TXT_BLACK, 2.0f,
+                 C4(0.05f, 0.01f, 0.01f, 0.85f));
+      ui_text_ex(d1, ccx - w1 * 0.5f, dy0, 2.6f, TXT_BLACK, 2.0f, C4(C_THREAT, 1));
+      char d2[40];
+      snprintf(d2, sizeof d2, "BY %s", ent_name(g_match.last_killer));
+      ui_text(d2, ccx - ui_text_width(d2, 1) * 0.5f, dy0 + 30, 1, C_BONE, 0.92f);
+      float rp = 1.0f - f_clamp((float)p->respawn_t / PLAYER_RESPAWN_TICKS, 0.0f, 1.0f);
+      ui_rect(ccx - w1 * 0.5f, dy0 + 46, w1, 3, C_BONE, 0.14f);
+      ui_rect(ccx - w1 * 0.5f, dy0 + 46, w1 * rp, 3, C_BLAZE, 0.95f);
+      ui_text_ex("REDEPLOY", ccx - ui_text_width_tr("REDEPLOY", 0.8f, 1.5f) * 0.5f,
+                 dy0 + 53, 0.8f, TXT_REG, 1.5f, C4(C_HAZE, 0.9f));
     }
 
-    // Match over: winner banner + rematch hint; the scoreboard forces on.
+    // Match over: winner hero over a top scrim, graticule ruler under it;
+    // the scoreboard forces on below. VICTORY is gated on g_local_ent, not
+    // on a literal 0 — a high-human-id client wins matches too.
     if (g_match.over) {
-      char msg[24];
-      if (g_match.winner == 0) snprintf(msg, sizeof msg, "VICTORY");
+      ui_vgrad(0, 0, g_ui_vw, 96, C4(0, 0, 0, 0.60f), C4(0, 0, 0, 0));
+      char msg[32];
+      if (g_match.winner == g_local_ent) snprintf(msg, sizeof msg, "VICTORY");
       else snprintf(msg, sizeof msg, "%s WINS", ent_name(g_match.winner));
-      float w1 = ui_text_width(msg, 3);
-      ui_text(msg, ccx - w1 * 0.5f + 1, 27, 3, 0.05f, 0.05f, 0.06f, 0.9f);
-      ui_text(msg, ccx - w1 * 0.5f, 26, 3, C_ACCENT, 1);
+      float w1 = ui_text_width_tr(msg, 2.6f, 2.2f);
+      ui_text_ex(msg, ccx - w1 * 0.5f + 1, 25, 2.6f, TXT_BLACK, 2.2f,
+                 C4(0.04f, 0.03f, 0.02f, 0.85f));
+      ui_text_ex(msg, ccx - w1 * 0.5f, 24, 2.6f, TXT_BLACK, 2.2f, C4(C_BLAZE, 1));
+      ui_rect(ccx - w1 * 0.5f, 47, w1, 1, C_BONE, 0.30f);
       const char *sub = "PRESS FIRE FOR REMATCH";
-      ui_text(sub, ccx - ui_text_width(sub, 1) * 0.5f, 52, 1, C_TEXT, 0.9f);
+      ui_text_ex(sub, ccx - ui_text_width_tr(sub, 0.9f, 1.4f) * 0.5f, 54, 0.9f,
+                 TXT_REG, 1.4f, C4(C_BONE, 0.85f));
       // The same version/update line the ESC panel carries (§15.1): the match
       // end is where the player is already stopped. Native sessions only —
       // harness screenshots must not grow a label that says nothing there.
@@ -21374,7 +22201,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
       if (native) {
         char ul[96];
         upd_status_line(ul, sizeof ul);
-        ui_text(ul, ccx - ui_text_width(ul, 1) * 0.5f, 64, 1, C_DIM, 0.8f);
+        ui_text(ul, ccx - ui_text_width(ul, 0.8f) * 0.5f, 68, 0.8f, C_DIM, 0.7f);
       }
     }
 
@@ -21385,6 +22212,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
     glBindTexture(GL_TEXTURE_2D, R.font_tex);
     ui_begin();
   }
+  if (g_menu_open && session_pauses()) ui_menu_backdrop();
   if (g_menu_open) ui_menu();
   ui_flush();
 
@@ -22000,6 +22828,10 @@ static void leave_match(void) {              // MATCH LEAVE / failed connection
 
 static int app_frame(app_t *a, player_t *p, double dt, const frame_input_t *in) {
   if (dt > 0.1) dt = 0.1;  // hitch clamp: never spiral the sim
+  // Presentation motion clock: real dt while playing; the harness never gets
+  // here for uiframe/shot, so those keep the fixed 1/60 default and stay
+  // deterministic. Purely presentation — the sim never reads it.
+  g_ui_dt = dt > 0.05 ? 0.05f : (float)dt;
 
   // Drive an in-progress handshake even while still playing locally (§1.1):
   // the switch to online happens on the first snapshot, inside net_cl_poll.
@@ -28314,6 +29146,11 @@ static int native_main(int w, int h, uint32_t seed) {
   // Async, never blocking the start (§15.1); harness and server sessions never
   // reach this line, which IS the "server and harness never update" rule.
   upd_check_start();
+  // Boot into the menu over the LIVE arena (§9.1's spirit: the match is
+  // already running behind it, so "I just want to shoot" stays ONE press —
+  // RESUME is pre-focused). Play mode only: the harness never opens it, so
+  // every proof keeps its historical first frame.
+  ui_open_menu();
   // --connect HOST[:PORT]: begin a join while the local match runs (§1.1). The
   // §11 cut-line entry point; the ONLINE menu drives the same start_connect.
   if (g_boot_connect && g_boot_connect[0]) {
@@ -29663,6 +30500,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
             GetCurrentProcessId());
   g_audio_h = CreateThread(NULL, 0, audio_thread, NULL, 0, NULL);
   upd_check_start();   // async; never blocks the start (§15.1)
+  ui_open_menu();      // boot into the menu over the live arena, as on Linux
   if (g_boot_connect && g_boot_connect[0]) {   // --connect (§1.1), same as Linux
     char host[64]; int port = g_cfg.mp_port;
     snprintf(host, sizeof host, "%s", g_boot_connect);
