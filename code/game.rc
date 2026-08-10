@@ -1,0 +1,3 @@
+// Application icon resource. Explorer picks the icon with the lowest ID as
+// the file icon; the Windows backend also loads ID 1 for the window class.
+1 ICON "icon.ico"

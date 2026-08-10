@@ -1,0 +1,86 @@
+# Release on every push to main (design §14), lean version. ONE build job
+# proves both binaries, one release job publishes. The release job does not
+# EXIST while the build is red (`needs:`), so "tag first, test later, updaters
+# stuck on yesterday" cannot happen. Tag = YYYY-MM-DD, a same-day re-cut
+# overwrites. Two assets, deliberately: linux-amd64 (desktop + SteamOS) and
+# windows-amd64 (also covers Windows-on-ARM via its built-in x64 emulation).
+# linux-arm64 was dropped 2026-08-08 — it had no player target, and the
+# aarch64 devcontainer builds "dev", which never auto-updates anyway.
+name: Release
+on:
+  push:
+    branches: [main]
+
+# TCB note (§15.7): actions and the container image run with the release token.
+# Pin actions to SHAs and the image to a digest once the repo is public.
+# contents: read, not {} — an empty set strips even read, and checkout on a
+# private repo then 404s ("repository not found"). The release job alone
+# raises itself to contents: write.
+permissions: { contents: read }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # debian:trixie-slim is the devcontainer's image and the only mainstream
+    # one where BOTH compilers accept -std=c23 (gcc 12 AND 13 reject it;
+    # ubuntu-latest ships gcc 13). Without it the first build fails.
+    container: debian:trixie-slim
+    steps:
+      # Before checkout: actions/checkout needs git in the container.
+      # build-essential (not "gcc make"): libc6-dev is only a RECOMMENDS.
+      # The mingw METApackage, not -win32: the plain
+      # x86_64-w64-mingw32-gcc name is an update-alternatives symlink.
+      - name: Toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential git ca-certificates \
+            libegl-dev libgl-dev libx11-dev \
+            libgl1-mesa-dri libglx-mesa0 libegl1 libgl1 libx11-6 \
+            gcc-mingw-w64-x86-64
+      - uses: actions/checkout@v7
+
+      # BUILD_VERSION/BUILD_COMMIT MUST be passed: without them every binary is
+      # a "dev" build (§13.3) and never updates.
+      - name: Build
+        run: |
+          V=$(date -u +%Y-%m-%d); C=$(echo ${{ github.sha }} | cut -c1-7)
+          make all BUILD_VERSION="$V" BUILD_COMMIT="$C"
+          mv build/game     skill-issue-linux-amd64
+          mv build/game.exe skill-issue-windows-amd64.exe
+
+      # Warning gate WITHOUT LTO (-flto swallows -Wformat-truncation, §14.2),
+      # then the self-contained proof gate. The build that ships is proved.
+      - name: Gate
+        run: |
+          gcc -std=c23 -O2 -Wall -Wextra -Werror -c code/game.c -o /dev/null
+          x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Werror -c code/game.c -o /dev/null
+          ./tools/ci-proofs.sh ./skill-issue-linux-amd64
+
+      - uses: actions/upload-artifact@v7
+        with: { name: assets, path: skill-issue-*, if-no-files-found: error }
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest        # no container: gh is needed here
+    permissions: { contents: write }
+    concurrency: { group: release-publish, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { name: assets, path: dist }
+      - name: Publish
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          V=$(date -u +%Y-%m-%d)
+          # upload-artifact drops the x bit; the updater swaps the file in as-is.
+          chmod +x dist/skill-issue-linux-*
+          echo "$V" > dist/VERSION
+          # Dated header: the updater compares an ORDER, not an inequality
+          # (§15.2) — without it an "update" could be a downgrade.
+          ( cd dist && { echo "# version $V"; sha256sum skill-issue-* VERSION; } > SHA256SUMS )
+          git tag -f "$V" && git push origin "refs/tags/$V" --force
+          gh release delete "$V" --yes 2>/dev/null || true   # only today's tag; yesterday's
+                                                             # release stays as the rollback (§15.4)
+          gh release create "$V" dist/* --title "$V" --latest \
+            --notes-file .github/release-body.md

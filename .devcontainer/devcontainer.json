@@ -1,0 +1,38 @@
+{
+    "name": "skill-issue",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "root",
+    "features": {
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "lts"
+        },
+        "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools"
+            ],
+            "settings": {
+                "C_Cpp.default.compilerPath": "/usr/bin/gcc",
+                "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+                "C_Cpp.default.cStandard": "c23"
+            }
+        }
+    },
+    "mounts": [
+        "source=claude-code-config-${devcontainerId},target=/root/.claude,type=volume",
+        // Windows host: USERPROFILE = C:\Users\<name>. Mounted read-only and
+        // COPIED in postCreate, because a Windows bind reads 0777 in the
+        // container and ssh refuses a key that world-readable.
+        "source=${localEnv:USERPROFILE}/.ssh,target=/root/.ssh-host,type=bind,readonly"
+    ],
+    "runArgs": [
+        "--cap-add=SYS_PTRACE",
+        "--security-opt",
+        "seccomp=unconfined"
+    ],
+    "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder} && mkdir -p code build && gcc --version >/dev/null && x86_64-w64-mingw32-gcc --version >/dev/null && magick -version >/dev/null && python3 --version >/dev/null && ffmpeg -version >/dev/null && ffprobe -version >/dev/null && echo 'toolchain ok' && mkdir -p /root/.ssh && cp -rL /root/.ssh-host/. /root/.ssh/ && chmod 700 /root/.ssh && chmod 600 /root/.ssh/* && ssh -V"
+}
