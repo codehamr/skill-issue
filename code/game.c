@@ -8105,6 +8105,9 @@ struct bot_t {
   int   cov_retry;                     // ticks until a FAILED probe may re-run
   int   in_cover;                      // moving to break the line right now
   int   slide_cd, jump_cd;             // tactical cooldowns
+  int   prefire_t, prefire_cd;         // pre-fire burst window / its cooldown
+  int   prefiring;                     // this tick fires on BELIEF, not sight
+  int   peek;                          // this tick started a corner peek move
   int   swap_cd;                       // AI-policy cooldown; never a weapon timer
   int   peek_dir;                      // -1/+1 side it leans out from cover
   // Authoritative auditory investigation. A zero hear_tick means no memory.
@@ -10019,6 +10022,10 @@ static void bot_tick(int bi) {
   }
   if (b->slide_cd > 0) b->slide_cd--;
   if (b->jump_cd > 0) b->jump_cd--;
+  if (b->prefire_t > 0) b->prefire_t--;
+  if (b->prefire_cd > 0) b->prefire_cd--;
+  b->prefiring = 0;
+  b->peek = 0;
   if (b->cov_retry > 0) b->cov_retry--;
   if (b->swap_cd > 0) b->swap_cd--;
   bot_hear_update(b, bi);
@@ -10298,6 +10305,27 @@ static void bot_tick(int bi) {
     }
     b->crouch = 0;
 
+    // PRE-FIRE: a human who is CONFIDENT the corner is about to break holds
+    // the trigger through it — rounds land on the angle as it opens, before
+    // visual confirmation. Confidence is a TIGHT belief (the dead-reckoning
+    // radius still small), fresh memory and short range; the shot itself goes
+    // through the normal trigger discipline below (settle, bursts, pauses),
+    // aimed at the same belief point the pre-aim already holds. A tactic, so
+    // its RATE rides sk->tac (never a gun-handling knob), and the burst
+    // window is committed once so it reads as intent rather than as flicker.
+    if ((b->belief == BOT_BELIEF_OCCLUDED_HOLD ||
+         b->belief == BOT_BELIEF_INVESTIGATE) &&
+        b->belief_radius < 1.3f && ahl > 2.0f && ahl < 20.0f &&
+        (int)(g_tick - b->last_seen_tick) < 84) {
+      if (b->prefire_t > 0) b->prefiring = 1;
+      else if (b->prefire_cd == 0 &&
+               rng_rangef(&g_rng_bot, 0.0f, 1.0f) < sk->tac * 0.010f) {
+        b->prefire_t = (int)rng_rangef(&g_rng_bot, 24.0f, 54.0f);
+        b->prefire_cd = (int)rng_rangef(&g_rng_bot, 300.0f, 700.0f);
+        b->prefiring = 1;
+      }
+    }
+
     int hidden_need_cover = b->wp.reload_t > 0 || (b->hurt_t > 0 && b->hp < 45);
     if (!hidden_need_cover) b->cov_valid = 0;
     if (hidden_need_cover && !b->cov_valid && b->cov_retry == 0) {
@@ -10332,7 +10360,32 @@ static void bot_tick(int bi) {
         } else {
           wx = sdx / sl;
           wz = sdz / sl;
-          pace = 0.75f;
+          // A human RUNS the approach and only slows for the last angle — the
+          // constant 0.75 shuffle read as a bot creeping everywhere. Running
+          // is also what makes the two peek moves below reachable at all: a
+          // slide has to be EARNED at speed (the shared entry gate).
+          pace = sl > 8.0f ? 1.0f : 0.75f;
+          float spd2 = sqrtf(b->vel.x * b->vel.x + b->vel.z * b->vel.z);
+          // SLIDE-PEEK / traversal slide: break into the believed angle low
+          // and fast, or eat distance on a long approach. Intent only fires
+          // when the shared gate would take it (speed check here), so a
+          // request is never silently eaten.
+          if (!b->sliding && b->grounded && b->slide_cd == 0 && sl > 3.0f &&
+              spd2 > g_cfg.mv[MV_RUN] * SLIDE_START_SPEED &&
+              rng_rangef(&g_rng_bot, 0.0f, 1.0f) < sk->tac * 0.006f) {
+            want_slide = 1;
+            b->peek = sl < 12.0f;
+          }
+          // CORNER-JUMP: closing on a tight belief, occasionally break the
+          // sightline vertically as the angle opens — the human peek-jump.
+          // Rate rides sk->tac; the cooldown keeps it an event, not a habit.
+          if (!b->sliding && b->grounded && b->jump_cd == 0 && sl > 2.5f &&
+              sl < 13.0f && b->belief_radius < 3.2f &&
+              rng_rangef(&g_rng_bot, 0.0f, 1.0f) < sk->tac * 0.022f) {
+            want_jump = 1;
+            b->peek = 1;
+            b->jump_cd = (int)rng_rangef(&g_rng_bot, 360.0f, 780.0f);
+          }
         }
       } else if (b->belief == BOT_BELIEF_SEARCH_SWEEP) {
         if (sl < 0.9f) {
@@ -10469,9 +10522,12 @@ static void bot_tick(int bi) {
   }
 
   // Trigger discipline: shots leave only once the (imperfect) aim has settled
-  // onto the target, after the reaction delay, in bursts with pauses.
-  int trigger = engaging && b->react_t == 0 && b->pause_t == 0 && !b->sliding &&
-                b->wp.switch_t == 0 &&
+  // onto the target, after the reaction delay, in bursts with pauses. A
+  // PRE-FIRE window (armed above, aimed at the belief point) goes through the
+  // same discipline — the only difference is what the settle is measured
+  // against, which want_yaw/want_pitch already carry in that state.
+  int trigger = (engaging || b->prefiring) && b->react_t == 0 &&
+                b->pause_t == 0 && !b->sliding && b->wp.switch_t == 0 &&
                 diff > -0.05f && diff < 0.05f && pdiff > -0.06f && pdiff < 0.06f;
   if (trigger && b->wp.cool[b->wp.cur] == 0 && b->wp.reload_t == 0 &&
       b->wp.ammo[b->wp.cur] > 0) {
@@ -16732,8 +16788,13 @@ static v3 fig_guard_clear(v3 p, float r) {
   }
   return p;
 }
+// `style`: 1 = trigger hand (aimed index, TWRAP thumb cut), 0 = support hand
+// closing a full C-wrap (magazine, bolt knob — anything gripped ACROSS), 2 =
+// the support HEEL grip: palm heel under the handguard, fingers wrapping the
+// far flank, THUMB POINTING FORWARD along the near-upper flank — the modern
+// C-clamp-family hold both weapons now share on the fore-end.
 static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
-                     int on_trigger, const v3 *trig_pt, v3 *out_palm_dir) {
+                     int style, const v3 *trig_pt, v3 *out_palm_dir) {
   ga = v3_norm(ga);
   v3 w = v3_sub(wrist, gc);
   float aw = v3_dot(w, ga);                     // where along the tube the hand is
@@ -17004,12 +17065,12 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
       // where it breaks out TO is the weapon's own published trigger contact
       // point, not a tuned sweep. See fig_trig_pt.
       float sweep = FSW[f], reach = 0.0f;
-      int aimed = on_trigger && f == 3 && trig_pt != NULL && !slid;
+      int aimed = style == 1 && f == 3 && trig_pt != NULL && !slid;
       // The whole hand squeezes, not just the index. Tiny — 3 degrees — but it
       // is three digits' worth of screen area moving together, where the index
       // alone measured 4-9 pixels of travel.
-      if (on_trigger && !aimed) sweep += TRIG_GRIP * g_gun_trig_s;
-      if (on_trigger && f == 3 && !aimed) { sweep = 1.42f; reach = 0.0125f; }
+      if (style == 1 && !aimed) sweep += TRIG_GRIP * g_gun_trig_s;
+      if (style == 1 && f == 3 && !aimed) { sweep = 1.42f; reach = 0.0125f; }
       fnode_t fg[5];
       // Node 0 sits BEHIND the knuckle row and inside the palm, so the root cap
       // is buried whatever the wrap angle; node 1 is the METACARPAL HEAD and is
@@ -17271,11 +17332,25 @@ static void fig_hand(v3 wrist, v3 gc, v3 ga, float gr, float side, v3 col,
     // three hundred times more of the trigger hand than the digit the press was
     // being animated on, so a squeeze that does not move it is a squeeze the
     // player cannot see.
-    const float TWRAP = (on_trigger ? 0.68f : 1.0f) *
-                        (1.0f + (on_trigger ? 0.06f * g_gun_trig_s : 0.0f));
-    v3 tb2 = hand_pt(gc, ga, e1, e2, 0.0455f, -side * 0.62f * TWRAP, gr + 0.0092f);
-    v3 tb3 = hand_pt(gc, ga, e1, e2, 0.0430f, -side * 1.28f * TWRAP, gr + 0.0079f);
-    v3 tb4 = hand_pt(gc, ga, e1, e2, 0.0395f, -side * 1.76f * TWRAP, gr + 0.0040f);
+    const float TWRAP = (style == 1 ? 0.68f : 1.0f) *
+                        (1.0f + (style == 1 ? 0.06f * g_gun_trig_s : 0.0f));
+    v3 tb2, tb3, tb4;
+    if (style == 2) {
+      // FORWARD THUMB. The heel grip trades the C's opposition cue for the
+      // drive-forward cue: phalanges at INCREASING axial stations along ga
+      // (little-finger -> index -> muzzle) at a nearly constant bearing on
+      // the near-upper flank, radius easing down so the pad RIDES the
+      // handguard surface (same HAND_BITE philosophy as the wrap). The
+      // bearing stays off the fingers' own arc so the two chains never run
+      // parallel on a shared flank (the z-fight class).
+      tb2 = hand_pt(gc, ga, e1, e2, 0.0500f, -side * 0.80f, gr + 0.0072f);
+      tb3 = hand_pt(gc, ga, e1, e2, 0.0770f, -side * 0.66f, gr + 0.0054f);
+      tb4 = hand_pt(gc, ga, e1, e2, 0.0990f, -side * 0.56f, gr + 0.0034f);
+    } else {
+      tb2 = hand_pt(gc, ga, e1, e2, 0.0455f, -side * 0.62f * TWRAP, gr + 0.0092f);
+      tb3 = hand_pt(gc, ga, e1, e2, 0.0430f, -side * 1.28f * TWRAP, gr + 0.0079f);
+      tb4 = hand_pt(gc, ga, e1, e2, 0.0395f, -side * 1.76f * TWRAP, gr + 0.0040f);
+    }
     fnode_t th[5] = {
       {tb0, col, col, 0.0119f, 0.0132f, 0, 0.86f},
       {tb1, col, col, 0.0134f, 0.0150f, 0, 0.92f},
@@ -17469,7 +17544,7 @@ static void fig_tube(v3 a, v3 b, float rox, float roz, float rix, float riz,
 
 // Sight line height above the gun origin — the ADS pose puts exactly this on
 // the camera axis, so the HUD dot/reticle lands in the aperture's center.
-#define VM_SIGHT_AR 0.075f
+#define VM_SIGHT_AR 0.062f
 #define VM_SIGHT_SR 0.085f
 
 // Where the trigger hand grips, in gun-local space: what a third-person figure
@@ -17773,7 +17848,13 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // ---- receiver group (flat-sided: boxes) ----
     mat_set(MAT_PARK_R, MAT_PARK_M);
     GBOX(0,  0.021f,  0.085f, 0.0155f, 0.0145f, 0.105f, upper);  // upper receiver
-    GBOX(0,  0.0375f, 0.075f, 0.0092f, 0.0032f, 0.135f, black);  // top rail
+    // Rail ends WITH the receiver: the old one cantilevered 40 mm rearward
+    // over the buffer tube with 8.4 mm of daylight beneath — side-on it read
+    // as a floating slab with a tooth. Flush is also the monolithic-upper
+    // look the rest of this remodel goes for.
+    // ...and its rear face 6 mm INSIDE the receiver's, never ON it: two
+    // same-facing coplanar rears were the exact z-fight vmcheck exists for.
+    GBOX(0,  0.0375f, 0.098f, 0.0092f, 0.0032f, 0.112f, black);  // top rail
     GBOX(0, -0.005f,  0.058f, 0.0145f, 0.0135f, 0.072f, body);   // lower receiver
     // Every small control is CENTRED on the face it sits on and at least 2.6 mm
     // thick, so both of its own side faces clear that face by more than the depth
@@ -17825,7 +17906,7 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
       // on the weapon in every first-person frame. Halved in every dimension: the
       // rail now reads as a rail instead of as the gun's defining feature, and it
       // still clears the depth buffer at arena range (2.4 mm proud, see below).
-      GBOX(0, 0.0415f, -0.026f + 0.021f * (float)r, 0.0104f, 0.0020f, 0.0042f, upper);
+      GBOX(0, 0.0415f, -0.005f + 0.021f * (float)r, 0.0104f, 0.0020f, 0.0042f, upper);
     GBOX(0.0145f, -0.004f, 0.040f, 0.0030f, 0.0044f, 0.0050f, black);  // bolt catch
     GBOX(-0.0145f, -0.006f, 0.078f, 0.0030f, 0.0038f, 0.0042f, black); // mag release
     GBOX(-0.0155f, 0.028f, 0.056f, 0.0030f, 0.0040f, 0.0060f, upper);  // forward assist
@@ -17850,6 +17931,10 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     }
     mat_set(MAT_PARK_R, MAT_PARK_M);
     GBOX(0, -0.020f, 0.108f, 0.0146f, 0.011f, 0.0292f, body);    // magwell
+    // Flared feed collar, proud of the well on every side — the aggressive
+    // competition-magwell silhouette, and a real thickness step (>2.6 mm
+    // through the well's top face) so nothing grazes.
+    GBOX(0, -0.0122f, 0.1085f, 0.0158f, 0.0041f, 0.0301f, black); // magwell flare
     // ---- stock group ----
     GCH(16, 1, 1, gz, {  // buffer tube, both ends capped and buried
       // -0.178, not -0.155: THE BUTT PAD WAS NOT ATTACHED TO THE RIFLE. The
@@ -17873,7 +17958,14 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // buried length. A butt is wider than the tube it caps anyway.
     GBOX(0,  0.010f, -0.183f, 0.0142f, 0.0265f, 0.011f, black);  // butt pad
     mat_set(MAT_POLY_R, 0.0f);
-    GBOX(0,  0.032f, -0.120f, 0.0092f, 0.0072f, 0.042f, body);   // cheek riser
+    // The tube is CLAD now: an angular polymer stock body swallows it from the
+    // butt pad to a short exposed neck at the receiver — bulky, futuristic,
+    // and it retires the bare-tube float class for good. The ridge on top is
+    // the cheek line, buried into the slab with differing cross-sections.
+    // (top at 0.0355, NOT 0.0365 — that is the butt pad's own top plane, and
+    // two same-facing tops sharing 4 mm of overlap was a measured z-fight)
+    GBOX(0,  0.0115f, -0.114f, 0.0130f, 0.0240f, 0.0620f, body); // stock body
+    GBOX(0,  0.0355f, -0.120f, 0.0095f, 0.0060f, 0.0480f, body); // cheek ridge
     // ---- grip, trigger, magazine ----
     mat_set(MAT_POLY_R, 0.0f);
     // A PISTOL GRIP HAS TO BE AS LONG AS THE HAND ON IT. This was 62 mm from
@@ -18089,14 +18181,15 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     mat_set(MAT_STEEL_R, MAT_STEEL_M);
     fig_tube(GUNP(-0.0130f, 0.0090f, 0.196f), GUNP(-0.0182f, 0.0090f, 0.196f),
              0.0068f * gg, 0.0068f * gg, 0.0040f * gg, 0.0040f * gg, 12, steel, gy);   // front sling loop
-    fig_tube(GUNP(-0.0100f, 0.0140f, -0.148f), GUNP(-0.0152f, 0.0140f, -0.148f),
-             0.0066f * gg, 0.0066f * gg, 0.0038f * gg, 0.0038f * gg, 12, steel, gy);   // rear sling loop
     mat_set(MAT_PARK_R, MAT_PARK_M);
-    GCH(16, 1, 1, gy, {  // muzzle brake with a wider crowned rim
-      GN(0, 0.0225f, 0.461f, 0.0084f, 0.0081f, black),
-      GN(0, 0.0225f, 0.482f, 0.0088f, 0.0085f, black),
-      GN(0, 0.0225f, 0.489f, 0.0070f, 0.0069f, upper),
+    GCH(16, 1, 1, gy, {  // muzzle brake: a heavier, blunter head on the barrel
+      GN(0, 0.0225f, 0.461f, 0.0104f, 0.0100f, black),
+      GN(0, 0.0225f, 0.482f, 0.0112f, 0.0108f, black),
+      GN(0, 0.0225f, 0.489f, 0.0086f, 0.0084f, upper),
     });
+    // Side ports, proud of the head — the detail that says COMPENSATOR.
+    GBOX( 0.0096f, 0.0225f, 0.474f, 0.0030f, 0.0026f, 0.0080f, black);
+    GBOX(-0.0096f, 0.0225f, 0.474f, 0.0030f, 0.0026f, 0.0080f, black);
     // ...and a real bore down the crown: a solid muzzle face is the one detail
     // the player looks straight at every time the gun comes up.
     fig_tube(GUNP(0, 0.0225f, 0.4855f), GUNP(0, 0.0225f, 0.4925f),
@@ -18140,9 +18233,15 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // and their tops still end 1.5 mm ABOVE the window's lower edge — in open
     // air inside the frame — rather than buried in a 1.6 mm wall where two faces
     // would be closer together than the depth buffer can resolve at 25 m.
+    // LOWERED 13 mm (VM_SIGHT_AR 0.075 -> 0.062): a dot belongs just above
+    // the bore, not on stilts. The posts shrink with it — 13.3 mm tall now —
+    // and every stated clearance of the three-piece mount is re-solved for
+    // the new height: bottoms buried 1 mm into the rail (whose teeth no
+    // longer reach this station), tops still 1.5 mm ABOVE the window's inner
+    // lower edge in open air, outer faces 1.07 mm inside the frame's wall.
     GBOX(0, 0.0424f, 0.1834f, 0.0136f, 0.0060f, 0.0100f, black);  // rail clamp
-    GBOX( 0.0148f, 0.0530f, 0.1834f, 0.0028f, 0.0130f, 0.0050f, black);  // R post
-    GBOX(-0.0148f, 0.0530f, 0.1834f, 0.0028f, 0.0130f, 0.0050f, black);  // L post
+    GBOX( 0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, black);  // R post
+    GBOX(-0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, black);  // L post
     // The window is 16:9 — 21.0 x 37.3 mm — and the frame around it is ONE ring:
     // 1.6 mm of wall, 3.4 mm deep, in bright steel. That is the whole sight.
     //
@@ -19373,7 +19472,7 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
       // i == 0 and never receives the blade, so no brace guard is needed here.)
       const v3 *tp = i == 1 ? &g_gun_trig_p : NULL;
       v3 pd;
-      fig_hand(P->wri[i], hc, ha, hr, s, kt->glove, i == 1, tp, &pd);
+      fig_hand(P->wri[i], hc, ha, hr, s, kt->glove, i == 1 ? 1 : 2, tp, &pd);
       // ...and the SAME forearm the viewmodel builds, off the same palm axis.
       // The wrist rotations are the viewmodel's business — there the arm is free
       // and the hold decides where it goes — while here the elbow is already
@@ -21068,9 +21167,11 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // the axis is raked. Trigger hand: back, down and a little right. Support
       // hand: down and left, which is the side the arm actually comes from and
       // therefore the side the palm's heel lands on.
+      // Support: nearly straight DOWN — the heel grip carries the weight
+      // under the handguard, not on its left flank.
       v3 br = h == 0
         ? v3_add(v3_scale(gx, 0.34f), v3_add(v3_scale(gy, 0.16f), v3_scale(gz, -0.92f)))
-        : v3_add(v3_scale(gx, -0.36f), v3_scale(gy, -0.93f));
+        : v3_add(v3_scale(gx, -0.20f), v3_scale(gy, -0.975f));
       // On the magazine the arm comes from the left and FORWARD instead of from
       // below, which is what turns the travel into a reach rather than a slide.
       if (h == 1 && mgv > 0.0f)
@@ -21142,9 +21243,12 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // A hand that has left the grip for the bolt is not on the trigger, and
       // routing its index at a blade 60 mm away would stretch the digit across
       // the receiver.
-      int ontrig = h == 0 && ga_.bhand < 0.35f;
+      // Trigger hand fires (1) unless it left for the bolt knob (0 = wrap);
+      // support hand holds the forward-thumb HEEL grip (2) on the fore-end
+      // and closes the full C (0) once it travels to the magazine.
+      int style = h == 0 ? (ga_.bhand < 0.35f ? 1 : 0) : (mgv > 0.5f ? 0 : 2);
       fig_hand(hd[h].wrist, hd[h].gc, hd[h].ga, hd[h].gr, hd[h].side, glove,
-               ontrig, ontrig ? &g_gun_trig_p : NULL, &pd);
+               style, style == 1 ? &g_gun_trig_p : NULL, &pd);
       g_vm_hdbg[h].palm_mm = g_fig_palm_mm;
       mat_set(MAT_CLOTH_R, 0.0f);
       // THE FOREARM'S DIRECTION IS DERIVED FROM THE PALM'S, and that is the
@@ -21177,7 +21281,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       bx = v3_dot(bx, bx) > 1e-8f ? v3_norm(bx) : v3_norm(v3_cross(pd, gx));
       v3 bn = v3_norm(v3_cross(pd, bx));            // out of the palm
       float ext = (h == 0 ? 18.0f : 12.0f) * DEG2RAD;
-      float dev = (h == 0 ? 15.0f : -12.0f) * DEG2RAD;
+      float dev = (h == 0 ? 15.0f : -6.0f) * DEG2RAD;
       v3 back = v3_rot_axis(v3_scale(pd, -1.0f), bx, hd[h].side * ext);
       back = v3_norm(v3_rot_axis(back, bn, hd[h].side * dev));
       // AND THEN LEAN IT BACK. Getting the wrist angle right left the support
@@ -21923,64 +22027,71 @@ static void render_frame(const player_t *p, float alpha, int fps,
       // commonest way to run out and the counter is the one element that can
       // say so BEFORE it happens.
       {
-        // Subtle by default: a slim, quiet cluster — the numeral carries it,
-        // the slab is barely there (modern minimal HUD discipline).
-        const float bw2 = 96, bh = 34;
-        float bx = g_ui_vw - 14 - bw2, by = g_ui_vh - 14 - bh;
-        ui_rrect_c(bx, by, bw2, bh, 0, C4(0, 0, 0, 0.34f), C4(0, 0, 0, 0.44f));
+        // Frameless esports cluster, right-anchored: weapon tag, numeral,
+        // magazine pips. Hard 1px shadows instead of any plate.
+        float rxe = g_ui_vw - 16;
+        float by = g_ui_vh - 34;
         int mag = WPN_DEF[p->wp.cur].mag, cur = p->wp.ammo[p->wp.cur];
         float a01 = f_clamp((float)cur / (0.25f * (float)mag), 0.0f, 1.0f);
         float cr = 0.941f + (1.000f - 0.941f) * (1 - a01);
         float cg = 0.957f + (0.294f - 0.957f) * (1 - a01);
         float cb2 = 0.973f + (0.227f - 0.973f) * (1 - a01);
-        ui_text_ex(p->wp.cur == WPN_SR ? "\x03" : "\x02", bx + 8, by + 2.5f,
-                   0.95f, TXT_REG, 0, C4(C_HAZE, 0.85f));
-        ui_text_ex(WPN_DEF[p->wp.cur].name, bx + 20, by + 4.5f, 0.65f, TXT_REG, 1.4f,
-                   C4(C_HAZE, 0.85f));
-        char am[16];
-        snprintf(am, sizeof am, "%d", cur);
-        char mg[16];
-        snprintf(mg, sizeof mg, "/%d", mag);
-        float mgw = ui_text_width(mg, 0.8f);
-        float amw = ui_text_width(am, 1.7f);
-        ui_text_ex(am, bx + bw2 - 8 - mgw - 2 - amw, by + 11, 1.7f, TXT_BOLD, 0,
-                   C4(cr, cg, cb2, 0.95f));
-        ui_text(mg, bx + bw2 - 8 - mgw, by + 18, 0.8f, C_HAZE, 0.9f);
-        float tx0 = bx + 8, tw = bw2 - 16, ty = by + bh - 7;
+        char wn2[16];
+        snprintf(wn2, sizeof wn2, "%s %s", p->wp.cur == WPN_SR ? "\x03" : "\x02",
+                 WPN_DEF[p->wp.cur].name);
         if (p->wp.reload_t > 0) {
-          // The magazine row becomes the reload progress capsule, and the
-          // label takes the eyebrow slot. Soft blink, not a hard strobe.
           int tot = p->wp.reload_tac ? WPN_DEF[p->wp.cur].reload_tac_ticks
                                      : WPN_DEF[p->wp.cur].reload_ticks;
           float pr = f_clamp(1.0f - (float)p->wp.reload_t / (float)(tot > 0 ? tot : 1),
                              0.0f, 1.0f);
           float bl = (p->wp.reload_t / 15) % 2 == 0 ? 1.0f : 0.55f;
-          ui_text_ex("RELOADING",
-                     bx + bw2 - 8 - ui_text_width_tr("RELOADING", 0.65f, 1.4f),
-                     by + 4.5f, 0.65f, TXT_REG, 1.4f, C4(C_BLAZE, bl));
-          ui_rect(tx0, ty, tw, 2, C_BONE, 0.10f);
-          ui_rect(tx0, ty, tw * pr, 2, C_BLAZE, 0.95f);
+          float rlw = ui_text_width_tr("RELOADING", 0.55f, 1.6f);
+          ui_text_ex("RELOADING", rxe - rlw + 0.6f, by + 2.4f, 0.55f, TXT_REG, 1.6f,
+                     C4(0.02f, 0.03f, 0.04f, 0.7f));
+          ui_text_ex("RELOADING", rxe - rlw, by + 1.8f, 0.55f, TXT_REG, 1.6f,
+                     C4(C_BLAZE, bl));
+          float ty = by + 13.5f, tw = 54, tx0 = rxe - tw;
+          ui_rect(tx0, ty + 0.8f, tw, 2, 0, 0, 0, 0.45f);
+          ui_rect(tx0, ty, tw, 2, C_BONE, 0.16f);
+          ui_rect(tx0, ty, tw * pr, 2, C_BLAZE, 0.9f);
         } else {
-          // Graduated in fives — a counted instrument strip, not a dashed line.
-          float gapp = mag > 12 ? 1.0f : 2.0f;
+          float wnw = ui_text_width_tr(wn2, 0.55f, 1.6f);
+          ui_text_ex(wn2, rxe - wnw + 0.6f, by + 2.4f, 0.55f, TXT_REG, 1.6f,
+                     C4(0.02f, 0.03f, 0.04f, 0.7f));
+          ui_text_ex(wn2, rxe - wnw, by + 1.8f, 0.55f, TXT_REG, 1.6f, C4(C_HAZE, 0.8f));
+          float ty = by + 13.5f, tw = 54, tx0 = rxe - tw;
+          float gapp = mag > 12 ? 0.8f : 1.6f;
           int groups = mag > 12 ? (mag - 1) / 5 : 0;
-          float sw = (tw - (float)(mag - 1) * gapp - (float)groups * 2.0f) / (float)mag;
+          float sw = (tw - (float)(mag - 1) * gapp - (float)groups * 1.6f) / (float)mag;
           float sx2 = tx0;
+          ui_rect(tx0, ty + 0.8f, tw, 1.8f, 0, 0, 0, 0.40f);
           for (int i = 0; i < mag; i++) {
-            if (i && mag > 12 && i % 5 == 0) sx2 += 2.0f;
-            if (i < cur) ui_rect(sx2, ty, sw, 2, cr, cg, cb2, 0.85f);
-            else         ui_rect(sx2, ty, sw, 2, C_BONE, 0.09f);
+            if (i && mag > 12 && i % 5 == 0) sx2 += 1.6f;
+            if (i < cur) ui_rect(sx2, ty, sw, 1.8f, cr, cg, cb2, 0.9f);
+            else         ui_rect(sx2, ty, sw, 1.8f, C_BONE, 0.14f);
             sx2 += sw + gapp;
           }
         }
+        char am[16];
+        snprintf(am, sizeof am, "%d", cur);
+        char mg[16];
+        snprintf(mg, sizeof mg, "/%d", mag);
+        float mgw = ui_text_width(mg, 0.75f);
+        float amw = ui_text_width(am, 1.5f);
+        float ax = rxe - 24 - mgw - 2 - amw;
+        ui_text_ex(am, ax + 0.8f, by + 0.8f, 1.5f, TXT_BOLD, 0, C4(0.02f, 0.03f, 0.04f, 0.75f));
+        ui_text_ex(am, ax, by, 1.5f, TXT_BOLD, 0, C4(cr, cg, cb2, 0.95f));
+        ui_text_ex(mg, rxe - 24 - mgw + 0.6f, by + 6.2f, 0.75f, TXT_REG, 0,
+                   C4(0.02f, 0.03f, 0.04f, 0.7f));
+        ui_text(mg, rxe - 24 - mgw, by + 5.6f, 0.75f, C_HAZE, 0.9f);
       }
       // Health, bottom-left: the mirror chip. The bar keeps a GHOST — the
       // chunk just lost trails behind for a beat (presentation state only,
       // smoothed on g_ui_dt), which is what makes damage READ as an amount.
       {
-        const float bw2 = 78, bh = 34, bx = 14;
-        float by = g_ui_vh - 14 - bh;
-        ui_rrect_c(bx, by, bw2, bh, 0, C4(0, 0, 0, 0.34f), C4(0, 0, 0, 0.44f));
+        // Frameless esports cluster: numeral + hairline bar, nothing else.
+        const float bx = 16, tw = 54;
+        float by = g_ui_vh - 34;
         float hp01 = f_clamp((float)p->hp / PLAYER_HP, 0.0f, 1.0f);
         static float ghost;
         if (hp01 >= ghost) ghost = hp01;
@@ -21989,16 +22100,20 @@ static void render_frame(const player_t *p, float alpha, int fps,
         float cr = 0.941f + (1.000f - 0.941f) * tt;
         float cg = 0.957f + (0.294f - 0.957f) * tt;
         float cb2 = 0.973f + (0.227f - 0.973f) * tt;
-        ui_text_ex("HP", bx + 8, by + 4.5f, 0.65f, TXT_REG, 1.4f, C4(C_HAZE, 0.85f));
         char hps[8];
         snprintf(hps, sizeof hps, "%d", p->hp);
         float pulse = p->hp <= 25 ? 0.72f + 0.28f * sinf(g_ui_time * 7.0f) : 0.95f;
-        ui_text_ex(hps, bx + 8, by + 11, 1.7f, TXT_BOLD, 0, C4(cr, cg, cb2, pulse));
-        float tx0 = bx + 8, tw = bw2 - 16, ty = by + bh - 7;
-        ui_rect(tx0, ty, tw, 2, C_BONE, 0.10f);
+        ui_text_ex("HP", bx + 1, by + 2.4f, 0.55f, TXT_REG, 1.6f, C4(0.02f, 0.03f, 0.04f, 0.7f));
+        ui_text_ex("HP", bx, by + 1.8f, 0.55f, TXT_REG, 1.6f, C4(C_HAZE, 0.8f));
+        float hx = bx + 12;
+        ui_text_ex(hps, hx + 0.8f, by + 0.8f, 1.5f, TXT_BOLD, 0, C4(0.02f, 0.03f, 0.04f, 0.75f));
+        ui_text_ex(hps, hx, by, 1.5f, TXT_BOLD, 0, C4(cr, cg, cb2, pulse));
+        float ty = by + 13.5f;
+        ui_rect(bx, ty + 0.8f, tw, 2, 0, 0, 0, 0.45f);
+        ui_rect(bx, ty, tw, 2, C_BONE, 0.16f);
         if (ghost > hp01)
-          ui_rect(tx0 + tw * hp01, ty, tw * (ghost - hp01), 2, C_BONE, 0.50f);
-        ui_rect(tx0, ty, tw * hp01, 2, cr, cg, cb2, 0.85f);
+          ui_rect(bx + tw * hp01, ty, tw * (ghost - hp01), 2, C_BONE, 0.55f);
+        ui_rect(bx, ty, tw * hp01, 2, cr, cg, cb2, 0.9f);
       }
       // Low-HP vignette: a breathing THREAT edge, gradient so it never
       // reads as a solid frame over the game.
@@ -22058,31 +22173,33 @@ static void render_frame(const player_t *p, float alpha, int fps,
       snprintf(msc, sizeof msc, "%d", me);
       snprintf(lsc, sizeof lsc, "%d", lead);
       float pk = g_score_pop > 0 ? (float)g_score_pop / SCORE_POP_TICKS : 0.0f;
-      float ms = 1.1f + 0.35f * pk * pk;
-      float mw = ui_text_width(msc, ms), lw = ui_text_width(lsc, 1.1f);
+      float ms = 1.0f + 0.3f * pk * pk;
+      float mw = ui_text_width(msc, ms), lw = ui_text_width(lsc, 1.0f);
       char ft[12];
       snprintf(ft, sizeof ft, "FT %d", g_cfg.sp_frag);
-      float ftw = ui_text_width_tr(ft, 0.6f, 0.8f);
-      const float sep = 9, pad = 10;
-      float cw = mw + sep + lw + pad + ftw + 8 + 2 * pad;
-      float chx = ccx - cw * 0.5f, chy = 6;
-      ui_rrect_c(chx, chy, cw, 18, 0, C4(0, 0, 0, 0.38f), C4(0, 0, 0, 0.46f));
+      const float sep = 8;
+      float cw = mw + sep + lw;
+      float chx = ccx - cw * 0.5f, chy = 8;
       int ahead = me >= lead && me > 0;
-      ui_text_ex(msc, chx + pad, chy + 4, ms, TXT_BOLD, 0,
+      float shd[4] = {0.02f, 0.03f, 0.04f, 0.75f};
+      ui_text_ex(msc, chx + 0.8f, chy + 0.8f, ms, TXT_BOLD, 0, shd);
+      ui_text_ex(msc, chx, chy, ms, TXT_BOLD, 0,
                  ahead ? C4(C_BLAZE, 0.95f) : C4(C_BONE, 0.95f));
-      ui_text_ex(":", chx + pad + mw + sep * 0.5f - 1.2f, chy + 4, 1.1f,
-                 TXT_REG, 0, C4(C_HAZE, 0.7f));
-      ui_text_ex(lsc, chx + pad + mw + sep, chy + 4, 1.1f, TXT_BOLD, 0,
+      ui_text_ex(":", chx + mw + sep * 0.5f - 1.2f + 0.6f, chy + 0.6f, 1.0f, TXT_REG, 0, shd);
+      ui_text_ex(":", chx + mw + sep * 0.5f - 1.2f, chy, 1.0f, TXT_REG, 0, C4(C_HAZE, 0.7f));
+      ui_text_ex(lsc, chx + mw + sep + 0.8f, chy + 0.8f, 1.0f, TXT_BOLD, 0, shd);
+      ui_text_ex(lsc, chx + mw + sep, chy, 1.0f, TXT_BOLD, 0,
                  lead > me ? C4(C_THREAT, 0.9f) : C4(C_HAZE, 0.95f));
-      // the match goal lives ON the instrument, not one TAB away
-      ui_text_ex(ft, chx + cw - pad - ftw, chy + 6.5f, 0.6f, TXT_REG, 0.8f,
-                 C4(C_HAZE, 0.7f));
+      ui_text_ex(ft, ccx + cw * 0.5f + 10 + 0.6f, chy + 2.6f, 0.55f, TXT_REG, 0.8f, shd);
+      ui_text_ex(ft, ccx + cw * 0.5f + 10, chy + 2.0f, 0.55f, TXT_REG, 0.8f, C4(C_HAZE, 0.7f));
       float lim = (float)g_cfg.sp_frag;
       if (lim > 0) {
         float p1 = f_clamp((float)me / lim, 0, 1), p2 = f_clamp((float)lead / lim, 0, 1);
-        ui_rect(chx + 3, chy + 15.5f, cw - 6, 1.5f, C_BONE, 0.10f);
-        ui_rect(chx + 3, chy + 15.5f, (cw - 6) * p2, 1.5f, C_THREAT, 0.75f);
-        ui_rect(chx + 3, chy + 15.5f, (cw - 6) * p1, 1.5f, C_BLAZE, 0.9f);
+        float bw3 = cw + 24, bx3 = ccx - bw3 * 0.5f, by3 = chy + 11.5f;
+        ui_rect(bx3, by3 + 0.7f, bw3, 1.4f, 0, 0, 0, 0.40f);
+        ui_rect(bx3, by3, bw3, 1.4f, C_BONE, 0.14f);
+        ui_rect(bx3, by3, bw3 * p2, 1.4f, C_THREAT, 0.7f);
+        ui_rect(bx3, by3, bw3 * p1, 1.4f, C_BLAZE, 0.85f);
       }
     }
     // ...and the multi-kill banner, under the crosshair rather than over it,
@@ -22118,30 +22235,32 @@ static void render_frame(const player_t *p, float alpha, int fps,
         int meK = g_feed[i].src == g_local_ent, meD = g_feed[i].dst == g_local_ent;
         int src_h = human_of_ent(g_feed[i].src) > 0;   // >0: a remote human
         int dst_h = human_of_ent(g_feed[i].dst) > 0;
-        float knw = ui_text_width(kn, 0.9f), vnw = ui_text_width(vn, 0.9f);
-        float chev = ui_text_width("\x01", 0.9f);
-        float hsw = g_feed[i].hs ? ui_text_width("\x04", 0.9f) + 3 : 0;
-        const float rowh = 11;
-        float rw = 7 + knw + 4 + chev + 3 + hsw + vnw + 7;
-        float rx0 = g_ui_vw - 8 - rw + slide;
-        if (meD)
-          ui_rrect_c(rx0, fy, rw, rowh, 1, C4(0.30f, 0.07f, 0.05f, 0.55f * fa),
-                     C4(0.20f, 0.04f, 0.03f, 0.60f * fa));
-        else
-          ui_rrect_c(rx0, fy, rw, rowh, 1, C4(0.024f, 0.031f, 0.043f, 0.48f * fa),
-                     C4(0.016f, 0.020f, 0.030f, 0.55f * fa));
-        if (meK) ui_rect(rx0, fy, 2, rowh, C_BLAZE, 0.9f * fa);
-        float tx = rx0 + 7, ty2 = fy + 2.5f;
-        if (meK)        ui_text(kn, tx, ty2, 0.9f, C_BLAZE, fa);
-        else if (src_h) ui_text(kn, tx, ty2, 0.9f, C_SIGNAL, fa);
-        else            ui_text(kn, tx, ty2, 0.9f, C_BONE, 0.92f * fa);
+        float knw = ui_text_width(kn, 0.85f), vnw = ui_text_width(vn, 0.85f);
+        float chev = ui_text_width("\x01", 0.85f);
+        float hsw = g_feed[i].hs ? ui_text_width("\x04", 0.85f) + 3 : 0;
+        const float rowh = 10;
+        // Pure text, right-anchored — no plate, so nothing changes width
+        // behind the names. A hard 1px shadow carries readability.
+        float rw = knw + 4 + chev + 3 + hsw + vnw;
+        float tx = g_ui_vw - 10 - rw + slide, ty2 = fy;
+        float sh[4] = {0.02f, 0.03f, 0.04f, 0.75f * fa};
+        ui_text_ex(kn, tx + 0.7f, ty2 + 0.7f, 0.85f, TXT_BOLD, 0, sh);
+        if (meK)        ui_textb(kn, tx, ty2, 0.85f, C_BLAZE, fa);
+        else if (src_h) ui_textb(kn, tx, ty2, 0.85f, C_SIGNAL, fa);
+        else            ui_textb(kn, tx, ty2, 0.85f, C_BONE, 0.92f * fa);
         tx += knw + 4;
-        ui_text("\x01", tx, ty2, 0.9f, C_HAZE, 0.85f * fa);
+        ui_text_ex("\x01", tx + 0.7f, ty2 + 0.7f, 0.85f, TXT_REG, 0, sh);
+        ui_text("\x01", tx, ty2, 0.85f, C_HAZE, 0.8f * fa);
         tx += chev + 3;
-        if (g_feed[i].hs) { ui_text("\x04", tx, ty2, 0.9f, C_THREAT, fa); tx += hsw; }
-        if (meD)        ui_text(vn, tx, ty2, 0.9f, C_THREAT, fa);
-        else if (dst_h) ui_text(vn, tx, ty2, 0.9f, C_SIGNAL, fa);
-        else            ui_text(vn, tx, ty2, 0.9f, C_HAZE, 0.95f * fa);
+        if (g_feed[i].hs) {
+          ui_text_ex("\x04", tx + 0.7f, ty2 + 0.7f, 0.85f, TXT_REG, 0, sh);
+          ui_text("\x04", tx, ty2, 0.85f, C_THREAT, fa);
+          tx += hsw;
+        }
+        ui_text_ex(vn, tx + 0.7f, ty2 + 0.7f, 0.85f, TXT_BOLD, 0, sh);
+        if (meD)        ui_textb(vn, tx, ty2, 0.85f, C_THREAT, fa);
+        else if (dst_h) ui_textb(vn, tx, ty2, 0.85f, C_SIGNAL, fa);
+        else            ui_textb(vn, tx, ty2, 0.85f, C_HAZE, 0.95f * fa);
         fy += rowh + 2;
       }
     }
@@ -24637,6 +24756,10 @@ static void botmemory_proof(void) {
 
   g_num_solids = 1;
   g_solids[0] = (solid_t){.min = {{-2,0,-5}}, .max = {{2,3,-4}}, .pen = 0};
+  // hidden_fire once meant "fired at a remembered position at all" — the
+  // PRE-FIRE tactic makes exactly that a designed behaviour. The invariant
+  // that survives is DISCIPLINE: a hidden shot may leave only inside an armed
+  // pre-fire window (b->prefiring), never as free blind fire. Expected 0.
   int hidden_fire = 0;
   int hidden_retained = 1;
   int old_shots = g_match.shots[1];
@@ -24652,7 +24775,8 @@ static void botmemory_proof(void) {
   g_players[0].pos = (v3){{12, 0, -8}};
   g_solids[1] = (solid_t){.min = {{10,0,-10}}, .max = {{14,3,-6}}, .pen = 0};
   g_num_solids = 2;
-  if (g_match.shots[1] != old_shots) hidden_fire = 1;
+  if (g_match.shots[1] != old_shots && !g_bots[0].prefiring) hidden_fire = 1;
+  old_shots = g_match.shots[1];
   g_match.nbots = 2;
   g_bots[1] = (bot_t){.pos = {{5,0,-8}}, .hp = PLAYER_HP, .alive = 1,
                        .active = 1, .grounded = 1, .eye = EYE_STAND};
@@ -24663,7 +24787,8 @@ static void botmemory_proof(void) {
     bot_tick(0);
     if (g_bots[0].tgt != 0) visible_decoy_held = 0;
     if (g_bots[0].tgt != 0 || g_bots[0].lose_t <= 0) hidden_retained = 0;
-    if (g_match.shots[1] != old_shots) hidden_fire = 1;
+    if (g_match.shots[1] != old_shots && !g_bots[0].prefiring) hidden_fire = 1;
+    old_shots = g_match.shots[1];
   }
   int after_60 = g_bots[0].tgt == 0 &&
                  (g_bots[0].belief == BOT_BELIEF_INVESTIGATE ||
@@ -24678,7 +24803,8 @@ static void botmemory_proof(void) {
     g_tick++;
     bot_tick(0);
     if (g_bots[0].tgt != 0 || g_bots[0].lose_t <= 0) hidden_retained = 0;
-    if (g_match.shots[1] != old_shots) hidden_fire = 1;
+    if (g_match.shots[1] != old_shots && !g_bots[0].prefiring) hidden_fire = 1;
+    old_shots = g_match.shots[1];
   }
   int after_300 = g_bots[0].tgt == 0 &&
                   (g_bots[0].belief == BOT_BELIEF_INVESTIGATE ||
@@ -26957,6 +27083,8 @@ static void run_script(char *script, sim_ctx_t *s) {
       long slides = 0, jumps = 0, cr_ticks = 0, sl_ticks = 0, preaim = 0, tot = 0;
       long cov_ticks = 0, hold_ticks = 0, investigate_ticks = 0, search_ticks = 0;
       long visible_ticks = 0, memory_ticks = 0, reacquired = 0, search_anchors = 0;
+      long prefires = 0, prefire_ticks = 0, peeks = 0;
+      int was_pf[MAX_BOTS] = {0};
       int was_sl[MAX_BOTS] = {0}, was_air[MAX_BOTS] = {0};
       int was_memory[MAX_BOTS] = {0}, was_searching[MAX_BOTS] = {0};
       int was_search_index[MAX_BOTS] = {0};
@@ -26990,6 +27118,10 @@ static void run_script(char *script, sim_ctx_t *s) {
           if (bt->sliding && !was_sl[b]) slides++;
           if (!bt->grounded && was_air[b] == 0 && bt->vel.y > 1.0f) jumps++;
           if (bt->tgt >= 0 && bt->lose_t > 0) preaim++;
+          if (bt->prefiring) prefire_ticks++;
+          if (bt->prefiring && !was_pf[b]) prefires++;
+          was_pf[b] = bt->prefiring;
+          if (bt->peek) peeks++;
           if (bt->in_cover) cov_ticks++;
           int memory = bt->tgt >= 0 && bt->belief != BOT_BELIEF_VISIBLE;
           int searching = bt->tgt >= 0 &&
@@ -27021,7 +27153,8 @@ static void run_script(char *script, sim_ctx_t *s) {
              "crouch_pct=%.1f preaim_pct=%.1f cover_pct=%.1f hold=%ld "
              "investigate=%ld search=%ld visible=%ld reacquisition=%ld "
              "memory_pct=%.1f investigate_pct=%.1f search_pct=%.1f "
-             "reacquired=%ld searchanchors=%ld\n", n, tot, slides,
+             "reacquired=%ld searchanchors=%ld prefires=%ld prefire_pct=%.1f "
+             "peeks=%ld\n", n, tot, slides,
              tot ? 100.0 * (double)sl_ticks / (double)tot : 0.0, jumps,
              tot ? 100.0 * (double)cr_ticks / (double)tot : 0.0,
              tot ? 100.0 * (double)preaim / (double)tot : 0.0,
@@ -27030,7 +27163,8 @@ static void run_script(char *script, sim_ctx_t *s) {
              reacquired, tot ? 100.0 * (double)memory_ticks / (double)tot : 0.0,
              tot ? 100.0 * (double)investigate_ticks / (double)tot : 0.0,
              tot ? 100.0 * (double)search_ticks / (double)tot : 0.0,
-             reacquired, search_anchors);
+             reacquired, search_anchors, prefires,
+             tot ? 100.0 * (double)prefire_ticks / (double)tot : 0.0, peeks);
     } else if (!strcmp(t, "figv")) {
       g_fchk_v = !g_fchk_v;  // locate every offending triangle, not just count
     } else if (!strcmp(t, "figcheck")) {

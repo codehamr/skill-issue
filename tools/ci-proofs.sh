@@ -54,7 +54,11 @@ done
 # near is config-conditioned; fresh defaults give 14/14/26/21 (§10.1). A change
 # here is a geometry regression OR a config that leaked in — investigate, don't
 # just bump. It lives ONCE, here, the only reader.
-WANT_NEAR="14 14 26 21"
+# Re-baselined 2026-08-10 after the AR remodel (clad stock, low sight mount,
+# magwell flare, forward-thumb heel grip): +3 advisory-tier grazes per tier,
+# all by construction (tube buried in the stock slab, low mount in the 1.6 mm
+# window wall band). zfight stays 0 on every tier.
+WANT_NEAR="17 17 29 24"
 [ "$NEAR" = "$WANT_NEAR" ] || { say "GATE near '$NEAR' != baseline '$WANT_NEAR'"; fail=1; }
 
 # parity: no MISMATCH in the shared-code rows
