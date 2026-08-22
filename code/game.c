@@ -17878,6 +17878,18 @@ static void ui_home(int click, float cx, float cy) {
   // say PAUSED while the world runs. The boot screen shows nothing: nothing is
   // paused there, the camera is live, and a chip saying so would be a label on
   // a screen that has no state to report.
+  // IT GOES UNDER THE HAIRLINE, NOT IN THE WORDMARK'S OWN BOX. Right-aligned to
+  // the rail at y 32 it was drawn ON TOP of the title: the plate spanned
+  // x 179.3-242 by y 32-47, and the wordmark spans x 34-246.7 by y 30-51.7 (cap
+  // height is scale * 7, so 3.1 is 21.7 units tall) — the chip covered the last
+  // letters of ISSUE. Two things decide where it goes instead. The band between
+  // the rule and the tiles is EMPTY by construction, because the tile block is
+  // bottom-anchored at vh * 0.80 and grows upward (y 59.2 to ~127 at vh 360, and
+  // more on a taller viewport, never less). And it is LEFT-aligned, because the
+  // rail's right edge is not an axis anything else on this screen uses — the
+  // wordmark overruns HOME_RAIL_W by 4.7 units — while its left edge carries the
+  // wordmark, the rule and every tile. The plate's edge lands on rx and the type
+  // keeps the 8-unit inset it had.
   int chip = 1;
 #ifndef _WIN32
   chip = !g_headless;   // a proof shot carries no label at all
@@ -17886,9 +17898,8 @@ static void ui_home(int click, float cx, float cy) {
     const char *cl = session_pauses() ? "PAUSED" : g_online ? "LIVE" : NULL;
     if (cl) {
       float clw = ui_text_width_tr(cl, 0.85f, 1.8f);
-      float ccx2 = rx + rw - clw - 12;
-      ui_rect(ccx2 - 8, 32, clw + 16, 15, 0.02f, 0.03f, 0.04f, 0.55f);
-      ui_text_ex(cl, ccx2, 36, 0.85f, TXT_BOLD, 1.8f,
+      ui_rect(rx, 65, clw + 16, 15, 0.02f, 0.03f, 0.04f, 0.55f);
+      ui_text_ex(cl, rx + 8, 69, 0.85f, TXT_BOLD, 1.8f,
                  C4(C_BONE, session_pauses() ? 0.85f : 1.0f));
     }
   }
