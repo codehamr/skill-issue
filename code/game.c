@@ -17004,6 +17004,17 @@ static int   g_ui_drag;          // active slider, 0 = none
 // consumes them in its preamble. Focus is a row index in LAYOUT order — every
 // interactive row registers itself once per frame via ui_focus_row, so the
 // index is stable exactly as long as the layout is, and a page change resets it.
+//
+// THE INDEX IS THE IDENTITY; THE MOVE IS GEOMETRIC. Stepping the index by one
+// is only navigation while the layout is one column, and the entry screen is
+// not: LEAVE|MATCH and SETTINGS|CONTROLS sit side by side, so ±1 walked them in
+// a snake and left/right — a direction the player is already holding — reached
+// nothing at all. Every row hands ui_focus_row its rect anyway, so the step is
+// a nearest-rect-in-that-direction search over the rects of the LAST frame (the
+// search runs in the preamble, before this frame's layout, which is the same
+// place g_ui_nfocus_last is read for). The alternative is a per-page table of
+// neighbours, i.e. a second copy of the layout, and it drifts the first time a
+// row moves.
 enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK, NAV_BACK, NAV_TABL, NAV_TABR };
 static int g_nav_q[16], g_nav_n;
 static int g_nav_kbd;   // last nav event came from the keyboard: the page hint
@@ -17017,6 +17028,105 @@ static int g_ui_nfocus_last;   // ...and last frame (wrap-around runs pre-layout
 static float g_focus_sx, g_focus_sy, g_focus_sw, g_focus_sh;  // ring glide state
 static int g_ui_pad_mode;      // last menu input was the pad: focus ring, no cursor
 static int g_nav_act = -1;     // OK/LEFT/RIGHT pending for the focused row
+
+// One row's geometry as the move sees it. `lr` is the one thing a rect cannot
+// say: whether this row SPENDS left/right on its own value (a slider, a cycle,
+// a segmented selector) or leaves it to the navigation (a tile, a button, a
+// bind pill). Nothing in this menu is both value-bearing and side-by-side, so
+// the two readings of that axis never compete over the same row.
+#define UI_MAX_FOCUS 64   // the longest page is 18 rows; a row past this keeps
+                          // its focus id and simply contributes no geometry
+typedef struct { float x, y, w, h; int lr; } focus_rect_t;
+static focus_rect_t g_focus_r[UI_MAX_FOCUS];
+static int g_focus_rn;        // rects recorded LAST frame (the move is pre-layout)
+static float g_nav_ax = -1e9f, g_nav_ay;   // the VIRTUAL CURSOR: a vertical move
+                                           // keeps the x it was given and a
+                                           // horizontal one keeps the y, so
+                                           // walking down a two-column screen
+                                           // and back up returns to the column
+                                           // you left instead of to whichever
+                                           // centre happens to be nearer.
+                                           // < -1e8 = unset, adopt the row's own
+static void nav_anchor_reset(void) { g_nav_ax = -1e9f; }
+
+// Distance from `p` to the interval [lo, hi], 0 inside it. The perpendicular
+// term of the score is an INTERVAL distance and not a centre distance because a
+// full-width row CONTAINS the anchor: scored by centres, PLAY and QUIT would be
+// penalised for being wide, which is the opposite of what their width means.
+static float nav_gap(float p, float lo, float hi) {
+  return p < lo ? lo - p : p > hi ? p - hi : 0.0f;
+}
+
+// Step the focus one row in `dir` (NAV_UP..NAV_RIGHT). Two tiers, and the
+// second one is VERTICAL ONLY on purpose:
+//   1. rows that overlap the current row on the perpendicular axis — the
+//      aligned case, which is every page in this menu;
+//   2. for up/down, the nearest row weighted by how far off-axis it is, so a
+//      future staggered layout can never strand a row out of reach.
+// A sideways step gets no such fallback: no overlap means nothing is beside the
+// row, and a weighted LEFT would then fly across the screen into another row's
+// business — reaching that row is what up/down is for. When up/down finds
+// nothing it WRAPS to the far end, which is what the ±1 index did.
+static void nav_move(int dir) {
+  int n = g_focus_rn;
+  if (n <= 0) return;
+  if (g_ui_focus < 0 || g_ui_focus >= n) { g_ui_focus = 0; return; }
+  int vert = dir == NAV_UP || dir == NAV_DOWN;
+  float sgn = (dir == NAV_DOWN || dir == NAV_RIGHT) ? 1.0f : -1.0f;
+  const focus_rect_t *c = &g_focus_r[g_ui_focus];
+  if (g_nav_ax < -1e8f) {
+    g_nav_ax = c->x + c->w * 0.5f;
+    g_nav_ay = c->y + c->h * 0.5f;
+  }
+  float anch = vert ? g_nav_ax : g_nav_ay;
+  float cmid = vert ? c->y + c->h * 0.5f : c->x + c->w * 0.5f;
+  float clo  = vert ? c->x : c->y, cex = vert ? c->w : c->h;
+  int best = -1, alt = -1;
+  float bs = 0, bp = 0, as = 0;
+  for (int i = 0; i < n; i++) {
+    if (i == g_ui_focus) continue;
+    const focus_rect_t *r = &g_focus_r[i];
+    float rmid = vert ? r->y + r->h * 0.5f : r->x + r->w * 0.5f;
+    float along = (rmid - cmid) * sgn;
+    // Half a UI unit of slack is what makes a PAIR a pair: two tiles sharing a
+    // y are neither above nor below one another, so a vertical step skips both
+    // of its own siblings instead of picking the nearer half by rounding.
+    if (along <= 0.5f) continue;
+    float rlo = vert ? r->x : r->y, rex = vert ? r->w : r->h;
+    float gap = nav_gap(anch, rlo, rlo + rex);
+    if (rlo < clo + cex && clo < rlo + rex) {
+      if (best < 0 || along < bs - 0.5f ||
+          (along < bs + 0.5f && gap < bp)) { best = i; bs = along; bp = gap; }
+    } else if (vert) {
+      float sc = along + 2.0f * gap;
+      if (alt < 0 || sc < as) { alt = i; as = sc; }
+    }
+  }
+  if (best < 0) best = alt;
+  if (best < 0 && vert) {
+    float ext = 0;
+    for (int i = 0; i < n; i++) {
+      const focus_rect_t *r = &g_focus_r[i];
+      float end = (r->y + r->h * 0.5f) * -sgn;   // `far` is a MACRO in windef.h
+      float gap = nav_gap(anch, r->x, r->x + r->w);
+      if (best < 0 || end > ext + 0.5f ||
+          (end > ext - 0.5f && gap < bp)) { best = i; ext = end; bp = gap; }
+    }
+  }
+  if (best < 0) return;
+  const focus_rect_t *r = &g_focus_r[best];
+  g_ui_focus = best;
+  if (vert) g_nav_ay = r->y + r->h * 0.5f;   // the other axis is CARRIED
+  else      g_nav_ax = r->x + r->w * 0.5f;
+}
+
+// Does the focused row spend left/right on its own value? An empty table (the
+// first frame of a page) answers yes, which is the pre-geometry behaviour: park
+// the event for whichever row is about to claim focus id 0.
+static int nav_focus_lr(void) {
+  if (g_focus_rn <= 0) return 1;
+  return g_ui_focus >= 0 && g_ui_focus < g_focus_rn && g_focus_r[g_ui_focus].lr;
+}
 
 typedef enum { UI_PAGE_ROOT, UI_PAGE_MATCH, UI_PAGE_SETTINGS,
                UI_PAGE_CONTROLS, UI_PAGE_DEV, UI_PAGE_COUNT } ui_page_t;
@@ -17076,6 +17186,7 @@ static void ui_route(ui_page_t page) {
   g_ui_page = page;
   g_ui_tab = (int)page;
   g_ui_focus = 0;
+  nav_anchor_reset();   // the carried column belongs to the page that set it
   g_ui_quit_arm = 0;
   g_ui_upd_arm = 0;
   g_focus_sw = 0;   // the focus ring snaps to its new page, no cross-page glide
@@ -17168,10 +17279,14 @@ enum { DRAG_SENSE = 1, DRAG_FOV, DRAG_CAP, DRAG_VOL, DRAG_BOTS, DRAG_FRAG,
 
 // Register one interactive row (layout order) and draw the focus ring when the
 // pad drives the menu. Returns whether this row has focus — the row then also
-// answers ui_nav_take for the OK/LEFT/RIGHT event of the frame.
-static int ui_focus_row(float x, float y, float w, float h) {
+// answers ui_nav_take for the OK/LEFT/RIGHT event of the frame. `lr` says
+// whether this row's own value eats left/right; the rect is what NEXT frame's
+// nav_move navigates over, which is why it is recorded even with the pad
+// nowhere near the menu — the FIRST pad event must already have geometry.
+static int ui_focus_row(float x, float y, float w, float h, int lr) {
   int fid = g_ui_nfocus++;
   int foc = fid == g_ui_focus;
+  if (fid < UI_MAX_FOCUS) g_focus_r[fid] = (focus_rect_t){x, y, w, h, lr};
   if (foc && g_ui_pad_mode) {
     // The ring GLIDES: its rect is smoothed toward the focused row on the
     // presentation clock (fixed-step in the harness), which is what makes pad
@@ -17241,7 +17356,7 @@ static float ui_slider(int id, float x, float y, float w, float v,
 // the pill is sized to the longest option so nothing ever overflows it.
 static int ui_cycle(const char *label, const char *const *opts, int n, int *idx,
                     float px, float pw, float y, int click, float cx, float cy) {
-  int foc = ui_focus_row(px + 10, y - 1, pw - 20, 15);
+  int foc = ui_focus_row(px + 10, y - 1, pw - 20, 15, 1);
   int chg = 0;
   if (ui_nav_take(foc, NAV_LEFT)) { *idx = (*idx + n - 1) % n; chg = 1; }
   if (ui_nav_take(foc, NAV_RIGHT) || ui_nav_take(foc, NAV_OK)) {
@@ -17293,7 +17408,7 @@ static int ui_toggle(const char *label, int *val, float px, float pw, float y,
 static int ui_pill(const char *label, const char *tok, float px, float pw,
                    float y, int active, float minw, int click,
                    float cx, float cy) {
-  int foc = ui_focus_row(px + 10, y - 1, pw - 20, 15);
+  int foc = ui_focus_row(px + 10, y - 1, pw - 20, 15, 0);
   ui_text(label, px + 16, y + 3, 1, C_TEXT, 1);
   float bw = ui_text_width(tok, 1) + 12;
   if (bw < minw) bw = minw;
@@ -17319,7 +17434,7 @@ static int ui_pill(const char *label, const char *tok, float px, float pw,
 // "this will happen if you press"; danger keeps THREAT.
 static int ui_button(const char *label, float x, float y, float w, float h,
                      int click, float cx, float cy, int danger) {
-  int foc = ui_focus_row(x, y, w, h);
+  int foc = ui_focus_row(x, y, w, h, 0);
   int hot = cx >= x && cx <= x + w && cy >= y && cy <= y + h;
   float ty = y + (h - 7) * 0.5f;
   if (hot) {
@@ -17360,7 +17475,7 @@ static void ui_section(const char *title, float px, float pw, float y) {
 static float ui_param_row(const param_def_t *d, float *val, int drag_id,
                           float px, float y, int click, float cx, float cy) {
   char buf[16];
-  int foc = ui_focus_row(px + 10, y - 1, 320, 15);
+  int foc = ui_focus_row(px + 10, y - 1, 320, 15, 1);
   int touched = 0;
   if (ui_nav_take(foc, NAV_LEFT))  { *val = f_clamp(*val - d->step, d->lo, d->hi); touched = 1; }
   if (ui_nav_take(foc, NAV_RIGHT)) { *val = f_clamp(*val + d->step, d->lo, d->hi); touched = 1; }
@@ -17404,7 +17519,7 @@ static float ui_pad_row(int i, float px, float y, int click, float cx, float cy)
 // twice more.
 static void ui_subsel(const char *const *opts, int n, int *idx, float px,
                       float pw, float y, int click, float cx, float cy) {
-  int foc = ui_focus_row(px + 10, y - 1, pw - 20, 15);
+  int foc = ui_focus_row(px + 10, y - 1, pw - 20, 15, 1);
   if (ui_nav_take(foc, NAV_LEFT)) *idx = (*idx + n - 1) % n;
   if (ui_nav_take(foc, NAV_RIGHT) || ui_nav_take(foc, NAV_OK))
     *idx = (*idx + 1) % n;
@@ -17474,7 +17589,7 @@ static float home_dip(void);
 static int ui_tile(const char *label, const char *sub, float x, float y,
                    float w, float h, float ls, int click, float cx, float cy,
                    int danger) {
-  int foc = ui_focus_row(x, y, w, h);
+  int foc = ui_focus_row(x, y, w, h, 0);
   int hot = (cx >= x && cx <= x + w && cy >= y && cy <= y + h) ||
             (foc && g_ui_pad_mode);
   // STATE BY VALUE, ON ONE GEOMETRY. Two rules, and the second is the one that
@@ -17745,13 +17860,16 @@ static void ui_menu(void) {
     } else if (g_ui_rebind >= 0) {
       if (ev == NAV_BACK) g_ui_rebind = -1;
     } else switch (ev) {
-      case NAV_UP:
-        if (g_ui_nfocus_last > 0)
-          g_ui_focus = (g_ui_focus + g_ui_nfocus_last - 1) % g_ui_nfocus_last;
-        g_ui_quit_arm = 0; g_ui_upd_arm = 0;
-        break;
-      case NAV_DOWN:
-        if (g_ui_nfocus_last > 0) g_ui_focus = (g_ui_focus + 1) % g_ui_nfocus_last;
+      // All four directions through ONE mover: up/down and left/right differ in
+      // the axis they search, not in what they mean. LEFT/RIGHT still belongs
+      // to the focused row's VALUE first — a slider that could be left
+      // sideways is a slider the pad cannot set — so it navigates only on a row
+      // that does not spend it.
+      case NAV_LEFT: case NAV_RIGHT:
+        if (nav_focus_lr()) { g_nav_act = ev; break; }
+        [[fallthrough]];
+      case NAV_UP: case NAV_DOWN:
+        nav_move(ev);
         g_ui_quit_arm = 0; g_ui_upd_arm = 0;
         break;
       // LB/RB and PgUp/PgDn no longer cycle hidden global tabs. Visible local
@@ -17925,7 +18043,7 @@ static void ui_menu(void) {
 
   // FPS cap: 30..500 in steps of 10; the right end of the track means OFF.
   // Not a param row (the OFF sentinel), so it registers its focus row itself.
-  int capfoc = ui_focus_row(px + 10, y - 1, 320, 15);
+  int capfoc = ui_focus_row(px + 10, y - 1, 320, 15, 1);
   ui_text("FPS CAP", px + 16, y + 3, 1, C_TEXT, 1);
   float cap = g_cfg.fps_cap ? (float)g_cfg.fps_cap : 510.0f;
   // A preserved out-of-range value (fps_cap 700 parses fine) enters the
@@ -18304,7 +18422,11 @@ static void ui_menu(void) {
   // The frame's focus-row census: wrap-around in next frame's preamble uses
   // it, and a page/selector switch that shrank the list must not leave focus dangling.
   g_ui_nfocus_last = g_ui_nfocus;
-  if (g_ui_focus >= g_ui_nfocus) g_ui_focus = g_ui_nfocus > 0 ? g_ui_nfocus - 1 : 0;
+  g_focus_rn = g_ui_nfocus < UI_MAX_FOCUS ? g_ui_nfocus : UI_MAX_FOCUS;
+  if (g_ui_focus >= g_ui_nfocus) {
+    g_ui_focus = g_ui_nfocus > 0 ? g_ui_nfocus - 1 : 0;
+    nav_anchor_reset();   // a shrunk list moved the focus, not the player
+  }
   g_nav_act = -1;
 }
 
@@ -28571,10 +28693,17 @@ static void pad_sync(float dt) {
     // held across a menu close navigates the reopened menu while every other
     // eaten button correctly stays dead. The stick is deliberately not eaten —
     // it is a level device with no swallow state.
-    pad_nav_dir(0, (g_pad.btn[PB_UP]    && !g_pad_eat[PB_UP])    || sy >  0.5f, dt, NAV_UP);
-    pad_nav_dir(1, (g_pad.btn[PB_DOWN]  && !g_pad_eat[PB_DOWN])  || sy < -0.5f, dt, NAV_DOWN);
-    pad_nav_dir(2, (g_pad.btn[PB_LEFT]  && !g_pad_eat[PB_LEFT])  || sx < -0.5f, dt, NAV_LEFT);
-    pad_nav_dir(3, (g_pad.btn[PB_RIGHT] && !g_pad_eat[PB_RIGHT]) || sx >  0.5f, dt, NAV_RIGHT);
+    // THE STICK MOVES ON ITS DOMINANT AXIS, the dpad on both. Now that
+    // left/right navigates, a thumb shoved diagonally would otherwise step
+    // TWICE from one push — down and across — landing two rows from the one the
+    // player was looking at. A hat has four discrete switches and a deliberate
+    // diagonal, so it keeps both; a stick's diagonal is a miss. Vertical wins
+    // the exact tie (>= against >), so the split is total.
+    float ah = fabsf(sx), av = fabsf(sy);
+    pad_nav_dir(0, (g_pad.btn[PB_UP]    && !g_pad_eat[PB_UP])    || (sy >  0.5f && av >= ah), dt, NAV_UP);
+    pad_nav_dir(1, (g_pad.btn[PB_DOWN]  && !g_pad_eat[PB_DOWN])  || (sy < -0.5f && av >= ah), dt, NAV_DOWN);
+    pad_nav_dir(2, (g_pad.btn[PB_LEFT]  && !g_pad_eat[PB_LEFT])  || (sx < -0.5f && ah >  av), dt, NAV_LEFT);
+    pad_nav_dir(3, (g_pad.btn[PB_RIGHT] && !g_pad_eat[PB_RIGHT]) || (sx >  0.5f && ah >  av), dt, NAV_RIGHT);
   } else {
     for (int i = 0; i < 4; i++) g_pad_nav_t[i] = g_pad_nav_hold[i] = 0;
   }
