@@ -1,0 +1,101 @@
+# Release on every push to main (design §14), lean version. ONE build job
+# proves both binaries, one release job publishes. The release job does not
+# EXIST while the build is red (`needs:`), so "tag first, test later, updaters
+# stuck on a bad build" cannot happen. Exactly ONE release exists at any time:
+# the tag "latest", deleted and recreated every push — no history. The updater
+# only ever fetches releases/latest/download/, so the tag NAME is nothing to
+# it; it orders builds by the DATE still written into VERSION and SHA256SUMS'
+# "# version" header. Rollback is therefore client-side only (each client keeps
+# its own exe.old, §15.4) — no prior release is kept to fall back to. Two
+# assets, deliberately: linux-amd64 (desktop + SteamOS) and windows-amd64 (also
+# covers Windows-on-ARM via its built-in x64 emulation). linux-arm64 was
+# dropped 2026-08-08 — no player target, and the aarch64 devcontainer builds
+# "dev", which never auto-updates anyway.
+name: Release
+on:
+  push:
+    branches: [main]
+
+# TCB note (§15.7): actions and the container image run with the release token.
+# Pin actions to SHAs and the image to a digest once the repo is public.
+# contents: read, not {} — an empty set strips even read, and checkout on a
+# private repo then 404s ("repository not found"). The release job alone
+# raises itself to contents: write.
+permissions: { contents: read }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # debian:trixie-slim is the devcontainer's image and the only mainstream
+    # one where BOTH compilers accept -std=c23 (gcc 12 AND 13 reject it;
+    # ubuntu-latest ships gcc 13). Without it the first build fails.
+    container: debian:trixie-slim
+    steps:
+      # Before checkout: actions/checkout needs git in the container.
+      # build-essential (not "gcc make"): libc6-dev is only a RECOMMENDS.
+      # The mingw METApackage, not -win32: the plain
+      # x86_64-w64-mingw32-gcc name is an update-alternatives symlink.
+      - name: Toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential git ca-certificates \
+            libegl-dev libgl-dev libx11-dev \
+            libgl1-mesa-dri libglx-mesa0 libegl1 libgl1 libx11-6 \
+            gcc-mingw-w64-x86-64
+      - uses: actions/checkout@v7
+
+      # BUILD_VERSION/BUILD_COMMIT MUST be passed: without them every binary is
+      # a "dev" build (§13.3) and never updates.
+      - name: Build
+        run: |
+          V=$(date -u +%Y-%m-%d); C=$(echo ${{ github.sha }} | cut -c1-7)
+          make all BUILD_VERSION="$V" BUILD_COMMIT="$C"
+          # game-x86_64, NOT game: the two are the same compile on an x86_64
+          # runner, but only the x86_64 target is guaranteed to be one — and
+          # an asset called linux-amd64 that is not amd64 fails on the player's
+          # machine with an exec format error, which is the failure the deploy
+          # guard exists for and which CI has no equivalent of.
+          mv build/game-x86_64 skill-issue-linux-amd64
+          mv build/game.exe    skill-issue-windows-amd64.exe
+
+      # Warning gate WITHOUT LTO (-flto swallows -Wformat-truncation, §14.2),
+      # then the self-contained proof gate. The build that ships is proved.
+      - name: Gate
+        run: |
+          gcc -std=c23 -O2 -Wall -Wextra -Werror -c code/game.c -o /dev/null
+          x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Werror -c code/game.c -o /dev/null
+          ./tools/ci-proofs.sh ./skill-issue-linux-amd64
+
+      - uses: actions/upload-artifact@v7
+        with: { name: assets, path: skill-issue-*, if-no-files-found: error }
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest        # no container: gh is needed here
+    permissions: { contents: write }
+    concurrency: { group: release-publish, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { name: assets, path: dist }
+      - name: Publish
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          V=$(date -u +%Y-%m-%d)
+          # upload-artifact drops the x bit; the updater swaps the file in as-is.
+          chmod +x dist/skill-issue-linux-*
+          echo "$V" > dist/VERSION
+          # The tag is fixed ("latest"), so the DATE the updater orders by lives
+          # ONLY here — the "# version" header plus VERSION's own sum. Without it
+          # an "update" could silently be a downgrade (§15.2).
+          ( cd dist && { echo "# version $V"; sha256sum skill-issue-* VERSION; } > SHA256SUMS )
+          # Exactly ONE release, always the tag "latest", recreated each push.
+          # Delete every existing release+tag first (this also migrates away any
+          # old dated releases), drop a dangling "latest" tag so the new tag
+          # pins to THIS commit, then publish.
+          gh release list --limit 1000 --json tagName -q '.[].tagName' \
+            | xargs -r -n1 gh release delete --yes --cleanup-tag
+          git push origin :refs/tags/latest 2>/dev/null || true
+          gh release create latest dist/* --target "${{ github.sha }}" \
+            --title latest --latest --notes-file .github/release-body.md
