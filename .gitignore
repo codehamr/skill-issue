@@ -7,6 +7,7 @@ screenshots/
 .codex/
 .codehamr/
 .pi/
+post/
 tools/*
 !tools/ci-proofs.sh
 !tools/server-report.awk

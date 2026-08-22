@@ -26760,7 +26760,7 @@ static const home_shot_t HOME_SHOT[HOME_NSHOT + 1] = {
   //     close enough that the brake fills a corner and the barrel runs out of
   //     frame past the camera.
   { 5.0f, 1, {  96.f, 14.0f, 0.185f, 0.600f}, { 100.f, 18.0f, 0.195f, 0.300f}, 26.0f,
-    0.010f, 0, 1, "MUZZLE BRAKE"},
+    0, 0.010f, 1, "MUZZLE BRAKE"},
   // 2 — THE FIREFIGHT, at full speed, and SHORT. The camera leaves the player
   //     entirely and rides a bot. Five and a half seconds of somebody else's
   //     firefight outstays its welcome — the shot exists to say the arena is
@@ -26772,8 +26772,8 @@ static const home_shot_t HOME_SHOT[HOME_NSHOT + 1] = {
   //     dust off the boots and the fight cracking past behind him. Low and
   //     tracking from the open side; the camera rides his own frame, so it stays
   //     with him for the whole travel. AR ONLY — see HOME_SUB_SLIDE.
-  { 6.5f, 0, { 2.20f, 1.50f, 0.90f, 1.00f}, { 1.85f, 0.05f, 0.40f, 0.42f}, 0, 0,
-    0.40f, 0, NULL},
+  { 6.5f, 0, { 2.20f, 1.50f, 0.90f, 1.00f}, { 1.85f, 0.05f, 0.40f, 0.42f}, 0,
+    0.40f, 0, 0, NULL},
   // 4 — orbit on the strong side while the rifle comes to the shoulder.
   { 5.5f, 0, { 1.72f, 0.86f, 1.34f, 1.30f}, { 0.82f, 1.90f, 0.86f, 1.16f}, 0, 0, 0, 0, NULL},
   // 5 — the receiver: the brushed flat, the port, the broken edges.
@@ -26787,22 +26787,22 @@ static const home_shot_t HOME_SHOT[HOME_NSHOT + 1] = {
   //     the other way it opened inside the optic mount, which reads as a flat
   //     field of dark blue — a dead frame, not a shot.
   { 4.5f, 1, {  78.f, 38.0f, 0.520f, 0.020f}, {  84.f, 34.0f, 0.515f, 0.200f}, 26.0f,
-    0.028f, 0, 1, "UPPER RECEIVER"},
+    0, 0.028f, 1, "UPPER RECEIVER"},
   // 6 — out of cover and straight down the lens. Full speed while the lean
   //     reads as a movement, then eased into a light 0.45x for the automatic
   //     fire. The one angle in the loop where the player is being shot at.
-  { 6.5f, 0, { 0.55f, 3.05f, 1.05f, 1.42f}, { 0.20f, 2.30f, 1.28f, 1.46f}, 0, 0,
-    0.45f, 0, NULL},
+  { 6.5f, 0, { 0.55f, 3.05f, 1.05f, 1.42f}, { 0.20f, 2.30f, 1.28f, 1.46f}, 0,
+    0.45f, 0, 0, NULL},
   // 7 — LOW AND TRAVELLING FORWARD along the handguard, on a wide lens and
   //     close in, so the rail runs out of frame past the camera rather than
   //     sitting in it. The one pass that goes UNDER the bore line: every other
   //     close-up looks down on the weapon, and a rifle only ever seen from
   //     above is a rifle with no underside.
   { 4.5f, 1, { 124.f, -18.0f, 0.215f, 0.260f}, { 118.f, -12.0f, 0.220f, 0.520f}, 30.0f,
-    -0.012f, 0, 1, "HANDGUARD"},
+    0, -0.012f, 1, "HANDGUARD"},
   // 8 — the optic, while the bolt gun comes to the eye.
   { 5.0f, 1, { 104.f, 22.0f, 0.450f, -0.020f}, {  98.f, 18.0f, 0.455f, 0.150f}, 22.0f,
-    0.090f, 0, 1, "OPTIC"},
+    0, 0.090f, 1, "OPTIC"},
   // 9 — down onto the ejection port from high on the strong side, falling to a
   //     rake. Steep enough at the top that the port and the brass deflector are
   //     seen as PLAN rather than as a silhouette edge, which is the one reading
@@ -26816,7 +26816,7 @@ static const home_shot_t HOME_SHOT[HOME_NSHOT + 1] = {
   //     lens was looking onto the firing FIST, which is a glove filling a frame
   //     captioned EJECTION PORT.
   { 4.5f, 1, {  62.f, 44.0f, 0.500f, 0.010f}, {  68.f, 40.0f, 0.505f, 0.150f}, 28.0f,
-    0.038f, 0, 1, "EJECTION PORT"},
+    0, 0.038f, 1, "EJECTION PORT"},
   // 10 — THE SUBSTITUTE, and it exists to delete one specific bad frame. The
   //     slide is a one-handed carry with the muzzle rotated 66 degrees up, which
   //     is right for a carbine and absurd for a bolt gun: a 700 mm heavy barrel
@@ -26831,7 +26831,7 @@ static const home_shot_t HOME_SHOT[HOME_NSHOT + 1] = {
   //     the barrel drifted into frame. A travel has to start ON the thing it
   //     is travelling along.
   { 6.5f, 1, {  88.f, 10.0f, 0.200f, 0.540f}, {  94.f, 15.0f, 0.210f, 0.180f}, 26.0f,
-    0.020f, 0, 1, "HEAVY BARREL"},
+    0, 0.020f, 1, "HEAVY BARREL"},
 };
 
 // The director's finger: (shot, action, start, hold) in shot-local seconds.
