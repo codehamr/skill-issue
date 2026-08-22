@@ -1221,6 +1221,17 @@ static float pad_curve_apply(float m, int curve) {
 
 typedef struct {
   float sense;               // mouse sensitivity, degrees per count at 0.022 base
+  // ADS SENS for the MOUSE, and deliberately not the pad's construction. The
+  // pad's ADS scale is anchored on the ZOOM RATIO (a thumb pushes a rate, so a
+  // 2x zoom without a 2x slowdown doubles the felt turn speed and the stick
+  // becomes unusable at range); a mouse pushes an ANGLE, and a mouse player's
+  // muscle memory is a distance on the mat — auto-scaling it with the zoom is
+  // the thing they turn off first in every shooter that ships it. So this is a
+  // PLAIN multiplier, blended by the same ADS ramp, and 1.00 means the hip
+  // sensitivity carries straight through the raise. At the default the factor
+  // is exactly 1.0 for every value of ads_s, which is why adding it moves no
+  // artefact in the battery.
+  float ads_sense;           // mouse ADS sensitivity multiplier, 1 = unchanged
   float fov;                 // horizontal FOV in degrees
   int   vsync;
   int   fps_cap;             // frame limiter, 0 = off
@@ -1322,7 +1333,7 @@ static config_t config_defaults(void) {
   //     silhouette edges, which is the one content that MSAA is cheap on and
   //     that crawls visibly without it. llvmpipe never sees this (the harness
   //     renders into an FBO), and a GPU that cannot afford 8 has the slider.
-  config_t c = {.sense = 1.0f, .fov = 100.0f, .vsync = 0, .fps_cap = 120, .show_fps = 1, .msaa = 8,
+  config_t c = {.sense = 1.0f, .ads_sense = 1.0f, .fov = 100.0f, .vsync = 0, .fps_cap = 120, .show_fps = 1, .msaa = 8,
                 // sp_diff 2 = HARD. The bot count came down to 1, so difficulty
                 // is what carries the challenge now — see SP_BOTS_DEF.
                 .vol = VOL_DEF.def, .sp_bots = (int)SP_BOTS_DEF.def, .sp_diff = 2,
@@ -1387,6 +1398,7 @@ static void config_emit(FILE *f, const config_t *c) {
     "# key tokens: a-z 0-9 space tab lshift lctrl | mouse1=left mouse2=right mouse3=middle\n"
     "#             mouse4/mouse5 = thumb buttons (back/forward)\n"
     "sense %.3f\n"
+    "ads_sense %.3f\n"
     "fov %.0f\n"
     "vsync %d\n"
     "fps_cap %d\n"
@@ -1394,7 +1406,8 @@ static void config_emit(FILE *f, const config_t *c) {
     "msaa %d\n"
     "third_person %d\n"
     "devmode %d\n",
-    (double)c->sense, (double)c->fov, c->vsync, c->fps_cap, c->show_fps, c->msaa,
+    (double)c->sense, (double)c->ads_sense, (double)c->fov, c->vsync, c->fps_cap,
+    c->show_fps, c->msaa,
     c->third_person, c->devmode);
   fprintf(f, "%s %.2f\n", VOL_DEF.key, (double)c->vol);
   fprintf(f, "sp_bots %d\nsp_difficulty %d\nsp_fraglimit %d\nplayer_name %s\n",
@@ -1565,6 +1578,11 @@ static void config_load_or_create(const char *path, config_t *c) {
     if (cut_tail) fprintf(stderr, "config: line for '%s' longer than 127 chars — tail dropped\n", key);
     if (cut_hash) fprintf(stderr, "config: '#' cuts the value of '%s' (quote it is not supported)\n", key);
     if      (!strcmp(key, "sense")) c->sense = parse_float(val, c->sense, 0.001f, 10.0f);
+    // Range wider than the slider's on both ends, the same policy every other
+    // scalar here follows: a hand-edited file is allowed to ask for more than
+    // the menu offers, and the menu must not quietly rewrite it (see
+    // ui_param_row's snap-on-interaction-only rule).
+    else if (!strcmp(key, "ads_sense")) c->ads_sense = parse_float(val, c->ads_sense, 0.01f, 10.0f);
     else if (!strcmp(key, "fov"))   c->fov   = parse_float(val, c->fov, 50.0f, 130.0f);
     else if (!strcmp(key, "vsync") || !strcmp(key, "fps_cap") ||
              !strcmp(key, "show_fps") || !strcmp(key, "msaa")) {
@@ -6338,9 +6356,22 @@ static void player_spawn(player_t *p) {
   for (int w = 0; w < WPN_COUNT; w++) p->wp.ammo[w] = WPN_DEF[w].mag;
 }
 
+// MOUSE LOOK, and the ADS multiplier lives HERE rather than at the three call
+// sites — the online fork, the singleplayer path and the harness `look` command
+// all have to feel the same, and the harness one is what a proof measures. It
+// is applied as a factor on the whole step, so it scales yaw and pitch by the
+// same amount: a mouse player's ADS sensitivity is one number, not two.
+// ads_sense 1.00 makes this the identity at every point of the ramp.
+static float mouse_ads_look_scale(const player_t *p) {
+  float ads = p->wp.ads_s;
+  if (ads <= 0) return 1.0f;
+  return 1.0f + (g_cfg.ads_sense - 1.0f) * ads;
+}
+
 static void player_look(player_t *p, float dx, float dy, float sense) {
-  p->yaw += dx * sense * SENSE_RAD_PER_COUNT;
-  p->pitch = f_clamp(p->pitch - dy * sense * SENSE_RAD_PER_COUNT, -PITCH_MAX, PITCH_MAX);
+  float k = sense * mouse_ads_look_scale(p) * SENSE_RAD_PER_COUNT;
+  p->yaw += dx * k;
+  p->pitch = f_clamp(p->pitch - dy * k, -PITCH_MAX, PITCH_MAX);
 }
 
 // Generic AABB body helpers — shared by the player and the bot so both
@@ -17190,7 +17221,31 @@ static void pad_eat_held(void);
 static void platform_menu_changed(void);
 static void platform_vsync_changed(void);
 
-static int g_ui_name_edit;  // Singleplayer page: the name field is capturing keys
+static int g_ui_name_edit;  // Settings page: the name field is capturing keys
+
+// THE ONE FIELD IN THE GAME THAT NEEDS A KEYBOARD, ON THE ONE DEVICE THAT HAS
+// NONE. The name editor took keys and nothing else, so a pad player reached it,
+// armed it, and was told by the hint line to "TYPE ON KEYBOARD" — on a handheld,
+// in a game whose whole point is that it ships to one. This is that keyboard,
+// and it is a GRID rather than a widget tree: the glyph set is already fixed by
+// name_glyph (A-Z and 0-9, nothing else can survive a save), so the layout is a
+// constant and the entire state is a cursor.
+//
+// Four uniform rows of nine, which is exactly the 36 glyphs name_glyph accepts,
+// plus an action row. DELETE and DONE are their OWN row rather than two cells
+// stolen from the last one: a wide action wants a wide target, and it keeps
+// every glyph row the same width — which is what makes the cursor predictable,
+// the only property a grid actually has to have.
+#define UI_KB_COLS 9
+#define UI_KB_GROWS 4                        // glyph rows
+#define UI_KB_ROWS (UI_KB_GROWS + 1)         // ...plus DELETE / DONE
+static const char UI_KB_ROW[UI_KB_GROWS][UI_KB_COLS + 1] = {
+  "ABCDEFGHI", "JKLMNOPQR", "STUVWXYZ0", "123456789",
+};
+static int g_ui_kb;         // the on-screen keyboard is up with the name edit
+static int g_ui_kb_r, g_ui_kb_c;   // cursor: row 0..UI_KB_ROWS-1, col in row
+
+static int ui_kb_cols(int r) { return r < UI_KB_GROWS ? UI_KB_COLS : 2; }
 
 // Feed a token to the name editor: single chars append (A-Z/0-9), "back"
 // deletes, "enter"/"escape" finish. An empty name falls back to PLAYER.
@@ -17199,6 +17254,7 @@ static void ui_name_key(const char *tok) {
   if (!strcmp(tok, "enter") || !strcmp(tok, "escape")) {
     if (!l) snprintf(g_cfg.name, sizeof g_cfg.name, "PLAYER");
     g_ui_name_edit = 0;
+    g_ui_kb = 0;    // the keyboard exists only for as long as the field does
   } else if (!strcmp(tok, "back")) {
     if (l) g_cfg.name[l - 1] = '\0';
   } else if (tok[0] && !tok[1] && l < sizeof g_cfg.name - 1) {
@@ -17207,6 +17263,58 @@ static void ui_name_key(const char *tok) {
       g_cfg.name[l] = g;
       g_cfg.name[l + 1] = '\0';
     }
+  }
+}
+
+// A row change keeps the cursor's horizontal POSITION, not its index — the
+// action row is two cells wide and the glyph rows are nine, and stepping down
+// from "E" onto "DELETE" has to land under E rather than at the left edge.
+static int ui_kb_remap(int c, int from, int to) {
+  int n = ui_kb_cols(from), m = ui_kb_cols(to);
+  int o = (int)(((float)c + 0.5f) * (float)m / (float)n);
+  return o < 0 ? 0 : o >= m ? m - 1 : o;
+}
+
+// ONE press, two devices: the pad's A and a click on a key are the same act,
+// and a second copy of this switch is how the two drift apart.
+static void ui_kb_press(int r, int c) {
+  if (r < UI_KB_GROWS) {
+    char t[2] = {UI_KB_ROW[r][c], 0};
+    ui_name_key(t);
+  } else {
+    ui_name_key(c == 0 ? "back" : "enter");
+  }
+}
+
+// The keyboard OWNS navigation while it is up, the same way an armed rebind
+// capture does — a grid's four directions are its own, and handing them to the
+// page's nearest-rect mover would step the cursor to whatever happens to be
+// geometrically closest instead of to the next letter.
+//
+// B is BACKSPACE here and not "back". Inside a text field, undoing the last
+// thing you did IS deleting the last character, it is the correction a player
+// makes most often, and the cost of guessing wrong is one keypress; the way OUT
+// is the DONE tile and START, both of which are visible or already universal.
+static void ui_kb_nav(int ev) {
+  int n = ui_kb_cols(g_ui_kb_r);
+  switch (ev) {
+    case NAV_LEFT:  g_ui_kb_c = (g_ui_kb_c + n - 1) % n; break;
+    case NAV_RIGHT: g_ui_kb_c = (g_ui_kb_c + 1) % n; break;
+    case NAV_UP: {
+      int r = (g_ui_kb_r + UI_KB_ROWS - 1) % UI_KB_ROWS;
+      g_ui_kb_c = ui_kb_remap(g_ui_kb_c, g_ui_kb_r, r);
+      g_ui_kb_r = r;
+      break;
+    }
+    case NAV_DOWN: {
+      int r = (g_ui_kb_r + 1) % UI_KB_ROWS;
+      g_ui_kb_c = ui_kb_remap(g_ui_kb_c, g_ui_kb_r, r);
+      g_ui_kb_r = r;
+      break;
+    }
+    case NAV_OK: ui_kb_press(g_ui_kb_r, g_ui_kb_c); break;
+    case NAV_BACK: ui_name_key("back"); break;
+    default: break;    // LB/RB carry no meaning on a grid
   }
 }
 
@@ -17314,6 +17422,7 @@ static const char *pad_disp(const char *tok) {
 }
 
 enum { DRAG_SENSE = 1, DRAG_FOV, DRAG_CAP, DRAG_VOL, DRAG_BOTS, DRAG_FRAG,
+       DRAG_ADS_SENSE,  // 7, the one id left before the MV block starts
        DRAG_MV0 = 8, DRAG_WP0 = 32, DRAG_PAD0 = 56 };  // +i = tuning slider i
 
 // Register one interactive row (layout order) and draw the focus ring when the
@@ -17614,6 +17723,15 @@ static void ui_text_fit(const char *t, float x, float y, float maxw, float scale
   ui_text_ex(t, x, y, sc, thr, track * sc / scale, c);
 }
 
+#ifndef _WIN32
+// Defined with the evdev pump in the Linux backend. Forward-declared here
+// because the harness parser sits ABOVE the platform split and `padscan` is
+// the one proof that has to reach below it — the node table it reports is the
+// backend's, and no shared-code mock of /dev/input would prove anything about
+// the machine the game is actually running on.
+static void nat_pad_report(int frames);
+#endif
+
 // The boot screen's layout sits with the rest of the menu, but its director
 // lives with the renderer — a camera is not a widget. These are the only two
 // things the layout needs from it, and neither exposes the shot list.
@@ -17906,6 +18024,88 @@ static void ui_home(int click, float cx, float cy) {
   if (g_home) ui_home_cards(vw, vh);
 }
 
+// THE ON-SCREEN KEYBOARD, drawn LAST and over a scrim, because it is a modal
+// and the scrim is what says so. Everything in it is the menu's own vocabulary:
+// the machined chamfered panel, and focus carried by VALUE — the lit key takes
+// the pale fill and dark type that ui_button and ui_tile already use for the
+// same state. No accent edge on any key. Thirty-six coloured cells is exactly
+// the twitching rail ui_tile's comment argues against, and there is no third
+// state here for an accent to mean.
+static void ui_keyboard(int click, float cx, float cy) {
+  const float kw = 340, pad = 13, gap = 3, keyh = 22, nameh = 26;
+  float cellw = (kw - 2 * pad - (UI_KB_COLS - 1) * gap) / UI_KB_COLS;
+  float actw  = (kw - 2 * pad - gap) * 0.5f;
+  float body  = 12 + 18 + nameh + 12 + UI_KB_ROWS * (keyh + gap) - gap + 13;
+  float kx = g_ui_vw * 0.5f - kw * 0.5f;
+  float ky = g_ui_vh * 0.5f - body * 0.5f;
+  if (ky < 4) ky = 4;
+
+  // The page behind stays visible as CONTEXT and stops competing for the eye.
+  // 0.80 rather than the 0.62 this started at: the settings panel is a stack of
+  // sliders whose right-hand value column is bright type on a dark plate, and
+  // at the lighter scrim those numbers read straight through the modal and sat
+  // in the gaps between the keys.
+  ui_rect(0, 0, g_ui_vw, g_ui_vh, 0.012f, 0.018f, 0.030f, 0.80f);
+  ui_panel(kx, ky, kw, body, 0, 1);
+
+  float y = ky + 12;
+  ui_textb("PLAYER NAME", kx + pad, y, 1.1f, C_BONE, 0.92f);
+  y += 18;
+
+  // The field. The name is a RUNTIME string, so it is fitted to the box rather
+  // than trusted to be short — 15 glyphs at the authored size overrun a 4:3
+  // viewport's narrower virtual width, which is the failure ui_text_fit exists
+  // for. The scale is solved here rather than delegated because the CARET has
+  // to be placed at the end of the drawn text, and that needs the width the
+  // text was actually drawn at.
+  ui_rrect_c(kx + pad, y, kw - 2 * pad, nameh, 0,
+             C4(1, 1, 1, 0.055f), C4(1, 1, 1, 0.030f));
+  {
+    float sc = 2.2f, trk = 0.9f;
+    for (int i = 0; i < 8 &&
+         ui_text_width_tr(g_cfg.name, sc, sc * trk) > kw - 2 * pad - 30; i++)
+      sc *= 0.94f;
+    float tx = kx + pad + 11, ty = y + (nameh - sc * 7.0f) * 0.5f;
+    float tw = ui_text_width_tr(g_cfg.name, sc, sc * trk);
+    ui_text_ex(g_cfg.name, tx, ty, sc, TXT_BOLD, sc * trk, C4(C_BONE, 1));
+    // A STATIC caret, deliberately not a blinking one: g_ui_time advances once
+    // per RENDERED frame, so a blink would make every harness `uiframe` and
+    // `shot` of this screen depend on how many frames happened to precede it.
+    ui_rect(tx + tw + (tw > 0 ? 3.0f : 0.0f), ty, 2, sc * 7.0f, C_BONE, 0.55f);
+  }
+  y += nameh + 12;
+
+  for (int r = 0; r < UI_KB_ROWS; r++) {
+    int n = ui_kb_cols(r);
+    float w = r < UI_KB_GROWS ? cellw : actw;
+    for (int c = 0; c < n; c++) {
+      float x = kx + pad + (float)c * (w + gap);
+      int over = cx >= x && cx <= x + w && cy >= y && cy <= y + keyh;
+      // Hovering ALSO moves the cursor, so putting the mouse down and picking
+      // the pad back up does not teleport the highlight to wherever the grid
+      // was last navigated. The guard is what keeps a mouse parked over a key
+      // from fighting the pad for it.
+      if (over && !g_ui_pad_mode) { g_ui_kb_r = r; g_ui_kb_c = c; }
+      int lit = over || ((r == g_ui_kb_r && c == g_ui_kb_c) && g_ui_pad_mode);
+      char lab[8];
+      if (r < UI_KB_GROWS) { lab[0] = UI_KB_ROW[r][c]; lab[1] = '\0'; }
+      else snprintf(lab, sizeof lab, "%s", c == 0 ? "DELETE" : "DONE");
+      if (lit)
+        ui_rrect_c(x, y, w, keyh, 0, C4(0.96f, 0.97f, 0.98f, 0.96f),
+                   C4(0.86f, 0.89f, 0.92f, 0.96f));
+      else
+        ui_rrect_c(x, y, w, keyh, 0, C4(1, 1, 1, 0.050f), C4(1, 1, 1, 0.032f));
+      float ls = r < UI_KB_GROWS ? 1.5f : 1.0f;
+      float lw = ui_text_width(lab, ls);
+      ui_text_ex(lab, x + (w - lw) * 0.5f, y + (keyh - ls * 7.0f) * 0.5f, ls,
+                 lit ? TXT_BLACK : TXT_BOLD,
+                 0, lit ? C4(0.03f, 0.04f, 0.05f, 1) : C4(C_BONE, 0.88f));
+      if (click && over) ui_kb_press(r, c);
+    }
+    y += keyh + gap;
+  }
+}
+
 static void ui_menu(void) {
   static int prev_down;
   static float pmx = -1e9f, pmy;
@@ -17921,7 +18121,9 @@ static void ui_menu(void) {
   for (int i = 0; i < g_nav_n; i++) {
     int ev = g_nav_q[i];
     g_ui_pad_mode = 1;
-    if (g_ui_name_edit) {
+    if (g_ui_kb) {
+      ui_kb_nav(ev);
+    } else if (g_ui_name_edit) {
       if (ev == NAV_BACK || ev == NAV_OK) ui_name_key("enter");
     } else if (g_ui_rebind >= 0) {
       if (ev == NAV_BACK) g_ui_rebind = -1;
@@ -17955,6 +18157,12 @@ static void ui_menu(void) {
 
   int click = g_ui_mdown && !prev_down;
   prev_down = g_ui_mdown;
+  // The on-screen keyboard is a MODAL, so it owns the frame's click. Without
+  // this a press on a key also lands on whatever page row is behind it — the
+  // same reason every control gates its own click on `g_ui_rebind < 0`, done
+  // once here instead of once per widget.
+  int kbclick = click;
+  if (g_ui_kb) click = 0;
   if (!g_ui_mdown) g_ui_drag = 0;
   float cx = g_ui_cx / g_uis, cy = g_ui_cy / g_uis;
   // Real mouse motion or a click hands the menu back to the cursor.
@@ -18080,12 +18288,25 @@ static void ui_menu(void) {
   {
     // Click it, type A-Z/0-9, backspace deletes, enter/esc done.
     char shown[16];
-    if (g_ui_name_edit) snprintf(shown, sizeof shown, "%s-", g_cfg.name);
-    else                snprintf(shown, sizeof shown, "%s", g_cfg.name);
+    // The pill's trailing '-' is its caret. While the on-screen keyboard is up
+    // the modal carries a real one in a field five times the size, and two
+    // carets on one screen is one caret too many.
+    if (g_ui_name_edit && !g_ui_kb) snprintf(shown, sizeof shown, "%s-", g_cfg.name);
+    else                            snprintf(shown, sizeof shown, "%s", g_cfg.name);
     // 40 px minimum: a two-letter name must not shrink the field to a stub.
     if (ui_pill("NAME", shown, px, pw, y, g_ui_name_edit, 40, click, cx, cy)) {
-      if (g_ui_name_edit) ui_name_key("enter");
-      else g_ui_name_edit = 1;
+      if (g_ui_name_edit) {
+        ui_name_key("enter");
+      } else {
+        g_ui_name_edit = 1;
+        // THE PAD BRINGS ITS OWN KEYBOARD. Gated on the device that armed the
+        // field, not on the platform: a desktop player driving this menu with
+        // the ARROW KEYS (g_nav_kbd — the Steam desktop layout emulates the
+        // dpad as arrows) is sitting at a keyboard and should just type, while
+        // a pad on a handheld has nothing to type with. Cursor mode types too.
+        g_ui_kb = g_ui_pad_mode && !g_nav_kbd;
+        g_ui_kb_r = g_ui_kb_c = 0;
+      }
     }
     y += 15;
   }
@@ -18097,6 +18318,12 @@ static void ui_menu(void) {
   // y+15 layout constants the helper owns. Step 0.01 selects the same "%.2f".
   { param_def_t sd = {"", "SENSITIVITY", 0.35f, 0.05f, 2.0f, 0.01f};
     y = ui_param_row(&sd, &g_cfg.sense, DRAG_SENSE, px, y, click, cx, cy); }
+  // The mouse's own ADS multiplier, directly under the sensitivity it
+  // multiplies — the pad page has had this pair since it existed and the mouse
+  // page had only half of it. Same label as the pad's row on purpose: it is the
+  // same idea, and a player who has set one knows what the other is.
+  { param_def_t ad = {"", "ADS SENS", 1.0f, 0.10f, 2.0f, 0.05f};
+    y = ui_param_row(&ad, &g_cfg.ads_sense, DRAG_ADS_SENSE, px, y, click, cx, cy); }
 
   y += 4;
   ui_section("GRAPHICS", px, pw, y);
@@ -18400,6 +18627,9 @@ static void ui_menu(void) {
     ph = want;
   }
 
+  // LAST, over everything, and over its own scrim — see ui_keyboard.
+  if (g_ui_kb) ui_keyboard(kbclick, cx, cy);
+
   // Hints: the menu tells the player its own grammar, and the line follows the
   // STATE — while a capture is armed, the grammar it advertises ("B BACK")
   // would be wrong for a pad capture, where B is a bindable button and only
@@ -18425,15 +18655,23 @@ static void ui_menu(void) {
     // keyboard user has no A or LB at all), so the hint speaks whichever
     // language the last navigation event actually arrived in.
     if (g_nav_kbd)
-      h = g_ui_name_edit ? "TYPE A-Z 0-9   ENTER DONE"
+      h = g_ui_kb        ? "ARROWS MOVE   ENTER SELECT   OR JUST TYPE"
+        : g_ui_name_edit ? "TYPE A-Z 0-9   ENTER DONE"
         : g_ui_quit_arm  ? "ENTER CONFIRM QUIT   ESC BACK"
         : g_ui_upd_arm   ? "ENTER CONFIRM UPDATE   ESC BACK"
                          : "ARROWS MOVE   ENTER OK   LEFT/RIGHT ADJUST   ESC BACK";
     else
-      h = g_ui_name_edit ? "TYPE ON KEYBOARD   A/B DONE"
+      // The keyboard's own grammar, and B is the one line that has to be spelt
+      // out: it DELETES here rather than backing out, which is the one place in
+      // this menu where B does not mean "leave". START is the universal exit
+      // and the DONE tile is the visible one, so the way out is never hidden.
+      h = g_ui_kb        ? "A SELECT   B DELETE   START DONE"
+        : g_ui_name_edit ? "TYPE ON KEYBOARD   A/B DONE"
         : g_ui_quit_arm  ? "A CONFIRM QUIT   B BACK"
         : g_ui_upd_arm   ? "A CONFIRM UPDATE   B BACK"
                          : "A OK   < > ADJUST   B BACK";
+  } else if (g_ui_kb) {
+    h = "CLICK A KEY   OR TYPE   ENTER DONE";
   } else if (g_ui_name_edit) {
     // Cursor mode: the accent-filled pill alone does not say typing works.
     h = "TYPE A-Z 0-9   ENTER DONE";
@@ -30337,6 +30575,9 @@ static void usage(void) {
        "  pad on|off         mark a pad connected / clear all pad state\n"
        "  padsync            one shared pad frame step (edges, nav, trig hysteresis)\n"
        "  padstat            processed pad state + actions held through the binds\n"
+       "  padscan [N]        the REAL /dev/input scan for N frames (default\n"
+       "                     600): the node table, which one is ACTIVE, and\n"
+       "                     every hand-over. The on-device pad proof\n"
        "  padcurve           f(0..1) table for linear/standard/dynamic (proof)\n"
        "  padlook N          N ticks of right-stick look, yaw/pitch delta in deg\n"
        "menu/UI commands (uiframe and shot both run one UI logic+draw pass):\n"
@@ -32177,6 +32418,21 @@ static void run_script(char *script, sim_ctx_t *s) {
         else if (!strcmp(k, "rt")) g_pad.rt = v;
         else { fprintf(stderr, "script: unknown pad field '%s'\n", k); exit(1); }
       }
+    } else if (!strcmp(t, "padscan")) {
+      // THE ON-DEVICE PROOF FOR THE MULTI-NODE PUMP, and the one pad proof
+      // that cannot be faked. Every other one drives g_pad through the
+      // harness's own `pad` command, which is exactly what cannot answer the
+      // question this fix is about: does THIS machine's node table contain the
+      // pad in my hands, and does the hand-over pick it. It runs the REAL
+      // evdev scan against the REAL /dev/input for N frames (default 600 =
+      // 5 s, two rescan cadences) and prints the table it converged on plus
+      // every hand-over on the way. Linux only — there is no harness on the
+      // Windows build to reach the XInput half with.
+#ifndef _WIN32
+      nat_pad_report((int)opt_n(600));
+#else
+      printf("padscan unavailable on this backend\n");
+#endif
     } else if (!strcmp(t, "padsync")) {
       pad_sync(TICK_DT);
     } else if (!strcmp(t, "padlook")) {
@@ -32254,10 +32510,12 @@ static void run_script(char *script, sim_ctx_t *s) {
       if (hit < 0) { fprintf(stderr, "script: unknown nav '%s'\n", k); exit(1); }
       nav_push(hit);
     } else if (!strcmp(t, "uistat")) {
-      // qarm/nedit: the two MODAL states (armed QUIT confirm, name capture) —
-      // without them the harness could only assert either by pixel-diffing.
+      // qarm/nedit/kb: the MODAL states (armed QUIT confirm, name capture, the
+      // on-screen keyboard) — without them the harness could only assert any of
+      // them by pixel-diffing. kb prints the CURSOR as well as the flag: the
+      // grid's whole state is that pair, so a nav proof needs no screenshot.
       printf("ui menu=%d tab=%d page=%s control=%s padsub=%d devsub=%d wpn=%d focus=%d/%d padmode=%d "
-             "rebind=%d rebindpad=%d qarm=%d uarm=%d nedit=%d dev=%d curve=%s "
+             "rebind=%d rebindpad=%d qarm=%d uarm=%d nedit=%d kb=%d kbcur=%d,%d name=%s dev=%d curve=%s "
              "dz=(%.2f %.2f) sens=%.0f "
              "adss=%.2f assist=%d inv=%d conn=%d\n",
              g_menu_open, g_ui_tab, ui_page_name(g_ui_page),
@@ -32265,6 +32523,7 @@ static void run_script(char *script, sim_ctx_t *s) {
              g_ui_pad_sub, g_ui_dev_sub, g_ui_wpn,
              g_ui_focus, g_ui_nfocus_last, g_ui_pad_mode, g_ui_rebind,
              g_ui_rebind_pad, g_ui_quit_arm, g_ui_upd_arm, g_ui_name_edit,
+             g_ui_kb, g_ui_kb_r, g_ui_kb_c, g_cfg.name,
              DEV_MENU && g_cfg.devmode, PAD_CURVE_OPTS[g_cfg.pad_curve],
              (double)g_cfg.pad[PAD_DZ_L], (double)g_cfg.pad[PAD_DZ_R],
              (double)g_cfg.pad[PAD_SENS],
@@ -33225,9 +33484,9 @@ static void run_script(char *script, sim_ctx_t *s) {
              VN[v], local, rdate[0] ? rdate : "-", why[0] ? why : "-",
              v == UPDV_UPDATE || v == UPDV_RECUT, own, have ? "" : " (stand-in)");
     } else if (!strcmp(t, "cfg")) {
-      printf("cfg sense=%.2f fov=%d vsync=%d fps_cap=%d show_fps=%d msaa=%d binds=",
-             (double)g_cfg.sense, (int)g_cfg.fov, g_cfg.vsync, g_cfg.fps_cap,
-             g_cfg.show_fps, g_cfg.msaa);
+      printf("cfg sense=%.2f ads_sense=%.2f fov=%d vsync=%d fps_cap=%d show_fps=%d msaa=%d binds=",
+             (double)g_cfg.sense, (double)g_cfg.ads_sense, (int)g_cfg.fov, g_cfg.vsync,
+             g_cfg.fps_cap, g_cfg.show_fps, g_cfg.msaa);
       for (int i = 0; i < IN_COUNT; i++) printf("%s%s", i ? "," : "", g_cfg.bind[i]);
       printf(" padbinds=");
       for (int i = 0; i < IN_COUNT; i++) printf("%s%s", i ? "," : "", g_cfg.padbind[i]);
@@ -35382,10 +35641,66 @@ static_assert(sizeof(ev_absinfo_t) == 24, "input_absinfo ABI");
 #define PBTN_DPAD_LEFT 0x222
 #define PBTN_DPAD_RIGHT 0x223
 
-static int    g_pad_fd = -1;
-static double g_pad_rescan;                       // next scan while disconnected
-static double g_pad_reprobe;                      // next ownership probe while connected
-static struct { int min, max; } g_pad_absr[PABS_RZ + 1];
+// A HANDHELD HAS MORE THAN ONE PAD, AND THE ONE THE PLAYER IS HOLDING IS NOT
+// THE ONE WITH THE HIGHEST EVENT MINOR. The scan used to keep the LAST match,
+// on the reasoning that Steam's virtual uinput pad is created after the
+// physical nodes and so gets the higher number. True, and useless the moment
+// there are TWO virtual pads. Measured on the deploy handheld (a Legion Go S
+// under SteamOS) with an 8BitDo Ultimate 2 on its 2.4 GHz dongle:
+//
+//   Microsoft X-Box 360 pad 0 -> event18   (Steam's view of the 8BitDo)
+//   Microsoft X-Box 360 pad 1 -> event22   (Steam's view of the BUILT-IN pad)
+//
+// so "keep the last" latched the built-in controls and the pad in the player's
+// hands did nothing at all — every ioctl succeeding, read() returning EAGAIN
+// forever, nothing anywhere reporting an error. Over Bluetooth the same
+// controller happens to land in the higher slot, which is the whole reason the
+// defect read as "works on BT, not on the dongle": a coin toss dressed as a
+// rule. There is no static ordering that answers "which pad is the player
+// holding" — slot order is Steam's, minor order is the kernel's, and neither
+// knows about hands.
+//
+// So stop guessing. Hold EVERY candidate node open and let the one that was
+// last TOUCHED drive the game. Draining all of them is not an extra cost we
+// are choosing either: an unread evdev fd overflows its kernel ring, which is
+// the exact defect nat_pad_resync already exists for.
+#define PAD_NODES 8
+// A button going DOWN, or half a stick's travel: comfortably past any drift a
+// worn stick has, so a pad face-down on a table can never steal the session.
+#define PAD_WAKE_DEFL 0.5f
+// ...AND the incumbent has to have gone quiet first. Without this the physical
+// node and Steam's virtual twin OF THE SAME CONTROLLER — both live, both
+// candidates, both reporting the one thumb — hand the session back and forth
+// every frame. A pad being actively used keeps it; a pad nobody is touching
+// yields on the next press anywhere. Twins are immune by construction: they
+// are drained in the same pump call, so they stamp the IDENTICAL timestamp and
+// the strict > below never fires between them.
+#define PAD_WAKE_QUIET 1.0
+
+typedef struct {
+  int    fd;                                 // -1 = free slot
+  int    idx;                                // /dev/input/eventIDX = identity
+  double touched;                            // last significant input (nat_now)
+  char   name[64];                           // EVIOCGNAME, for the stderr log
+  struct { int min, max; } absr[PABS_RZ + 1];
+} pad_node_t;
+
+// SPELLED OUT, because a static array is zero-initialised and fd 0 IS A VALID
+// DESCRIPTOR — it is stdin. With the implicit zeros every slot read as OCCUPIED
+// before the first scan, so the scan had no free slot to add to and the read
+// loop below called read() on STDIN instead: measured, the game blocked
+// forever on the first frame whenever stdin was an open pipe with no data,
+// which is most ways of launching it from a shell. `-1` has to be written, and
+// the assert is what keeps this list and PAD_NODES from drifting apart.
+#define PAD_NODE_FREE {.fd = -1, .idx = -1}
+static pad_node_t g_pad_node[PAD_NODES] = {
+  PAD_NODE_FREE, PAD_NODE_FREE, PAD_NODE_FREE, PAD_NODE_FREE,
+  PAD_NODE_FREE, PAD_NODE_FREE, PAD_NODE_FREE, PAD_NODE_FREE,
+};
+static_assert(PAD_NODES == 8, "the initializer list above is written out");
+static int    g_pad_act = -1;                     // the node that drives g_pad
+static double g_pad_rescan;                       // next hotplug scan
+static double g_pad_reprobe;                      // next ownership probe
 
 #define PAD_TESTBIT(a, b) ((a)[(b) >> 3] & (1u << ((b) & 7)))
 
@@ -35403,45 +35718,72 @@ static int nat_pad_btn(unsigned short code) {
 }
 
 // Normalisation against the device's OWN reported range — a Deck stick is
-// -32768..32767 but nothing in the gamepad spec promises that.
-static float nat_pad_stick(int code, int v) {
-  int mn = g_pad_absr[code].min, mx = g_pad_absr[code].max;
+// -32768..32767 but nothing in the gamepad spec promises that. Parameterised by
+// NODE rather than reading a global range table, because the wake test below
+// has to judge nodes that are NOT the active one.
+static float nat_pad_axis(const pad_node_t *n, int code, int v, int centred) {
+  int mn = n->absr[code].min, mx = n->absr[code].max;
   if (mx <= mn) return 0;
-  return f_clamp((float)(v - mn) / (float)(mx - mn) * 2.0f - 1.0f, -1.0f, 1.0f);
-}
-static float nat_pad_trig(int code, int v) {
-  int mn = g_pad_absr[code].min, mx = g_pad_absr[code].max;
-  if (mx <= mn) return 0;
-  return f_clamp((float)(v - mn) / (float)(mx - mn), 0.0f, 1.0f);
+  float u = (float)(v - mn) / (float)(mx - mn);
+  return centred ? f_clamp(u * 2.0f - 1.0f, -1.0f, 1.0f) : f_clamp(u, 0.0f, 1.0f);
 }
 
-static void nat_pad_abs(int code, int v) {
+static void nat_pad_abs(const pad_node_t *n, int code, int v) {
   switch (code) {
-    case PABS_X:  g_pad.lx =  nat_pad_stick(PABS_X, v); break;
-    case PABS_Y:  g_pad.ly = -nat_pad_stick(PABS_Y, v); break;  // evdev +y is DOWN
-    case PABS_RX: g_pad.rx =  nat_pad_stick(PABS_RX, v); break;
-    case PABS_RY: g_pad.ry = -nat_pad_stick(PABS_RY, v); break;
-    case PABS_Z:  g_pad.lt =  nat_pad_trig(PABS_Z, v); break;
-    case PABS_RZ: g_pad.rt =  nat_pad_trig(PABS_RZ, v); break;
+    case PABS_X:  g_pad.lx =  nat_pad_axis(n, PABS_X, v, 1); break;
+    case PABS_Y:  g_pad.ly = -nat_pad_axis(n, PABS_Y, v, 1); break;  // evdev +y is DOWN
+    case PABS_RX: g_pad.rx =  nat_pad_axis(n, PABS_RX, v, 1); break;
+    case PABS_RY: g_pad.ry = -nat_pad_axis(n, PABS_RY, v, 1); break;
+    case PABS_Z:  g_pad.lt =  nat_pad_axis(n, PABS_Z, v, 0); break;
+    case PABS_RZ: g_pad.rt =  nat_pad_axis(n, PABS_RZ, v, 0); break;
     case PABS_HAT0X: g_pad.btn[PB_LEFT] = v < 0; g_pad.btn[PB_RIGHT] = v > 0; break;
     case PABS_HAT0Y: g_pad.btn[PB_UP]   = v < 0; g_pad.btn[PB_DOWN]  = v > 0; break;
     default: break;
   }
 }
 
-static void nat_pad_close(void) {
-  if (g_pad_fd >= 0) close(g_pad_fd);
-  g_pad_fd = -1;
-  memset(&g_pad, 0, sizeof g_pad);
+// "The player TOUCHED this pad", the one question the hand-over turns on. A
+// RELEASE is deliberately not enough: putting a pad down sends releases on its
+// way to idle, and a pad being put down must not claim the session.
+static int nat_pad_woke(const pad_node_t *n, const ev_event_t *e) {
+  if (e->type == PEV_KEY)
+    return e->value != 0 && (nat_pad_btn(e->code) >= 0 ||
+                             e->code == PBTN_TL2 || e->code == PBTN_TR2);
+  if (e->type != PEV_ABS) return 0;
+  switch (e->code) {
+    case PABS_X: case PABS_Y: case PABS_RX: case PABS_RY:
+      return fabsf(nat_pad_axis(n, e->code, e->value, 1)) > PAD_WAKE_DEFL;
+    case PABS_Z: case PABS_RZ:
+      return nat_pad_axis(n, e->code, e->value, 0) > PAD_WAKE_DEFL;
+    case PABS_HAT0X: case PABS_HAT0Y: return e->value != 0;
+    default: return 0;
+  }
+}
+
+// Drop ONE node: unplugged, or Steam has taken ownership of it. Losing the
+// ACTIVE node has to zero g_pad too, or a stick that happened to be deflected
+// when the dongle was pulled keeps walking the player for the rest of the
+// match. The other nodes are untouched — that is the point of the table.
+static void nat_pad_drop(int slot) {
+  if (g_pad_node[slot].fd >= 0) close(g_pad_node[slot].fd);
+  g_pad_node[slot].fd = -1;
+  g_pad_node[slot].idx = -1;
+  if (g_pad_act == slot) {
+    g_pad_act = -1;
+    memset(&g_pad, 0, sizeof g_pad);
+  }
 }
 
 // The kernel's per-client evdev buffer is a RING: stall long enough (focus
 // loss pauses the loop) and it overflows, the kernel emits SYN_DROPPED, and
 // every level tracked from events is untrustworthy — a release may be gone.
 // The ground truth is one ioctl away, so re-read it instead of guessing.
-static void nat_pad_resync(void) {
+// ONLY ever called on the ACTIVE node: it writes g_pad, and a resync of the
+// node nobody is holding would publish that pad's idle levels over the levels
+// of the pad in the player's hands.
+static void nat_pad_resync(const pad_node_t *n) {
   unsigned char keys[(PKEY_MAX + 8) / 8] = {0};
-  if (ioctl(g_pad_fd, EVIOCGKEY_(sizeof keys), keys) >= 0) {
+  if (ioctl(n->fd, EVIOCGKEY_(sizeof keys), keys) >= 0) {
     for (int c = PBTN_A; c <= PBTN_THUMBR; c++) {
       int b = nat_pad_btn((unsigned short)c);
       if (b >= 0) g_pad.btn[b] = PAD_TESTBIT(keys, c) != 0;
@@ -35453,24 +35795,36 @@ static void nat_pad_resync(void) {
     // Digital-trigger fallback lives outside nat_pad_btn (TL2/TR2 map to no
     // PB_ button), so without this a drop storm leaves lt/rt stuck on pads
     // that have no analog trigger axis — same gate as the event pump's.
-    if (g_pad_absr[PABS_Z].max <= g_pad_absr[PABS_Z].min)
+    if (n->absr[PABS_Z].max <= n->absr[PABS_Z].min)
       g_pad.lt = PAD_TESTBIT(keys, PBTN_TL2) ? 1.0f : 0.0f;
-    if (g_pad_absr[PABS_RZ].max <= g_pad_absr[PABS_RZ].min)
+    if (n->absr[PABS_RZ].max <= n->absr[PABS_RZ].min)
       g_pad.rt = PAD_TESTBIT(keys, PBTN_TR2) ? 1.0f : 0.0f;
   }
   for (int a = 0; a <= PABS_RZ; a++) {
     ev_absinfo_t ai;
-    if (g_pad_absr[a].max > g_pad_absr[a].min &&
-        ioctl(g_pad_fd, EVIOCGABS_(a), &ai) >= 0)
-      nat_pad_abs(a, ai.value);
+    if (n->absr[a].max > n->absr[a].min &&
+        ioctl(n->fd, EVIOCGABS_(a), &ai) >= 0)
+      nat_pad_abs(n, a, ai.value);
   }
   // The dpad is an ABS hat on xpad and friends — outside both loops above, so
   // a resync that skips it leaves a dpad direction stuck through the exact
   // event storm that caused the drop. Hats need no range table (values -1/0/1).
   for (int a = PABS_HAT0X; a <= PABS_HAT0Y; a++) {
     ev_absinfo_t ai;
-    if (ioctl(g_pad_fd, EVIOCGABS_(a), &ai) >= 0) nat_pad_abs(a, ai.value);
+    if (ioctl(n->fd, EVIOCGABS_(a), &ai) >= 0) nat_pad_abs(n, a, ai.value);
   }
+}
+
+// Make `slot` the node that drives the game. The old node's LEVELS have to go
+// with it — a stick left deflected on the pad being handed away would keep
+// walking the player — and the new node's have to be read out of the kernel
+// rather than waited for, since evdev never re-reports an unchanged level.
+static void nat_pad_activate(int slot) {
+  g_pad_act = slot;
+  memset(&g_pad, 0, sizeof g_pad);
+  nat_pad_resync(&g_pad_node[slot]);
+  fprintf(stderr, "pad: active -> %s (event%d)\n",
+          g_pad_node[slot].name, g_pad_node[slot].idx);
 }
 
 // The gamepad fingerprint is BTN_GAMEPAD + ABS_X: the kernel gamepad spec
@@ -35502,7 +35856,10 @@ static int nat_pad_sysfs_is_pad(int idx) {
   return (int)((w[n - 1 - word] >> bit) & 1ull);
 }
 
-static int nat_pad_try(const char *path, int idx) {
+// Fills `out`'s ranges and name on success and returns the fd; the caller owns
+// both. The node's own axis ranges live on the NODE because two pads in one
+// session need not agree on them (a Deck stick is 16-bit, a HID pad often 8).
+static int nat_pad_try(const char *path, int idx, pad_node_t *out) {
   int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
     // EACCES on a node whose sysfs says "gamepad" = Steam is hiding the pad
@@ -35527,97 +35884,175 @@ static int nat_pad_try(const char *path, int idx) {
   ioctl(fd, EVIOCGRAB_, 0);
   for (int a = 0; a <= PABS_RZ; a++) {
     ev_absinfo_t ai;
-    g_pad_absr[a].min = g_pad_absr[a].max = 0;
+    out->absr[a].min = out->absr[a].max = 0;
     if (PAD_TESTBIT(abits, a) && ioctl(fd, EVIOCGABS_(a), &ai) >= 0) {
-      g_pad_absr[a].min = ai.minimum;
-      g_pad_absr[a].max = ai.maximum;
+      out->absr[a].min = ai.minimum;
+      out->absr[a].max = ai.maximum;
     }
   }
-  char name[64] = "?";
-  ioctl(fd, EVIOCGNAME_(sizeof name), name);
-  name[sizeof name - 1] = '\0';  // the kernel does not terminate on truncation
-  fprintf(stderr, "pad: %s (%s)\n", name, path);
+  snprintf(out->name, sizeof out->name, "?");
+  ioctl(fd, EVIOCGNAME_(sizeof out->name), out->name);
+  out->name[sizeof out->name - 1] = '\0';  // the kernel does not terminate on truncation
+  fprintf(stderr, "pad: %s (%s)\n", out->name, path);
   return fd;
 }
 
 static void nat_pad_pump(double now) {
-  if (g_pad_fd < 0) {
-    // Cheap hotplug: rescan every 2 s while nothing is connected. Steam can
-    // create its virtual pad AFTER the game started, so a one-shot scan at
-    // startup would permanently miss the Deck's own controls. The scan keeps
-    // the LAST match: uinput nodes (Steam's virtual pad) are created after
-    // the physical ones and get the higher event number, and event minors are
-    // not recycled promptly, so 64 covers long sessions of BT reconnects.
-    if (now < g_pad_rescan) return;
+  // HOTPLUG runs on the same 2 s cadence whether or not a pad is already
+  // held, which the single-fd version could not afford to do. It has to: the
+  // dongle goes into a machine whose BUILT-IN pad is already the session's,
+  // and a scan that only ran while disconnected would never see it. Steam
+  // also creates its virtual node AFTER the game started, so a one-shot scan
+  // at startup misses the handheld's own controls too. Nodes already held are
+  // skipped by event INDEX, which is what makes the scan idempotent.
+  if (now >= g_pad_rescan) {
     g_pad_rescan = now + 2.0;
     g_pad_denied = 0;  // re-judged per scan: the layout switch can happen live
     for (int i = 0; i < 64; i++) {
+      int slot = -1, held = 0;
+      for (int s = 0; s < PAD_NODES; s++) {
+        if (g_pad_node[s].fd >= 0) {
+          if (g_pad_node[s].idx == i) { held = 1; break; }
+        } else if (slot < 0) {
+          slot = s;
+        }
+      }
+      if (held) continue;
+      if (slot < 0) break;              // table full — nothing left to add to
       char path[32];
       snprintf(path, sizeof path, "/dev/input/event%d", i);
-      int fd = nat_pad_try(path, i);
-      if (fd >= 0) {
-        if (g_pad_fd >= 0) close(g_pad_fd);
-        g_pad_fd = fd;
-      }
+      pad_node_t n = {.fd = -1, .idx = i, .touched = 0};
+      int fd = nat_pad_try(path, i, &n);
+      if (fd < 0) continue;
+      n.fd = fd;
+      g_pad_node[slot] = n;
     }
-    if (g_pad_fd < 0) return;
-    g_pad.connected = 1;
-    g_pad_reprobe = now + 2.0;
-    nat_pad_resync();
   }
-  // Ownership can be TAKEN mid-session: when Steam Input starts managing the
-  // pad it grabs the node the game holds, and from then on read() returns
-  // EAGAIN forever with no error — g_pad freezes at its last levels (a
-  // deflected stick keeps walking the player) and nothing reaches the rescan.
-  // The scan-time grab probe answers ownership, so repeat it on the same 2 s
-  // cadence: success = still ours, release immediately; EBUSY = Steam owns it
-  // now — drop the node (which also zeroes g_pad, stopping any stuck input)
-  // and let the rescan find Steam's later-numbered virtual pad.
+  // Ownership can be TAKEN mid-session: when Steam Input starts managing a pad
+  // it grabs the node the game holds, and from then on read() returns EAGAIN
+  // forever with no error — that node freezes at its last levels and nothing
+  // reaches the rescan. The scan-time grab probe answers ownership, so repeat
+  // it on the same 2 s cadence, PER NODE: success = still ours, release
+  // immediately; EBUSY = Steam owns it now, so drop that one and let the scan
+  // find its virtual replacement. Dropping one no longer costs the session —
+  // the pads on the other slots keep playing.
   if (now >= g_pad_reprobe) {
     g_pad_reprobe = now + 2.0;
-    if (ioctl(g_pad_fd, EVIOCGRAB_, 1) < 0) {
-      if (errno == EBUSY) {
-        g_pad_denied = 1;
-        nat_pad_close();
-        g_pad_rescan = now + 2.0;
-        return;
-      }
-    } else {
-      ioctl(g_pad_fd, EVIOCGRAB_, 0);
-    }
-  }
-  ev_event_t ev;
-  for (;;) {
-    ssize_t n = read(g_pad_fd, &ev, sizeof ev);
-    if (n != (ssize_t)sizeof ev) {
-      if (n < 0 && errno == EAGAIN) break;  // == EWOULDBLOCK on every Linux libc
-      if (n < 0 && errno == EINTR) continue;  // a signal is not an unplug
-      nat_pad_close();  // unplugged (ENODEV) or a truncated read: start over
-      g_pad_rescan = now + 2.0;
-      return;
-    }
-    if (ev.type == PEV_KEY) {
-      // value 2 is auto-repeat, which is still "held". The digital-trigger
-      // fallback is gated on the device NOT advertising the analog axis:
-      // hid-playstation reports BOTH (BTN_TL2 flips at a light pull, after
-      // the ABS in the same frame), and taking the digital edge there slams
-      // a half-pulled analog trigger to 1.0/0.0 and defeats the hysteresis.
-      if (ev.code == PBTN_TL2) {
-        if (g_pad_absr[PABS_Z].max <= g_pad_absr[PABS_Z].min)
-          g_pad.lt = ev.value ? 1.0f : 0.0f;
-      } else if (ev.code == PBTN_TR2) {
-        if (g_pad_absr[PABS_RZ].max <= g_pad_absr[PABS_RZ].min)
-          g_pad.rt = ev.value ? 1.0f : 0.0f;
+    for (int s = 0; s < PAD_NODES; s++) {
+      if (g_pad_node[s].fd < 0) continue;
+      if (ioctl(g_pad_node[s].fd, EVIOCGRAB_, 1) < 0) {
+        if (errno == EBUSY) { g_pad_denied = 1; nat_pad_drop(s); }
       } else {
-        int b = nat_pad_btn(ev.code);
-        if (b >= 0) g_pad.btn[b] = ev.value != 0;
+        ioctl(g_pad_node[s].fd, EVIOCGRAB_, 0);
       }
-    } else if (ev.type == PEV_ABS) {
-      nat_pad_abs(ev.code, ev.value);
-    } else if (ev.type == PEV_SYN && ev.code == PSYN_DROPPED) {
-      nat_pad_resync();
     }
   }
+  // EVERY node is drained every frame; only the ACTIVE one writes g_pad. The
+  // draining is mandatory rather than incidental: an evdev fd nobody reads
+  // overflows its kernel ring, and a node that overflows while idle is a node
+  // whose first real event arrives behind a SYN_DROPPED.
+  for (int s = 0; s < PAD_NODES; s++) {
+    pad_node_t *n = &g_pad_node[s];
+    if (n->fd < 0) continue;
+    int active = (s == g_pad_act);
+    ev_event_t ev;
+    for (;;) {
+      ssize_t r = read(n->fd, &ev, sizeof ev);
+      if (r != (ssize_t)sizeof ev) {
+        if (r < 0 && errno == EAGAIN) break;  // == EWOULDBLOCK on every Linux libc
+        if (r < 0 && errno == EINTR) continue;  // a signal is not an unplug
+        nat_pad_drop(s);  // unplugged (ENODEV) or a truncated read
+        break;
+      }
+      if (nat_pad_woke(n, &ev)) n->touched = now;
+      if (!active) continue;            // drained for the ring, not for state
+      if (ev.type == PEV_KEY) {
+        // value 2 is auto-repeat, which is still "held". The digital-trigger
+        // fallback is gated on the device NOT advertising the analog axis:
+        // hid-playstation reports BOTH (BTN_TL2 flips at a light pull, after
+        // the ABS in the same frame), and taking the digital edge there slams
+        // a half-pulled analog trigger to 1.0/0.0 and defeats the hysteresis.
+        if (ev.code == PBTN_TL2) {
+          if (n->absr[PABS_Z].max <= n->absr[PABS_Z].min)
+            g_pad.lt = ev.value ? 1.0f : 0.0f;
+        } else if (ev.code == PBTN_TR2) {
+          if (n->absr[PABS_RZ].max <= n->absr[PABS_RZ].min)
+            g_pad.rt = ev.value ? 1.0f : 0.0f;
+        } else {
+          int b = nat_pad_btn(ev.code);
+          if (b >= 0) g_pad.btn[b] = ev.value != 0;
+        }
+      } else if (ev.type == PEV_ABS) {
+        nat_pad_abs(n, ev.code, ev.value);
+      } else if (ev.type == PEV_SYN && ev.code == PSYN_DROPPED) {
+        nat_pad_resync(n);
+      }
+    }
+  }
+  // HAND-OVER. Two conditions, and each one is load-bearing. The challenger
+  // must have been touched MORE RECENTLY than the incumbent — otherwise a pad
+  // touched once at boot steals the session back the moment the pad actually
+  // in use pauses. And the incumbent must have gone quiet for PAD_WAKE_QUIET,
+  // which is what keeps a controller's physical node and Steam's virtual twin
+  // of it from trading the session every frame.
+  int best = -1;
+  for (int s = 0; s < PAD_NODES; s++)
+    if (g_pad_node[s].fd >= 0 && s != g_pad_act && g_pad_node[s].touched > 0 &&
+        (best < 0 || g_pad_node[s].touched > g_pad_node[best].touched))
+      best = s;
+  if (g_pad_act < 0) {
+    // Nothing is driving: either the first scan just landed or the active pad
+    // was unplugged. Take the freshest TOUCHED node, else the lowest slot —
+    // an untouched pad still has to answer the menu's first button press.
+    if (best < 0)
+      for (int s = 0; s < PAD_NODES; s++)
+        if (g_pad_node[s].fd >= 0) { best = s; break; }
+    if (best >= 0) nat_pad_activate(best);
+  } else if (best >= 0 &&
+             g_pad_node[best].touched > g_pad_node[g_pad_act].touched &&
+             now - g_pad_node[g_pad_act].touched >= PAD_WAKE_QUIET) {
+    nat_pad_activate(best);
+  }
+  // One flag over the whole table: "is there a pad at all". nat_pad_drop and
+  // nat_pad_activate both clear g_pad wholesale, so this is republished here
+  // rather than maintained at every site that can change it.
+  int any = 0;
+  for (int s = 0; s < PAD_NODES; s++) if (g_pad_node[s].fd >= 0) any = 1;
+  g_pad.connected = any;
+}
+
+// `padscan` (harness). Pumps the REAL scan for `frames` iterations at the real
+// frame cadence — long enough to cross the 2 s rescan more than once — and
+// prints the node table plus every hand-over on the way. `act` marks the node
+// that is driving g_pad; `touch` is seconds since that node was last touched,
+// which is the whole input to the hand-over rule.
+static void nat_pad_report(int frames) {
+  double t0 = nat_now();
+  int prev_act = -2;
+  for (int f = 0; f < frames; f++) {
+    nat_pad_pump(nat_now());
+    if (g_pad_act != prev_act) {
+      printf("padscan t=%.2f active=%s\n", nat_now() - t0,
+             g_pad_act < 0 ? "none" : g_pad_node[g_pad_act].name);
+      prev_act = g_pad_act;
+    }
+    struct timespec ts = {0, 8333333L};   // ~120 Hz, the game's own frame rate
+    nanosleep(&ts, NULL);
+  }
+  double now = nat_now();
+  int n = 0;
+  for (int i = 0; i < PAD_NODES; i++) {
+    if (g_pad_node[i].fd < 0) continue;
+    n++;
+    printf("padscan node event%-2d %s touch=%s name=%s\n",
+           g_pad_node[i].idx, i == g_pad_act ? "ACT" : "   ",
+           g_pad_node[i].touched > 0 ? "yes" : "no ", g_pad_node[i].name);
+    if (g_pad_node[i].touched > 0)
+      printf("padscan   last touched %.2f s ago\n", now - g_pad_node[i].touched);
+  }
+  printf("padscan nodes=%d active=%s denied=%d conn=%d\n", n,
+         g_pad_act < 0 ? "none" : g_pad_node[g_pad_act].name,
+         g_pad_denied, g_pad.connected);
 }
 
 // --- refresh rate ----------------------------------------------------------
@@ -37390,8 +37825,9 @@ static_assert(sizeof(win_xi_state_t) == 16, "XINPUT_STATE ABI");
 static_assert(sizeof(win_xi_gamepad_t) == sizeof(pad_xinput_raw_t), "XINPUT raw sample ABI");
 typedef DWORD (WINAPI *pfn_XInputGetState)(DWORD, win_xi_state_t *);
 static pfn_XInputGetState g_xi_get_state;
-static int    g_xi_slot = -1;
-static double g_xi_rescan;
+static int      g_xi_slot = -1;
+static double   g_xi_rescan;
+static unsigned g_xi_live;      // bit s = slot s answered on the last scan
 
 static void win_pad_load(void) {
   win_dinput_load(0.0);
@@ -37400,22 +37836,68 @@ static void win_pad_load(void) {
   if (m) g_xi_get_state = (pfn_XInputGetState)(void *)GetProcAddress(m, "XInputGetState");
 }
 
+// IS ANYTHING BEING PRESSED ON THIS PAD. Levels, not edges — which is all
+// XInput offers and all the hand-over below needs, since it only ever asks "is
+// the pad I am reading idle while another one is not". Half a thumb's travel is
+// well past any drift, so a pad on a table cannot answer yes.
+static int win_xi_busy(const win_xi_gamepad_t *g) {
+  const SHORT DZ = 16384;
+  return g->wButtons != 0 || g->bLeftTrigger > 128 || g->bRightTrigger > 128 ||
+         g->sThumbLX > DZ || g->sThumbLX < -DZ ||
+         g->sThumbLY > DZ || g->sThumbLY < -DZ ||
+         g->sThumbRX > DZ || g->sThumbRX < -DZ ||
+         g->sThumbRY > DZ || g->sThumbRY < -DZ;
+}
+
+// THE SAME DEFECT THE EVDEV PUMP HAD, MIRRORED: this used to latch the FIRST
+// slot that answered and keep it for the session, so a machine with two pads
+// connected — a handheld's built-in controls plus an 8BitDo on its 2.4 GHz
+// dongle, the exact case measured on the deploy device — played whichever one
+// Windows happened to enumerate first and ignored the one in the player's
+// hands. "First slot" and "last event minor" are the same guess wearing
+// different clothes, and neither knows anything about hands.
+//
+// XInput makes the fix smaller than the Linux one, because a slot IS a physical
+// pad (there are no virtual twins to thrash between) and every read is a whole
+// state rather than an event stream. So: keep reading the active slot, and only
+// while it is IDLE look for another slot that is not. A pad being used is never
+// interrupted, and picking up the other pad takes one press.
+//
+// NOTE: compile-checked only — this container cannot run the Windows build.
 static int win_xinput_pump(pad_state_t *out, double now) {
   if (!g_xi_get_state) return 0;
   win_xi_state_t st;
-  if (g_xi_slot < 0) {
-    // Empty XInput slots are expensive to poll (a device enumeration inside
-    // the call), so scan on a 2 s timer rather than every frame.
-    if (now < g_xi_rescan) return 0;
+  // Empty XInput slots are expensive to poll (a device enumeration inside the
+  // call), so which slots EXIST is refreshed on a 2 s timer rather than every
+  // frame. Reading a slot that does exist is cheap, which is what makes the
+  // per-frame hand-over search below affordable.
+  if (now >= g_xi_rescan) {
     g_xi_rescan = now + 2.0;
-    for (DWORD i = 0; i < 4 && g_xi_slot < 0; i++)
-      if (g_xi_get_state(i, &st) == 0 /* ERROR_SUCCESS */) g_xi_slot = (int)i;
-    if (g_xi_slot < 0) return 0;
+    g_xi_live = 0;
+    for (DWORD i = 0; i < 4; i++)
+      if (g_xi_get_state(i, &st) == 0 /* ERROR_SUCCESS */) g_xi_live |= 1u << i;
+    if (g_xi_slot >= 0 && !(g_xi_live & (1u << g_xi_slot))) g_xi_slot = -1;
+    if (g_xi_slot < 0)
+      for (int i = 0; i < 4; i++)
+        if (g_xi_live & (1u << i)) { g_xi_slot = i; break; }
   }
+  if (g_xi_slot < 0) return 0;
   if (g_xi_get_state((DWORD)g_xi_slot, &st) != 0) {
     g_xi_slot = -1;
+    g_xi_live = 0;
     g_xi_rescan = now + 2.0;
     return 0;
+  }
+  // HAND-OVER: only while the active pad is idle, and only to a slot that is
+  // not. Gating on idle is what keeps a pad in use from being taken away
+  // mid-turn, and it is also what keeps the extra reads off the hot path.
+  if (!win_xi_busy(&st.Gamepad)) {
+    for (int i = 0; i < 4; i++) {
+      if (i == g_xi_slot || !(g_xi_live & (1u << i))) continue;
+      win_xi_state_t o;
+      if (g_xi_get_state((DWORD)i, &o) != 0) { g_xi_live &= ~(1u << i); continue; }
+      if (win_xi_busy(&o.Gamepad)) { g_xi_slot = i; st = o; break; }
+    }
   }
   const win_xi_gamepad_t *g = &st.Gamepad;
   // SHORT is -32768..32767; pad_apply_xinput clamps the one-step negative
