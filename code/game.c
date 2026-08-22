@@ -2057,8 +2057,15 @@ static void upd_status_line(char *out, size_t n) {
     case UPD_UNSUPPORTED: r = snprintf(out, n, "%s - NO RELEASE FOR THIS PLATFORM", pre); break;
     case UPD_CHECKING:  r = snprintf(out, n, "%s - CHECKING...", pre); break;
     case UPD_CURRENT:   r = snprintf(out, n, "%s - UP TO DATE [CHECKED %ld MIN AGO]", pre, mins); break;
-    case UPD_UPDATE:    r = snprintf(out, n, "%s - UPDATE %s AVAILABLE", pre, g_upd_remote_date); break;
-    case UPD_RECUT:     r = snprintf(out, n, "%s - REBUILD AVAILABLE", pre); break;
+    // ONE line for both offers, and it names the build on the other end the
+    // same way `pre` names this one. "REBUILD AVAILABLE" said neither WHICH
+    // build nor that it was newer — and a same-day re-cut is the common case
+    // with one rolling release, so the state a player sees most often was the
+    // one that read least like an update. Date plus seven hex is also the
+    // whole diagnosis: an equal date means a re-cut, a later one a new day.
+    case UPD_UPDATE:
+    case UPD_RECUT:     r = snprintf(out, n, "%s - UPDATE %s+%.7s AVAILABLE", pre,
+                                     g_upd_remote_date, g_upd_remote_sha); break;
     case UPD_RDONLY:    r = snprintf(out, n, "%s - FOLDER NOT WRITABLE: DOWNLOAD MANUALLY", pre); break;
     default:            r = snprintf(out, n, "%s - CHECK FAILED%s%s", pre,
                                      g_upd_why[0] ? ": " : "", g_upd_why); break;
@@ -2073,6 +2080,38 @@ static void upd_status_line(char *out, size_t n) {
 static void upd_check_start(void);
 static int  upd_apply(void);          // returns 0 on failure, g_upd_why says why
 static int  upd_rollback_now(void);
+
+// A SECOND CHECK, ON THE SCREEN THAT SHOWS THE ANSWER. The boot check is one
+// shot, so a client that was ALREADY RUNNING when a release went out never
+// learns about it — and with one rolling "latest" that is re-cut several times
+// a day, that is the common case rather than an edge one. The entry screen is
+// where the status line and the APPLY UPDATE row live, so OPENING it is the
+// event; a timer in the frame loop would spend requests nobody is looking at.
+//
+// The policy is a pure predicate so it can be asserted without a network:
+//   - a verdict still in flight is not re-asked (UPD_CHECKING),
+//   - an OFFER is never re-asked, because a later fetch that failed would take
+//     an APPLY UPDATE row away from under the player's thumb,
+//   - everything else — up to date, failed, read-only — is re-asked once the
+//     throttle has expired, so ESC-tapping cannot become a request per press.
+// upd_check_gate() still owns the dev/off/unsupported refusals and the
+// one-checker-at-a-time exchange; this only decides WHETHER to ask it.
+#define UPD_RECHECK_S 600
+static int upd_recheck_due(long now, long at, int st) {
+  if (st == UPD_CHECKING || st == UPD_UPDATE || st == UPD_RECUT) return 0;
+  if (at && now - at < UPD_RECHECK_S) return 0;
+  return 1;
+}
+// Called by BOTH native backends from platform_menu_changed, at the point where
+// each already knows it is not the harness — the same one-call-site-per-backend
+// shape upd_check_start has, and the reason the harness and the dedicated
+// server still cannot reach the network through this.
+static void upd_menu_recheck(void) {
+  if (!g_menu_open) return;
+  if (!upd_recheck_due((long)time(NULL), atomic_load(&g_upd_checked_at),
+                       atomic_load(&g_upd_state))) return;
+  upd_check_start();
+}
 
 // The genuinely per-OS updater primitives, forward-declared like net_udp_*:
 // the transport (curl child / WinHTTP) and the fs probe. Everything else in
@@ -17809,7 +17848,23 @@ static void ui_home(int click, float cx, float cy) {
   if (g_ui_pad_mode) {
     const char *ph = g_nav_kbd ? "ARROWS MOVE   ENTER OK"
                    : g_ui_quit_arm ? "A CONFIRM QUIT" : "A OK   D-PAD MOVE";
-    ui_text_ex(ph, rx, y - 13, 0.75f, TXT_REG, 1.5f, C4(C_HAZE, 0.75f));
+    // THE HINT LIVES IN THE GAP, NOT ABOVE IT. `y` is the name line and the
+    // tile block ends at y - 12, so the old y - 13 asked for a line one unit
+    // ABOVE the block's own bottom edge — and a stroke overshoots its box by
+    // about a unit, so two units of the hint's cap height were drawn INSIDE the
+    // QUIT tile (measured: 333 px of the tile's own rect changed the moment pad
+    // mode turned on). The free band is [y-12, y-1] and the ink is 7 units
+    // tall, so y - 9 centres it with two units of air either side. The name
+    // line may NOT move to make room: the hint is pad-only, and a rail that
+    // reflows when a controller is touched is worse than a collision.
+    // The band is measured against the FOCUS RING, not the tile: the ring is
+    // drawn at fy-1.5 by fh+3, so a focused QUIT reaches 1.5 units past its own
+    // bottom edge — and QUIT focused is exactly the state the hint is most
+    // about. Ring bottom 289.5, name ink 299.0, ink 7 units tall: y - 8.25 is
+    // the centre of what is left, 1.25 units of air either side. That is all
+    // the band has; more air needs the footer line to move, which is a layout
+    // change and not this fix.
+    ui_text_ex(ph, rx, y - 8.25f, 0.75f, TXT_REG, 1.5f, C4(C_HAZE, 0.75f));
   }
   ui_text_ex(g_cfg.name, rx, y, 0.85f, TXT_BOLD, 1.6f, C4(C_BONE, 0.72f));
   float nw = ui_text_width_tr(g_cfg.name, 0.85f, 1.6f);
@@ -30333,7 +30388,9 @@ static void usage(void) {
        "  localent N         force g_local_ent (identity-sweep instrument;\n"
        "                     diff sfxlog/HUD against the id-0 run)\n"
        "  updinfo            version, own asset name, the FULL asset table\n"
-       "                     (the naming contract) and the update status line\n"
+       "                     (the naming contract), the update status line and\n"
+       "                     the menu-open re-check policy as never/just-inside/\n"
+       "                     just-outside the throttle, per update state\n"
        "  updcheck P [DATE]  run the update comparison against a local\n"
        "                     SHA256SUMS file P; DATE overrides the local\n"
        "                     version for UPDATE/DOWNGRADE cases\n\n",
@@ -33101,6 +33158,28 @@ static void run_script(char *script, sim_ctx_t *s) {
       }
       if (upd_own_sha(sha)) printf("sha %s\n", sha);
       printf("line %s\n", line);
+      // The MENU-OPEN RE-CHECK's policy, tabulated the way padcurve tabulates
+      // its curves: the predicate is pure, and it is the only part of that path
+      // a harness can reach at all (the call itself lives in each native
+      // backend, past its own not-the-harness gate). A fixed `now` keeps the
+      // table deterministic — a wall clock in a proof's output is not a proof.
+      // What must hold: an offer is NEVER re-asked, a check in flight is never
+      // doubled, and everything else flips from 0 to 1 across UPD_RECHECK_S.
+      {
+        static const struct { int st; const char *n; } RS[] = {
+          {UPD_CURRENT, "current"}, {UPD_FAILED, "failed"},
+          {UPD_RDONLY, "rdonly"},   {UPD_CHECKING, "checking"},
+          {UPD_UPDATE, "update"},   {UPD_RECUT, "recut"},
+        };
+        long now = 1000000;
+        printf("recheck window=%ds", UPD_RECHECK_S);
+        for (int i = 0; i < (int)(sizeof RS / sizeof RS[0]); i++)
+          printf(" %s=%d/%d/%d", RS[i].n,
+                 upd_recheck_due(now, 0, RS[i].st),
+                 upd_recheck_due(now, now - (UPD_RECHECK_S - 1), RS[i].st),
+                 upd_recheck_due(now, now - UPD_RECHECK_S, RS[i].st));
+        printf("\n");
+      }
     } else if (!strcmp(t, "updcheck")) {
       // The §15.2 comparison against a LOCAL file — the whole rule set is
       // provable without the network, and the output can move (truncated
@@ -35873,6 +35952,7 @@ static void audio_start(void) {
 static void platform_menu_changed(void) {
   g_ui_mdown = 0;
   if (g_headless) return;
+  upd_menu_recheck();   // native only, and past the harness gate on purpose
   if (g_menu_open) {
     nat_grab(0);
     // Seed the UI cursor from the real pointer, in WINDOW coordinates: g_ui_cx
@@ -36391,6 +36471,13 @@ static int upd_fetch(const char *url, char *dst, size_t cap, size_t *out_len) {
     close(fds[0]); close(fds[1]);
     char *const cargv[] = {
       "curl", "-q", "-fsS", "--proto", "=https", "--proto-redir", "=https",
+      // THE URL NEVER CHANGES, SO IT MUST BE ASKED FRESH. Both the sums and
+      // the asset live under releases/latest/download/, one fixed path per
+      // platform for the life of the project, and the DATE inside is equal
+      // across a same-day re-cut — so a proxy or CDN that caches by URL serves
+      // a body that nothing in it can be told is stale. curl keeps no cache of
+      // its own; this is for everything between here and GitHub.
+      "-H", "Cache-Control: no-cache", "-H", "Pragma: no-cache",
       "--location", "--max-redirs", "5", "--connect-timeout", "5",
       "--max-time", "30", "--max-filesize", UPD_STR(UPD_FETCH_MAX), "--no-progress-meter",
       "-o", "-", (char *)url, NULL};
@@ -37465,6 +37552,7 @@ static void win_input_clear(void) {
 }
 
 static void platform_menu_changed(void) {
+  upd_menu_recheck();   // the Windows backend has no harness path to gate
   if (g_menu_open) {
     ClipCursor(NULL);
     POINT pt;
@@ -37674,7 +37762,11 @@ static int upd_fetch(const char *url, char *dst, size_t cap, size_t *out_len) {
   req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
   if (!req) goto done;
-  if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) ||
+  // Ask fresh: same reason as the curl side (one fixed URL, and a same-day
+  // re-cut carries the same date inside). WinHTTP holds no cache itself, but
+  // AUTOMATIC_PROXY means the request may well go through one that does.
+  if (!WinHttpSendRequest(req, L"Cache-Control: no-cache\r\nPragma: no-cache",
+                          (DWORD)-1L, NULL, 0, 0, 0) ||
       !WinHttpReceiveResponse(req, NULL))
     goto done;
   DWORD status = 0, sl = sizeof status;
