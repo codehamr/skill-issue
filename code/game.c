@@ -10368,20 +10368,47 @@ static int bot_desired_weapon(const bot_t *b, int engaging, float target_dist,
 // the same stance a crouched bot's head sat 10 cm higher than a crouched
 // player's and was a measurably different target.
 // *part is 3 for the head, 2 for the body; returns the hit distance or -1.
-// `off` is the lateral displacement a lean has moved the upper body by. The
-// head takes all of it and the torso box a bit over half — a lean bends the
-// spine, so the shoulders travel nearly as far as the head and the boots not at
-// all, and a box with its floor at the feet can only average that. It matters
-// that this exists at all: a peek that moves the shot origin without moving the
-// target is a free kill, and the whole appeal of leaning is that it is a TRADE.
-static float ent_trace_box(v3 p, float eye, v3 off, v3 o, v3 d, int *part) {
+//
+// THE BOX STANDS IN THE BODY'S OWN FRAME, and that is the fairness rule: how
+// wide a target you are has to be a function of how you are STANDING, not of
+// the compass bearing between you and the shooter. These boxes used to be
+// world-axis aligned, so the same figure presented 440 mm along x and 600 mm
+// along z — a factor of 1.36 decided by which way north is — and turning the
+// figure 90 degrees moved neither number. Measured by sweeping aimed shots
+// laterally across a frozen puppet in 2 cm steps, which is the instrument for
+// any change to this function.
+// The RAY is rotated into the frame rather than the box out of it: one
+// ray_aabb, one hit distance, and it is still in world metres because a
+// rotation preserves length. The lean then collapses to a shift along local x,
+// because lean_offset is k * the body's own right axis by construction.
+// `lat` is that shift. The head takes all of it and the torso box a bit over
+// half — a lean bends the spine, so the shoulders travel nearly as far as the
+// head and the boots not at all, and a box with its floor at the feet can only
+// average that. It matters that this exists at all: a peek that moves the shot
+// origin without moving the target is a free kill, and the whole appeal of
+// leaning is that it is a TRADE.
+//
+// The extents are the figure's own, measured with `figm` in the MODEL frame:
+// 0.28 across is the deltoid span (556 mm shouldered, 629 mm idle), so the
+// shoulders are inside the box where a world box left up to 108 mm of each
+// upper arm outside it; 0.22 deep covers the trunk front to back (carrier
+// 361 mm, and the pack stands 255 mm off the spine — POSE_HALF's chest). The
+// head is ONE number because a head is round: 0.13 takes the helmet's
+// 210 x 251 mm with the smallest margin that still admits the ear covers,
+// where the old 0.14 square paid 35 mm of air per side at DOUBLE damage.
+static float ent_trace_box(v3 p, float eye, float yaw, float lat,
+                           v3 o, v3 d, int *part) {
   v3 n;
-  float neck = p.y + eye - 0.12f;
-  v3 hmn = {{p.x + off.x - 0.14f, neck, p.z + off.z - 0.14f}};
-  v3 hmx = {{p.x + off.x + 0.14f, p.y + eye + 0.18f, p.z + off.z + 0.14f}};
-  v3 bo = v3_scale(off, LEAN_BODY_K);
-  v3 bmn = {{p.x + bo.x - 0.30f, p.y, p.z + bo.z - 0.22f}};
-  v3 bmx = {{p.x + bo.x + 0.30f, neck, p.z + bo.z + 0.22f}};
+  float c = cosf(yaw), s = sinf(yaw);   // right = (c, 0, s): local +x is right
+  v3 ro = v3_sub(o, p);
+  v3 lo = {{ro.x * c + ro.z * s, ro.y, ro.z * c - ro.x * s}};
+  v3 ld = {{d.x * c + d.z * s, d.y, d.z * c - d.x * s}};
+  float neck = eye - 0.12f;
+  float bl = lat * LEAN_BODY_K;
+  v3 hmn = {{lat - 0.13f, neck,        -0.13f}};
+  v3 hmx = {{lat + 0.13f, eye + 0.18f,  0.13f}};
+  v3 bmn = {{bl - 0.28f, 0.0f, -0.22f}};
+  v3 bmx = {{bl + 0.28f, neck,  0.22f}};
   // A muzzle INSIDE the box still hits it. ray_aabb deliberately reports no hit
   // for an origin inside a solid (there is no sensible entry face, and the lean
   // probe and the third-person pivot cast both depend on that), but entities do
@@ -10392,8 +10419,8 @@ static float ent_trace_box(v3 p, float eye, v3 off, v3 o, v3 d, int *part) {
   #define IN_BOX(P, MN, MX) ((P).x >= (MN).x && (P).x <= (MX).x && \
                              (P).y >= (MN).y && (P).y <= (MX).y && \
                              (P).z >= (MN).z && (P).z <= (MX).z)
-  float th = IN_BOX(o, hmn, hmx) ? 0.001f : ray_aabb(o, d, hmn, hmx, &n);
-  float tb = IN_BOX(o, bmn, bmx) ? 0.001f : ray_aabb(o, d, bmn, bmx, &n);
+  float th = IN_BOX(lo, hmn, hmx) ? 0.001f : ray_aabb(lo, ld, hmn, hmx, &n);
+  float tb = IN_BOX(lo, bmn, bmx) ? 0.001f : ray_aabb(lo, ld, bmn, bmx, &n);
   #undef IN_BOX
   if (th > 0 && (tb <= 0 || th <= tb)) { *part = 3; return th; }
   if (tb > 0) { *part = 2; return tb; }
@@ -10412,8 +10439,7 @@ static float bot_eye(const bot_t *b) { return b->eye; }
 
 // Lag-compensation history: the server rewinds OTHER entities to
 // the moment the shooter's input tick was rendered on his screen. Each tick
-// records the exact box arguments ent_trace_box takes (pos, eye, lean-derived
-// offset, yaw). Write-only in singleplayer — nothing reads it there, so the
+// records the exact box arguments ent_trace_box takes (pos, eye, yaw, lean). Write-only in singleplayer — nothing reads it there, so the
 // byte gate is untouched — and the trace only ever runs on the server path.
 #define NET_HIST 128                 // ~1 s at 120 Hz, > any sane rewind window
 typedef struct { v3 pos; float eye, yaw, lean; unsigned char alive; } hist_t;
@@ -10461,8 +10487,8 @@ static float net_hist_trace(int e, long t, float frac, v3 o, v3 d, int *part) {
   float eye = a->eye + (b->eye - a->eye) * frac;
   float yaw = a->yaw, lean = a->lean + (b->lean - a->lean) * frac;
   int hh = human_of_ent(e);
-  v3 off = hh >= 0 ? lean_offset(yaw, lean) : (v3){{0, 0, 0}};
-  return ent_trace_box(pos, eye, off, o, d, part);
+  return ent_trace_box(pos, eye, yaw, hh >= 0 ? lean_eye_off(lean) : 0.0f,
+                       o, d, part);
 }
 
 // The lag-comp REWIND GATE. While a network human's move tick runs on the
@@ -10477,12 +10503,13 @@ static float net_hist_trace(int e, long t, float frac, v3 o, v3 d, int *part) {
 static long g_lagcomp_view = -1;
 
 static float bot_trace_one(const bot_t *b, v3 o, v3 d, int *part) {
-  return ent_trace_box(b->pos, bot_eye(b), (v3){{0, 0, 0}}, o, d, part);
+  return ent_trace_box(b->pos, bot_eye(b), b->yaw, 0.0f, o, d, part);
 }
 
 static float player_trace(const player_t *pl, v3 o, v3 d, int *part) {
   if (!pl->alive) return -1.0f;
-  return ent_trace_box(pl->pos, pl->eye, lean_offset(pl->yaw, pl->lean), o, d, part);
+  return ent_trace_box(pl->pos, pl->eye, pl->yaw, lean_eye_off(pl->lean),
+                       o, d, part);
 }
 
 // Nearest entity along the ray that is closer than *dist (pre-filled with the
@@ -34069,9 +34096,8 @@ static void run_script(char *script, sim_ctx_t *s) {
       float d_c = GUN_RANGE, d_n = GUN_RANGE;
       float hc = net_hist_trace(1, past, 0.0f, eye, dir, &part_c);   // compensated
       // uncompensated: trace against the CURRENT box
-      v3 nowoff = {{0, 0, 0}};
-      float hn = ent_trace_box(g_bots[0].pos, bot_eye(&g_bots[0]), nowoff,
-                               eye, dir, &part_n);
+      float hn = ent_trace_box(g_bots[0].pos, bot_eye(&g_bots[0]),
+                               g_bots[0].yaw, 0.0f, eye, dir, &part_n);
       d_c = hc > 0 ? hc : -1; d_n = hn > 0 ? hn : -1;
       // residual: how far the aimed ray passes from the CURRENT target centre
       v3 cur = {{g_bots[0].pos.x, g_bots[0].pos.y + bot_eye(&g_bots[0]) - ENT_CHEST_OFF,
@@ -34659,11 +34685,11 @@ static void run_script(char *script, sim_ctx_t *s) {
       v3 dn = {{0, -1, 0}};
       v3 pabove = {{p->pos.x, p->pos.y + 4.0f, p->pos.z}};
       v3 babove = {{b->pos.x, b->pos.y + 4.0f, b->pos.z}};
-      v3 noff = {{0, 0, 0}};  // hitbox parity is measured upright, both sides
-      float ph = ent_trace_box(p->pos, EYE_STAND, noff, pabove, dn, &ppart);
-      float bh = ent_trace_box(b->pos, EYE_STAND, noff, babove, dn, &bpart);
-      float pc = ent_trace_box(p->pos, EYE_CROUCH, noff, pabove, dn, &ppart);
-      float bc = ent_trace_box(b->pos, EYE_CROUCH, noff, babove, dn, &bpart);
+      // hitbox parity is measured upright (no lean), each at its own yaw
+      float ph = ent_trace_box(p->pos, EYE_STAND, p->yaw, 0.0f, pabove, dn, &ppart);
+      float bh = ent_trace_box(b->pos, EYE_STAND, b->yaw, 0.0f, babove, dn, &bpart);
+      float pc = ent_trace_box(p->pos, EYE_CROUCH, p->yaw, 0.0f, pabove, dn, &ppart);
+      float bc = ent_trace_box(b->pos, EYE_CROUCH, b->yaw, 0.0f, babove, dn, &bpart);
       // Two kinds of row, DECLARED in the output. `shared` rows put the same
       // expression in both columns because the one-copy refactor removed the
       // bot-side twin they originally compared — their MISMATCH branch is
