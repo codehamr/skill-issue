@@ -29,7 +29,9 @@
 from a seed at startup. Nobody has map knowledge. What carries over is aim and movement.
 
 **Two guns, everyone gets both.** A hitscan rifle and a bolt sniper that one-shots to the
-body. No loadouts, no battle pass. Most walls can be shot through, at full damage.
+body. No loadouts, no battle pass. Rounds cross up to 1.2 m of material at *full* damage, so
+most cover in the arena is a timing problem rather than a wall — and anything thicker still
+has corners. The arena's outer shell is the one thing nothing goes through.
 
 **Movement you can get good at.** Air control to carve a jump, a slide that carries real
 speed out of a corner, `Q`/`E` lean to peek with your eye instead of your whole body.
@@ -37,15 +39,17 @@ speed out of a corner, `Q`/`E` lean to peek with your eye instead of your whole 
 **No SBMM. Ever.** Mixed lobbies. You will run into someone better than you. If you get
 farmed, you got farmed. The title of the game is the diagnosis.
 
-**Instant.** The match is already running behind the menu: one press and you are
-shooting, keyboard or pad. The bots hear you, remember you and push, so it works solo too.
+**Instant.** There is a live firefight behind the start screen while you read it. Two
+presses — SINGLEPLAYER, then START MATCH — and you are shooting, keyboard or pad. The bots
+hear you, remember you and push, so it works solo too.
 
 ## Multiplayer
 
 The dedicated server is the same file with graphics and sound stripped out, running the
 same simulation at the full 120 Hz tick, with lag compensation that rewinds the world to
-the tick you actually shot on. Up to 8 humans per match; bots fill the empty slots and
-are never disguised as humans.
+the tick you actually shot on. Up to 8 humans per arena — my own Quick Join box is set
+lower while it is small — and bots fill the empty slots without ever being disguised as
+humans.
 
 Quick Join lands on a small server I run and pay for myself, so no promises it stays
 smooth if a crowd shows up. Which is fine: anyone can host with any Linux copy.
@@ -61,11 +65,17 @@ experiment too seriously, have fun with it.
 
 ## Usage ping
 
-The game pings my server about once a minute: a random install id, the mode, seconds
-played, Windows or Linux, build version. No name, no hardware details, no addresses
-stored. `telemetry 0` in `config.cfg` opts out. It also checks GitHub at startup for a
-newer build, always asks first, keeps the old binary for rollback. `update_check 0`
-turns it off.
+The game pings my server about once a minute, and this is the whole packet: an install id
+(a number rolled from the clock when the game first ran and kept in `config.cfg` — not
+anything about your machine), whether the ping is the first of the session or a later one,
+which mode you are in, seconds played, Windows or Linux, and the build version. No name,
+no hardware details, no addresses stored. `telemetry 0` in `config.cfg` opts out.
+
+It also checks GitHub for a newer build. On the start screen — before you are in a match —
+it installs it by itself and restarts, showing `UPDATING...` for a moment. Once a session is
+running it never does that: from then on the update is a row in the menu that you press. The
+binary it replaced is left beside the new one with a `.old` suffix, so a bad build is one rename
+away from being undone. `update_check 0` turns the whole thing off.
 
 ## License
 

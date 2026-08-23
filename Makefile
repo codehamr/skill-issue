@@ -42,10 +42,10 @@ OPT      := -O3 -ffast-math -funroll-loops -flto=auto
 # download now, and AVX2 code is a #UD *before main()* on every Windows 11
 # machine without it — an instant, message-less crash. x86-64-v2 is exactly
 # Windows 11's own CPU floor, and the handheld loses nothing measurable
-# (design §13.4; the CPU cost of this game is the scalar figure build).
+# (the CPU cost of this game is the scalar figure build).
 WIN_ARCH := -march=x86-64-v2
 
-# The version the auto-updater compares against (design §13.3). Without an
+# The version the auto-updater compares against. Without an
 # explicit BUILD_VERSION the build is a developer build and NEVER updates —
 # that is the default and not the special case, so a local build can never
 # clobber itself with a release. BUILD_COMMIT is the only re-cut confirmation
@@ -56,11 +56,11 @@ VERFLAG       := -DBUILD_VERSION='"$(BUILD_VERSION)"' -DBUILD_COMMIT='"$(BUILD_C
 
 WIN_CC     := x86_64-w64-mingw32-gcc
 WIN_RES    := x86_64-w64-mingw32-windres
-WIN_CFLAGS := -std=c23 $(OPT) $(WIN_ARCH) -Wall -Wextra -mwindows
+WIN_CFLAGS := -std=c23 $(OPT) $(WIN_ARCH) -Wall -Wextra -Wshadow -mwindows
 WIN_LIBS   := -static -lgdi32 -luser32 -lopengl32 -lwinmm -lole32 -lwinhttp -lws2_32 -lm
 
 # -fno-tree-vectorize is a DEPENDENCY decision, not an optimization one
-# (design §13.4, measured 2026-08-08): under -ffast-math the auto-vectorizer
+# (measured 2026-08-08): under -ffast-math the auto-vectorizer
 # pulls libmvec.so.1 into NEEDED for zero measured win. With the flag, one
 # dependency fewer and the floor is the bare -std=c23 __isoc23_* GLIBC_2.38
 # (which no flag can lower); trace/match/kine are byte-identical against the
@@ -70,7 +70,7 @@ WIN_LIBS   := -static -lgdi32 -luser32 -lopengl32 -lwinmm -lole32 -lwinhttp -lws
 # which is why the flag predates the arm64 release's removal and outlives it.
 # Linux only — Windows has no libmvec and keeps WIN_ARCH above.
 LIN_CC     := gcc
-LIN_CFLAGS := -std=c23 $(OPT) -fno-tree-vectorize -Wall -Wextra
+LIN_CFLAGS := -std=c23 $(OPT) -fno-tree-vectorize -Wall -Wextra -Wshadow
 LIN_LIBS   := -lEGL -lGL -lX11 -lm
 
 # The shippable Linux binary is x86_64. On an x86_64 host the native gcc IS
@@ -145,10 +145,12 @@ deploy: $(DEPLOY_BIN)
 	ssh $(DEPLOY_HOST) chmod +x game
 
 # ---------------------------------------------------------------------------
-# Dedicated server on the VPS — three commands, no systemd (server.md).
-#   server-deploy  build + ship + (re)start ~/skill-issue/game, prove loopback
-#   server-logs    render game.log into last-24h / all-time usage stats
-#   server-delete  kill the process group and remove ~/skill-issue entirely
+# Dedicated server on the VPS — four commands, no systemd. These comments are
+# the ops authority; there is no separate server document.
+#   server-deploy      build + ship + (re)start ~/skill-issue/game, prove loopback
+#   server-logs        render game.log into last-24h / all-time usage stats
+#   server-logs-reset  truncate game.log IN PLACE (never rm — see the target)
+#   server-delete      kill the process group and remove ~/skill-issue entirely
 #
 # These targets are the maintainer's own deploy path — the game itself needs
 # none of them: any Linux copy runs a server with `./game --server`. `.env` in
@@ -448,4 +450,4 @@ init:
 	git push --force origin main
 	@echo "Git history reset to single 'init' commit"
 
-.PHONY: all clean deploy init server-deploy server-delete server-logs
+.PHONY: all clean deploy init server-deploy server-delete server-logs server-logs-reset

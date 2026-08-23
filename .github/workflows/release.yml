@@ -1,4 +1,4 @@
-# Release on every push to main (design §14), lean version. ONE build job
+# Release on every push to main, lean version. ONE build job
 # proves both binaries, one release job publishes. The release job does not
 # EXIST while the build is red (`needs:`), so "tag first, test later, updaters
 # stuck on a bad build" cannot happen. Exactly ONE release exists at any time:
@@ -6,7 +6,7 @@
 # only ever fetches releases/latest/download/, so the tag NAME is nothing to
 # it; it orders builds by the DATE still written into VERSION and SHA256SUMS'
 # "# version" header. Rollback is therefore client-side only (each client keeps
-# its own exe.old, §15.4) — no prior release is kept to fall back to. Two
+# its own exe.old) — no prior release is kept to fall back to. Two
 # assets, deliberately: linux-amd64 (desktop + SteamOS) and windows-amd64 (also
 # covers Windows-on-ARM via its built-in x64 emulation). linux-arm64 was
 # dropped 2026-08-08 — no player target, and the aarch64 devcontainer builds
@@ -16,7 +16,7 @@ on:
   push:
     branches: [main]
 
-# TCB note (§15.7): actions and the container image run with the release token.
+# TCB note: actions and the container image run with the release token.
 # Pin actions to SHAs and the image to a digest once the repo is public.
 # contents: read, not {} — an empty set strips even read, and checkout on a
 # private repo then 404s ("repository not found"). The release job alone
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v7
 
       # BUILD_VERSION/BUILD_COMMIT MUST be passed: without them every binary is
-      # a "dev" build (§13.3) and never updates.
+      # a "dev" build and never updates.
       - name: Build
         run: |
           V=$(date -u +%Y-%m-%d); C=$(echo ${{ github.sha }} | cut -c1-7)
@@ -59,7 +59,7 @@ jobs:
           mv build/game-x86_64 skill-issue-linux-amd64
           mv build/game.exe    skill-issue-windows-amd64.exe
 
-      # Warning gate WITHOUT LTO (-flto swallows -Wformat-truncation, §14.2),
+      # Warning gate WITHOUT LTO (-flto swallows -Wformat-truncation),
       # then the self-contained proof gate. The build that ships is proved.
       - name: Gate
         run: |
@@ -88,7 +88,7 @@ jobs:
           echo "$V" > dist/VERSION
           # The tag is fixed ("latest"), so the DATE the updater orders by lives
           # ONLY here — the "# version" header plus VERSION's own sum. Without it
-          # an "update" could silently be a downgrade (§15.2).
+          # an "update" could silently be a downgrade.
           ( cd dist && { echo "# version $V"; sha256sum skill-issue-* VERSION; } > SHA256SUMS )
           # Exactly ONE release, always the tag "latest", recreated each push.
           # Delete every existing release+tag first (this also migrates away any

@@ -1,6 +1,6 @@
 # tools/server-report.awk — renders `make server-logs`. Input: optionally one
 # lone byte-count line (the size header the Makefile prepends), then raw
-# game.log lines per the grammar in server.md. Unknown lines are ignored by
+# game.log lines per the grammar that slog() in code/game.c writes. Unknown lines are ignored by
 # design — stderr noise must never break the report. -v now=<unix time>.
 #
 # THE REPORT IS PLAYERS AND PLAYTIME. It reads exactly one line shape,

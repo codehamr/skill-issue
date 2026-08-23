@@ -1,5 +1,5 @@
 #!/bin/sh
-# The proof gate, self-contained (design §14.2). A build proves itself BEFORE
+# The proof gate, self-contained. A build proves itself BEFORE
 # it is tagged — that is the guard against a bad release, since there is no
 # rollback history. Deliberately lean: the strong, arch- and config-independent
 # invariants only. No recorded md5 baseline, no per-arch file, no qemu record —
@@ -56,7 +56,7 @@ for d in 0 3 12 30; do
   i=$((i + 1))
 done
 # near is config-conditioned; fresh defaults give the WANT_NEAR quadruple
-# below (§10.1). A change here is a geometry regression OR a config that
+# below. A change here is a geometry regression OR a config that
 # leaked in — investigate, don't just bump. It lives ONCE, here, the only
 # reader — the prose deliberately repeats no number.
 # Re-baselined 2026-08-10 (evening) after the reference remodel of BOTH
@@ -328,7 +328,7 @@ for k in drops ev_drops; do
   [ "${v:-x}" = 0 ] || { say "GATE budget $k=$v (want 0)"; fail=1; }
 done
 
-# glibc floor — printed, not gated (a rise silently excludes distros; §13.4)
+# glibc floor — printed, not gated (a rise silently excludes distros)
 if command -v objdump >/dev/null 2>&1; then
   floor="$(objdump -T "$BIN" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
   say "info glibc floor: ${floor:-none} (2.38 = Ubuntu 23.10+ / Debian 13+ / SteamOS 3.7+)"
