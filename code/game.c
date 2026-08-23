@@ -1978,7 +1978,7 @@ static upd_verdict_t upd_compare(const char *buf, size_t len,
 // --- update state, published by the check thread, read by UI and updinfo ---
 typedef enum {
   UPD_DEV, UPD_OFF, UPD_UNSUPPORTED, UPD_CHECKING,
-  UPD_CURRENT, UPD_UPDATE, UPD_RECUT, UPD_FAILED, UPD_RDONLY,
+  UPD_CURRENT, UPD_UPDATE, UPD_RECUT, UPD_APPLYING, UPD_FAILED, UPD_RDONLY,
 } upd_state_e;
 // The strings are written by the thread BEFORE the seq_cst state store and
 // only read after a load sees a completed state — same publish idiom as the
@@ -1990,9 +1990,8 @@ static char g_upd_remote_date[11];
 static char g_upd_remote_sha[65];
 static char g_upd_why[32];
 // Written by the check thread's fs probe, read by the menu every frame while
-// the check is still in flight — they must be atomic like the state above.
+// the check is still in flight — it must be atomic like the state above.
 static _Atomic int g_upd_writable = -1;        // probed before any offer
-static _Atomic int g_upd_have_old;             // <exe>.old exists → rollback
 
 // ONE cap for the update download. curl's --max-filesize (stringified below)
 // and both apply-path buffers must be the same number, or bumping one side
@@ -2060,10 +2059,20 @@ static void upd_check_finish(int fetch_ok, const char *buf, size_t len) {
   atomic_store(&g_upd_state, st);
 }
 
-// ONE string for the ESC-panel line, the match-end line and updinfo — display
-// and diagnosis are the same copy (design §15.1). English, like the rest of
-// the in-game UI. Font note: the 5x7 font has no '?' or parentheses.
-static void upd_status_line(char *out, size_t n) {
+// THE DIAGNOSTIC LINE, and it is no longer on any screen. The player-facing
+// half of the updater is now exactly two things — the version at the foot of
+// the entry screen and an UPDATE tile that only exists when there is one — so
+// this string survives for `updinfo` and the server log, where a full state
+// name is what a bug report needs. It used to be printed under the match-end
+// hero as well, which put a build hash and a check age on the one screen whose
+// subject is who won. Font note: the 5x7 font has no '?' or parentheses.
+// [[maybe_unused]]: its ONE consumer is the harness `updinfo`, and the harness
+// is the Linux backend's half of the file — on MinGW nothing calls this, which
+// is a -Wunused-function warning and therefore a broken build (the warning gate
+// is part of the release, see .github/workflows/release.yml). Same idiom as
+// ui_page_name. It stays shared rather than moving below the split because the
+// state machine it prints is shared.
+[[maybe_unused]] static void upd_status_line(char *out, size_t n) {
   const char *ver = upd_is_dev() ? "DEV" : BUILD_VERSION;
   char pre[48];
   int r = snprintf(pre, sizeof pre, "VERSION %s+%.7s", ver, BUILD_COMMIT);
@@ -2084,6 +2093,7 @@ static void upd_status_line(char *out, size_t n) {
     case UPD_UPDATE:
     case UPD_RECUT:     r = snprintf(out, n, "%s - UPDATE %s+%.7s AVAILABLE", pre,
                                      g_upd_remote_date, g_upd_remote_sha); break;
+    case UPD_APPLYING:  r = snprintf(out, n, "%s - UPDATING...", pre); break;
     case UPD_RDONLY:    r = snprintf(out, n, "%s - FOLDER NOT WRITABLE: DOWNLOAD MANUALLY", pre); break;
     default:            r = snprintf(out, n, "%s - CHECK FAILED%s%s", pre,
                                      g_upd_why[0] ? ": " : "", g_upd_why); break;
@@ -2092,12 +2102,19 @@ static void upd_status_line(char *out, size_t n) {
 }
 
 // Platform halves (defined in the Linux/Windows backends below the split):
-// start the async check thread, and apply/rollback the swap. All three are
-// no-ops or failures in harness and server sessions by construction — only
-// the native frame loop ever calls them.
+// start the async check thread, and perform the swap. Both are no-ops or
+// failures in harness and server sessions by construction — only the native
+// frame loop ever calls them.
+//
+// THERE IS NO ROLLBACK. It was a second swap, backwards, with its own UI row,
+// its own probe field and its own failure strings — a whole mechanism for the
+// one case where a release is broken AND the player works out that the menu
+// row is what fixes it. The <exe>.old copy the apply leaves behind is kept
+// (it costs a link() and it is the only recovery a bad build has), but it is
+// now a file on disk for a human to rename, not a button. What replaced the
+// button is the reason the button was rare: the update is applied by itself.
 static void upd_check_start(void);
 static int  upd_apply(void);          // returns 0 on failure, g_upd_why says why
-static int  upd_rollback_now(void);
 
 // A SECOND CHECK, ON THE SCREEN THAT SHOWS THE ANSWER. The boot check is one
 // shot, so a client that was ALREADY RUNNING when a release went out never
@@ -2109,14 +2126,16 @@ static int  upd_rollback_now(void);
 // The policy is a pure predicate so it can be asserted without a network:
 //   - a verdict still in flight is not re-asked (UPD_CHECKING),
 //   - an OFFER is never re-asked, because a later fetch that failed would take
-//     an APPLY UPDATE row away from under the player's thumb,
+//     the UPDATE row away from under the player's thumb — and an offer that is
+//     already being INSTALLED (UPD_APPLYING) is not a question at all,
 //   - everything else — up to date, failed, read-only — is re-asked once the
 //     throttle has expired, so ESC-tapping cannot become a request per press.
 // upd_check_gate() still owns the dev/off/unsupported refusals and the
 // one-checker-at-a-time exchange; this only decides WHETHER to ask it.
 #define UPD_RECHECK_S 600
 static int upd_recheck_due(long now, long at, int st) {
-  if (st == UPD_CHECKING || st == UPD_UPDATE || st == UPD_RECUT) return 0;
+  if (st == UPD_CHECKING || st == UPD_UPDATE || st == UPD_RECUT ||
+      st == UPD_APPLYING) return 0;
   if (at && now - at < UPD_RECHECK_S) return 0;
   return 1;
 }
@@ -2129,6 +2148,65 @@ static void upd_menu_recheck(void) {
   if (!upd_recheck_due((long)time(NULL), atomic_load(&g_upd_checked_at),
                        atomic_load(&g_upd_state))) return;
   upd_check_start();
+}
+
+// AN UPDATE IS NOT A DECISION, AND THE BOOT SCREEN IS WHERE IT COSTS NOTHING.
+// With one rolling `latest` re-cut several times a day, "there is a newer build"
+// is the normal state of an installed client rather than an event, and a player
+// who is asked about it every second session learns to press past it — which is
+// how a fixed bug stays live on a machine that has the fix sitting next to it.
+// So the offer applies ITSELF, and the two guards below are the whole policy:
+//
+//   g_home  — the boot screen, i.e. before the player has entered a session.
+//             This is the ONE moment where a swap costs nothing: the match
+//             behind the reel has no score anybody is keeping, and the restart
+//             lands on the same screen the player is already looking at. Past
+//             it, an update is a row in the menu and nothing else; a process
+//             that replaces itself mid-firefight is the one thing a menu may
+//             never do, whatever the version numbers say.
+//   !g_online — --connect kicks a connection at boot, so g_home alone does not
+//             mean "no session": a client that is already talking to a server
+//             is in a match as far as the player is concerned.
+//   ROOT page — the entry screen itself, not one of its forms. A player who is
+//             three rows into CONTROLS with a rebind capture armed, or holding
+//             a slider, is DOING something; replacing the process under that is
+//             the same rudeness as doing it mid-firefight, one screen up. They
+//             get the update the moment they come back to the rail, or on the
+//             next start. This one term covers every modal in the menu, which
+//             is why it is a page test and not a list of them.
+//
+// TWO PHASES, and the second one is the point. upd_apply blocks for the whole
+// download and then execv's, so a single-call version would freeze the picture
+// for a second or two and come back as a different process with nothing on
+// screen ever having said why. Arming stores UPD_APPLYING, the frame that is
+// already being drawn says UPDATING..., and the NEXT frame does the work — one
+// state, two readers, and the manual tile arms exactly the same way.
+// Forward-declared like platform_menu_changed: the page enum lives with the UI,
+// 15k lines down, and this policy belongs HERE with the rest of it.
+static int ui_on_entry_screen(void);
+
+static void upd_arm_apply(void) {
+  int st = atomic_load(&g_upd_state);
+  if (st != UPD_UPDATE && st != UPD_RECUT) return;
+  if (atomic_load(&g_upd_busy)) return;      // a check is still in flight
+  atomic_store(&g_upd_state, UPD_APPLYING);
+}
+
+// Called once per frame from app_pump, which is the shared glue BOTH native
+// backends run and NOTHING else does — the harness drives app_frame directly
+// and the dedicated server has no frame loop at all, so this is the same
+// "one call site per backend, and no reachable path from a proof" property
+// upd_check_start has.
+static void upd_auto_tick(void) {
+  if (atomic_load(&g_upd_state) == UPD_APPLYING) {
+    if (atomic_load(&g_upd_busy)) return;
+    // upd_apply only returns on FAILURE: on success the image is already the
+    // new binary (execv) or the process has exited (CreateProcessW + exit).
+    if (!upd_apply()) atomic_store(&g_upd_state, UPD_FAILED);
+    return;
+  }
+  if (!g_home || !g_menu_open || g_online || !ui_on_entry_screen()) return;
+  upd_arm_apply();
 }
 
 // The genuinely per-OS updater primitives, forward-declared like net_udp_*:
@@ -17063,9 +17141,12 @@ static int session_pauses(void) {
 static int   g_ui_rebind = -1;   // action currently being rebound, -1 = none
 static int   g_ui_rebind_pad;    // ...and which bind table that row edits
 static int   g_ui_quit;          // set by the QUIT button
-static int   g_ui_quit_arm;      // QUIT needs a second press on the Root page
-static int   g_ui_upd_arm;       // UPDATE/ZURUECK too: one press must never
-                                 // end the session (design §15.1)
+static int   g_ui_quit_arm;      // QUIT needs a second press on the Root page:
+                                 // one press must never end the session
+                                 // (design §15.1). The UPDATE row had the same
+                                 // arm and lost it — it neither ends a session
+                                 // nor destroys anything, and it only appears
+                                 // at all when there IS an update.
 static float g_ui_cx, g_ui_cy;   // cursor in real framebuffer px
 static int   g_ui_mdown;         // left button level state
 static int   g_ui_drag;          // active slider, 0 = none
@@ -17202,6 +17283,12 @@ typedef enum { UI_PAGE_ROOT, UI_PAGE_MATCH, UI_PAGE_SETTINGS,
                UI_PAGE_CONTROLS, UI_PAGE_DEV, UI_PAGE_COUNT } ui_page_t;
 
 static ui_page_t g_ui_page = UI_PAGE_ROOT;
+
+// "Is the player looking at the entry screen rather than at one of its forms" —
+// the updater's own question (see upd_auto_tick), answered where the page state
+// lives so there is one reader of the enum outside this section and no copy of
+// the enum's spelling in the updater.
+static int ui_on_entry_screen(void) { return g_ui_page == UI_PAGE_ROOT; }
 static int g_ui_control;  // CONTROLS page: 0 keyboard/mouse, 1 gamepad
 static int g_ui_tab;      // legacy uistat field; mirrors the page enum
 static int g_ui_pad_sub;  // CONTROLS/GAMEPAD: 0 sticks+aim, 1 buttons
@@ -17335,7 +17422,6 @@ static void ui_route(ui_page_t page) {
   g_ui_focus = 0;
   nav_anchor_reset();   // the carried column belongs to the page that set it
   g_ui_quit_arm = 0;
-  g_ui_upd_arm = 0;
   g_focus_sw = 0;   // the focus ring snaps to its new page, no cross-page glide
 }
 
@@ -17364,7 +17450,7 @@ static void ui_close_menu(void) {
   g_tele_played = 1;
   g_ui_rebind = -1;
   g_ui_drag = 0;
-  g_ui_quit_arm = 0; g_ui_upd_arm = 0;
+  g_ui_quit_arm = 0;
   pad_eat_held();  // the button that closed the menu must not act in the game
   ui_audio_pause(0);
   config_write(g_cfg_path, &g_cfg);
@@ -17880,40 +17966,50 @@ static void ui_home(int click, float cx, float cy) {
            g_cfg.sp_bots, g_cfg.sp_bots == 1 ? "" : "S",
            DIFF[g_cfg.sp_diff < 0 || g_cfg.sp_diff > 2 ? 1 : g_cfg.sp_diff],
            g_cfg.sp_frag);
-  // The ONE difference the first tile carries: at boot it starts the session,
-  // in a pause it gives it back. Same tile, same place, same press.
-  if (ui_tile(g_home ? "PLAY" : "RESUME", sub, rx, y, rw, th, 2.1f,
-              click, cx, cy, 0)) {
-    g_ui_quit_arm = 0; g_ui_upd_arm = 0;
-    ui_close_menu();
+  // TWO DESTINATIONS, AND NEITHER OF THEM IS "GO BACK". The rail used to open
+  // with a PLAY/RESUME tile above ONLINE and MATCH, which is three ways of
+  // saying "a session" stacked on top of each other — and the top one meant
+  // two different things depending on whether a match had begun. The screen is
+  // a MODE CHOICE now: singleplayer or multiplayer, named the way every other
+  // game names them, and the way back into a running match is the key that got
+  // you here (ESC / B, see the chip line below). That is what makes the rail
+  // safe: no tile on this screen can end a round by being pressed once.
+  //
+  // SINGLEPLAYER ROUTES rather than starting, and its caption is the ruleset it
+  // would start with, so the press that opens the page is also the press that
+  // shows you what you are about to play. The page's own first row is the START
+  // button — two presses from boot to bullets, one more than the old PLAY tile
+  // and one fewer than PLAY-then-MATCH-to-change-anything.
+  if (ui_tile("SINGLEPLAYER", sub, rx, y, rw, th, 2.1f, click, cx, cy, 0)) {
+    g_ui_quit_arm = 0;
+    ui_route(UI_PAGE_MATCH);
   }
   y += th + gap;
 
   {
     int st = g_cl.state;
     int busy = st == NC_CONNECTING || st == NC_JOINING || st == NC_PLAYING;
-    const char *ml = busy ? "CONNECTING" : "ONLINE";
+    const char *ml = busy ? "CONNECTING" : "MULTIPLAYER";
     const char *ms = st == NC_FAILED
                    ? (g_cl.reject == NR_FULL  ? "ALL ARENAS FULL"
                     : g_cl.reject == NR_PROTO ? "UPDATE REQUIRED"
                     : g_cl.reject == NR_WORLD ? "ARENA MISMATCH"
                                               : "SERVER UNREACHABLE")
                    : "QUICK JOIN";
-    // ...and online the same slot is the way OUT of the match, which is the
-    // one destination a paused session has and a boot screen does not.
+    // ...and online the same slot is the way OUT of the match, which is the one
+    // destination a live session has and a boot screen does not. It keeps the
+    // full width the mode tile has: it is the same slot, not a smaller one.
     if (g_online) {
-      if (ui_tile("LEAVE", "END MATCH", rx, y, hw, sh2, 1.25f, click, cx, cy, 1)) {
-        g_ui_quit_arm = 0; g_ui_upd_arm = 0;
+      if (ui_tile("LEAVE MATCH", "BACK TO SINGLEPLAYER", rx, y, rw, sh2, 1.25f,
+                  click, cx, cy, 1)) {
+        g_ui_quit_arm = 0;
         leave_match(); ui_close_menu();
       }
-    } else if (ui_tile(ml, ms, rx, y, hw, sh2, 1.25f, click, cx, cy, 0) && !busy) {
-      g_ui_quit_arm = 0; g_ui_upd_arm = 0;
+    } else if (ui_tile(ml, ms, rx, y, rw, sh2, 1.25f, click, cx, cy, 0) && !busy) {
+      g_ui_quit_arm = 0;
       if (start_connect(g_cfg.mp_host, g_cfg.mp_port)) ui_close_menu();
     }
   }
-  if (ui_tile("MATCH", "BOTS / SKILL", rx + hw + gap, y, hw, sh2, 1.25f,
-              click, cx, cy, 0))
-    ui_route(UI_PAGE_MATCH);
   y += sh2 + gap;
 
   if (ui_tile("SETTINGS", "VIDEO / AUDIO", rx, y, hw, sh2, 1.25f, click, cx, cy, 0))
@@ -17929,32 +18025,32 @@ static void ui_home(int click, float cx, float cy) {
     y += sh2 + gap;
   }
 
-  // An update is a row only when there is something to DO with it, exactly as
-  // on the pause page — it takes the QUIT tile's place for the one press it
-  // needs and QUIT slides under it.
+  // AN UPDATE IS A ROW ONLY WHEN THERE IS SOMETHING LEFT TO DO WITH IT, and
+  // after the boot screen applies them by itself that is the exception rather
+  // than the rule: the row exists for the verdict that arrived LATE, once the
+  // player had already left the reel (a sleeping radio, a captive portal). One
+  // press, not two — the old CONFIRM step guarded a row that could also mean
+  // ROLLBACK, and installing the build the player is already being told about
+  // is not the kind of act that needs a second thought. It takes the QUIT
+  // tile's place for as long as it exists and QUIT slides under it.
   int ust = atomic_load(&g_upd_state);
   int offer = ust == UPD_UPDATE || ust == UPD_RECUT;
-  if (offer || g_upd_have_old) {
-    const char *ulab = g_ui_upd_arm ? "CONFIRM UPDATE"
-                     : offer ? "APPLY UPDATE" : "ROLLBACK UPDATE";
-    if (ui_tile(ulab, BUILD_VERSION, rx, y, rw, qh, 1.1f, click, cx, cy, 0)) {
+  if (offer || ust == UPD_APPLYING) {
+    // The label is the STATE: arming stores UPD_APPLYING and the frame that is
+    // already in flight draws it, which is the whole reason the apply is two
+    // phases (see upd_arm_apply).
+    if (ui_tile(offer ? "UPDATE & RESTART" : "UPDATING...",
+                offer ? g_upd_remote_date : NULL, rx, y, rw, qh, 1.1f,
+                click, cx, cy, 0) && offer) {
       g_ui_quit_arm = 0;
-      if (!g_ui_upd_arm) g_ui_upd_arm = 1;
-      else {
-        g_ui_upd_arm = 0;
-        config_write(g_cfg_path, &g_cfg);
-        if (!atomic_load(&g_upd_busy)) {
-          int ok = offer ? upd_apply() : upd_rollback_now();
-          if (!ok) atomic_store(&g_upd_state, UPD_FAILED);
-        }
-      }
+      config_write(g_cfg_path, &g_cfg);
+      upd_arm_apply();
     }
     y += qh + gap;
   }
 
   if (ui_tile(g_ui_quit_arm ? "CONFIRM QUIT" : "QUIT", NULL, rx, y, rw, qh,
               1.1f, click, cx, cy, 1)) {
-    g_ui_upd_arm = 0;
     if (!g_ui_quit_arm) g_ui_quit_arm = 1;
     else { config_write(g_cfg_path, &g_cfg); g_ui_quit = 1; }
   }
@@ -17986,11 +18082,18 @@ static void ui_home(int click, float cx, float cy) {
   }
   ui_text_ex(g_cfg.name, rx, y, 0.85f, TXT_BOLD, 1.6f, C4(C_BONE, 0.72f));
   float nw = ui_text_width_tr(g_cfg.name, 0.85f, 1.6f);
-  ui_text_ex("V " BUILD_VERSION, rx + nw + 12, y + 1, 0.7f, TXT_REG, 1.0f,
-             C4(C_HAZE, 0.5f));
-  if (ust == UPD_FAILED)
-    ui_text_ex("UPDATE FAILED", rx, y + 11, 0.7f, TXT_REG, 1.0f,
-               C4(C_THREAT, 0.8f));
+  // THE VERSION LIVES HERE AND NOWHERE ELSE. It used to be printed under the
+  // match-end hero as well, as a full VERSION/commit/check-age status line —
+  // on the one screen whose subject is who won, in a game that updates itself.
+  // One quiet line at the foot of the entry screen is what a build number is
+  // for: it answers "which build am I running" when somebody asks, and it is
+  // never the thing the eye lands on. A FAILED check is appended to the same
+  // line rather than given a red one of its own; nothing is broken for the
+  // player, the game just could not reach the release.
+  char vl[40];
+  snprintf(vl, sizeof vl, "V %s%s", BUILD_VERSION,
+           ust == UPD_FAILED ? " - UPDATE CHECK FAILED" : "");
+  ui_text_ex(vl, rx + nw + 12, y + 1, 0.7f, TXT_REG, 1.0f, C4(C_HAZE, 0.5f));
 
   // The state chip, on the same predicate the tick reads (§9.7) so it can never
   // say PAUSED while the world runs. The boot screen shows nothing: nothing is
@@ -18019,6 +18122,18 @@ static void ui_home(int click, float cx, float cy) {
       ui_rect(rx, 65, clw + 16, 15, 0.02f, 0.03f, 0.04f, 0.55f);
       ui_text_ex(cl, rx + 8, 69, 0.85f, TXT_BOLD, 1.8f,
                  C4(C_BONE, session_pauses() ? 0.85f : 1.0f));
+      // ...AND THE WAY BACK IN, because no TILE says it any more. Removing
+      // RESUME is what makes the rail unambiguous (nothing on it can end a
+      // round), and the price is that "how do I get back to my match" has to be
+      // written down somewhere. It goes NEXT TO THE CHIP rather than in the
+      // footer: the chip is the state, this is the exit from that state, and the
+      // footer band is the menu's own grammar line. Keyed on the DEVICE the
+      // menu is being driven with, exactly like the footer hint — a handheld
+      // player has no ESC, and a desktop player driving the menu with the arrow
+      // keys (g_nav_kbd) has no B.
+      const char *back = g_ui_pad_mode && !g_nav_kbd ? "B RETURNS TO MATCH"
+                                                     : "ESC RETURNS TO MATCH";
+      ui_text_ex(back, rx + clw + 24, 69, 0.7f, TXT_REG, 1.0f, C4(C_HAZE, 0.7f));
     }
   }
   if (g_home) ui_home_cards(vw, vh);
@@ -18138,12 +18253,12 @@ static void ui_menu(void) {
         [[fallthrough]];
       case NAV_UP: case NAV_DOWN:
         nav_move(ev);
-        g_ui_quit_arm = 0; g_ui_upd_arm = 0;
+        g_ui_quit_arm = 0;
         break;
       // LB/RB and PgUp/PgDn no longer cycle hidden global tabs. Visible local
       // selectors on Controls and Dev own all lateral navigation.
       case NAV_TABL: case NAV_TABR:
-        g_ui_quit_arm = 0; g_ui_upd_arm = 0;
+        g_ui_quit_arm = 0;
         break;
       case NAV_BACK:
         if (g_ui_page == UI_PAGE_ROOT) ui_close_menu();
@@ -18470,10 +18585,41 @@ static void ui_menu(void) {
       y += 10;
     }
   } else if (drawn_page == UI_PAGE_MATCH) {
-    // Singleplayer setup: mode (deathmatch only for now), bot count and
-    // difficulty, frag limit, player name, and a restart to apply it all
-    // to a fresh match. Bots/difficulty/limit also apply live.
-    ui_section("MATCH", px, pw, y);
+    // SINGLEPLAYER — the mode's own page, and since the entry screen stopped
+    // carrying a PLAY tile this is also where a match is started. The ACTION
+    // COMES FIRST, above the rules it uses, and that ordering is an input
+    // decision rather than a taste: the page is reached by pressing
+    // SINGLEPLAYER, so a pad lands on row 0 with the focus already on START and
+    // the boot-to-bullets path is two presses. With the button in its
+    // conventional place at the foot it would be four D-pad presses past three
+    // sliders, every time.
+    // NO SECTION HEADER OVER THE BUTTON: the panel's own title already says
+    // SINGLEPLAYER two lines above it, and a rule that repeats the title is a
+    // second heading for one thing.
+    y += 4;
+    // ONE BUTTON, TWO LABELS, and the difference is the one thing a player must
+    // not have to guess: at the boot screen there is no round to lose, in a
+    // pause there is. RESTART is honest about what it does to the score, and it
+    // is the only control in the menu that can end a running match — which is
+    // exactly why it lives on a page you have to walk to, instead of on the
+    // rail where the old PLAY/RESUME tile sat.
+    //
+    // TWO PATHS, AND THE ONLINE ONE MUST NOT TAKE BOTH. restart_req is serviced
+    // by the next sim tick and match_tick never runs online, so an online press
+    // has to leave first — and leave_match's LAST statement is already
+    // match_restart(), a fresh local arena, which is precisely what this button
+    // is asking for. Arming the flag on top of it would restart the match twice
+    // (and regenerate the map twice) for one press. The `else` is the whole
+    // difference; see leave_match's own comment for why that call is where the
+    // fresh arena comes from.
+    if (ui_button(g_home ? "START MATCH" : "RESTART MATCH", px + 16, y,
+                  pw - 32, 18, click, cx, cy, 0)) {
+      if (g_online) leave_match();
+      else g_match.restart_req = 1;   // serviced by the next sim tick
+      ui_close_menu();
+    }
+    y += 24;
+    ui_section("RULES", px, pw, y);
     y += 14;
     ui_text("MODE", px + 16, y + 3, 1, C_TEXT, 1);
     {  // every enum value wears the chip, even a read-only one
@@ -18496,24 +18642,6 @@ static void ui_menu(void) {
       y = ui_param_row(&SP_FRAG_DEF, &v, DRAG_FRAG, px, y, click, cx, cy);
       g_cfg.sp_frag = (int)v;
     }
-
-
-    y += 8;
-    // GATED LIKE THE FIRE PRESS (!g_online). This is the SECOND writer of
-    // restart_req reachable in a networked session — UI_PAGE_ROOT routes here
-    // unconditionally and a networked session's menu does not pause
-    // (session_pauses) — and the two writers have to agree, or the next
-    // reader has to discover the rule twice. Inert online today for exactly
-    // the reason measured at the fire press in player_move_tick, so this
-    // changes no behaviour; it removes a write with no servicer. The button
-    // is still DRAWN online and simply does nothing there: hiding or
-    // relabelling it is a menu change and is deliberately a follow-up, not
-    // part of this fix.
-    if (ui_button("RESTART MATCH", px + 16, y, pw - 32, 16, click, cx, cy, 0)) {
-      if (!g_online) g_match.restart_req = 1;  // serviced by the next sim tick
-      ui_close_menu();
-    }
-    y += 16;   // past the button: `y` is what sizes the panel
   } else if (drawn_page == UI_PAGE_DEV) {
     // DEV — the developer tuning workbench: every knob a PLAYER never touches
     // (movement feel, weapon feel). Lives behind `dev` so an install ships
@@ -18658,7 +18786,6 @@ static void ui_menu(void) {
       h = g_ui_kb        ? "ARROWS MOVE   ENTER SELECT   OR JUST TYPE"
         : g_ui_name_edit ? "TYPE A-Z 0-9   ENTER DONE"
         : g_ui_quit_arm  ? "ENTER CONFIRM QUIT   ESC BACK"
-        : g_ui_upd_arm   ? "ENTER CONFIRM UPDATE   ESC BACK"
                          : "ARROWS MOVE   ENTER OK   LEFT/RIGHT ADJUST   ESC BACK";
     else
       // The keyboard's own grammar, and B is the one line that has to be spelt
@@ -18668,7 +18795,6 @@ static void ui_menu(void) {
       h = g_ui_kb        ? "A SELECT   B DELETE   START DONE"
         : g_ui_name_edit ? "TYPE ON KEYBOARD   A/B DONE"
         : g_ui_quit_arm  ? "A CONFIRM QUIT   B BACK"
-        : g_ui_upd_arm   ? "A CONFIRM UPDATE   B BACK"
                          : "A OK   < > ADJUST   B BACK";
   } else if (g_ui_kb) {
     h = "CLICK A KEY   OR TYPE   ENTER DONE";
@@ -18679,7 +18805,6 @@ static void ui_menu(void) {
     // The footer band exists on EVERY frame — an empty reserved strip reads
     // as a layout mistake, and the grammar chip doubles as the exit sign.
     h = g_ui_quit_arm ? "CLICK AGAIN CONFIRMS QUIT   ESC BACK"
-      : g_ui_upd_arm  ? "CLICK AGAIN CONFIRMS UPDATE   ESC BACK"
                       : "ESC BACK";
   }
   if (h) {
@@ -28661,19 +28786,12 @@ static void render_frame(const player_t *p, float alpha, int fps,
       }
       ui_text_ex(sub, ccx - ui_text_width_tr(sub, 0.9f, 1.4f) * 0.5f, 54, 0.9f,
                  TXT_REG, 1.4f, C4(C_BONE, 0.85f));
-      // The same version/update line the ESC panel carries (§15.1): the match
-      // end is where the player is already stopped. Native sessions only —
-      // harness screenshots must not grow a label that says nothing there.
-      // Same #ifndef idiom as the PAUSED label: g_headless is Linux-only.
-      int native = 1;
-#ifndef _WIN32
-      native = !g_headless;
-#endif
-      if (native) {
-        char ul[96];
-        upd_status_line(ul, sizeof ul);
-        ui_text(ul, ccx - ui_text_width(ul, 0.8f) * 0.5f, 68, 0.8f, C_DIM, 0.7f);
-      }
+      // NO VERSION LINE HERE. This used to carry the same VERSION+update status
+      // string the entry screen does, on the reasoning that the match end is
+      // where the player is already stopped — but what it actually did was put
+      // a build hash, a commit and a "CHECKED 4 MIN AGO" under the name of
+      // whoever just won. The version has one home now (the foot of the entry
+      // screen) and the update has one voice (a tile, only when there is one).
     }
 
     if (g_score_held || g_match.over) ui_scoreboard();
@@ -29471,6 +29589,11 @@ static int app_frame(app_t *a, player_t *p, double dt, const frame_input_t *in) 
 // deltas stay parameters because their accumulators are backend-owned (filled
 // by wndproc / the XI2 pump). Returns 1 when the session should end.
 static int app_pump(app_t *a, player_t *p, double dt, float mdx, float mdy) {
+  // The updater's per-frame half (§15.1): apply what the boot screen armed.
+  // It lives HERE and not in app_frame because app_frame is what the harness
+  // runs — see upd_auto_tick's own comment for why that distinction is the
+  // whole "a proof never touches the network" rule.
+  upd_auto_tick();
   int binds[IN_COUNT], pbinds[IN_COUNT];
   pad_sync((float)dt);
   resolve_binds(binds, pbinds);
@@ -32515,14 +32638,14 @@ static void run_script(char *script, sim_ctx_t *s) {
       // them by pixel-diffing. kb prints the CURSOR as well as the flag: the
       // grid's whole state is that pair, so a nav proof needs no screenshot.
       printf("ui menu=%d tab=%d page=%s control=%s padsub=%d devsub=%d wpn=%d focus=%d/%d padmode=%d "
-             "rebind=%d rebindpad=%d qarm=%d uarm=%d nedit=%d kb=%d kbcur=%d,%d name=%s dev=%d curve=%s "
+             "rebind=%d rebindpad=%d qarm=%d nedit=%d kb=%d kbcur=%d,%d name=%s dev=%d curve=%s "
              "dz=(%.2f %.2f) sens=%.0f "
              "adss=%.2f assist=%d inv=%d conn=%d\n",
              g_menu_open, g_ui_tab, ui_page_name(g_ui_page),
              g_ui_control ? "gamepad" : "keyboard",
              g_ui_pad_sub, g_ui_dev_sub, g_ui_wpn,
              g_ui_focus, g_ui_nfocus_last, g_ui_pad_mode, g_ui_rebind,
-             g_ui_rebind_pad, g_ui_quit_arm, g_ui_upd_arm, g_ui_name_edit,
+             g_ui_rebind_pad, g_ui_quit_arm, g_ui_name_edit,
              g_ui_kb, g_ui_kb_r, g_ui_kb_c, g_cfg.name,
              DEV_MENU && g_cfg.devmode, PAD_CURVE_OPTS[g_cfg.pad_curve],
              (double)g_cfg.pad[PAD_DZ_L], (double)g_cfg.pad[PAD_DZ_R],
@@ -33418,9 +33541,9 @@ static void run_script(char *script, sim_ctx_t *s) {
       char own[64], line[96], sha[65];
       int have = update_asset_name(own, sizeof own);
       upd_status_line(line, sizeof line);
-      printf("updinfo version=%s commit=%.7s own=%s writable=%d rollback=%d\n",
+      printf("updinfo version=%s commit=%.7s own=%s writable=%d\n",
              BUILD_VERSION, BUILD_COMMIT, have ? own : "none",
-             g_upd_writable, g_upd_have_old);
+             g_upd_writable);
       for (int i = 0; i < UPD_NASSETS; i++) {
         char nm[64];
         upd_asset_name(nm, sizeof nm, i);
@@ -36954,7 +37077,7 @@ static int upd_fetch(const char *url, char *dst, size_t cap, size_t *out_len) {
 
 // Writability is probed BEFORE any offer (§15.3): an unwritable directory
 // (AppImage mount, /usr/local/bin) must show the manual line, not download
-// 800 KB per start that can go nowhere. Also scans for the rollback copy.
+// 800 KB per start that can go nowhere.
 static void upd_probe_fs(void) {
   char exe[512], p[600];
   if (!exe_path(exe, sizeof exe)) { g_upd_writable = 0; return; }
@@ -36962,8 +37085,6 @@ static void upd_probe_fs(void) {
   int fd = open(p, O_CREAT | O_EXCL | O_WRONLY, 0600);
   if (fd >= 0) { close(fd); unlink(p); g_upd_writable = 1; }
   else g_upd_writable = 0;
-  snprintf(p, sizeof p, "%s.old", exe);
-  g_upd_have_old = access(p, F_OK) == 0;
 }
 
 static void *upd_thread(void *arg) {
@@ -36996,12 +37117,13 @@ static void tele_resolve_start(void) {
 // Download to MEMORY, hash THERE, only then touch the filesystem, and never
 // re-read the written file by path (TOCTOU, §15.3). After the verified bytes
 // exist under <exe>.new.<pid>, everything left is metadata: link the current
-// binary to <exe>.old (the §15.4 rollback copy), rename() the new one over
+// binary to <exe>.old (kept as the manual recovery copy — there is no rollback
+// button any more, see the forward declarations), rename() the new one over
 // the exe — atomic even under a running process — and execv it.
 
-// The "metadata done, become the new binary" tail (§15.3), shared by apply
-// and rollback. execv replaces the image with no CRT teardown, so no thread
-// join is needed here (the Windows twin, win_relaunch, must join WASAPI).
+// The "metadata done, become the new binary" tail (§15.3). execv replaces the
+// image with no CRT teardown, so no thread join is needed here (the Windows
+// twin, win_relaunch, must join WASAPI).
 static int upd_relaunch(const char *exe) {
   config_write(g_cfg_path, &g_cfg);
   execv(exe, g_main_argv);
@@ -37037,30 +37159,12 @@ static int upd_apply(void) {
   if (close(fd) != 0) bad = 1;
   if (bad) { unlink(newp); snprintf(g_upd_why, sizeof g_upd_why, "WRITE"); return 0; }
   unlink(old);
-  if (link(exe, old) != 0) { /* best effort: a failed link loses rollback, not the swap */ }
+  if (link(exe, old) != 0) { /* best effort: a failed link loses the copy, not the swap */ }
   if (rename(newp, exe) != 0) {
     unlink(newp);
     snprintf(g_upd_why, sizeof g_upd_why, "RENAME");
     return 0;
   }
-  return upd_relaunch(exe);
-}
-
-// The same swap, backwards (§15.4): current becomes .old, .old becomes the
-// exe — so after a rollback the forward update is offered again.
-static int upd_rollback_now(void) {
-  char exe[512], old[600], tmp[600];
-  if (!exe_path(exe, sizeof exe)) return 0;
-  snprintf(old, sizeof old, "%s.old", exe);
-  snprintf(tmp, sizeof tmp, "%s.rb.%d", exe, (int)getpid());
-  if (access(old, F_OK) != 0) { snprintf(g_upd_why, sizeof g_upd_why, "NO OLD"); return 0; }
-  if (rename(exe, tmp) != 0)  { snprintf(g_upd_why, sizeof g_upd_why, "RENAME"); return 0; }
-  if (rename(old, exe) != 0) {
-    rename(tmp, exe);          // restore — the running file must stay in place
-    snprintf(g_upd_why, sizeof g_upd_why, "RENAME");
-    return 0;
-  }
-  rename(tmp, old);
   return upd_relaunch(exe);
 }
 
@@ -37118,9 +37222,9 @@ static int native_main(int w, int h, uint32_t seed) {
   // reach this line, which IS the "server and harness never update" rule.
   upd_check_start();
   // Boot into the menu over the LIVE arena (§9.1's spirit: the match is
-  // already running behind it, so "I just want to shoot" stays ONE press —
-  // RESUME is pre-focused). Play mode only: the harness never opens it, so
-  // every proof keeps its historical first frame.
+  // already running behind it, so SINGLEPLAYER -> START MATCH is two presses
+  // with the focus starting on the first of them). Play mode only: the harness
+  // never opens it, so every proof keeps its historical first frame.
   ui_open_menu();
   // ...and the boot menu is the BOOT SCREEN: tiles over a live camera rather
   // than a panel over a freeze-frame. Play mode only, exactly like the
@@ -38310,8 +38414,6 @@ static void upd_probe_fs(void) {
     DeleteFileW(p);
     g_upd_writable = 1;
   } else g_upd_writable = 0;
-  upd_wpath(p, 600, exe, L".old");
-  g_upd_have_old = GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
 }
 
 static DWORD WINAPI upd_thread(LPVOID arg) {
@@ -38342,8 +38444,8 @@ static void tele_resolve_start(void) {
   else atomic_store(&g_tele_ip, 0xFFFFFFFFu);   // no thread, no telemetry
 }
 
-// The one §15.3 "metadata done, become the new binary" step, shared by apply
-// and rollback (it was duplicated in both). On success the WASAPI thread is
+// The one §15.3 "metadata done, become the new binary" step. On success the
+// WASAPI thread is
 // stopped and joined BEFORE exit(0) — WinMain's own teardown comment names
 // the race: exiting while the audio thread sits inside a WASAPI/COM call is
 // resolved by loader luck. The join runs only after CreateProcessW succeeded,
@@ -38407,30 +38509,6 @@ static int upd_apply(void) {
     snprintf(g_upd_why, sizeof g_upd_why, "RENAME");
     return 0;
   }
-  return win_relaunch(exe);
-}
-
-static int upd_rollback_now(void) {
-  wchar_t exe[512], old[600], tmp[600];
-  DWORD elen = GetModuleFileNameW(NULL, exe, 512);
-  if (!elen || elen >= 512) return 0;
-  upd_wpath(old, 600, exe, L".old");
-  _snwprintf(tmp, 600, L"%s.rb.%lu", exe, (unsigned long)GetCurrentProcessId());
-  tmp[599] = 0;
-  if (GetFileAttributesW(old) == INVALID_FILE_ATTRIBUTES) {
-    snprintf(g_upd_why, sizeof g_upd_why, "NO OLD");
-    return 0;
-  }
-  if (!MoveFileExW(exe, tmp, MOVEFILE_REPLACE_EXISTING)) {
-    snprintf(g_upd_why, sizeof g_upd_why, "RENAME");
-    return 0;
-  }
-  if (!MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING)) {
-    MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING);
-    snprintf(g_upd_why, sizeof g_upd_why, "RENAME");
-    return 0;
-  }
-  MoveFileExW(tmp, old, MOVEFILE_REPLACE_EXISTING);
   return win_relaunch(exe);
 }
 

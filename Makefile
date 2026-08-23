@@ -417,6 +417,26 @@ server-logs:
 	    cat $(SERVER_DIR)/game.log 2>/dev/null' \
 	  | awk -v now="$$(date +%s)" -f tools/server-report.awk
 
+# TRUNCATE IN PLACE, NEVER `rm`. The respawn wrapper holds this exact file open
+# with `>> game.log` (see server-deploy), so removing it leaves the server
+# writing to a deleted inode: every line until the next server-deploy goes
+# nowhere, and `make server-logs` then reports an empty log that is not empty
+# but UNREACHABLE — the one failure mode a reset must not be able to cause.
+# `: > file` keeps the inode and O_APPEND simply continues at 0.
+#
+# It prints the byte count it cleared, because a reset that says nothing is
+# indistinguishable from an ssh that never landed; and it names what is lost,
+# because the report's "all time" column is all-time OF THIS LOG — the unique
+# player count starts over here. No prompt: an explicitly typed target IS the
+# confirmation, and the same reasoning the destructive `server-delete` uses.
+server-logs-reset:
+	@$(SERVER_DIR_GUARD)
+	@ssh -n $(SERVER_HOST) 'D="$$HOME/$(SERVER_DIR)"; \
+	  if [ ! -f "$$D/game.log" ]; then \
+	    echo "no game.log on $(SERVER_HOST) — nothing to reset"; exit 0; fi; \
+	  n=$$(wc -c < "$$D/game.log"); : > "$$D/game.log"; \
+	  echo "game.log reset on $(SERVER_HOST) ($$n bytes cleared; all-time stats start over)"'
+
 # build/ carries a Dropbox-ignore NTFS attribute on the folder itself —
 # delete its contents, never the folder, or the attribute is lost.
 clean:
