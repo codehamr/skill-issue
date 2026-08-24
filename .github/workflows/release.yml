@@ -49,7 +49,14 @@ jobs:
       # a "dev" build and never updates.
       - name: Build
         run: |
+          # ONE date for the whole release, stamped ONCE and carried to the publish
+          # job as an artifact. Two independent `date -u` calls straddling UTC
+          # midnight would put a BUILD_VERSION of day N inside a binary published
+          # under a VERSION of day N+1 — and the updater orders by that published
+          # date, so every installed client would then see "newer" forever and
+          # re-install the same build on every boot.
           V=$(date -u +%Y-%m-%d); C=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "$V" > VERSION
           make all BUILD_VERSION="$V" BUILD_COMMIT="$C"
           # game-x86_64, NOT game: the two are the same compile on an x86_64
           # runner, but only the x86_64 target is guaranteed to be one — and
@@ -63,12 +70,16 @@ jobs:
       # then the self-contained proof gate. The build that ships is proved.
       - name: Gate
         run: |
-          gcc -std=c23 -O2 -Wall -Wextra -Werror -c code/game.c -o /dev/null
-          x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Werror -c code/game.c -o /dev/null
+          # -Wshadow BELONGS HERE. The Makefile passes it on every build but with
+          # no -Werror, and this gate had -Werror without it — so nothing in the
+          # tree actually enforced the "-Wall -Wextra -Wshadow clean on both
+          # compilers" contract, and a shadowed local could ship.
+          gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
+          x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
           ./tools/ci-proofs.sh ./skill-issue-linux-amd64
 
       - uses: actions/upload-artifact@v7
-        with: { name: assets, path: skill-issue-*, if-no-files-found: error }
+        with: { name: assets, path: "skill-issue-*\nVERSION", if-no-files-found: error }
 
   release:
     needs: build
@@ -82,10 +93,10 @@ jobs:
       - name: Publish
         env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
         run: |
-          V=$(date -u +%Y-%m-%d)
+          # The build job's date, not a fresh one — see the note there.
+          V=$(cat dist/VERSION)
           # upload-artifact drops the x bit; the updater swaps the file in as-is.
           chmod +x dist/skill-issue-linux-*
-          echo "$V" > dist/VERSION
           # The tag is fixed ("latest"), so the DATE the updater orders by lives
           # ONLY here — the "# version" header plus VERSION's own sum. Without it
           # an "update" could silently be a downgrade.

@@ -196,7 +196,7 @@ SERVER_ADDR = $(shell ssh -G $(SERVER_HOST) 2>/dev/null | awk '/^hostname /{prin
 
 # EVERY destructive line below is `$$HOME/$(SERVER_DIR)`-relative and pastes
 # that value UNQUOTED into a root shell on the VPS (`mkdir -p`, the scp
-# destination, `D=`), so this guard runs FIRST in both server targets — and
+# destination, `D=`), so this guard runs FIRST in every server target — and
 # once it has passed, every later line may interpolate the value freely.
 # TWO clauses, and the ORDER matters:
 #  1. anything outside [A-Za-z0-9._/-]. Whitespace and every shell
@@ -414,7 +414,10 @@ server-delete:
 # The `2>/dev/null` PRECEDES `wc -c <` on purpose: redirections apply left to
 # right, and with the stderr redirect last the shell's own "cannot open"
 # message for a missing log escapes to the terminal before stderr is silenced.
+# The guard runs here too. SERVER_DIR is interpolated unquoted into a remote shell
+# on every one of these targets; this was the only one that skipped the check.
 server-logs:
+	@$(SERVER_DIR_GUARD)
 	@ssh -n $(SERVER_HOST) '2>/dev/null wc -c < $(SERVER_DIR)/game.log; \
 	    cat $(SERVER_DIR)/game.log 2>/dev/null' \
 	  | awk -v now="$$(date +%s)" -f tools/server-report.awk

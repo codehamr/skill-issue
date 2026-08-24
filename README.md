@@ -84,9 +84,9 @@ the start screen, before you are in a match and with the menu on its top level, 
 downloads the build, checks it against the published hash, installs it by itself and
 restarts, showing `UPDATING...` for a moment. Once a session is running it never does
 that: from then on the update is a row in the menu that you press. If the folder the game
-sits in is not writable it says so and touches nothing. The binary it replaced is left
-beside the new one with a `.old` suffix, so a bad build is one rename away from being
-undone. `update_check 0` in `config.cfg` turns the whole thing off.
+sits in is not writable it touches nothing and no update row appears. The binary it
+replaced is left beside the new one with a `.old` suffix, so a bad build is one rename
+away from being undone. `update_check 0` in `config.cfg` turns the whole thing off.
 
 ## License
 

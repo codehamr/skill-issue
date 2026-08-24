@@ -9,8 +9,8 @@
 #   tools/ci-proofs.sh <binary>
 #
 # Asserted (each must hold on every architecture):
-#   figcheck: surface closed + wound + no coplanar overlap (open/flip/zfight/
-#             degen = 0) at four profile tiers, and `near` AND `cross` at their
+#   figcheck: surface closed + wound + no coplanar overlap (open/flip/dup/
+#             zfight/degen = 0) at four profile tiers, and `near` AND `cross` at their
 #             documented fresh-config baselines (the WANT_NEAR / WANT_CROSS
 #             lines below are the single authority — the config is part of the
 #             number, so the script writes fresh defaults itself)
@@ -42,10 +42,9 @@ field() { printf '%s' "$1" | sed -n "s/.* $2=\([0-9]*\).*/\1/p" | head -1; }
 
 # figcheck at the four DIST tiers — invariants AND the near quadruple
 NEAR=""
-i=0
 for d in 0 3 12 30; do
   line="$(run "figcheck 60 $d" | grep '^figcheck' | head -1)"
-  for k in open flip zfight degen; do
+  for k in open flip dup zfight degen; do
     v="$(field "$line" "$k")"
     [ "${v:-x}" = 0 ] || { say "GATE figcheck dist=$d $k=$v (want 0)"; fail=1; }
   done
@@ -53,7 +52,6 @@ for d in 0 3 12 30; do
   NEAR="${NEAR:+$NEAR }$n"
   c="$(field "$line" cross)"
   CROSS="${CROSS:+$CROSS }$c"
-  i=$((i + 1))
 done
 # near is config-conditioned; fresh defaults give the WANT_NEAR quadruple
 # below. A change here is a geometry regression OR a config that
@@ -313,7 +311,29 @@ WANT_NEAR="40 40 46 36"
 # grazes (pairs MOVED, not appeared), `near` did not move at any tier
 # (40 40 46 36), `zfight` is 0 at all four, every hard invariant is 0, and
 # every non-sliding pose is byte-identical (4 A/B screenshots, md5-equal).
-WANT_CROSS="76 76 73 47"
+# -1 at DIST 12 with the SLIDE-IS-A-CROUCH fix (2026-08-24). The bot's slide
+# launch wrote `crouch = 0` and the stance machine is gated on `!sliding`, so
+# nothing could raise it again: a bot rendered with its hip at 190 mm kept a
+# STANDING collider and a standing hitbox for the whole slide.
+#
+# THE ANIM SOLVER IS NOT WHAT MOVED, and the first draft of this note said it was.
+# anim_tick's one read of the raw crouch flag is `(crouch && !slide)`, so
+# `crouch_s` is 0.00 on every sliding tick either way (`skel 60`, both binaries)
+# and both crouch/slide terms are unchanged. What moved is the EYE: a crouched
+# bot eases `b->eye` toward EYE_CROUCH, `bot_eye` is the aim origin, so
+# `want_pitch = atan2f(dy, hl)` differs from the second slide tick on (yaw does
+# not - it is dx/dz only). The third-person weapon and hands follow that pitch,
+# and the skull then rides 0.5 deg differently over the carrier at the max tick,
+# so ONE carrier/helm_shell pair (13.2 -> 13.7 deg) leaves the 1.8-15 deg band.
+#
+# PROVEN to be the pose and not the builders: at sixteen identical staged poses
+# (idle / crouch / ADS / slide, x four tiers) the two binaries print
+# byte-identical figcheck lines, the offender list at DIST 12 is otherwise
+# identical, `worst_t` (14) and `tris` (5180) do not move, `near` does not move at
+# any tier, and the delta reproduces at -O0 (i.e. semantic, not FP contraction).
+# Bisected to that one line: with it reverted and everything else in place, the
+# quadruple reads 76 76 73 47 again.
+WANT_CROSS="76 76 72 47"
 [ "${CROSS:-}" = "$WANT_CROSS" ] || { say "GATE cross '${CROSS:-}' != baseline '$WANT_CROSS'"; fail=1; }
 
 # parity: no MISMATCH in the shared-code rows
@@ -321,8 +341,15 @@ run "parity" | grep -q MISMATCH && { say "GATE parity MISMATCH"; fail=1; } || tr
 
 # budget at 20 bots hard: nothing dropped. Render a frame first (budget only
 # accumulates during scene build).
-bl="$(run "bots 20; skill hard; wait 1200; shot screenshots/_ci.png; wait 300; shot screenshots/_ci.png; budget" | grep '^budget' | head -1)"
-rm -f "$ROOT/screenshots/_ci.png"
+# ...into a TEMPORARY path, not screenshots/: that directory is gitignored, so a CI
+# checkout or a fresh clone does not have it and both shots failed to open
+# ("cannot write screenshots/_ci.png", swallowed by this block's own grep). The
+# gate still MEASURED — render_frame runs to completion before write_png, so the
+# scene was built and drops/ev_drops were real — but the shot proved nothing and
+# depended on an untracked directory. mktemp writes anywhere.
+CISHOT="$(mktemp -u)_ci.png"
+bl="$(run "bots 20; skill hard; wait 1200; shot $CISHOT; wait 300; shot $CISHOT; budget" | grep '^budget' | head -1)"
+rm -f "$CISHOT"
 for k in drops ev_drops; do
   v="$(field "$bl" "$k")"
   [ "${v:-x}" = 0 ] || { say "GATE budget $k=$v (want 0)"; fail=1; }
