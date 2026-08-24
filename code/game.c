@@ -241,6 +241,12 @@ static v3 v3_norm(v3 a) {
 static v3    v3_sub(v3 a, v3 b) { return (v3){{a.x - b.x, a.y - b.y, a.z - b.z}}; }
 static float v3_len(v3 a) { return sqrtf(v3_dot(a, a)); }
 static float f_clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+// GLSL's smoothstep, so a ramp authored in a shader and the same ramp evaluated
+// in C are the same curve rather than two hand-fitted ones.
+static float f_smoothstep(float e0, float e1, float x) {
+  float t = f_clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
 // NaN/inf tests that survive -ffast-math, which folds isnan()/isfinite()/v != v to a
 // constant.
 static int f_is_nan(float v) {
@@ -2039,6 +2045,162 @@ static v3 wind_dir(void) {
   return (v3){{cosf(g_wind_ang), 0.0f, sinf(g_wind_ang)}};
 }
 
+// ---------------------------------------------------------------------------
+// THE SUN — map state, exactly like the wind, and hashed off the seed for the
+// same reason: a single draw from g_rng here would re-roll the layout of every
+// arena anyone has ever recorded. What varies is the TIME OF DAY, and it is the
+// biggest single lever this renderer has: the same arena under a 45-degree sun
+// and under an 8-degree one is two places.
+//
+// ONE STRUCT, AND IT IS THE ONLY AUTHORITY. The direction used to be three
+// #defines stringized into the GLSL, with C re-typing them for the shadow
+// projection, the shadow-cull foot and the boot screen's sun-side corner — four
+// readers of a constant that could only stay in step by hand. Everything below
+// is DERIVED from the one drawn direction by sun_build, and both shader programs
+// read the result through one uploader (rig_upload), so the sky, the world, the
+// shadow map and the showcase cannot disagree about where the light is.
+typedef struct {
+  v3    dir;                       // TO the light, unit
+  v3    col;                       // radiance after atmospheric extinction
+  v3    sky_top, sky_hor, sky_gnd;
+  float exposure;                  // eye adaptation; see sun_build
+  float disc;                      // how hard the visible disc burns; see sun_set
+  float cloud;                     // deck coverage, this arena's weather
+  float sh_half, sh_depth;         // the shadow ortho box this elevation needs
+  v3    sh_centre;                 // ...and where it has to be centred
+} sun_t;
+static sun_t g_sun_all[SRV_LOBBIES];
+#define g_sun (g_sun_all[g_lobby])
+
+// The tallest thing that can cast across the arena, for the shadow box fit.
+#define SUN_CAST_H     4.6f
+// Below this the extinction model runs out and the shadows stop landing on the
+// arena at all: at 6 degrees a 4.6 m wall throws 44 m of shadow, which is most
+// of the floor. It is a floor on the DRAW, not a clamp inside the model.
+#define SUN_ELEV_MIN   6.5f
+#define SUN_ELEV_MAX   54.0f
+
+// Rayleigh + aerosol optical depth at unit air mass, and the radiance above it
+// all. NOT invented: the three taus are the ones that reproduce the light rig
+// this game shipped with — (2.90, 2.56, 2.04) at 38 degrees — from a white
+// 3.60 source, so a mid-afternoon arena is bit-for-bit the look that was tuned
+// and every other elevation follows from the same physics rather than from a
+// second set of hand-picked colours.
+static v3 sun_extinct(float sin_elev, float elev_deg) {
+  // Kasten-Young air mass. A plain 1/sin blows up at the horizon — which is
+  // where half the interesting light is — and this is the standard fit that
+  // does not.
+  float am = 1.0f / (sin_elev + 0.15f * powf(elev_deg + 3.885f, -1.253f));
+  return (v3){{3.60f * expf(-0.132f * am), 3.60f * expf(-0.210f * am),
+               3.60f * expf(-0.356f * am)}};
+}
+
+static void sun_set(float elev_deg, float azi_rad);
+
+static void sun_build(uint32_t seed) {
+  // Hashed off the seed, never drawn from the map stream — see wind_dir().
+  uint32_t h = seed * 2654435761u + 0x5C1Fu;
+  h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+  float u = (float)(h >> 8) * (1.0f / 16777216.0f);
+  uint32_t h2 = h * 2246822519u + 1u;
+  h2 ^= h2 >> 13; h2 *= 3266489917u; h2 ^= h2 >> 16;
+  float az = (float)(h2 >> 8) * (1.0f / 16777216.0f) * (2.0f * F_PI);
+  // u^1.5 leans the draw toward the low sun WITHOUT pinning it there: about
+  // two arenas in five come up under 20 degrees, i.e. golden hour, and the
+  // rest spread over the afternoon. A uniform draw gave a flat afternoon most
+  // of the time, which is the one look this whole pass exists to escape.
+  float ed = SUN_ELEV_MIN + (SUN_ELEV_MAX - SUN_ELEV_MIN) * u * sqrtf(u);
+  sun_set(ed, az);
+  // The weather is its own draw off the same hash: a clear arena and a
+  // banded one are different places under the same sun, and coupling the two
+  // would mean every sunset came with the same sky.
+  uint32_t h3 = h * 3266489917u + 0x9E37u;
+  h3 ^= h3 >> 15; h3 *= 2246822519u; h3 ^= h3 >> 13;
+  g_sun.cloud = 0.13f + 0.26f * ((float)(h3 >> 8) * (1.0f / 16777216.0f));
+}
+
+// The whole rig from one angle pair. Split out of sun_build because the harness
+// `sun` command drives it too: a look that can only be reached by hunting seeds
+// cannot be reviewed.
+static void sun_set(float elev_deg, float azi_rad) {
+  sun_t *S = &g_sun;
+  float e = elev_deg * (F_PI / 180.0f);
+  float se = sinf(e), ce = cosf(e);
+  S->dir = (v3){{ce * sinf(azi_rad), se, -ce * cosf(azi_rad)}};
+  S->col = sun_extinct(se, elev_deg);
+  // DUSK IS A RAMP ON THE ELEVATION, not a second mode. Everything below
+  // crosses over between 3 and 29 degrees, so no seed lands in a gap.
+  float dusk = 1.0f - f_smoothstep(0.05f, 0.49f, se);
+  S->sky_top = v3_lerp((v3){{0.14f, 0.27f, 0.49f}},
+                       (v3){{0.052f, 0.070f, 0.180f}}, dusk);
+  // The horizon AWAY from the sun. The fire on the other side is the aureole
+  // and the haze band, both of which already carry the reddened sun colour —
+  // painting it in here as well is how a sunset ends up orange all the way
+  // round, which no sunset is.
+  S->sky_hor = v3_lerp((v3){{0.88f, 0.96f, 1.11f}},
+                       (v3){{0.255f, 0.205f, 0.265f}}, dusk);
+  S->sky_gnd = v3_lerp((v3){{0.36f, 0.33f, 0.29f}},
+                       (v3){{0.085f, 0.072f, 0.082f}}, dusk);
+  // EYE ADAPTATION, AND ONLY PARTLY. A low sun delivers a third of the light,
+  // and a frame that simply goes a third as bright is a frame the player
+  // cannot fight in. The 0.55 exponent gives back most of the stop but not
+  // all of it, so dusk still READS as dusk — measured, sunlit ground lands at
+  // 157 against 187 at midday — while the silhouettes the whole art direction
+  // depends on keep their separation.
+  float lum = 0.2126f * S->col.x + 0.7152f * S->col.y + 0.0722f * S->col.z;
+  S->exposure = 0.40f * powf(2.556f / fmaxf(lum, 0.02f), 0.55f);
+  // THE SHADOW BOX FOLLOWS THE SUN DOWN. 31 was the tight fit for a fixed
+  // 38-degree light and is nowhere near enough at 8: a wall smears 1/tan(elev)
+  // of its own height across the floor, 5.9 m there and 33 m here. The box is
+  // also SHIFTED half that smear downwind of the light, because a shadow only
+  // ever falls one way — centring it would pay for an equal margin on the side
+  // no shadow can reach, i.e. half the resolution for nothing.
+  // THE DISC MAY NOT BURN THE SAME AT EVERY HOUR. 26 is right for a midday
+  // sun — it saturates every channel and reads as a hole in the sky, which is
+  // what looking at the sun does. At 8 degrees the same 26 saturates just as
+  // hard, so the one frame the whole sunset is built around ended with a WHITE
+  // pinprick sitting in an orange sky: the extinction that reddened everything
+  // else never reached the source itself. Measured against the tonemap at the
+  // matching exposure, 0.8 puts the low disc at roughly (221, 180, 125) — an
+  // orange orb — and the ramp is over by 30 degrees, where a sun should blind.
+  S->disc = 0.8f + 25.2f * f_smoothstep(0.13f, 0.58f, se);
+  S->cloud = 0.26f;   // sun_build re-draws this per map; this is the default
+  float tan_e = se / sqrtf(fmaxf(1.0f - se * se, 1.0e-4f));
+  float smear = fminf(SUN_CAST_H / fmaxf(tan_e, 0.10f), 34.0f);
+  S->sh_half = ARENA_HALF * 1.06f + smear * 0.5f;
+  S->sh_depth = 2.2f * S->sh_half + 40.0f;
+  v3 dh = v3_norm((v3){{S->dir.x, 0.0f, S->dir.z}});
+  S->sh_centre = (v3){{-dh.x * smear * 0.5f, 1.6f, -dh.z * smear * 0.5f}};
+}
+
+// THE AIR OVER THIS ARENA, per theme — the tint of the dust it carries and how
+// much of it there is. ONE pair of numbers feeds BOTH halves of the atmosphere:
+// the haze band the sky pass draws along the horizon and the aerial perspective
+// the world pass fades distant geometry into. They are the same medium seen in
+// two geometries, so they may not be tuned apart — a horizon that is dusty while
+// the far wall in front of it is clear is the seam this arrangement exists to
+// make impossible.
+//
+// The tint is a multiplier on the dust's own scattered radiance, so 1.0 is
+// "grey dust" and the departures are what give each theme its light:
+//   QUARTZ  dry warm air over concrete   — barely tinted, thin
+//   SLATE   cool damp mist off wet stone — blue, and the thickest of the three
+//   SAND    ochre desert dust            — warm, and it owns the horizon
+static v3 atmo_tint(void) {
+  switch (g_theme.surf) {
+  case SURF_SAND: return (v3){{1.20f, 0.99f, 0.72f}};
+  case SURF_WET:  return (v3){{0.84f, 0.93f, 1.10f}};
+  default:        return (v3){{1.06f, 1.00f, 0.90f}};
+  }
+}
+static float atmo_haze(void) {
+  switch (g_theme.surf) {
+  case SURF_SAND: return 0.46f;
+  case SURF_WET:  return 0.50f;
+  default:        return 0.33f;
+  }
+}
+
 // Ripple strength / glitter strength / standing-water level, per treatment.
 static v3 surf_params(void) {
   switch (g_theme.surf) {
@@ -2066,6 +2228,7 @@ static void map_generate(uint32_t seed) {
     g_rng_gun[h] = rng_gun_seed(seed, h);
   g_rng_bot = (uint64_t)(seed ^ 0xB07u) * 2654435761u + 1;
   g_num_solids = 0;
+  sun_build(seed);   // hashed off the seed, like the wind; see sun_build
   g_theme = THEMES[rng_u32() % (sizeof THEMES / sizeof THEMES[0])];
   {  // see wind_dir(): hashed off the seed, never drawn from the map stream
     uint32_t wh = seed * 2246822519u;
@@ -11209,12 +11372,13 @@ static int net_cl_poll(void) {
 // and the environment reflection that gives metal its sheen. Everything here is LINEAR
 // radiance; `tonemap` is the only place that converts to display values.
 //
-// ONE copy of the sun direction: the shadow-map projection needs the same vector in C
-// (it casts along -SUN_DIR), and a hand-typed twin there is how shadows end up cast from
-// a sun the shader no longer has. The components are stringized into the GLSL below.
-#define SUN_DIR_X 0.72f
-#define SUN_DIR_Y 0.62f
-#define SUN_DIR_Z 0.34f
+// ONE copy of the sun: sun_set in C derives the direction, the extinguished sun
+// colour, the three sky colours, the exposure and the shadow box from a single
+// drawn elevation, and rig_upload hands that one struct to BOTH shader programs.
+// It used to be three #defines stringized into the GLSL with C re-typing them for
+// the shadow projection — four readers of a constant that could only agree by hand,
+// and the reason this comment used to warn about shadows cast from a sun the shader
+// no longer had. Now nothing can be re-typed, because nothing is typed twice.
 #define GLSL_NUM2(v) #v
 #define GLSL_NUM(v)  GLSL_NUM2(v)
 // The floor's baseline roughness, and it lives up here because the FRAGMENT SHADER
@@ -11251,26 +11415,80 @@ static int net_cl_poll(void) {
   "  return mix(mix(vhash2(i), vhash2(i + vec2(1.0, 0.0)), f.x),\n" \
   "             mix(vhash2(i + vec2(0.0, 1.0)), vhash2(i + vec2(1.0, 1.0)), f.x), f.y);\n" \
   "}\n" \
-  /* 38 degrees up, not 62. A near-overhead sun lights three 90-degrees-apart
-     faces of the same box to within a few percent of each other: no azimuthal
-     cue anywhere in the frame, nothing for a cast shadow to subtract, and every
-     material reads as overcast satin however good its BRDF is. */ \
-  "const vec3 SUN_DIR = normalize(vec3(" GLSL_NUM(SUN_DIR_X) ", " \
-    GLSL_NUM(SUN_DIR_Y) ", " GLSL_NUM(SUN_DIR_Z) "));\n" \
-  /* Sun up, sky down. Measured off the frames: the horizon landed at 185 display
-     while sunlit ground reached 130, and NOTHING in any frame reached the
-     tonemap's shoulder — an arena lit by a lightbox behind it, with no highlight
-     end for any material to reach. A clear sky is not brighter than the ground it
-     lights; it only was here because the ambient was paying for what the sun
-     should have. */ \
-  "const vec3 SUN_COL = vec3(2.90, 2.56, 2.04);\n" \
-  "const vec3 SKY_HOR = vec3(0.88, 0.96, 1.11);\n" \
-  "const vec3 SKY_TOP = vec3(0.14, 0.27, 0.49);\n" \
-  "const vec3 SKY_GND = vec3(0.36, 0.33, 0.29);\n" \
-  /* Exposure. Every light above is a radiance in the same unit as the sky the
-     player can see, so ONE number decides where mid-grey lands and the balance
-     between sun, sky and reflection is never re-derived per surface. */ \
-  "const float EXPOSURE = 0.40;\n" \
+  /* THE LIGHT RIG, and every one of these is now map state rather than a
+     constant. NEVER near-overhead: a sun at 62 degrees lights three
+     90-degrees-apart faces of the same box to within a few percent of each
+     other — no azimuthal cue anywhere in the frame, nothing for a cast shadow
+     to subtract, and every material reads as overcast satin however good its
+     BRDF is. sun_set draws between 6.5 and 54 degrees for exactly that reason.
+     Sun up, sky down: a clear sky is not brighter than the ground it lights,
+     and it only was here once because the ambient was paying for what the sun
+     should have.
+     EXPOSURE is here rather than baked into each light because every value
+     above is a radiance in the same unit as the sky the player can see, so ONE
+     number decides where mid-grey lands and the balance between sun, sky and
+     reflection is never re-derived per surface. */ \
+  "uniform vec3 SUN_DIR;\n" \
+  "uniform vec3 SUN_COL;\n" \
+  "uniform vec3 SKY_HOR;\n" \
+  "uniform vec3 SKY_TOP;\n" \
+  "uniform vec3 SKY_GND;\n" \
+  "uniform float EXPOSURE;\n" \
+  "uniform float SUN_DISC;\n" \
+  /* THE AIR. rgb is the dust's tint, w how much of it there is; atmo_tint /
+     atmo_haze in C are the one authority and this is their only reader. The
+     medium is EXPONENTIAL IN HEIGHT — dust settles — and that single fact is
+     what both halves below are derived from, which is why they cannot drift:
+     the horizon band the sky draws and the aerial perspective the world fades
+     into are one function evaluated along two different rays. */ \
+  "uniform vec4 uAtmo;\n" \
+  /* Scale height of the dust layer, in metres, as its reciprocal — the world's
+     fog integral wants 1/H and the sky's slant path wants nothing else. 9 m
+     over a 2.75 m wall means a wall's foot is measurably hazier than its cap,
+     which is the whole reason to integrate a profile rather than a distance. */ \
+  "const float FOG_INVH = 0.1111;\n" \
+  /* One number turns "how hazy is the horizon" into "how thick is the air",
+     so a theme tunes ONE value and both halves move together. */ \
+  "const float FOG_RHO_K = 0.030;\n" \
+  /* Dust forward-scatters hard, so the quarter of the sky the sun is in is
+     where the haze is bright and the opposite quarter is where it is grey.
+     That azimuthal split is the single strongest mood cue a clear-sky arena
+     has, and without it a haze band is just a grey smear.
+     SCHLICK, NOT HENYEY-GREENSTEIN, and the reason is where this runs: a
+     world fragment evaluates sky_env up to three times (the environment
+     reflection, the water's own reflection and the aerial perspective), so
+     one sqrt in here is three per pixel. Schlick's rational fit to HG needs
+     none — k = 1.55g - 0.55g^3 is the standard mapping and at g = 0.58 the
+     two agree to within 4% of the forward peak, which is a tuning constant's
+     worth of difference in a term that already carries one. */ \
+  /* uHaze.rgb is the whole tinted ambient half — uAtmo.rgb * (SUN_COL*0.055 +
+     SKY_HOR*0.30) — and uHazeS is uAtmo.rgb * SUN_COL * 1.20, both folded in C
+     because both are constant for the entire draw. A GLSL compiler will not
+     hoist a uniform-only expression out of a fragment shader, so leaving them
+     written out meant six vector multiplies and three adds per sky_env call,
+     three times per world pixel, to recompute the same two colours. */ \
+  /* THE DERIVED COLOURS, FOLDED IN C. The light rig used to be `const`, so the
+     GLSL compiler constant-folded every colour built out of it — the two ends
+     of the hemisphere ambient, the ground bounce, the sky's own sun azimuth.
+     Making the sun map state took that folding away and handed the fragment
+     shader a mix, three scales and a normalize per pixel to rebuild the same
+     four values: measured at 6 ms/frame on the llvmpipe proxy, i.e. more than
+     the entire glare chain, for arithmetic that cannot change within a draw.
+     rig_upload folds them once instead. */ \
+  "uniform vec3 uHaze, uHazeS, uAmbD, uAmbU, uBounce;\n" \
+  "vec3 haze_rad(float mu){\n" \
+  "  float k = 0.792;\n" \
+  "  float den = 1.0 - k * mu;\n" \
+  "  float ph = 0.0293337 / max(den * den, 1.0e-4);\n" \
+  "  return uHaze + uHazeS * ph;\n" \
+  /* 0.95 on the forward peak and not 1.20: at 1.20 the quarter of the sky the
+     sun is in went past the tonemap's shoulder, and with the aerial
+     perspective fading everything into that same colour, a bot at twenty
+     metres between the player and a low sun stopped being a silhouette and
+     became milk. The lobe still runs about twenty to one against the opposite
+     quarter, which is where the mood is; what came off was the part that was
+     only clipping. */ \
+  "}\n" \
   "vec3 sky_env(vec3 d, float disc){\n" \
   "  float t = clamp(d.y, -1.0, 1.0);\n" \
   /* ONE pow, not two. A ternary over two pow calls is flattened to a select by
@@ -11290,10 +11508,17 @@ static int net_cl_poll(void) {
      on a fixed epsilon. A fixed epsilon either loses the disc entirely or
      strobes as the pixel grid crosses its rim, because the whole disc spans
      about a hundred-thousandth of the cosine's range. */ \
-  "  float sun = 0.0;\n" \
+  /* EVERYTHING INSIDE THIS BRANCH IS MULTIPLIED BY `disc`, and only the sky
+     pass ever passes a non-zero one. The three lobes used to sit outside it —
+     multiplied by disc, so arithmetically absent, but evaluated: two pow calls
+     on every world fragment, three times over, for a result that was then
+     scaled to nothing. The branch is uniform-valued per draw, so it costs
+     nothing to take. */ \
+  "  float lobes = 0.0;\n" \
   "  if (disc > 0.0) {\n" \
   "    float e = max(fwidth(s), 1.0e-7);\n" \
-  "    sun = smoothstep(0.99998917 - e, 0.99998917 + e, s) * 26.0;\n" \
+  "    lobes = smoothstep(0.99998917 - e, 0.99998917 + e, s) * SUN_DISC\n" \
+  "          + SUN_DISC * 0.065 * pow(s, 2600.0) + 0.13 * pow(s, 110.0);\n" \
   "  }\n" \
   /* Two aureoles, not one. The tight one (~110) is the corona a clear sky has
      around a low sun; the broad one (8) is the forward-scattered haze over the
@@ -11304,8 +11529,44 @@ static int net_cl_poll(void) {
      backdrop rather than as a light source. The middle lobe is the GLARE — a
      degree and a third wide, which is what a camera and an eye both do with a
      source this bright. */ \
-  "  c += SUN_COL * (disc * sun + disc * 1.7 * pow(s, 2600.0)\n" \
-  "                + disc * 0.13 * pow(s, 110.0) + 0.085 * pow(s, 8.0));\n" \
+  /* THE GLARE SCALES WITH THE SOURCE, and it did not. The 1.3-degree lobe was
+     a fixed 1.7 while the disc under it was being dimmed for a low sun, so a
+     sunset ended up with a white glare blob exactly where the orange orb was
+     supposed to be — the disc was fixed and the thing sitting on top of it was
+     not. 0.065 * SUN_DISC reproduces the old 1.7 at a midday sun to two
+     figures and follows it down. The BROAD lobe below stays fixed and stays
+     outside the branch: it is the whole quarter of the sky forward-scattering,
+     which is what a world fragment's aerial perspective has to fade into, and
+     it does not stop at dusk. s^8 by three squarings — pow() here was a
+     transcendental per sky_env call for an exponent that is a power of two. */ \
+  "  float s2 = s * s, s4 = s2 * s2;\n" \
+  "  c += SUN_COL * (lobes + 0.085 * s4 * s4);\n" \
+  /* ...AND THEN THE AIR IN FRONT OF ALL OF IT. The haze goes on LAST because
+     it is extinction as well as in-scatter: it has to dim the sun disc and the
+     aureole the same way it dims the blue behind them, or the sky ends up with
+     a hard sun sitting in soft air. The slant path is 1/sin(elevation) less the
+     vertical one, which is exactly 0 at the zenith — so the top of the sky
+     keeps its own colour whatever the arena's dust does, and only the bottom
+     of it turns. */ \
+  /* A 1/sin(elevation) slant path is the honest profile for a medium that
+     reaches to infinity, and over a 48 m arena it is also far too BROAD: it
+     put a third of the haze at 25 degrees up and took the blue out of the
+     whole sky. The cube pulls the band down onto the horizon where the long
+     low rays actually are — 86% at 8 degrees, 17% at 25, nothing at 45 — so
+     the arena stands under a hazy rim and a clean sky rather than inside a
+     sepia box. */ \
+  "  float st = max(1.0 - t, 0.0);\n" \
+  "  float sl = uAtmo.w * st * st * st / max(t, 0.06);\n" \
+  /* THE BRANCH IS THE POINT, not a micro-optimization. Every ray that leaves
+     the scene going UP — which is every environment reflection off a floor and
+     most of the sky pass — has a slant path of nearly nothing, and paying the
+     phase function for it was 25 ms/frame on the wet theme alone.
+     1 - exp(-sl) is a second-order Pade rather than the exp: 0.813 against
+     0.879 at the horizon, exact at both ends and monotone between, for one
+     divide instead of a transcendental. The haze is a tuned quantity, so a
+     3-point difference in its own knee is inside the tuning. */ \
+  "  if (sl > 0.004)\n" \
+  "    c = mix(c, haze_rad(s), 1.0 - 1.0 / (1.0 + sl * (1.0 + 0.5 * sl)));\n" \
   "  return c;\n" \
   "}\n" \
   /* The environment a SPECULAR surface sees, which is not the one the sky pass
@@ -11328,8 +11589,23 @@ static int net_cl_poll(void) {
   "}\n" \
   /* Filmic curve (ACES fit) then a gamma-2.0 encode — the albedo decode below
      is x*x, so an unlit surface round-trips to exactly its authored color. */ \
-  "const vec3 VM_FILL = vec3(1.08, 1.17, 1.38);\n" \
-  "const vec3 VM_RIM  = vec3(1.23, 1.31, 1.52);\n" \
+  /* THE HERO RIG IS THE SAME LIGHT THE ARENA IS STANDING IN, only aimed by the
+     camera instead of by the sun: the fill takes its hue from the SKY and the
+     rim from the SUN, so a weapon held up at dusk is lit orange from behind and
+     dim violet from above like everything else in the frame. They used to be
+     two fixed cool-white constants, which was invisible under a fixed midday
+     sun and became the loudest thing in the picture the moment the sun could
+     move — a blue-white rifle in a gold arena.
+     THE MAGNITUDE FOLLOWS THE ARENA, COMPRESSED. rig_upload divides by the
+     rig's own luminance so the colour is free to turn, then puts the strength
+     back on a 0.7 power of how much light the arena actually has. Pinning it
+     flat was the first attempt and it was visibly wrong: at a 7-degree sun the
+     weapon and the sleeve came out at midday brightness in a dusk frame and
+     became the brightest object in it, which is the one thing a first-person
+     weapon must not be. Following it 1:1 is the other failure — a weapon as
+     dark as the arena is a weapon the player cannot read — and this rig was
+     always a stylisation, so it sits between the two. */ \
+  "uniform vec3 VM_FILL, VM_RIM;\n" \
   /* GGX + Smith, once. Every light — sun, viewmodel fill, viewmodel rim — is the
      same call with a different direction and radiance, which is the only way
      three lights stay consistent with each other. */ \
@@ -11519,8 +11795,24 @@ static const char *WORLD_FS =
   // metres, and at every grazing angle, that is most of the floor in frame.
   "    float rv = vnoise2(P * 0.105);\n"
   "    float lam = 0.125 * (0.78 + 0.44 * rv);\n"
-  // The GRAZING fade is the load-bearing one and it was too gentle.
-  "    float vis = (1.0 - smoothstep(lam * 0.45, lam * 1.8, fp))\n"
+  // THE FOOTPRINT FADE IS A LEGIBILITY DECISION, NOT AN ALIASING FIX, and the
+  // instrument says so. At lam * 1.8 the field is still at full strength when
+  // the pixel footprint is one and a half TIMES the wavelength — measured on
+  // the overview camera, fp = 85 mm against a 125 mm ripple, 1.5 samples a
+  // cycle — and once a low sun started raking across it the whole floor read
+  // as corduroy rather than as sand. The natural conclusion is "that is
+  // aliasing", and it is WRONG: the shimmer rig (1x against 4x supersampled
+  // and downsampled, over the floor region) reads 2.901 before and 2.881
+  // after, i.e. unchanged, on frames whose pixels differ over a third of the
+  // time. The supersampled reference shows the same lattice, because at this
+  // scale the pattern is resolved and simply reads as fabric.
+  // So: lam * 0.5 is the Nyquist limit and lam * 0.16 is about six samples a
+  // cycle, and the fade is pulled back to them because a ripple you cannot
+  // read as relief should not be drawn as one — not because it was flickering.
+  // It costs the ripples past ~8 m at eye height, which is about where real
+  // sand stops showing them, and everything the fade takes is handed to
+  // ROUGHNESS by the branch below.
+  "    float vis = (1.0 - smoothstep(lam * 0.16, lam * 0.5, fp))\n"
   "              * smoothstep(0.10, 0.42, nv) * loose;\n"
   "    if (vis > 0.004) {\n"
   // The heading barely moves, and that is the correction.
@@ -11627,8 +11919,7 @@ static const char *WORLD_FS =
   "  float NoV = max(dot(n, V), 1e-4);\n"
   // Diffuse irradiance: the same sky, smoothed to a hemisphere lobe. Sun-facing AO is
   // only partly applied — a crease is dark in ambient light, not in a direct beam.
-  "  vec3 amb = mix(SKY_GND * 0.44, mix(SKY_HOR, SKY_TOP, 0.45) * 0.40,\n"
-  "                 n.y * 0.5 + 0.5);\n"
+  "  vec3 amb = mix(uAmbD, uAmbU, n.y * 0.5 + 0.5);\n"
   "  vec3 irr = amb * ao;\n"
   "  float fr = pow(1.0 - NoV, 5.0);\n"
   "  vec3 Fe = F0 + (max(vec3(1.0 - rough), F0) - F0) * fr;\n"
@@ -11662,7 +11953,7 @@ static const char *WORLD_FS =
   "  if (n.y < 0.0) bnc = -n.y * exp(-max(vWorld.y, 0.0) * 0.85);\n"
   // ...AND SIDEWAYS, which is what the down-facing version was missing.
   "  float bncs = (1.0 - abs(n.y)) * exp(-max(vWorld.y, 0.0) * 2.2);\n"
-  "  vec3 bounce = diff * (bnc + bncs * 0.55) * SKY_GND * 1.35;\n"
+  "  vec3 bounce = diff * (bnc + bncs * 0.55) * uBounce;\n"
   "  vec3 col = lit(n, V, SUN_DIR, diff, F0, rough, SUN_COL * sh)\n"
   "           + diff * irr\n"
   "           + env * Fe * (1.0 - 0.62 * rough)\n"
@@ -11694,8 +11985,42 @@ static const char *WORLD_FS =
   "    if (att > 0.002)\n"
   "      col += lit(n, V, normalize(md), diff, F0, rough, uMuzC * att);\n"
   "  }\n"
-  // Twice the aerial perspective.
-  "  col = mix(col, sky_env(-V, 0.0), 1.0 - exp(-d * d * 9.0e-5));\n"
+  // --- AERIAL PERSPECTIVE -------------------------------------------------
+  // NOT A FUNCTION OF DISTANCE. The old term was 1 - exp(-d*d*k), which says
+  // the air is the same everywhere; it is not, because dust settles. The
+  // density falls off exponentially with height and what this ray crosses is
+  // the INTEGRAL of that profile along it — closed form, so it costs two exp
+  // and a divide rather than a march.
+  //
+  // The difference is the whole point and it is visible on one wall: a 2.75 m
+  // solid is measurably hazier at its foot than at its cap, so it separates
+  // from the wall behind it instead of sharing its value. A distance fog
+  // cannot do that at any strength.
+  //
+  // The divide is by the HEIGHT DIFFERENCE, not by the ray's y component: the
+  // two are the same quantity scaled by d, and writing it this way keeps the
+  // horizontal ray — where the integral degenerates to a plain length — one
+  // branch away rather than one cancellation away. The branch's threshold is
+  // in metres of height, so it is the same threshold at every distance.
+  //
+  // The colour is sky_env along the SAME ray, which already carries the haze
+  // band: fully-fogged geometry lands on exactly the sky that would be behind
+  // it, so the join at a distant wall's top edge holds by construction and not
+  // by a matched constant.
+  "  float dy = vWorld.y - uEye.y;\n"
+  "  float ea = exp(-max(uEye.y, 0.0) * FOG_INVH);\n"
+  "  float eb = exp(-max(vWorld.y, 0.0) * FOG_INVH);\n"
+  "  float od = uAtmo.w * FOG_RHO_K * d\n"
+  "           * (abs(dy) > 0.05 ? (ea - eb) / (dy * FOG_INVH) : ea);\n"
+  // A THIRD sky_env, and the nearest geometry in the frame does not need it.
+  // The whole viewmodel sits 30 cm from the eye and every wall inside about a
+  // metre and a half integrates to under 0.002 of optical depth, i.e. under
+  // half a display level. Worth 1.7 ms on a first-person ADS frame (130.2 ->
+  // 128.5 on the llvmpipe proxy) and NOTHING on a camera-override shot, which
+  // is the honest way to read it: this gate pays where the viewmodel is, and a
+  // rig driven by `cam` never draws one.
+  "  if (od > 0.002)\n"
+  "    col = mix(col, sky_env(-V, 0.0), 1.0 - exp(-od));\n"
   "  oCol = vec4(tonemap(col), 1.0);\n"
   "}\n";
 
@@ -11719,30 +12044,60 @@ static const char *SKY_FS =
   GLSL_ENV
   "in vec2 vNdc; out vec4 oCol;\n"
   "uniform vec3 uFwd, uRight, uUp; uniform vec2 uTan;\n"
+  // (cos, sin) of the arena's OWN wind heading, and the deck's coverage.
+  "uniform vec2 uWindD; uniform float uCov;\n"
+  // The sun's heading, normalized once on the CPU: it is a uniform, so doing it
+  // per pixel is a rsqrt for a value that cannot change within the draw.
+  "uniform vec2 uSunXZ;\n"
+  // BANDS, NOT BLOBS. A deck sampled on an isotropic grid is cotton wool; what
+  // a sky actually shows is the wind, drawn out along it. The lookup runs in
+  // the WIND'S frame and is squashed 4:1 across it, so the streaks lie along
+  // the same heading that combs the sand into ripples and drags the drifts on
+  // the lee of every wall — one wind, three places it shows.
   "float deck(vec2 p){\n"
-  "  float w = vnoise2(p * 0.55) - 0.5;\n"
-  "  vec2 q = p + vec2(w, -w * 0.6) * 1.15;\n"
+  "  vec2 q0 = vec2(dot(p, uWindD), dot(p, vec2(-uWindD.y, uWindD.x)));\n"
+  "  q0 = vec2(q0.x * 0.52, q0.y * 1.28);\n"
+  "  float w = vnoise2(q0 * 0.55) - 0.5;\n"
+  "  vec2 q = q0 + vec2(w, -w * 0.6) * 1.15;\n"
   "  return vnoise2(q) * 0.62 + vnoise2(q * 2.31) * 0.38;\n"
   "}\n"
   "void main(){\n"
   "  vec3 dir = normalize(uFwd + uRight * (vNdc.x * uTan.x) + uUp * (vNdc.y * uTan.y));\n"
   "  vec3 c = sky_env(dir, 1.0);\n"
   "  float up = dir.y;\n"
-  "  if (up > 0.03) {\n"
-  "    float t = min(1.0 / max(up, 0.05), 14.0);\n"
-  "    vec2 p = dir.xz * t * 1.05;\n"
+  // 0.012, not 0.03: at a low sun the interesting deck is exactly the part
+  // lying ON the horizon, and the old cut-in threw that band away and started
+  // the clouds a hand's width above the one place they had to be.
+  "  if (up > 0.012) {\n"
+  "    float t = min(1.0 / max(up, 0.05), 16.0);\n"
+  "    vec2 p = dir.xz * t * 0.86;\n"
   "    float n = deck(p);\n"
-  "    float cov = 0.26;\n"
-  "    float dens = smoothstep(1.0 - cov, 1.0 - cov + 0.20, n);\n"
-  "    dens *= smoothstep(0.03, 0.26, up);\n"
+  "    float dens = smoothstep(1.0 - uCov, 1.0 - uCov + 0.20, n);\n"
+  "    dens *= smoothstep(0.012, 0.20, up);\n"
   "    if (dens > 0.002) {\n"
   // One offset sample TOWARD the sun, no march: where the deck is thick on the sun
   // side, this pixel is behind it and its underside goes grey.
-  "      float d2 = smoothstep(1.0 - cov, 1.0 - cov + 0.20,\n"
-  "                            deck(p + normalize(SUN_DIR.xz) * 0.42));\n"
+  "      float d2 = smoothstep(1.0 - uCov, 1.0 - uCov + 0.20,\n"
+  "                            deck(p + uSunXZ * 0.42));\n"
   "      float litc = exp(-d2 * 1.9) * (1.0 - exp(-d2 * 2.0 - 0.55));\n"
   "      vec3 base = sky_env(dir, 0.0);\n"
-  "      c = mix(c, base * mix(1.34, 2.05, litc), dens * 0.80);\n"
+  // A CLOUD IS LIT BY THE SUN, NOT TINTED BY THE SKY BEHIND IT. The old term
+  // was base * 1.34..2.05 — a multiply on whatever was behind the pixel — so
+  // at dusk, when the sky behind goes violet, the cloud went violet too and
+  // the one thing a sunset sky is FOR never happened. Splitting it into an
+  // ambient half (the sky, which does light the deck from every side) and a
+  // direct half (SUN_COL, which carries the reddening) is what makes the deck
+  // burn orange over a blue-violet zenith.
+  "      vec3 cl = base * mix(0.58, 1.02, litc)\n"
+  "              + SUN_COL * (0.020 + 0.42 * litc * litc);\n"
+  // THE RIM IS WHERE THE LIGHT COMES THROUGH. dens*(1-dens) peaks exactly on
+  // the edge of a band and is zero in its body and in clear sky, so this adds
+  // a bright fringe only where the deck is thin — and only toward the sun,
+  // which is the whole reason a backlit cloud has a burning edge and a
+  // front-lit one does not.
+  "      float s2 = max(dot(dir, SUN_DIR), 0.0);\n"
+  "      cl += SUN_COL * (dens * (1.0 - dens)) * 2.6 * pow(s2, 6.0);\n"
+  "      c = mix(c, cl, dens * 0.86);\n"
   "    }\n"
   "  }\n"
   "  oCol = vec4(tonemap(c), 1.0);\n"
@@ -11767,6 +12122,91 @@ static const char *BLUR_FS =
   "  c += texture(uTex, vUV + vec2(uPix.x, -uPix.y)).rgb;\n"
   "  c += texture(uTex, vUV - vec2(uPix.x, -uPix.y)).rgb;\n"
   "  oCol = vec4(c * 0.125, 1.0); }\n";   // exact, and three fdiv fewer
+
+// GLARE — the bloom and the light shafts, and they are ONE chain because they are
+// one phenomenon: bright things in front of a dusty atmosphere spill, and the
+// spill runs along the line to the sun when there is anything between. Building
+// them separately would mean two bright-passes, two quarter-res targets and two
+// composites for a result that is added together anyway.
+//
+// Everything here runs at quarter resolution, so ten taps cost 0.6 of a full-res
+// tap. That is the entire budget: no HDR buffer, no extra attachment, no depth
+// read — the input is the frame that was going to be presented regardless, pulled
+// down through the SAME blit and the SAME dual-Kawase ping-pong the frosted menu
+// backdrop already owned.
+//
+// THE OCCLUSION IS FREE AND EXACT. A shaft is a march toward the sun through the
+// bright-pass, so a wall between this pixel and the sun contributes nothing and
+// the shaft simply stops at its edge — no shadow lookup, no geometry, no list of
+// occluders that can disagree with the one the depth pass drew.
+static const char *GLARE_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uTex;\n"
+  "uniform vec3 uSunUV;\n"   // xy = the sun's place on screen, z = shaft strength
+  "uniform vec2 uKnee;\n"    // luminance knee: what counts as bright
+  "uniform vec3 uGain;\n"    // x bloom, y shafts, z composite
+  "uniform vec4 uGrade;\n"   // vignette, grain, grain seed, aspect
+  "uniform float uMode;\n"   // 0 = build the glare, 1 = add it back
+  "const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);\n"
+  "void main(){\n"
+  // --- THE COMPOSITE, AND IT IS ALSO THE GRADE ---------------------------
+  // ONE PASS DOES BOTH, and the blend mode is why. Under ONE/SRC_ALPHA the
+  // result is src.rgb + dst.rgb * src.a: the colour channels carry everything
+  // that ADDS light (the bloom, the shafts, the grain's bright half, the edge
+  // tint) and the alpha channel carries everything that MULTIPLIES it (the
+  // vignette, the grain's dark half). A grade written the obvious way needs a
+  // second full-res pass to multiply by, or the frame in a texture to read
+  // back; this needs neither.
+  //
+  // The consequence is a real constraint and it is worth stating: a blend
+  // factor is clamped to [0,1] against a fixed-point target, so the alpha half
+  // can only ever DARKEN. That is why the grain is split across both channels
+  // rather than written as one signed term.
+  "  if (uMode > 0.5) {\n"
+  "    vec2 q = (vUV - 0.5) * vec2(uGrade.w, 1.0);\n"
+  "    float r2 = dot(q, q) * 1.30;\n"
+  // Interleaved-gradient noise: three instructions, and unlike a value-noise
+  // hash it has no visible cell structure at one sample per pixel. The seed is
+  // driven by the SIM TICK and not by the rendered-frame counter — grain that
+  // moves with the render clock would make every harness screenshot depend on
+  // how many frames preceded it, which is the same trap the menu caret's lack
+  // of a blink documents.
+  "    float g = fract(52.9829189 * fract(dot(gl_FragCoord.xy + uGrade.z,\n"
+  "                                           vec2(0.06711056, 0.00583715))));\n"
+  "    float gn = (g - 0.5) * uGrade.y;\n"
+  "    float vig = 1.0 - uGrade.x * r2 * r2;\n"
+  // The edges go cool as well as dark. A vignette that only darkens reads as a
+  // lens fault; one that also loses a little warmth reads as the falloff of a
+  // real lens, and it costs an add.
+  "    vec3 add = texture(uTex, vUV).rgb * uGain.z\n"
+  "             + max(gn, 0.0) * 0.42\n"
+  "             + vec3(-0.008, -0.002, 0.010) * r2;\n"
+  "    oCol = vec4(add, clamp(vig * (1.0 + min(gn, 0.0)), 0.0, 1.0));\n"
+  "    return;\n"
+  "  }\n"
+  // A LUMINANCE KNEE, NOT A SUBTRACTION. Subtracting a threshold from each
+  // channel shifts the HUE of everything that glows — a warm 0.9 highlight comes
+  // out orange-red — and the one thing this pass must not do is recolour the
+  // sunset it is there to sell. Scaling by a smoothstep on the luminance keeps
+  // the colour and only decides how much of it spills.
+  "  vec3 s0 = texture(uTex, vUV).rgb;\n"
+  "  vec3 core = s0 * smoothstep(uKnee.x, uKnee.y, dot(s0, LUMA));\n"
+  "  vec3 acc = vec3(0.0);\n"
+  "  if (uSunUV.z > 0.0) {\n"
+  "    vec2 d = (uSunUV.xy - vUV) * (0.85 / 10.0);\n"
+  "    vec2 uv = vUV;\n"
+  "    float w = 1.0;\n"
+  "    for (int i = 0; i < 10; i++) {\n"
+  "      vec3 s = texture(uTex, uv).rgb;\n"
+  "      acc += s * smoothstep(uKnee.x, uKnee.y, dot(s, LUMA)) * w;\n"
+  "      w *= 0.90;\n"
+  "      uv += d;\n"
+  "    }\n"
+  "    acc *= uSunUV.z * 0.1;\n"
+  "  }\n"
+  "  oCol = vec4(core * uGain.x + acc * uGain.y, 1.0);\n"
+  "}\n";
 
 static const char *HUD_VS =
   "#version 330 core\n"
@@ -12048,8 +12488,9 @@ static int g_hud_visible = 1;  // harness capture switch; menus remain visible
 // One map over the whole 48 m arena: 4096 px gives ~1.3 cm texels, which is fine
 // enough that a figure self-shadows its own arms.
 #define SHADOW_TEX    4096
-#define SHADOW_HALF   31.0f   // light-space half extent: arena + the height smear
-#define SHADOW_DEPTH  80.0f
+// The light-space box is no longer a constant: it is fitted to the elevation by
+// sun_set (g_sun.sh_half / sh_depth / sh_centre), because a fixed 31 m half was
+// the tight fit for ONE sun angle and this arena no longer has one.
 // World depth range.
 #define ZNEAR         0.12f
 #define ZFAR          140.0f
@@ -12061,6 +12502,13 @@ static int g_hud_visible = 1;  // harness capture switch; menus remain visible
 // Where on the ADS ramp the scope picture starts to open.
 #define SCOPE_ADS_OPEN 0.55f
 
+// Every uniform GLSL_ENV declares, for one program. One struct, so adding a
+// light to the rig cannot be half-wired.
+typedef struct {
+  GLint sun, suncol, skytop, skyhor, skygnd, expo, disc, atmo, haze, hazes;
+  GLint ambd, ambu, bounce, vmfill, vmrim;
+} lightloc_t;
+
 typedef struct {
   int    width, height;
   GLuint prog_world, prog_hud, prog_sky, prog_depth;
@@ -12069,11 +12517,19 @@ typedef struct {
   GLint  u_vm, u_fill, u_rim, u_muzc, u_muzl, u_muzp;
   GLint  u_mdlo, u_mdlx, u_mdlz;           // the weapon's own frame
   GLint  u_surf;                           // the floor's theme treatment
+  // TWO PROGRAMS READ THE SAME LIGHT. GLSL_ENV is shared source, so every one of
+  // these is declared once, but a uniform location belongs to a PROGRAM: the
+  // world and the sky each need their own handle to the same value, and a single
+  // one used for both is a sky standing in different weather from the arena
+  // under it. rig_locs fills one of these per program and rig_upload is the ONE
+  // writer, so the two cannot drift however many uniforms the rig grows.
+  lightloc_t rig_world, rig_sky;
   GLuint sm_fbo, sm_tex;             // sun shadow map (depth only)
   mat4   light_vp;
   GLuint scope_fbo, scope_tex, scope_depth;  // picture-in-picture scope target
   int    scope_size;
-  GLint  u_sky_fwd, u_sky_right, u_sky_up, u_sky_tan;
+  GLint  u_sky_fwd, u_sky_right, u_sky_up, u_sky_tan, u_sky_wind, u_sky_cov;
+  GLint  u_sky_sunxz;
   GLuint vao_world, vbo_world, vao_hud, vbo_hud, vao_sky, font_tex;
   GLuint vao_scene, vbo_scene;   // per-frame dynamic 3D batch (bot, VFX, gun)
   int    world_verts;
@@ -12084,10 +12540,13 @@ typedef struct {
   int    world_cast_verts, world_decor_verts;
   GLuint present_fbo;               // frame destination: 0 on Windows, harness FBO on Linux
   GLuint msaa_fbo, msaa_rb[2];      // multisampled scene target, msaa_fbo 0 = MSAA off
+  int    frame_resolved;            // this frame's resolve has happened; see msaa_resolve
   int    msaa_cfg, msaa_w, msaa_h;  // setting/size the MSAA target was built for
   GLuint blur_fbo[2], blur_tex[2];  // quarter-res ping-pong: the frosted menu
   GLuint prog_blur;                 // dual-Kawase tap (see ui_menu_backdrop)
   GLint  u_blur_tex, u_blur_px;
+  GLuint prog_glare;                // bloom + light shafts (see glare_pass)
+  GLint  u_gl_tex, u_gl_sun, u_gl_knee, u_gl_gain, u_gl_mode, u_gl_grade;
   int    blur_w, blur_h;            // size the blur chain was built for
 } renderer_t;
 
@@ -12105,6 +12564,88 @@ static GLuint gl_compile(GLenum type, const char *src) {
     fatal(log);
   }
   return sh;
+}
+
+static lightloc_t rig_locs(GLuint p) {
+  return (lightloc_t){
+    .sun    = glGetUniformLocation(p, "SUN_DIR"),
+    .suncol = glGetUniformLocation(p, "SUN_COL"),
+    .skytop = glGetUniformLocation(p, "SKY_TOP"),
+    .skyhor = glGetUniformLocation(p, "SKY_HOR"),
+    .skygnd = glGetUniformLocation(p, "SKY_GND"),
+    .expo   = glGetUniformLocation(p, "EXPOSURE"),
+    .disc   = glGetUniformLocation(p, "SUN_DISC"),
+    .atmo   = glGetUniformLocation(p, "uAtmo"),
+    .haze   = glGetUniformLocation(p, "uHaze"),
+    .hazes  = glGetUniformLocation(p, "uHazeS"),
+    .ambd   = glGetUniformLocation(p, "uAmbD"),
+    .ambu   = glGetUniformLocation(p, "uAmbU"),
+    .bounce = glGetUniformLocation(p, "uBounce"),
+    .vmfill = glGetUniformLocation(p, "VM_FILL"),
+    .vmrim  = glGetUniformLocation(p, "VM_RIM"),
+  };
+}
+
+// Luminance, the one weighting. Used to re-normalize the hero rig below.
+static float v3_luma(v3 c) {
+  return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+// THE ONE WRITER. Call it with the program already bound; every consumer of the
+// light gets the whole rig or none of it, which is what stops a sky pass from
+// running one frame behind the world's sun.
+static void rig_upload(const lightloc_t *L) {
+  const sun_t *S = &g_sun;
+  glUniform3f(L->sun, S->dir.x, S->dir.y, S->dir.z);
+  glUniform3f(L->suncol, S->col.x, S->col.y, S->col.z);
+  glUniform3f(L->skytop, S->sky_top.x, S->sky_top.y, S->sky_top.z);
+  glUniform3f(L->skyhor, S->sky_hor.x, S->sky_hor.y, S->sky_hor.z);
+  glUniform3f(L->skygnd, S->sky_gnd.x, S->sky_gnd.y, S->sky_gnd.z);
+  glUniform1f(L->expo, S->exposure);
+  glUniform1f(L->disc, S->disc);
+  v3 at = atmo_tint();
+  glUniform4f(L->atmo, at.x, at.y, at.z, atmo_haze());
+  // The two halves of haze_rad that are constant for the whole draw, folded
+  // here so the fragment shader does not rebuild them three times a pixel.
+  glUniform3f(L->haze, at.x * (S->col.x * 0.055f + S->sky_hor.x * 0.30f),
+                       at.y * (S->col.y * 0.055f + S->sky_hor.y * 0.30f),
+                       at.z * (S->col.z * 0.055f + S->sky_hor.z * 0.30f));
+  glUniform3f(L->hazes, at.x * S->col.x * 0.95f, at.y * S->col.y * 0.95f,
+                        at.z * S->col.z * 0.95f);
+  // Diffuse irradiance, both ends of the hemisphere lobe. Sun-facing AO is only
+  // partly applied at the call site — a crease is dark in ambient light, not in
+  // a direct beam.
+  glUniform3f(L->ambd, S->sky_gnd.x * 0.44f, S->sky_gnd.y * 0.44f,
+                       S->sky_gnd.z * 0.44f);
+  { v3 up = v3_lerp(S->sky_hor, S->sky_top, 0.45f);
+    glUniform3f(L->ambu, up.x * 0.40f, up.y * 0.40f, up.z * 0.40f); }
+  glUniform3f(L->bounce, S->sky_gnd.x * 1.35f, S->sky_gnd.y * 1.35f,
+                         S->sky_gnd.z * 1.35f);
+  // The viewmodel's fill and rim: sky hue and sun hue, both re-normalized to a
+  // fixed DISPLAY strength (see VM_FILL's comment). The 1.22 / 1.35 reproduce
+  // the two constants this replaced to within 3% at a midday sun, so a weapon
+  // photographed at noon is the weapon that was tuned.
+  { v3 sky = v3_lerp(S->sky_hor, S->sky_top, 0.35f);
+    // THE FILL KEEPS ONLY HALF THE SKY'S CHROMA, taken out on the luminance
+    // axis. Physically the fill IS the sky, and at dusk the sky is a saturated
+    // violet — which lands on the one blue object in the frame, the player's
+    // own sleeve, and multiplies. Measured on the sleeve patch: 0.37
+    // saturation with the sky's full chroma against 0.29 in the arena's own
+    // light. The RIM keeps all of its colour, because the rim is the sun and
+    // the sun's warmth is the half of this rig that is supposed to read.
+    float sl0 = v3_luma(sky);
+    sky = v3_lerp((v3){{sl0, sl0, sl0}}, sky, 0.5f);
+    // `luma(col) * exposure` is the arena's light AFTER eye adaptation, i.e.
+    // what the player actually lost; 2.556 * 0.40 is that same quantity for the
+    // midday rig these constants were tuned under. The 0.7 power hands back
+    // about half of the loss.
+    float world = v3_luma(S->col) * S->exposure / (2.556f * 0.40f);
+    float k = 0.40f * powf(f_clamp(world, 0.05f, 4.0f), 0.70f)
+            / fmaxf(S->exposure, 0.05f);
+    float fs = 1.22f * k / fmaxf(v3_luma(sky), 0.02f);
+    float rs = 1.35f * k / fmaxf(v3_luma(S->col), 0.02f);
+    glUniform3f(L->vmfill, sky.x * fs, sky.y * fs, sky.z * fs);
+    glUniform3f(L->vmrim, S->col.x * rs, S->col.y * rs, S->col.z * rs); }
 }
 
 static GLuint gl_program(const char *vs, const char *fs) {
@@ -12482,17 +13023,29 @@ static void renderer_init(int width, int height) {
   R.u_eye = glGetUniformLocation(R.prog_world, "uEye");
   R.u_detail = glGetUniformLocation(R.prog_world, "uDetail");
   R.u_surf = glGetUniformLocation(R.prog_world, "uSurf");
+  R.rig_world = rig_locs(R.prog_world);
   R.u_emis = glGetUniformLocation(R.prog_world, "uEmis");
   R.u_screen = glGetUniformLocation(R.prog_hud, "uScreen");
   R.u_tex = glGetUniformLocation(R.prog_hud, "uTex");
   R.u_img = glGetUniformLocation(R.prog_hud, "uImg");
   R.prog_blur = gl_program(BLUR_VS, BLUR_FS);
+  R.prog_glare = gl_program(BLUR_VS, GLARE_FS);   // same fullscreen triangle
+  R.u_gl_tex  = glGetUniformLocation(R.prog_glare, "uTex");
+  R.u_gl_sun  = glGetUniformLocation(R.prog_glare, "uSunUV");
+  R.u_gl_knee = glGetUniformLocation(R.prog_glare, "uKnee");
+  R.u_gl_gain = glGetUniformLocation(R.prog_glare, "uGain");
+  R.u_gl_mode = glGetUniformLocation(R.prog_glare, "uMode");
+  R.u_gl_grade = glGetUniformLocation(R.prog_glare, "uGrade");
   R.u_blur_tex = glGetUniformLocation(R.prog_blur, "uTex");
   R.u_blur_px = glGetUniformLocation(R.prog_blur, "uPix");
   R.u_sky_fwd = glGetUniformLocation(R.prog_sky, "uFwd");
   R.u_sky_right = glGetUniformLocation(R.prog_sky, "uRight");
   R.u_sky_up = glGetUniformLocation(R.prog_sky, "uUp");
   R.u_sky_tan = glGetUniformLocation(R.prog_sky, "uTan");
+  R.u_sky_wind = glGetUniformLocation(R.prog_sky, "uWindD");
+  R.u_sky_cov = glGetUniformLocation(R.prog_sky, "uCov");
+  R.u_sky_sunxz = glGetUniformLocation(R.prog_sky, "uSunXZ");
+  R.rig_sky = rig_locs(R.prog_sky);
   glGenVertexArrays(1, &R.vao_sky);  // attribute-less: verts from gl_VertexID
 
   glGenVertexArrays(1, &R.vao_world);
@@ -14763,13 +15316,136 @@ static void blur_update(void) {
   glBindTexture(GL_TEXTURE_2D, R.font_tex);
 }
 
-// Resolve the multisampled scene into the present buffer.
+// Resolve the multisampled scene into the present buffer — ONCE PER FRAME, and
+// the latch is what makes that true. Three callers want a resolved frame (the
+// glare chain, the frosted menu backdrop, and the end of render_frame) and
+// before the latch each of them paid for its own: an 8x resolve of 1280x720 is
+// the single most expensive blit in the frame, and running it twice cost 12 ms
+// on the llvmpipe proxy for a second copy of a picture that had not changed.
+//
+// The consequence is the rule below it: once the frame is resolved, EVERYTHING
+// after it is drawn into the present buffer instead of the multisample one.
+// Nothing after the resolve is geometry — the glare composite is a fullscreen
+// triangle and the HUD is SDF text that carries its own antialiasing — so
+// there is nothing left for MSAA to do but be copied again.
 static void msaa_resolve(void) {
-  if (!R.msaa_fbo) return;
+  if (!R.msaa_fbo || R.frame_resolved) return;
   glBindFramebuffer(GL_READ_FRAMEBUFFER, R.msaa_fbo);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.present_fbo);
   glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.width, R.height,
                     GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  R.frame_resolved = 1;
+}
+
+// Where the frame is being built RIGHT NOW. One predicate, so a pass that draws
+// after the resolve cannot land on the buffer that is no longer being presented.
+static GLuint frame_fbo(void) {
+  return R.frame_resolved || !R.msaa_fbo ? R.present_fbo : R.msaa_fbo;
+}
+
+// A render target is an FBO AND its viewport; binding one without the other is how a
+// scope pass ends up drawn at window resolution.
+static void rt_bind(GLuint fbo, int w, int h) {
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glViewport(0, 0, w, h);
+}
+
+// The whole glare chain, and it is the last thing that happens to the PICTURE
+// before the HUD is drawn on top of it. Order is load-bearing in both directions:
+// after the viewmodel, so a muzzle flash and the weapon's own highlights spill
+// like everything else; before the HUD, because a bloomed ammo counter is a
+// smeared ammo counter.
+//
+// The chain reuses the frosted menu's ping-pong pair rather than owning targets:
+// present -> blur[0] (the blit), bright+shafts -> blur[1], two Kawase taps back
+// and forth, then ONE additive full-res draw. Nothing here allocates.
+static void glare_pass(float yaw, float pitch, float roll, float fovy, float aspect) {
+  blur_update();
+  if (!R.blur_fbo[0] || !R.blur_fbo[1]) return;   // no chain: no glare, not a broken frame
+  msaa_resolve();   // the glare reads a RESOLVED frame; also final-safe
+  // WHERE THE SUN IS ON SCREEN. The sun is a direction, not a point, so it
+  // projects through the camera basis rather than through the view matrix — and
+  // it has to be behind nothing: with the sun behind the camera the march would
+  // run toward a mirrored phantom and paint shafts converging on empty sky.
+  v3 cf, cr, cu;
+  cam_basis(yaw, pitch, roll, &cf, &cr, &cu);
+  float zs = v3_dot(g_sun.dir, cf);
+  float ty = tanf(fovy * 0.5f), tx = ty * aspect;
+  float sx = 0.0f, sy = 0.0f, rays = 0.0f;
+  if (zs > 0.02f) {
+    sx = v3_dot(g_sun.dir, cr) / (zs * tx);
+    sy = v3_dot(g_sun.dir, cu) / (zs * ty);
+    // Two fades, and they answer different questions. The first is "is the sun
+    // in front of me at all" — near the 90-degree edge the projection stretches
+    // without bound and a hard cut there would pop shafts on as the player
+    // turns. The second is "is it anywhere near the frame": past about two
+    // screens out the march direction is nearly the same for every pixel, which
+    // is a screen-wide directional smear and not a shaft.
+    float off = fmaxf(fabsf(sx), fabsf(sy));
+    rays = f_smoothstep(0.02f, 0.32f, zs) * (1.0f - f_smoothstep(1.1f, 2.8f, off));
+    // A LOW SUN THROWS THE LONG SHAFTS, and that is the same physics the haze
+    // band is built on: a shallow ray crosses more dust, so more of the beam
+    // scatters toward the eye. Tied to the arena's own dust as well, so a clear
+    // theme does not get a dusty theme's beams.
+    rays *= (0.55f + 0.95f * (1.0f - g_sun.dir.y)) * (0.55f + 1.15f * atmo_haze());
+  }
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, R.present_fbo);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.blur_fbo[0]);
+  glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.blur_w, R.blur_h,
+                    GL_COLOR_BUFFER_BIT, GL_LINEAR);
+  glDisable(GL_BLEND);
+  glDisable(GL_DEPTH_TEST);
+  glBindVertexArray(R.vao_sky);   // attribute-less fullscreen triangle
+  glViewport(0, 0, R.blur_w, R.blur_h);
+  glUseProgram(R.prog_glare);
+  glUniform1i(R.u_gl_tex, 0);
+  glUniform1f(R.u_gl_mode, 0.0f);
+  glUniform3f(R.u_gl_sun, sx * 0.5f + 0.5f, sy * 0.5f + 0.5f, rays);
+  // THE KNEE IS ABOVE SUNLIT GROUND, ON PURPOSE. Lit sand reads about 0.73 in
+  // display and half the frame is lit sand; a knee under it blooms the floor,
+  // which is how a bloom pass turns into a fog pass. 0.78..0.97 leaves the
+  // ground alone and takes the disc, the sky within a few degrees of it, the
+  // water's specular, the mica glitter, tracers and the muzzle flash. It was
+  // 0.72..0.94 and that reached into the aureole, which is already near the
+  // tonemap's shoulder: adding a blurred copy of it turned twenty degrees of
+  // sky into one flat clipped mass with the sun somewhere inside.
+  glUniform2f(R.u_gl_knee, 0.78f, 0.97f);
+  glUniform3f(R.u_gl_gain, 1.0f, 0.85f, 0.0f);
+  glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1]);
+  glBindTexture(GL_TEXTURE_2D, R.blur_tex[0]);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // Two growing dual-Kawase taps. They soften the shafts as much as they spread
+  // the bloom, which is why the two share a chain: a ten-tap march at quarter
+  // res is banded, and this is the filter that was already here to fix that.
+  glUseProgram(R.prog_blur);
+  glUniform1i(R.u_blur_tex, 0);
+  int src = 1;
+  for (int i = 0; i < 2; i++) {
+    glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1 - src]);
+    glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
+    glUniform2f(R.u_blur_px, (float)(i + 1) / (float)R.blur_w,
+                (float)(i + 1) / (float)R.blur_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    src = 1 - src;
+  }
+  rt_bind(frame_fbo(), R.width, R.height);
+  glEnable(GL_BLEND);
+  // ONE/SRC_ALPHA: the colour channels add, the alpha channel multiplies. See
+  // the composite branch in GLARE_FS.
+  glBlendFunc(GL_ONE, GL_SRC_ALPHA);
+  glUseProgram(R.prog_glare);
+  glUniform1f(R.u_gl_mode, 1.0f);
+  glUniform3f(R.u_gl_gain, 0.0f, 0.0f, 0.56f);
+  // The seed walks with the sim tick, so it is deterministic per tick and yet
+  // never still in play. 8 ticks is 15 Hz of grain, which is about where film
+  // sits: at 120 it strobes, at 1 it is dirt on the lens.
+  glUniform4f(R.u_gl_grade, 0.34f, 0.045f, (float)((g_tick / 8) % 733) * 7.13f,
+              (float)R.width / (float)R.height);
+  glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  glBindTexture(GL_TEXTURE_2D, R.font_tex);
 }
 
 // Frosted-glass backdrop for the PAUSING menu (a networked session never gets one):
@@ -14800,8 +15476,7 @@ static void ui_menu_backdrop(void) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
     src = 1 - src;
   }
-  glBindFramebuffer(GL_FRAMEBUFFER, R.msaa_fbo ? R.msaa_fbo : R.present_fbo);
-  glViewport(0, 0, R.width, R.height);
+  rt_bind(frame_fbo(), R.width, R.height);
   glEnable(GL_BLEND);
   glUseProgram(R.prog_hud);
   glBindVertexArray(R.vao_hud);
@@ -15960,15 +16635,15 @@ static int frustum_sees_cap(const frustum_t *f, v3 a, v3 b, float r) {
 }
 
 // Where this body's shadow can possibly land.
-#define SHADOW_CAST_MAX 24.0f
+#define SHADOW_CAST_MAX 42.0f
 static v3 shadow_foot(v3 c) {
-  const float ly = SUN_DIR_Y / sqrtf(SUN_DIR_X * SUN_DIR_X + SUN_DIR_Y * SUN_DIR_Y +
-                                     SUN_DIR_Z * SUN_DIR_Z);
-  float t = (c.y + 0.5f) / ly;
+  // THE CAP HAS TO FOLLOW THE SUN DOWN. At 38 degrees a body's shadow is under
+  // three metres long and a 24 m ceiling was slack; at 8 it is twenty, and a cap
+  // shorter than the real shadow culls a figure whose shadow is still on screen.
+  float t = (c.y + 0.5f) / fmaxf(g_sun.dir.y, 0.05f);
   if (t < 0.0f) t = 0.0f;
   if (t > SHADOW_CAST_MAX) t = SHADOW_CAST_MAX;
-  v3 d = v3_norm((v3){{-SUN_DIR_X, -SUN_DIR_Y, -SUN_DIR_Z}});
-  return v3_add(c, v3_scale(d, t));
+  return v3_add(c, v3_scale(v3_scale(g_sun.dir, -1.0f), t));
 }
 
 // The camera frustum of the frame being built, published for scene_build.
@@ -18457,16 +19132,28 @@ static kit_t fig_kit(int palette, float flash01, v3 flash_col) {
   if (palette == 1) {  // the player: the same kit in slate blue — the SAME
     // value ramp as the olive design (boots darkest, carrier light, helmet
     // peak), only the hue family changes.
-    olive = (v3){{0.352f, 0.394f, 0.498f}};
-    dark  = (v3){{0.278f, 0.310f, 0.398f}};
-    helm  = (v3){{0.404f, 0.442f, 0.542f}};
-    web   = (v3){{0.202f, 0.226f, 0.288f}};
-    boot  = (v3){{0.158f, 0.164f, 0.196f}};
+    //
+    // ...AND 35% LESS CHROMA THAN IT USED TO CARRY, taken out on the LUMINANCE
+    // axis so every value in the ramp is unchanged to four decimals (olive
+    // 0.3926, helm 0.4411, boot 0.1650 — the same numbers the 25 m silhouette
+    // contract was measured on). Saturation goes 0.29 -> 0.21 on the uniform.
+    // The reason is FIRST PERSON: the sleeve is the only part of this palette
+    // the player ever sees up close, it fills the bottom corner of every frame,
+    // and at the old chroma under a hero rig it read as cornflower blue — the
+    // most saturated thing in an arena whose whole light is warm. Hue family is
+    // untouched, so slate-versus-olive still tells a human from a bot at range;
+    // what is gone is a colour that was fighting the setting rather than
+    // sitting in it.
+    olive = (v3){{0.366f, 0.394f, 0.461f}};
+    dark  = (v3){{0.289f, 0.310f, 0.367f}};
+    helm  = (v3){{0.417f, 0.442f, 0.507f}};
+    web   = (v3){{0.210f, 0.226f, 0.266f}};
+    boot  = (v3){{0.160f, 0.164f, 0.185f}};
     // The three tones the palette used to leave behind, and leaving them behind was not
     // neutral — it was a different figure.
-    nyl   = (v3){{0.452f, 0.452f, 0.470f}};
-    rub   = (v3){{0.206f, 0.216f, 0.246f}};
-    bala  = (v3){{0.300f, 0.312f, 0.348f}};
+    nyl   = (v3){{0.452f, 0.452f, 0.464f}};
+    rub   = (v3){{0.210f, 0.216f, 0.236f}};
+    bala  = (v3){{0.304f, 0.312f, 0.335f}};
   }
   if (flash01 > 0) {  // hit flash: every surface washes toward the flash color
     olive = v3_lerp(olive, flash_col, flash01);
@@ -19541,8 +20228,149 @@ static v3 fx_cool(float a1, float knee, v3 hot, v3 mid, v3 cold) {
                    : v3_lerp(mid, cold, (a1 - knee) / (1.0f - knee));
 }
 
+// ---------------------------------------------------------------------------
+// AIRBORNE DUST — the grains the haze is made of, close enough to resolve.
+// ---------------------------------------------------------------------------
+// The aerial perspective says the air has substance; this says so at arm's
+// length. Everything else about the atmosphere is a smooth function, and a
+// smooth function is exactly what the eye stops believing after a second — what
+// sells air is a handful of individual things drifting through it.
+//
+// NO STATE, NO RNG, NO PARTICLE POOL. The field is a lattice hashed off its own
+// integer cell, so it is infinite, seamless and free to walk: the window of
+// cells follows the camera and the whole lattice translates on the arena's own
+// wind, which means a mote has parallax, a heading, and no spawn or death to
+// pop at. It is also a pure function of g_tick, so a harness screenshot at a
+// given tick is the same screenshot every time — the same reason the grain is
+// seeded off the tick and not off the rendered-frame counter.
+#define DUST_CELL   1.02f   // metres between lattice cells
+#define DUST_RING   4       // cells each way: 9^3 candidates, ~three in five survive
+#define DUST_FAR    9.0f    // past this a mote is under a pixel and only aliases
+
+static uint32_t dust_hash(int x, int y, int z) {
+  uint32_t h = (uint32_t)x * 0x8DA6B343u ^ (uint32_t)y * 0xD8163841u
+             ^ (uint32_t)z * 0xCB1AB31Fu;
+  h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+  return h;
+}
+static float dust_f(uint32_t h) { return (float)(h >> 8) * (1.0f / 16777216.0f); }
+
+// The SAME Schlick lobe haze_rad uses in the shader, at the same g. It is
+// written twice because it has to live on both sides of the GL boundary — the
+// haze is a per-pixel integral and this is a per-mote scalar — and the two
+// agreeing is what stops the individual grains from being brightest somewhere
+// the air around them is not.
+static float dust_phase(float mu) {
+  float den = 1.0f - 0.792f * mu;
+  return 0.0293337f / fmaxf(den * den, 1.0e-4f);
+}
+
+// Is this point standing in the sun? One ray against the solids, first hit
+// wins. A mote that says no still draws at a fraction rather than vanishing:
+// dust in shade is lit by the sky, and a hard zero would make the boundary of
+// every shadow flicker as the field drifts across it.
+static float dust_sunlit(v3 p) {
+  for (int i = 0; i < g_num_solids; i++) {
+    v3 n;
+    if (ray_aabb(p, g_sun.dir, g_solids[i].min, g_solids[i].max, &n) > 0.0f)
+      return 0.13f;
+  }
+  return 1.0f;
+}
+
+static void fx_dust(v3 eye) {
+  float dens = atmo_haze();
+  if (dens <= 0.0f) return;
+  float t = (float)g_tick * (float)TICK_DT;
+  v3 wd = wind_dir();
+  // The lattice's own displacement. Subtracting it before choosing the cell
+  // window and adding it back to the mote is what makes the FIELD move while
+  // the WINDOW stays on the camera.
+  v3 flow = {{wd.x * 0.42f * t, 0.11f * sinf(t * 0.31f), wd.z * 0.42f * t}};
+  v3 base = v3_sub(eye, flow);
+  int c0 = (int)floorf(base.x / DUST_CELL);
+  int c1 = (int)floorf(base.y / DUST_CELL);
+  int c2 = (int)floorf(base.z / DUST_CELL);
+  for (int ix = c0 - DUST_RING; ix <= c0 + DUST_RING; ix++)
+  for (int iy = c1 - DUST_RING; iy <= c1 + DUST_RING; iy++)
+  for (int iz = c2 - DUST_RING; iz <= c2 + DUST_RING; iz++) {
+    uint32_t h = dust_hash(ix, iy, iz);
+    if ((h & 255u) > 150u) continue;            // ~three cells in five carry one
+    v3 p = {{((float)ix + dust_f(h)) * DUST_CELL + flow.x,
+             ((float)iy + dust_f(h * 2654435761u)) * DUST_CELL + flow.y,
+             ((float)iz + dust_f(h * 40503u)) * DUST_CELL + flow.z}};
+    // Dust settles: nothing hangs at head height over a wall, and nothing
+    // hangs underground either.
+    if (p.y < 0.05f || p.y > 4.2f) continue;
+    v3 dv = v3_sub(p, eye);
+    float d2 = v3_dot(dv, dv);
+    if (d2 < 0.36f || d2 > DUST_FAR * DUST_FAR) continue;
+    float dist = sqrtf(d2);
+    v3 vd = v3_scale(dv, 1.0f / dist);
+    // A GRAIN IS BRIGHTEST WHEN IT IS BETWEEN YOU AND THE SUN, by a factor of
+    // twenty. That is the whole reason dust is something you notice on the way
+    // out of a doorway and never on the way in, and it is the same forward
+    // lobe the haze band is built on.
+    // The 0.05 floor is the sky lighting the same grain: without it the lobe
+    // falls to a fiftieth away from the sun and the air is empty everywhere
+    // but one cone, which is not what dust does — the ratio is what carries
+    // the effect, not the extinction.
+    float amp = 0.05f + dust_phase(v3_dot(vd, g_sun.dir));
+    // Twinkle: a triangle wave off the mote's own hash, squared. A grain is a
+    // faceted crystal tumbling in the air, so what the eye actually sees is it
+    // catching and losing the sun, not a steady point.
+    float tp = (float)((h >> 3) & 1023u) * (1.0f / 1024.0f) + t * 0.37f;
+    tp -= floorf(tp);
+    float tw = tp < 0.5f ? tp * 2.0f : (1.0f - tp) * 2.0f;
+    // Near fade and far fade. The near one keeps a mote from crossing the near
+    // plane as a full-screen smear; the far one hands it to the haze, which is
+    // the same dust integrated rather than resolved.
+    float fade = f_smoothstep(0.6f, 1.4f, dist)
+               * (1.0f - f_smoothstep(DUST_FAR * 0.55f, DUST_FAR, dist));
+    // tw^3, not tw^2, and the floor drops to a tenth. Grains are not a field of
+    // equal dots — most of them sit near the bottom of their cycle and a few
+    // are catching the sun at any moment, which is the difference between
+    // glitter and falling snow.
+    float k = dens * amp * (0.10f + 0.90f * tw * tw * tw) * fade * 0.82f;
+    // THE THRESHOLD COMES BEFORE THE RAY, and that ordering is the whole cost
+    // of this field: the shadow test walks the solid list, and most candidates
+    // are already too faint to draw — away from the sun the phase lobe is a
+    // twentieth of its peak. Testing first and culling second was ray-marching
+    // for motes that were never going to be pushed.
+    if (k < 0.004f) continue;
+    k *= dust_sunlit(p);
+    if (k < 0.004f) continue;
+    // Sized to hold about two pixels at any range rather than to a physical
+    // diameter: a 30-micron grain is a quarter of a pixel at four metres, and a
+    // quarter-pixel additive dot is not a mote, it is a scintillating artefact
+    // that MSAA cannot help with.
+    // THE NUMBER IS A HALF-WIDTH. fx_seg pushes a + side*w AND a - side*w, so
+    // the quad is 2w across and 3.4w long; sizing this as if it were the full
+    // width put six-by-ten pixel RECTANGLES in the sky, which the glare chain
+    // then bloomed into unmistakable squares.
+    // Size varies per mote as well as brightness: one diameter over a whole
+    // field is the other half of what made it read as snow.
+    float w = 0.0011f * dist * (0.62f + 0.85f * dust_f(h * 668265263u));
+    // Drawn as a short streak ALONG the drift, which is what a grain moving
+    // through a 120 Hz exposure looks like and what keeps it from reading as a
+    // hard dot.
+    // A SPINDLE, NOT A BAR. fx_seg interpolates width and colour along the
+    // segment but the cross-section is flat, so one quad is a hard-edged
+    // rectangle — at these sizes a lit rectangle is exactly what it looks
+    // like. Two segments tapering to nothing at both ends give a speck with
+    // ends that fade, which is all a two-pixel mote needs.
+    v3 str = v3_scale(wd, w * 2.2f);
+    v3 a = v3_sub(p, str), b = v3_add(p, str);
+    v3 col = v3_scale(g_sun.col, k);
+    const v3 z0 = {{0.0f, 0.0f, 0.0f}};
+    fx_seg(a, p, eye, w * 0.12f, w, z0, col);
+    fx_seg(p, b, eye, w, w * 0.12f, col, z0);
+  }
+}
+
 static void fx_build(v3 eye) {
   scene_reset();
+
   for (int i = 0; i < MAX_TRACERS; i++)
     if (g_tracers[i].life > 0) {
       float f = (float)g_tracers[i].life / TRACER_TICKS;
@@ -20079,6 +20907,11 @@ static void sky_pass(float yaw, float pitch, float roll, float fovy, float aspec
   cam_basis(yaw, pitch, roll, &sf, &sr, &su);
   float ty = tanf(fovy * 0.5f);
   glUseProgram(R.prog_sky);
+  rig_upload(&R.rig_sky);
+  glUniform2f(R.u_sky_wind, cosf(g_wind_ang), sinf(g_wind_ang));
+  { v3 sxz = v3_norm((v3){{g_sun.dir.x, 0.0f, g_sun.dir.z}});
+    glUniform2f(R.u_sky_sunxz, sxz.x, sxz.z); }
+  glUniform1f(R.u_sky_cov, g_sun.cloud);
   glUniform3f(R.u_sky_fwd, sf.x, sf.y, sf.z);
   glUniform3f(R.u_sky_right, sr.x, sr.y, sr.z);
   glUniform3f(R.u_sky_up, su.x, su.y, su.z);
@@ -20107,13 +20940,6 @@ static void fx_pass_end(void) {
   glDisable(GL_BLEND);
   glEnable(GL_CULL_FACE);
   glDepthMask(GL_TRUE);
-}
-
-// A render target is an FBO AND its viewport; binding one without the other is how a
-// scope pass ends up drawn at window resolution.
-static void rt_bind(GLuint fbo, int w, int h) {
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-  glViewport(0, 0, w, h);
 }
 
 // Renders one frame: world from the interpolated player camera, then HUD.
@@ -20257,7 +21083,7 @@ static unsigned home_loop(void);
 static void home_stage(player_t *p) {
   if (!p) return;
   // SUN_DIR points TO the light; the yaw convention is fwd = (sin y, 0, -cos y).
-  float syaw = atan2f(SUN_DIR_X, -SUN_DIR_Z) - 0.55f;
+  float syaw = atan2f(g_sun.dir.x, -g_sun.dir.z) - 0.55f;
   p->yaw = syaw;
   // ...AND IT STANDS HIM AT A CORNER, ON THE SUN SIDE OF IT. One shot leans out of
   // cover and fires down the lens, and a man leaning in open ground is a man with a
@@ -20265,7 +21091,7 @@ static void home_stage(player_t *p) {
   // rather than authored: the nearest vertical edge of a solid tall enough to hide
   // behind, at a distance the camera can still frame him from. `pen == 0` is the arena
   // SHELL (the edge of the world, not cover).
-  v3 sunh = v3_norm((v3){{SUN_DIR_X, 0.0f, SUN_DIR_Z}});
+  v3 sunh = v3_norm((v3){{g_sun.dir.x, 0.0f, g_sun.dir.z}});
   float best = -1e9f;
   v3 stand = p->pos;
   float syaw2 = syaw;
@@ -20654,6 +21480,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
                          const cam_override_t *ov) {
   if (g_world_dirty) { world_upload(); g_world_dirty = 0; }
   msaa_update();
+  R.frame_resolved = 0;
   glBindFramebuffer(GL_FRAMEBUFFER, R.msaa_fbo ? R.msaa_fbo : R.present_fbo);
   v3 feet = v3_lerp(p->prev_pos, p->pos, alpha);
   float eye_h = p->prev_eye + (p->eye - p->prev_eye) * alpha
@@ -20746,9 +21573,12 @@ static void render_frame(const player_t *p, float alpha, int fps,
   // back along the sun that nothing in the level is behind the near plane.
   int shadow_on = R.sm_fbo != 0;
   if (shadow_on) {
-    v3 ld = v3_norm((v3){{-SUN_DIR_X, -SUN_DIR_Y, -SUN_DIR_Z}});  // -SUN_DIR, one copy
-    v3 lc = v3_add((v3){{0, 1.6f, 0}}, v3_scale(ld, -SHADOW_DEPTH * 0.5f));
-    R.light_vp = m4_mul(m4_ortho(SHADOW_HALF, SHADOW_HALF, 0.5f, SHADOW_DEPTH),
+    // -g_sun.dir, and g_sun is the ONE copy: the shader is handed the same
+    // vector through rig_upload, so a shadow can no longer be cast from a sun
+    // the picture does not have.
+    v3 ld = v3_scale(g_sun.dir, -1.0f);
+    v3 lc = v3_add(g_sun.sh_centre, v3_scale(ld, -g_sun.sh_depth * 0.5f));
+    R.light_vp = m4_mul(m4_ortho(g_sun.sh_half, g_sun.sh_half, 0.5f, g_sun.sh_depth),
                         m4_look_dir(lc, ld));
     glBindFramebuffer(GL_FRAMEBUFFER, R.sm_fbo);
     glViewport(0, 0, SHADOW_TEX, SHADOW_TEX);
@@ -20777,6 +21607,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
   // The floor's treatment.
   { v3 sp = surf_params();
     glUniform4f(R.u_surf, sp.x, sp.y, sp.z, g_wind_ang); }
+  rig_upload(&R.rig_world);
   glUniform1f(R.u_emis, 0.0f);
   glUniform1i(R.u_sm, 0);
   glUniform1f(R.u_shadow, shadow_on ? 1.0f : 0.0f);
@@ -20797,7 +21628,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
     glUniform3f(R.u_muzc, 0.0f, 0.0f, 0.0f);
   }
   glUniform2f(R.u_smstep, 1.0f / SHADOW_TEX, 1.0f / SHADOW_TEX);
-  glUniform1f(R.u_smtexel, 2.0f * SHADOW_HALF / SHADOW_TEX);
+  glUniform1f(R.u_smtexel, 2.0f * g_sun.sh_half / SHADOW_TEX);
   glUniformMatrix4fv(R.u_lightvp, 1, GL_FALSE, R.light_vp.m);
   glBindVertexArray(R.vao_world);
   glDrawArrays(GL_TRIANGLES, 0, R.world_verts);
@@ -20867,6 +21698,22 @@ static void render_frame(const player_t *p, float alpha, int fps,
       glUniformMatrix4fv(R.u_vp, 1, GL_FALSE, vp.m);
     }
     fx_pass_end();
+  }
+
+  // AIRBORNE DUST, MAIN VIEW ONLY, and that is why it is its own submission
+  // rather than another builder inside fx_build. A mote is sized to hold about
+  // a pixel and a half at the world's FOV; the scope renders the same buffer
+  // through a NINE degree lens, which magnifies every one of them into a blob
+  // sitting between the crosshair and the target. A scope is not where you
+  // look at the air.
+  if (!third) {
+    scene_reset();
+    fx_dust(eye);
+    if (g_scene_floats) {
+      fx_pass_begin();
+      scene_draw_vp(&vp);
+      fx_pass_end();
+    }
   }
 
   // Viewmodel pass: depth cleared so the gun never clips into walls, own fixed-FOV
@@ -20986,6 +21833,9 @@ static void render_frame(const player_t *p, float alpha, int fps,
       fx_pass_end();
     }
   }
+
+  // The picture is finished here; everything after this line is interface.
+  glare_pass(yaw, pitch, roll, fovy, aspect);
 
   // HUD + menu: everything batches into one buffer, one draw call.
   g_ui_time += g_ui_dt;   // presentation clock (pulses, glides); never sim-read
@@ -21361,7 +22211,8 @@ static void render_frame(const player_t *p, float alpha, int fps,
   ui_flush();
 
   // Leave the present FBO bound on both targets so glReadPixels/SwapBuffers
-  // see it.
+  // see it. glare_pass has normally resolved already, in which case this is the
+  // latch's no-op and the HUD above was drawn straight into the present buffer.
   msaa_resolve();
   if (R.msaa_fbo) glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
 }
@@ -22877,6 +23728,11 @@ static void usage(void) {
        "  sfxlog N           print every audio routing decision for N ticks\n"
        "  mixdown P.wav N    render the real voice mixer + limiter for N ticks\n"
        "  map                theme/wind/surface treatment + all collision solids\n"
+       "  sun [ELEV AZI]     the arena's light: elevation/azimuth in DEGREES,\n"
+       "                     the extinguished sun colour, the exposure and the\n"
+       "                     shadow box. With two arguments it MOVES the sun —\n"
+       "                     the whole 6.5..54 range is reviewable without\n"
+       "                     hunting seeds for it\n"
        "  trace N            advance N ticks, printing pos each tick\n"
        "  shot PATH.png      render + write screenshot\n"
        "  capture V.rgb A.wav FPS N  RGB24+WAV capture at FPS=60|120 for N frames\n"
@@ -27191,15 +28047,40 @@ static void run_script(char *script, sim_ctx_t *s) {
              g_part_res_peak, PARTS_SKID_LO,
              R.world_decor_verts, DECOR_MAX_VERTS, g_mesh_drops,
              g_ui_peak, UI_MAX_VERTS, g_ui_drops);
+    } else if (!strcmp(t, "sun")) {
+      // THE LIGHT IS MAP STATE, so without this the only way to see a given
+      // time of day is to hunt seeds for it — and the whole range 6.5..54
+      // degrees has to be reviewable, not just the four elevations the seeds
+      // in the batteries happen to roll. With no argument it prints; with two
+      // it drives sun_set, which is the same entry map generation uses.
+      { char *a = take_tok();      // the opt_n idiom: take, test, push back
+        if (!a) { /* bare `sun` prints */ }
+        else {
+          char *e;
+          float ed = strtof(a, &e);
+          if (e == a || *e || f_is_nonfinite(ed)) g_tok_pushback = a;
+          else sun_set(ed, next_f() * (F_PI / 180.0f));
+        } }
+      { const sun_t *S = &g_sun;
+        printf("sun elev=%.2f azi=%.2f dir=(%.3f %.3f %.3f) "
+               "col=(%.3f %.3f %.3f) expo=%.3f sh_half=%.1f\n",
+               (double)(asinf(f_clamp(S->dir.y, -1.0f, 1.0f)) * (180.0f / F_PI)),
+               (double)(atan2f(S->dir.x, -S->dir.z) * (180.0f / F_PI)),
+               (double)S->dir.x, (double)S->dir.y, (double)S->dir.z,
+               (double)S->col.x, (double)S->col.y, (double)S->col.z,
+               (double)S->exposure, (double)S->sh_half); }
     } else if (!strcmp(t, "map")) {
       // The theme decides the whole surface treatment now (ripples, glitter,
       // standing water) and it was previously unprintable — you could only find
       // out which one a seed rolled by photographing it.
       { v3 sp = surf_params();
         static const char *SN[] = {"grit", "wet", "sand"};
-        printf("map theme=%s wind=%.3f ripple=%.2f glint=%.2f water=%.2f\n",
+        printf("map theme=%s wind=%.3f ripple=%.2f glint=%.2f water=%.2f "
+               "haze=%.2f sun_elev=%.2f\n",
                SN[g_theme.surf], (double)g_wind_ang,
-               (double)sp.x, (double)sp.y, (double)sp.z); }
+               (double)sp.x, (double)sp.y, (double)sp.z, (double)atmo_haze(),
+               (double)(asinf(f_clamp(g_sun.dir.y, -1.0f, 1.0f))
+                        * (180.0f / F_PI))); }
       for (int i = 0; i < g_num_solids; i++)
         printf("solid %d min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f)\n", i,
                (double)g_solids[i].min.x, (double)g_solids[i].min.y, (double)g_solids[i].min.z,
