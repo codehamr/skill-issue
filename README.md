@@ -19,8 +19,8 @@
 </p>
 
 <p align="center">
-  <img src="media/fight.png" alt="assault rifle firefight on a procedural sand arena" width="49%">
-  <img src="media/scope.png" alt="sniper scope on a bot returning fire" width="49%">
+  <img src="media/fight.png" alt="carbine headshot at dusk on a procedural sand arena" width="49%">
+  <img src="media/scope.png" alt="a bot in the sniper crosshair, one breath before the shot" width="49%">
 </p>
 
 ## The game
