@@ -11,14 +11,16 @@ post/
 tools/*
 !tools/ci-proofs.sh
 !tools/server-report.awk
+media/.cache/
 CLAUDE.md
 AGENTS.md
 docs/
 tmp.txt
 __pycache__
-trailer
 .env
 post.md
 *.mp4
+!media/hero.mp4
 opencode.json
 node_modules/
+media/hero.mp4

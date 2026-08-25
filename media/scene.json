@@ -1,0 +1,56 @@
+{
+  "_": "media/hero.gif \u2014 THE SCREENPLAY (media/scene.json). v5, 2026-08-25. \u2014 GOLD stage (seed 59, sun 6.5). EXACTLY TWO sniper scenes and no more: (1) the tracked headshot THROUGH the scope with the spark burst (one continuous take, speed-ramped into the shot), (2) the SAME kill from outside in slow4x with shooter AND target in frame. The AR ADS scene is the CALM version (dot waits, two taps, drop in view). The wall-slide runs longer from a camera set further back, the shooter released almost on the lane axis so his misses stitch the wall BEHIND the slider; the cut ends before the four hits that eventually stop him (first phit at src ~98).",
+  "out": ".cache/hero_src.mp4",
+  "w": 1920,
+  "h": 1080,
+  "bpm": 126,
+  "grade": "crop=iw:ih/1.32:0:(ih-oh)*0.35,eq=contrast=1.08:saturation=1.12:gamma=0.985,unsharp=3:3:0.35",
+  "fade_out": 0,
+  "gif_colors": 96,
+  "gif_fps": 18,
+  "shots": [
+    {
+      "clip": "gold_run",
+      "in_f": 60,
+      "beats": 1.25,
+      "speed": 1
+    },
+    {
+      "clip": "gold_fight",
+      "in_f": 50,
+      "beats": 2.5,
+      "speed": 1
+    },
+    {
+      "clip": "gold_wallslide",
+      "in_f": 16,
+      "beats": 2.75,
+      "speed": 2
+    },
+    {
+      "clip": "gold_lean",
+      "in_f": 96,
+      "beats": 2.0,
+      "speed": 1
+    },
+    {
+      "clip": "gold_scope",
+      "in_f": 235,
+      "beats": 1.0,
+      "speed": 1,
+      "zoom": 1.5
+    },
+    {
+      "clip": "gold_scope",
+      "beats": 1.75,
+      "speed": 3,
+      "zoom": 1.5
+    },
+    {
+      "clip": "gold_impact",
+      "in_f": 284,
+      "beats": 3.0,
+      "speed": 4
+    }
+  ]
+}

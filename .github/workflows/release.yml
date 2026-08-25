@@ -77,6 +77,10 @@ jobs:
           gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
           x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
           ./tools/ci-proofs.sh ./skill-issue-linux-amd64
+          # Memory-safety gate: the proof battery (incl. netfuzz, the packet
+          # fuzzer) under ASan/UBSan. The Makefile target owns the recipe and
+          # the reasoning; ~1 min compile + ~10 s run.
+          make asan-gate
 
       - uses: actions/upload-artifact@v7
         with: { name: assets, path: "skill-issue-*\nVERSION", if-no-files-found: error }

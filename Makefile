@@ -122,6 +122,26 @@ build/game-asan: code/game.c
 	mkdir -p build
 	$(LIN_CC) -std=c23 -O1 -g -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero -Wall -Wextra $< -o $@ $(LIN_LIBS)
 
+# The memory-safety gate: the standard proof battery run UNDER the sanitizers,
+# ~10 s once the binary exists. What each half buys:
+#   run 1 — the self-contained net proofs. netfuzz is the fuzzer this codebase
+#           already ships (garbage packets into every decoder); under ASan a
+#           decoder overread that happens to land in mapped memory stops being
+#           silent and becomes a hard failure.
+#   run 2 — 10 s of 20-bot sim (the gameplay hot paths), parity (shared
+#           player/bot code), figcheck 1 + mapcheck 20 (one pass through every
+#           figure/arena BUILDER — one tick is enough for memory errors, and
+#           figcheck's full O(n^2) surface sweep costs minutes under ASan
+#           while its geometry verdict is already gated in ci-proofs.sh).
+# detect_leaks=0 because LeakSanitizer fires spuriously from inside Mesa
+# (llvmpipe worker threads racing at exit, no game.c frame in the stack);
+# a flaky gate is worse than no leak check. ASan/UBSan errors still abort
+# with a non-zero exit, which is what CI reads.
+asan-gate: build/game-asan
+	ASAN_OPTIONS=detect_leaks=0 ./build/game-asan --seed 1337 --config "$$(mktemp -u)" --do "netpack 2000; netfuzz 50000; netpredict 600; netlagcomp; netstall; netanim 600; netfill; netloop 600; netdeath; netleave" >/dev/null
+	ASAN_OPTIONS=detect_leaks=0 ./build/game-asan --seed 1337 --config "$$(mktemp -u)" --do "fraglimit 1000; bots 20; skill hard; wait 1200; parity; figcheck 1; mapcheck 20" >/dev/null
+	@echo "asan-gate: OK"
+
 # Copy the SHIPPABLE Linux build to the handheld's home directory and make it
 # runnable there. `handheld` is an ssh config Host entry, which comes from the
 # Windows host's ~/.ssh mounted by .devcontainer/devcontainer.json — so the key
@@ -453,4 +473,4 @@ init:
 	git push --force origin main
 	@echo "Git history reset to single 'init' commit"
 
-.PHONY: all clean deploy init server-deploy server-delete server-logs server-logs-reset
+.PHONY: all clean deploy init server-deploy server-delete server-logs server-logs-reset asan-gate
