@@ -124,7 +124,12 @@ done
 # and they are not going away: the frame's wall is 1.6 mm of real thickness and a lens
 # ring buried in it is inside a millimetre of BOTH of its faces by construction. That is
 # the "two curved bodies that touch are tangent somewhere" case this tier exists for.
-WANT_NEAR="80 80 80 65"
+# -1 at DIST 30 with the JOINT/ARM pass (2026-08-25, second half of the player
+# pass): the thigh and shin now NARROW into the knee (0.056/0.058 at the joint
+# against the old 0.066/0.072), and one thigh/shin skin pair that ran sub-mm
+# parallel across the fold at k=6 separated — verified by pair-histogram diff
+# against HEAD: exactly `thigh/shin 2 -> 1`, nothing else moved on any tier.
+WANT_NEAR="80 80 80 64"
 [ "$NEAR" = "$WANT_NEAR" ] || { say "GATE near '$NEAR' != baseline '$WANT_NEAR'"; fail=1; }
 
 # `cross` — surfaces passing THROUGH each other at 1.8-15 degrees, the tier the
@@ -370,7 +375,38 @@ WANT_NEAR="80 80 80 65"
 # drawn pad and GUN_BUTT_Z agree again (figbury-butt is what measures that, and it was
 # 3.5 mm out). The pad's rolled edge then grazes the stock body's own last band for
 # 3.5 mm more, at the coarsest profile tier where both are k=6.
-WANT_CROSS="85 85 84 58"
+# Re-baselined 2026-08-25 (PLAYER MODEL PASS), 85/85/84/58 -> 90/90/81/62.
+# INVESTIGATED per pair histogram (figv) against a HEAD build. The named sources:
+# +5 at DIST 0/3 — burials of the new gear: the headset ear cups bury their
+# inner ends 6 mm inside the skull's own ellipse (skull/ear_cup), the mag
+# shingle's divider straps emerge from the shingle they ride, the shingle and
+# the flank radio emerge from the carrier, and the support hand brushes the
+# shingle in the reload stations (shingle/hand) — the "chain buried alongside
+# another chain grazes it" class the stock's and fig_joint's notes both record,
+# plus the arm-brushes-torso-surface class the carrier/uarm and torso/uarm
+# pairs already carried at HEAD (the flank radio adds radio/deltoid,
+# radio/sho_ball, radio/uarm to that family; it sits below the armpit swing and
+# nothing shows in motion frames).
+# -3 at DIST 12 — the goggle band's temple ends used to END exactly ON the old
+# ear pads' inner face (a coincident-plane defect, fixed rather than absorbed:
+# they now dive INSIDE the cups and a step lower), which retires every
+# skull/goggle pair (~3 per tick, the largest head-tier source) at every tier;
+# the divider straps and the helmet rails are gated behind g_fig_k >= 12, so
+# the coarse tiers never see them — the rail-teeth precedent. The retirement
+# outweighs the new gear's own pairs (magpouch/thigh, radio, shingle) here.
+# +4 at DIST 30 — the new gear masses (shingle, radio, dump pouch) graze their
+# hosts at k=6, where every curved skin is six flats, and the carried rifle
+# lies along the prouder shingle (shingle/gun).
+# zfight/open/flip/dup/degen are 0 on every tier through all of it, near did not
+# move on ANY tier, and figbury is byte-identical (5.8/0.7 AR, 5.7/0.5 SR).
+# Re-baselined again 2026-08-25 (JOINT/ARM pass), 90/90/81/62 -> 84/84/70/66.
+# The shoulder lost two whole part families: the deltoid BALL and the deltoid
+# armour pad are deleted (the deltoid is the arm chain's own fat top now), and
+# sho_ball/deltoid alone carried ~7 pairs per gate run at the close tiers —
+# hence the drop at DIST 0/3/12. What the coarse tier gains (+4 at DIST 30) is
+# the kneepad plate and the taller boot shaft grazing their hosts at k=6, the
+# designed-burial class as everywhere above.
+WANT_CROSS="84 84 70 66"
 [ "${CROSS:-}" = "$WANT_CROSS" ] || { say "GATE cross '${CROSS:-}' != baseline '$WANT_CROSS'"; fail=1; }
 
 # parity: no MISMATCH in the shared-code rows

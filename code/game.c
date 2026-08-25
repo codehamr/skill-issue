@@ -17659,6 +17659,37 @@ static void fig_ball(v3 c, float rx, float ry, float rz, v3 ax, v3 hint,
   }
   v3 sp = v3_sub(c, v3_scale(ax, ry)), np = v3_add(c, v3_scale(ax, ry));
   v3 sn = v3_scale(ax, -1.0f);
+  // THE FACETED FAMILY SHADES FLAT, exactly as fig_chain's bands do. The
+  // gradient normals below smooth-shade whatever k the profile has, so every
+  // k=8 joint was a polished sphere on a flat-faceted body — which is most of
+  // why the joints read as ball bearings. One normal per facet, from the
+  // facet's own winding; the smooth family (k >= 12) keeps the gradient.
+  if (!fig_round(k)) {
+    for (int j = 0; j < k; j++) {
+      int j2 = (j + 1) % k;
+      v3 fn = v3_cross(v3_sub(v[0][j], sp), v3_sub(v[0][j2], sp));
+      if (v3_dot(fn, fn) > 1e-14f) fn = v3_norm(fn); else fn = sn;
+      scene_push(sp, fn, col); scene_push(v[0][j], fn, col);
+      scene_push(v[0][j2], fn, col);
+      for (int i = 0; i + 1 < FIG_BALL_LAT; i++) {
+        v3 qn = v3_cross(v3_sub(v[i + 1][j2], v[i][j]),
+                         v3_sub(v[i][j2], v[i + 1][j]));
+        if (v3_dot(qn, qn) > 1e-14f) qn = v3_norm(qn); else qn = n[i][j];
+        scene_push(v[i][j], qn, col);
+        scene_push(v[i + 1][j], qn, col);
+        scene_push(v[i + 1][j2], qn, col);
+        scene_push(v[i][j], qn, col);
+        scene_push(v[i + 1][j2], qn, col);
+        scene_push(v[i][j2], qn, col);
+      }
+      int L = FIG_BALL_LAT - 1;
+      v3 fn2 = v3_cross(v3_sub(v[L][j2], np), v3_sub(v[L][j], np));
+      if (v3_dot(fn2, fn2) > 1e-14f) fn2 = v3_norm(fn2); else fn2 = ax;
+      scene_push(np, fn2, col); scene_push(v[L][j2], fn2, col);
+      scene_push(v[L][j], fn2, col);
+    }
+    return;
+  }
   for (int j = 0; j < k; j++) {
     int j2 = (j + 1) % k;
     scene_push(sp, sn, col); scene_push(v[0][j], n[0][j], col);
@@ -20056,22 +20087,31 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     v3 cf2 = v3_norm(v3_cross(spine, Rc));
     for (int e = 0; e < 2; e++) {
       float es = e ? 1.0f : -1.0f;
-      fnode_t st[4] = {
+      // FIVE nodes: the old four turned 65 degrees at the shoulder's crest and
+      // fig_chain's bevel folded back through the ring behind it — the same
+      // fold the helmet brim's note records, and it read as a torn notch in
+      // the strap from dead ahead. Splitting the crest into two ~35 degree
+      // turns unfolds it. Pulled 5 mm inboard as well: the outer edge sat
+      // 1 mm off the (now flat-shaded) deltoid's inner facet.
+      fnode_t st[5] = {
         {v3_add(P->chest, v3_add(v3_scale(Rc, es * 0.060f),
            v3_add(v3_scale(spine, 0.016f), v3_scale(cf2, 0.112f)))),
          kt->gear, kt->gear, 0.034f, 0.019f, 0, 0.0f},
         // OUTBOARD, over the shoulder rather than over the throat.
-        {v3_add(P->chest, v3_add(v3_scale(Rc, es * 0.106f),
+        {v3_add(P->chest, v3_add(v3_scale(Rc, es * 0.101f),
            v3_add(v3_scale(spine, 0.082f), v3_scale(cf2, 0.086f)))),
          kt->gear, kt->gear, 0.033f, 0.021f, 0, 0.0f},
-        {v3_add(P->chest, v3_add(v3_scale(Rc, es * 0.112f),
-           v3_add(v3_scale(spine, 0.092f), v3_scale(cf2, -0.010f)))),
+        {v3_add(P->chest, v3_add(v3_scale(Rc, es * 0.106f),
+           v3_add(v3_scale(spine, 0.093f), v3_scale(cf2, 0.040f)))),
+         kt->gear, kt->gear, 0.033f, 0.021f, 0, 0.0f},
+        {v3_add(P->chest, v3_add(v3_scale(Rc, es * 0.107f),
+           v3_add(v3_scale(spine, 0.090f), v3_scale(cf2, -0.012f)))),
          kt->gear, kt->gear, 0.033f, 0.021f, 0, 0.0f},
         {v3_add(P->chest, v3_add(v3_scale(Rc, es * 0.072f),
            v3_add(v3_scale(spine, 0.030f), v3_scale(cf2, -0.104f)))),
          kt->gear, kt->gear, 0.034f, 0.019f, 0, 0.0f}};
       probe("strap");
-      fig_chain(st, 4, 8, 1, 1, spine);
+      fig_chain(st, 5, 8, 1, 1, spine);
     }
   }
   // Trapezius wedges: the head used to float on a long bare neck over a flat shoulder
@@ -20125,7 +20165,11 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
       probe("packstrap");
       fig_chain(vb, 3, 8, 1, 1, spine);
     }
-    // Whip antenna off the pack's strong-side corner.
+    // Whip antenna off the pack's strong-side corner: a clean vertical mast
+    // BEHIND the shoulder, against the sky. It was moved onto a chest radio for
+    // one pass and moved back the same day — based at the chest its whip stood
+    // in front of the neck and crossed the FACE in every side view, and the
+    // blade twist made its base read as floating beside the arm.
     {
       v3 ab = v3_add(pb, v3_add(v3_scale(Rc, 0.072f), v3_scale(spine, 0.070f)));
       fnode_t an[3] = {
@@ -20139,16 +20183,112 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
       fig_chain(an, 3, 6, 1, 1, Rc);
     }
   }
-  // Two mag pouches on the belt line; they also mark which way the hips face.
+  // FRONT MAG SHINGLE — the operator's #1 mass (the MW read is chest-heavy, not
+  // back-heavy): a clustered triple pouch block at STERNUM height on the plate,
+  // 55 mm proud, so the side view gains its forward step where the plate is.
+  // ONE mass with two divider straps, never three floating pouches — six small
+  // items read as noise, one stepped block reads as a loaded carrier.
+  //
+  // EVERYTHING MOUNTED ON THE CARRIER FOLLOWS THE CARRIER'S OWN TWIST. The
+  // torso chain rolls its cross-sections by (TW)*tw to blade the shoulders, so
+  // the plate's FRONT at chest height is cfw rotated ~0.8*tw about the spine —
+  // a pouch authored square to the pelvis shears off the plate exactly when the
+  // figure is at the ready, which is always. Offsets AND node roll carry it.
+  {
+    mat_set(MAT_GEAR_R, 0.0f);
+    // 0.80 (and the radio's 0.86 below) approximate the carrier's own authored
+    // roll ladder (0.62/0.84/0.94 * tw) at the mount heights.
+    float thw = tw * 0.80f;
+    v3 fw2 = v3_rot_axis(cfw, spine, thw);
+    v3 rt2 = v3_rot_axis(prt, spine, thw);
+    // A small value step UNDER the carrier it hangs on, so the block reads as
+    // kit ON the plate rather than as a second plate.
+    v3 shc = v3_scale(kt->gear, 0.94f);
+    v3 flp = v3_scale(kt->gear, 1.03f);
+    // Buried into the carrier at both ends (the carrier's front face runs
+    // ~0.165..0.185 of cfw over this span), 55 mm proud at the belly.
+    fnode_t sg[5] = {
+      {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.215f), v3_scale(fw2, 0.132f))),
+       shc, shc, 0.100f, 0.028f, thw, 0.58f},
+      {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.242f), v3_scale(fw2, 0.172f))),
+       shc, shc, 0.114f, 0.058f, thw, 0.0f},
+      {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.292f), v3_scale(fw2, 0.176f))),
+       shc, shc, 0.116f, 0.062f, thw, 0.0f},
+      {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.328f), v3_scale(fw2, 0.168f))),
+       flp, flp, 0.108f, 0.050f, thw, 0.0f},   // flap lip
+      {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.360f), v3_scale(fw2, 0.142f))),
+       flp, flp, 0.088f, 0.026f, thw, 0.0f}};
+    probe("shingle");
+    g_fig_jit = 0.45f;
+    fig_chain(sg, 5, 8, 1, 1, rt2);
+    g_fig_jit = 1.0f;
+    // Two divider straps split the block into three mags. Hero/near tiers only
+    // (the rail-teeth precedent): the strap CREST stands ~18 mm proud of the
+    // shingle face — ~1.4 px at 12 m.
+    if (g_fig_k >= 12) {
+      for (int dv = 0; dv < 2; dv++) {
+        float ss = dv ? 1.0f : -1.0f;
+        fnode_t dvs[3] = {
+          {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.247f),
+             v3_add(v3_scale(rt2, ss * 0.039f), v3_scale(fw2, 0.194f)))),
+           kt->web, kt->web, 0.014f, 0.017f, thw, 0.0f},
+          {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.288f),
+             v3_add(v3_scale(rt2, ss * 0.039f), v3_scale(fw2, 0.240f)))),
+           kt->web, kt->web, 0.014f, 0.016f, thw, 0.0f},
+          {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.328f),
+             v3_add(v3_scale(rt2, ss * 0.039f), v3_scale(fw2, 0.194f)))),
+           kt->web, kt->web, 0.012f, 0.015f, thw, 0.0f}};
+        probe("shingle_strap");
+        fig_chain(dvs, 3, 8, 1, 1, rt2);
+      }
+    }
+    // Radio brick on the weak-side CUMMERBUND — the flank, not the chest front.
+    // On the chest it sat under the support arm in every ready pose and read as
+    // a prop strapped to the arm; the flank is what the side view shows, and
+    // the side view is where a radio lives on a real carrier. No antenna here —
+    // the whip stays on the pack's corner, behind the shoulder (see the pack).
+    mat_set(MAT_RUBBER_R, 0.0f);
+    {
+      float thw2 = tw * 0.86f;
+      v3 rt3 = v3_rot_axis(prt, spine, thw2);
+      v3 fw3 = v3_rot_axis(cfw, spine, thw2);
+      v3 rdc = v3_scale(kt->rub, 0.92f);
+      // Low on the flank (top station 0.344, not 0.368) and pulled 8 mm
+      // inboard: at -0.186 across with its top at armpit height the brick
+      // crossed the deltoid, the shoulder ball AND the upper arm (figv: 22
+      // pairs over the movement sweep) — a radio worn where the arm swings is
+      // a radio the arm passes through.
+      fnode_t rd[4] = {
+        {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.248f),
+           v3_add(v3_scale(rt3, -0.150f), v3_scale(fw3, 0.052f)))),
+         rdc, rdc, 0.026f, 0.024f, thw2, 0.55f},
+        {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.272f),
+           v3_add(v3_scale(rt3, -0.178f), v3_scale(fw3, 0.056f)))),
+         rdc, rdc, 0.030f, 0.036f, thw2, 0.0f},
+        {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.344f),
+           v3_add(v3_scale(rt3, -0.178f), v3_scale(fw3, 0.052f)))),
+         rdc, rdc, 0.030f, 0.036f, thw2, 0.0f},
+        {v3_add(P->pelvis, v3_add(v3_scale(spine, 0.368f),
+           v3_add(v3_scale(rt3, -0.152f), v3_scale(fw3, 0.048f)))),
+         rdc, rdc, 0.024f, 0.028f, thw2, 0.0f}};
+      probe("radio");
+      fig_chain(rd, 4, 8, 1, 1, fw3);
+    }
+    mat_set(MAT_GEAR_R, 0.0f);
+  }
+  // ONE mag pouch on the strong-side belt, pushed outboard. The old pair sat
+  // at +-0.072 — close enough to the midline that the two merged into a single
+  // dark blob at the crotch from every front view — and a mirrored pair is the
+  // action-figure symmetry the whole belt-kit exists to break (the weak side
+  // carries the dump pouch, down on the thigh).
   v3 pfw = v3_norm(v3_cross(spine, prt));
-  for (int i = 0; i < 2; i++) {
-    float s2 = i ? 1.0f : -1.0f;
-    v3 hipc = v3_add(P->pelvis, v3_add(v3_scale(prt, s2 * 0.072f),
+  {
+    v3 hipc = v3_add(P->pelvis, v3_add(v3_scale(prt, 0.118f),
                                        v3_scale(spine, 0.030f)));
     fnode_t mp[3] = {
-      {v3_add(hipc, v3_scale(pfw, 0.052f)), kt->belt, kt->belt, 0.052f, 0.034f, 0, 0.0f},
-      {v3_add(hipc, v3_scale(pfw, 0.086f)), kt->belt, kt->belt, 0.056f, 0.038f, 0, 0.0f},
-      {v3_add(hipc, v3_scale(pfw, 0.112f)), kt->belt, kt->belt, 0.042f, 0.028f, 0, 0.0f}};
+      {v3_add(hipc, v3_scale(pfw, 0.030f)), kt->belt, kt->belt, 0.050f, 0.033f, 0, 0.0f},
+      {v3_add(hipc, v3_scale(pfw, 0.068f)), kt->belt, kt->belt, 0.054f, 0.037f, 0, 0.0f},
+      {v3_add(hipc, v3_scale(pfw, 0.096f)), kt->belt, kt->belt, 0.040f, 0.026f, 0, 0.0f}};
     probe("magpouch");
     fig_chain(mp, 3, 12, 1, 1, spine);
   }
@@ -20171,66 +20311,48 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     // Split at the elbow for the same reason as the knee: a single chain through a
     // joint that flexes past 90 degrees has to pay for the fillet out of bone
     // length it does not have, and fig_chain pays by thinning the cross-section.
-    fnode_t ar[3] = {
-      // The upper arm starts AT the shoulder and runs straight to the elbow.
-      {P->sho[i], kt->sleeve, kt->sleeve, 0.058f, 0.060f, 0, 0.74f},
-      {v3_add(P->sho[i], v3_scale(ua, 0.42f)), kt->sleeve, kt->sleeve, 0.054f, 0.056f, 0, 0.0f},
-      {P->elb[i], kt->sleeve, kt->sleeve, 0.044f, 0.046f, 0, 0.0f}};   // elbow
+    // THE SHOULDER IS ONE MUSCLE, NOT THREE SHELLS. The old build stacked a
+    // deltoid BALL, an armour pad chain and the arm tube at the same joint —
+    // three concentric bulges, which is exactly the ball-jointed robot read.
+    // Now the deltoid IS the arm chain's own fat top: the chain starts BURIED
+    // in the trunk (so there is no end cap at the shoulder for a ball to
+    // swallow, and the ball is deleted, not shrunk), turns at the shoulder —
+    // fig_chain's bevel is the roundover — and carries the teardrop down the
+    // arm through measured stations: deltoid cap, deltoid belly at 24%, the
+    // insertion waist at 50%, the bicep belly at 68%, and a decisive narrowing
+    // into the elbow. A limb reads as a limb through its radius CHANGES at
+    // anatomical stations; both a straight cone and a stack of shells read as
+    // machine parts.
+    v3 inb = v3_norm(v3_sub(P->chest, P->sho[i]));   // into the trunk
+    // The waist stations sit 4-6 mm fatter than the first cut: at 0.053 the
+    // arm pinched visibly at the insertion and read as a doll's — a soldier's
+    // sleeved arm loses maybe a tenth of its girth between deltoid and elbow,
+    // not a quarter.
+    fnode_t ar[6] = {
+      {v3_add(P->sho[i], v3_scale(inb, 0.052f)), kt->sleeve, kt->sleeve, 0.0540f, 0.0580f, 0, 0.74f},
+      {v3_add(P->sho[i], v3_scale(ua, 0.020f)), kt->sleeve, kt->sleeve, 0.0680f, 0.0700f, 0, 0.80f},
+      {v3_add(P->sho[i], v3_scale(ua, 0.240f)), kt->sleeve, kt->sleeve, 0.0650f, 0.0675f, 0, 0.0f},
+      {v3_add(P->sho[i], v3_scale(ua, 0.500f)), kt->sleeve, kt->sleeve, 0.0580f, 0.0605f, 0, 0.0f},
+      {v3_add(P->sho[i], v3_scale(ua, 0.680f)), kt->sleeve, kt->sleeve, 0.0590f, 0.0620f, 0, 0.0f},
+      {P->elb[i], kt->sleeve, kt->sleeve, 0.0440f, 0.0460f, 0, 0.0f}};   // elbow
     // First bone runs chest-outward, so `spine` is the stable roll reference.
     // k=8 faceted: the sleeve family joins the crate language of the torso.
     probe("uarm");
-    fig_chain(ar, 3, 8, 1, 1, spine);
+    fig_chain(ar, 6, 8, 1, 1, spine);
     // The FOREARM is built after the hand, further down, because it needs the palm's
     // own axis — see fig_forearm.
-    {  // the elbow, and the pad on it, are one ball
+    {  // The elbow ball survives only as the cap-swallower between the two arm
+      // chains, and it wears the SLEEVE, near-host value: the old 0.68x dark
+      // rubber made every elbow the darkest accent on the arm — an
+      // articulation dot. What marks the joint now is SHAPE: swell 0.18 puts
+      // the mass on the olecranon side of the bend, where an elbow point is —
+      // 0.34 was tried and made a SPIKE of it, a flat-shaded facet corner
+      // standing off the arm like a spur.
       v3 hinge = v3_cross(ua, fa);
       if (v3_dot(hinge, hinge) < 1e-8f) hinge = spine;
-      mat_set(MAT_RUBBER_R, 0.0f);
       probe("elbow");
-      // The knee pad sits on `pants` and the elbow pad on `sleeve`, which is a value
-      // step lighter — so one shared rubber puts the elbow further from its host than
-      // the knee is from its own: measured, elbow/uarm 0.332 of mean linear luminance
-      // against knee/thigh 0.464.
       fig_joint(P->elb[i], ua, v3_sub(P->wri[i], P->elb[i]),
-                0.051f, 0.060f, 0.16f, 8, v3_scale(kt->sleeve, 0.68f));
-      mat_set(MAT_CLOTH_R, 0.0f);
-    }
-    {  // The deltoid: a BALL, not a capped tube along the arm. As a chain its first
-      // ring carried a flat end cap facing up and inboard, and that cap was plainly
-      // visible from outside — a dark ellipse on the end of a cylinder, which is why
-      // the shoulders read as barrels bolted on instead of armour over a joint.
-      mat_set(MAT_CLOTH_R, 0.0f);
-      probe("sho_ball");
-      // The shoulder's "parent bone" is the shoulder line itself — there is no clavicle
-      // in this skeleton — so the deltoid's long axis comes out of the line from the
-      // chest to the joint against the upper arm, which is where a deltoid's mass
-      // actually lies.
-      fig_joint(P->sho[i], v3_sub(P->sho[i], P->chest), ua,
-                0.066f, 0.078f, 0.12f, 8, v3_scale(kt->sleeve, 0.88f));
-    }
-    {  // Deltoid armour: a short pad riding the outside of the upper arm, strictly
-      // outside it at every station (the arm runs 0.067 -> 0.057 there, this runs 0.072
-      // -> 0.069).
-      v3 uad = v3_norm(ua);
-      mat_set(MAT_GEAR_R, 0.0f);
-      // First ring 6.5 mm INSIDE the shoulder ball, second 6 mm outside it, so the pad
-      // emerges through a decisive crossing rather than a near-tangent one — a shallow
-      // crossing is a hairline seam whose depth order is decided by rounding, and it is
-      // the one defect figcheck cannot see.
-      v3 dcol = v3_scale(kt->sleeve, 0.94f);
-      fnode_t sp[5] = {
-        // Re-spaced for the elongated joint below: -0.035/+0.015 was authored against a
-        // SPHERE, and against a mass that runs 84 mm down the arm the pad emerged
-        // through a long shallow stretch of it instead of through a decisive crossing —
-        // six grazing pairs on this join alone.
-        {v3_add(P->sho[i], v3_scale(uad, -0.058f)), dcol, dcol, 0.044f, 0.046f, 0, 0.66f},
-        {v3_add(P->sho[i], v3_scale(uad,  0.034f)), dcol, dcol, 0.076f, 0.078f, 0, 0.0f},
-        {v3_add(P->sho[i], v3_scale(uad,  0.055f)), dcol, dcol, 0.073f, 0.075f, 0, 0.0f},
-        {v3_add(P->sho[i], v3_scale(uad,  0.092f)), dcol, dcol, 0.066f, 0.068f, 0, 0.0f},
-        {v3_add(P->sho[i], v3_scale(uad,  0.122f)), dcol, dcol, 0.055f, 0.057f, 0, 0.0f}};
-      probe("deltoid");
-      fig_chain(sp, 5, 8, 1, 1, spine);
-      mat_set(MAT_CLOTH_R, 0.0f);
+                0.0520f, 0.0600f, 0.18f, 8, v3_scale(kt->sleeve, 0.96f));
     }
     // Hand: the SAME wrap the viewmodel uses, closed round the SAME published grip
     // cylinder of the SAME rifle.
@@ -20263,8 +20385,12 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
         back = v3_dot(back, back) > 1e-8f ? v3_norm(back) : v3_scale(pd, -1.0f);
         v3 lat = v3_cross(back, spine);
         lat = v3_dot(lat, lat) > 1e-8f ? v3_norm(lat) : Rc;
+        // k=8, the FACETED family: at k=12 the forearm was the one smooth
+        // polished tube on an otherwise flat-faceted body — the single
+        // loudest "robot arm" tell. The viewmodel's own call keeps 12: at
+        // arm's length from the lens a facet is a wall.
         fig_forearm(P->wri[i], back, pd, lat, s, kt->sleeve,
-                    v3_scale(kt->glove, 0.88f), &P->elb[i], 12);
+                    v3_scale(kt->glove, 0.88f), &P->elb[i], 8);
       }
     }
     mat_set(MAT_CLOTH_R, 0.0f);
@@ -20366,8 +20492,12 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
       // Cavity AO down the face: under the jaw and up under the helmet's brim are both
       // places light does not reach, and a head lit as if it were a free-floating ball
       // is most of why the face read as a flat patch.
-      {HP(0, -0.0880f, 0.0210f), kt.bala, kt.bala, 0.0505f, 0.0570f, 0, 0.74f},
-      {HP(0, -0.0640f, 0.0075f), kt.bala, kt.bala, 0.0680f, 0.0830f, 0, 0.80f},
+      // THE CHIN PROJECTS. At c 0.021 the mentum sat 11.5 mm BEHIND the mouth
+      // band above it — a receding chin on every 3/4 view. Forward to within
+      // ~3 mm of the mouth plane and 4 mm wider across: a masculine jaw is
+      // square and it ends under the lips, not under the ears.
+      {HP(0, -0.0885f, 0.0270f), kt.bala, kt.bala, 0.0545f, 0.0590f, 0, 0.74f},
+      {HP(0, -0.0645f, 0.0105f), kt.bala, kt.bala, 0.0700f, 0.0830f, 0, 0.80f},
       {HP(0, -0.0400f, -0.0035f), kt.bala, kt.bala, 0.0752f, 0.0930f, 0, 0.88f},
       {HP(0, -0.0056f, -0.0090f), kt.bala, kt.bala, 0.0790f, 0.0980f, 0, 0.94f},
       {HP(0, 0.0372f, -0.0110f), kt.bala, kt.bala, 0.0780f, 0.0965f, 0, 0.78f},
@@ -20421,17 +20551,57 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
     g_fig_jit = 1.0f;
     // (The brim is a node of the shell above — see the LIP comment.
     mat_set(MAT_HELM_R, 0.0f);
-    // Side rails / ear covers: two short pads over the temples. They also give
-    // the helmet a left-right axis, which a dome does not have.
+    // NVG SHROUD: the squarish mount block high on the brow, the single most
+    // recognizable modern-helmet cue there is. It sits ABOVE the goggle band
+    // (goggle top runs to hu 0.058 at the centre — the shroud's bottom edge at
+    // 0.060 clears it), buried into the shell at its base and ~21 mm proud.
+    {
+      // WIDER THAN TALL and clearly DARKER than the shell: at 0.90x of the
+      // shell's own colour the boss read as a hole in the dome in 3/4 views —
+      // an accessory bolted ON the shell has to separate from it in value, and
+      // a real shroud is a dark polymer plate on a painted shell.
+      v3 shl = v3_scale(kt.helm, 0.60f);
+      fnode_t nv[3] = {
+        {HP(0, 0.077f, 0.088f), shl, shl, 0.017f, 0.042f, 0, 0.0f},
+        {HP(0, 0.075f, 0.112f), shl, shl, 0.016f, 0.038f, 0, 0.0f},
+        {HP(0, 0.073f, 0.124f), shl, shl, 0.012f, 0.028f, 0, 0.0f}};
+      probe("nvg_shroud");
+      fig_chain(nv, 3, 8, 1, 1, hu);
+    }
+    // SIDE RAILS: one long low bar per temple, brow to nape. Hero/near tiers
+    // only: 9 mm of proudness is sub-pixel past 12 m.
+    if (g_fig_k >= 12) {
+      // The bar follows the shell's own ellipse (rx 0.105 across, rz 0.1205
+      // fwd) — a straight bar at the side flat floats in air past |c| ~ 0.03.
+      // 0.80x, not 0.88: at 0.88 the bar vanished into the shell's facet
+      // shading and the helmet kept reading as a bare dome from the side.
+      v3 rlc = v3_scale(kt.helm, 0.80f);
+      for (int e = 0; e < 2; e++) {
+        float es = e ? 1.0f : -1.0f;
+        // b 0.038: the goggle band's temple slope tops out at ~0.019 here, and
+        // a rail whose underside ran at 0.013 crossed it shallowly all along.
+        fnode_t rl[4] = {
+          {HP(es * 0.080f, 0.040f, 0.062f), rlc, rlc, 0.013f, 0.011f, 0, 0.0f},
+          {HP(es * 0.100f, 0.037f, 0.024f), rlc, rlc, 0.013f, 0.011f, 0, 0.0f},
+          {HP(es * 0.101f, 0.035f, -0.034f), rlc, rlc, 0.013f, 0.011f, 0, 0.0f},
+          {HP(es * 0.082f, 0.033f, -0.066f), rlc, rlc, 0.012f, 0.010f, 0, 0.0f}};
+        probe("helm_rail");
+        fig_chain(rl, 4, 8, 1, 1, hu);
+      }
+    }
+    // HEADSET EAR CUPS, in the helmet's high cut: two dark discs over the ears,
+    // decisively bigger and lower than the old helm-coloured temple pads —
+    // the shell stops above the ear on a modern lid and the cup fills the gap.
+    // They also give the helmet its left-right axis. Inner face 6 mm inside the
+    // skull, outer ~15 mm proud of the shell's base ring.
+    mat_set(MAT_RUBBER_R, 0.0f);
     for (int e = 0; e < 2; e++) {
       float es = e ? 1.0f : -1.0f;
-      // Pushed out with the k=8 shell (rx ~0.107 at this height): the cover's
-      // outer face rides 3 mm proud — buried is invisible, far proud is lumps.
-      v3 ec = HP(es * 0.083f, -0.024f, 0);
+      v3 ec = HP(es * 0.094f, -0.030f, 0.004f);
       fnode_t er[2] = {
-        {v3_add(ec, v3_scale(hf, 0.028f)), kt.helm, kt.helm, 0.024f, 0.020f, 0, 0.0f},
-        {v3_add(ec, v3_scale(hf, -0.044f)), kt.helm, kt.helm, 0.027f, 0.024f, 0, 0.0f}};
-      probe("helm_ear");
+        {v3_add(ec, v3_scale(hf, 0.032f)), kt.rub, kt.rub, 0.028f, 0.019f, 0, 0.0f},
+        {v3_add(ec, v3_scale(hf, -0.046f)), kt.rub, kt.rub, 0.031f, 0.022f, 0, 0.0f}};
+      probe("ear_cup");
       fig_chain(er, 2, 8, 1, 1, hu);
     }
     // Visor: ONE box spanning exactly the skull's flat front facet, which is 2*0.42*rx
@@ -20439,10 +20609,15 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
     mat_set(MAT_GLASS_R, 0.0f);          // ballistic lens: the one wet gleam
     {
       // Re-fitted to the deeper skull.
-      const float gz_[5] = {-0.072f, -0.050f, 0.000f, 0.050f, 0.072f};  // across
+      // The temple ends land INSIDE the ear cups (cup across-span 0.072..0.116
+      // — an end at 0.072 sat exactly ON the cup's inner face, the coincident-
+      // plane defect), and a step lower, so the band's centreline runs under
+      // the cup's top edge; the end's top and rear corners still exit the cup,
+      // but land inside the SHELL solid, so nothing shows.
+      const float gz_[5] = {-0.084f, -0.050f, 0.000f, 0.050f, 0.084f};  // across
       const float gd_[5] = {-0.026f, 0.056f, 0.080f, 0.056f, -0.026f};  // forward
-      const float gu_[5] = {0.006f, 0.016f, 0.020f, 0.016f, 0.006f};    // up
-      const float gr_[5] = {0.016f, 0.034f, 0.038f, 0.034f, 0.016f};    // height
+      const float gu_[5] = {-0.006f, 0.016f, 0.020f, 0.016f, -0.006f};  // up
+      const float gr_[5] = {0.014f, 0.034f, 0.038f, 0.034f, 0.014f};    // height
       fnode_t gg[5];
       // The temple ends are a QUIET step, not a bright one.
       v3 gfr = v3_scale(kt.bala, 1.12f);   // frame rim: a step over the cloth,
@@ -20486,7 +20661,7 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
     // TWO chains and a ball, not one chain through the knee.
     v3 thv = v3_sub(P.knee[i], P.hip[i]);
     v3 shv = v3_sub(P.ankle[i], P.knee[i]);
-    fnode_t th[6];
+    fnode_t th[7];   // stub, hip, [2 strap nodes on the rig leg], 0.42, 0.76, knee
     int nth = 0;
     // The thigh reaches BACKWARD ALONG ITS OWN AXIS into the pelvis: the end
     // cap ends up buried whatever the leg does, and because the stub is
@@ -20508,13 +20683,19 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
     }
     th[nth++] = (fnode_t){v3_add(P.hip[i], v3_scale(thv, 0.42f)),
                           kt.pants, kt.pants, 0.0855f, 0.1017f, 0, 0.0f};
-    th[nth++] = (fnode_t){P.knee[i], kt.pants, kt.pants, 0.066f, 0.072f, 0, 0.0f};
+    // A decisive narrowing INTO the knee (0.75 station, then 0.056/0.058 at
+    // the joint): the thin station is what makes the thigh read as a mass —
+    // and a knee no fatter than its own limb is what makes the joint read as
+    // a hinge instead of a ball.
+    th[nth++] = (fnode_t){v3_add(P.hip[i], v3_scale(thv, 0.76f)),
+                          kt.pants, kt.pants, 0.0740f, 0.0830f, 0, 0.0f};
+    th[nth++] = (fnode_t){P.knee[i], kt.pants, kt.pants, 0.056f, 0.058f, 0, 0.0f};
     probe("thigh");
     g_fig_jit = 0.40f;   // same cap as the torso: cloth, not crates
     fig_chain(th, nth, 8, 1, 1, prt);
     g_fig_jit = 1.0f;
     fnode_t sh[4] = {
-      {P.knee[i], kt.pants, kt.pants, 0.066f, 0.072f, 0, 0.0f},
+      {P.knee[i], kt.pants, kt.pants, 0.056f, 0.058f, 0, 0.0f},
       // Calf belly UP (0.076 -> 0.081): a shank with no calf is a pipe.
       {v3_add(P.knee[i], v3_scale(shv, 0.30f)), kt.pants, kt.pants, 0.081f, 0.083f, 0, 0.0f},
       {P.ankle[i], kt.dust1, kt.dust1, 0.048f, 0.050f, 0, 0.0f},          // ankle
@@ -20526,19 +20707,50 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
     g_fig_jit = 0.40f;
     fig_chain(sh, 4, 8, 1, 1, prt);
     g_fig_jit = 1.0f;
-    // The knee itself: a ball 4 mm proud of both tubes, so both of their flat end caps
-    // are strictly inside it whatever the flex.
+    // The knee itself: the cap-swallower between the two leg chains, in the
+    // HOST's own trouser value — the old dark rubber ball was the roundest AND
+    // darkest thing on the leg, i.e. an articulation dot. >= 6 mm bigger than
+    // the tube ends it swallows (0.056/0.058) in EVERY direction, and swell
+    // 0.36 puts the flexed mass on the patella side, where a knee's point is.
     {
       v3 hinge = v3_cross(td, sd);
       if (v3_dot(hinge, hinge) < 1e-8f) hinge = prt;
-      mat_set(MAT_RUBBER_R, 0.0f);
-      // >= 6 mm bigger than the tube ends it swallows (0.066/0.072) in EVERY direction:
-      // at 0.072 the ball's surface came out tangent to the tube's at some flex angles,
-      // which is 0.025 mm of separation — a z-fight. ...and the middle axis was 0.076,
-      // i.e. 4 mm — the one direction that BROKE that rule, and the one the tubes swing
-      // through when the knee folds.
       probe("knee");
-      fig_joint(P.knee[i], td, sd, 0.079f, 0.092f, 0.12f, 8, kt.pad);
+      fig_joint(P.knee[i], td, sd, 0.0655f, 0.0760f, 0.36f, 8,
+                v3_scale(kt.pants, 0.97f));
+    }
+    // THE KNEE PAD IS A PLATE, NOT A BALL: a flat dark cap strapped over the
+    // patella and the shin's top — the MW cue that reads as a step in the
+    // shin line at 15 m. Both ends ride the BONES (buried in the thigh's and
+    // shin's own tubes), so the plate bridges the joint's corner and follows
+    // the fold; the crown stands off the knee ball by the bend-scaled margin
+    // the ball itself grows by (fig_joint: swell 0.36 and the 0.22 out-shift).
+    {
+      float kbend = f_clamp(1.0f - v3_dot(td, sd), 0.0f, 1.0f);
+      v3 pfw = v3_norm(v3_cross(spine, prt));
+      // Away from the fold, biased forward so a dead-straight leg keeps a
+      // deterministic patella side instead of a spinning frame.
+      v3 kout = v3_add(v3_sub(td, sd), v3_scale(pfw, 0.35f));
+      kout = v3_sub(kout, v3_scale(v3_norm(v3_add(td, sd)),
+                                   v3_dot(kout, v3_norm(v3_add(td, sd)))));
+      kout = v3_dot(kout, kout) > 1e-6f ? v3_norm(kout) : pfw;
+      float off = 0.0575f + 0.038f * kbend;
+      mat_set(MAT_RUBBER_R, 0.0f);
+      // Near-black, not the rubber family: at kt.pad the plate read as a
+      // BUCKLE strapped between two greens; a black cap reads as kit. The
+      // ends are buried DEEP (their outer faces 25+ mm inside the bone tubes)
+      // — at 5 mm they ran near-parallel to the thigh's own skin and the seam
+      // shimmered, which is the z-race the first cut shipped with.
+      v3 kpc = v3_scale(kt.rub, 0.55f);
+      fnode_t kp[3] = {
+        {v3_add(v3_add(P.knee[i], v3_scale(td, -0.056f)), v3_scale(kout, 0.036f)),
+         kpc, kpc, 0.012f, 0.038f, 0, 0.0f},
+        {v3_add(P.knee[i], v3_scale(kout, off)), kpc, kpc, 0.013f, 0.041f, 0, 0.0f},
+        {v3_add(v3_add(P.knee[i], v3_scale(sd, 0.064f)), v3_scale(kout, 0.032f)),
+         kpc, kpc, 0.011f, 0.036f, 0, 0.0f}};
+      probe("kneepad");
+      fig_chain(kp, 3, 8, 1, 1, kout);
+      mat_set(MAT_CLOTH_R, 0.0f);
     }
     if (i == 1) {  // Drop-leg rig on the strong-side thigh. A loaded soldier's
       // widest point below the chest is his belt kit, and with nothing on the thigh the
@@ -20550,7 +20762,7 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
       mat_set(MAT_GEAR_R, 0.0f);
       // SEATED OFF THE THIGH'S OWN CROSS-SECTION, never off a constant.
       float rhip = fig_rmax(8, th[1].rx, th[1].rx);
-      float rbel = fig_rmax(8, th[nth - 2].rx, th[nth - 2].rx);
+      float rbel = fig_rmax(8, th[nth - 3].rx, th[nth - 3].rx);  // the 0.42 belly station (0.76 sits between it and the knee now)
       // Half-depth 40 mm at the belly: the outer face then stands >= 40 mm proud
       // of the leg in every direction, and the inner face is >= 25 mm buried in
       // it — the circumradius is ~15 mm over the inradius on this profile and
@@ -20573,6 +20785,41 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
       // — and this chain's first bone IS td, so the hint projected to zero and the
       // fallback anchored the cross-section to cross(td, WORLD UP).
       fig_chain(dl, 4, 8, 1, 1, out);
+    }
+    if (i == 0) {  // DUMP POUCH on the weak-side hip: the drop-leg rig's own
+      // construction (seated off the thigh's cross-section, riding its axis),
+      // but a soft bag — shorter, rounder, widest at the BOTTOM because fabric
+      // sags, and canted slightly BACK where the rig cants forward. The pair is
+      // the belt kit's asymmetry: one hard panel starboard, one soft bag port.
+      v3 pfw = v3_norm(v3_cross(spine, prt));
+      v3 out = v3_add(v3_scale(prt, -0.97f), v3_scale(pfw, -0.16f));
+      out = v3_sub(out, v3_scale(td, v3_dot(out, td)));
+      out = v3_dot(out, out) > 1e-6f ? v3_norm(out) : v3_scale(prt, -1.0f);
+      mat_set(MAT_GEAR_R, 0.0f);
+      float rhip = fig_rmax(8, th[1].rx, th[1].rx);
+      float rbel = fig_rmax(8, th[nth - 3].rx, th[nth - 3].rx);  // the 0.42 belly station (0.76 sits between it and the knee now)
+      // 0.55 toward the carrier nylon, not 0.30: at 0.30 the bag matched the
+      // drop-leg rig's value and the two hip lumps re-symmetrized at 12 m —
+      // one hard DARK panel starboard, one soft LIGHT bag port is the read.
+      v3 bag = v3_lerp(kt.belt, kt.gear, 0.55f);
+      // Top station at 0.012 with 0.78 of the stand-off: the bag's first ring
+      // is buried in the glute mass at the belt line — hung at 0.030 its top
+      // edge hovered beside the belt with sky behind it.
+      const float ds[4] = {0.012f, 0.060f, 0.118f, 0.158f};  // below the hip
+      const float dx[4] = {0.022f, 0.040f, 0.048f, 0.030f};  // depth, along out
+      const float dz[4] = {0.028f, 0.052f, 0.060f, 0.038f};  // width, round leg
+      fnode_t dp[4];
+      for (int q = 0; q < 4; q++) {
+        float u = (ds[q] - ds[0]) / (ds[3] - ds[0]);
+        float so = (rhip + (rbel - rhip) * u) * (q == 0 ? 0.78f : 1.0f);
+        dp[q] = (fnode_t){v3_add(v3_add(P.hip[i], v3_scale(out, so)),
+                                 v3_scale(td, ds[q])),
+                          bag, bag, dx[q], dz[q], 0, q ? 0.0f : 0.62f};
+      }
+      probe("dumppouch");
+      g_fig_jit = 0.45f;
+      fig_chain(dp, 4, 8, 1, 1, out);
+      g_fig_jit = 1.0f;
     }
     mat_set(MAT_LEATHER_R, 0.0f);   // boot + cuff
     // Boot: swept along the actual foot axis (which carries the toe pitch), so
@@ -20656,18 +20903,24 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
       probe("boot");
       fig_chain(bt, 7, 8, 1, 1, spine);  // sole down: rx is the boot height
       #undef SOLEN
-      // Cuff: the shaft up the shin, decisively WIDER than the trouser it swallows.
-      fnode_t cf[5] = {
-        {v3_add(P.ankle[i], v3_scale(sd, -0.150f)), kt.pants, kt.pants, 0.068f, 0.071f, 0, 0.0f},
-        {v3_add(P.ankle[i], v3_scale(sd, -0.108f)), kt.pants, kt.pants, 0.078f, 0.081f, 0, 0.0f},
-        {v3_add(P.ankle[i], v3_scale(sd, -0.086f)), kt.pants, kt.pants, 0.076f, 0.079f, 0, 0.0f},
-        {v3_add(P.ankle[i], v3_scale(sd, -0.070f)), up_c, up_c, 0.062f, 0.065f, 0, 0.0f},
-        {v3_add(P.ankle[i], v3_scale(sd,  0.014f)), up_c, up_c, 0.050f, 0.053f, 0, 0.0f}};
+      // Cuff: the shaft up the shin, decisively WIDER than the trouser it
+      // swallows — at the BLOUSE. The leather boundary moved UP 48 mm and the
+      // shaft under it slimmed 6 mm a side: a combat boot is ~200 mm of LACED
+      // shaft hugging the ankle with the trouser bloused over its top, and at
+      // the old numbers the leather started at the ankle bone, so the whole
+      // shaft read as baggy trouser and the boot as a shoe.
+      fnode_t cf[6] = {
+        {v3_add(P.ankle[i], v3_scale(sd, -0.168f)), kt.pants, kt.pants, 0.070f, 0.073f, 0, 0.0f},
+        {v3_add(P.ankle[i], v3_scale(sd, -0.138f)), kt.pants, kt.pants, 0.076f, 0.079f, 0, 0.0f},  // blouse crown
+        {v3_add(P.ankle[i], v3_scale(sd, -0.118f)), up_c, up_c, 0.066f, 0.069f, 0, 0.0f},          // shaft top
+        {v3_add(P.ankle[i], v3_scale(sd, -0.062f)), up_c, up_c, 0.056f, 0.059f, 0, 0.0f},          // laced shaft
+        {v3_add(P.ankle[i], v3_scale(sd, -0.030f)), up_c, up_c, 0.0525f, 0.0555f, 0, 0.0f},        // lace pinch
+        {v3_add(P.ankle[i], v3_scale(sd,  0.014f)), up_c, up_c, 0.0500f, 0.0530f, 0, 0.0f}};
       probe("bootcuff");
       // The shaft leather is the UPPER's band, not the toe-cap's.
       mat_set(MAT_CLOTH_R, 0.0f);
       g_fig_jit = 0.40f;
-      fig_chain(cf, 5, 8, 1, 1, prt);
+      fig_chain(cf, 6, 8, 1, 1, prt);
       g_fig_jit = 1.0f;
       mat_set(MAT_LEATHER_R, 0.0f);
       // NO LACING. It was a proud 6-gon strip plus four scene_box cross-bars, gated at
