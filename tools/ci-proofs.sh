@@ -99,7 +99,23 @@ done
 # across, so a trouser and a boot cuff that used to pass through each other now
 # graze instead — a crossing became a near-parallel pair, which is the trade
 # this whole pass is about and the direction it should go.
-WANT_NEAR="40 40 46 36"
+# Re-baselined 2026-08-25, 40/40/46/36 -> 78/78/78/63, with the WEAPON MODEL PASS:
+# both rifles were rebuilt from ~30 parts to ~72, so the number of neighbouring
+# surfaces that can be tangent roughly doubled and this tier roughly doubled with it.
+# INVESTIGATED, not bumped — six genuinely coplanar pairs were found and fixed on the
+# way here rather than absorbed into the number, and each is written up at its own site
+# in gun_build: the sight hood's bridge sharing both z planes with its side walls, the
+# rail crown sharing both ends with its base, the 24 rail teeth sitting 0.2 mm proud of
+# the crown, the coating annulus 0.6 mm inside the sight frame, the hood wall's top
+# 0.4 mm over the frame's, and the sniper's magwell sharing the chassis's own side flat
+# (that last one was zfight, not near, in all 77 SR poses).
+# What remains is the same CLASS the tier existed for: the gap histogram is spread
+# 0.1-1.0 mm exactly as HEAD's is (HEAD 14 pairs at 0.1-0.2 mm, now 20), not piled at
+# zero. zfight, open, flip, dup and degen are 0 on every tier and on vmcheck.
+# ...and 85/70 -> 78/63 at DIST 12 and 30 within the same pass, once gun_tier() took the
+# small parts out past 12 m: every pair those parts contributed at the coarse tiers went
+# with them, which is the LOD doing exactly what it was added for.
+WANT_NEAR="78 78 78 63"
 [ "$NEAR" = "$WANT_NEAR" ] || { say "GATE near '$NEAR' != baseline '$WANT_NEAR'"; fail=1; }
 
 # `cross` — surfaces passing THROUGH each other at 1.8-15 degrees, the tier the
@@ -333,7 +349,19 @@ WANT_NEAR="40 40 46 36"
 # any tier, and the delta reproduces at -O0 (i.e. semantic, not FP contraction).
 # Bisected to that one line: with it reverted and everything else in place, the
 # quadruple reads 76 76 73 47 again.
-WANT_CROSS="76 76 72 47"
+# Re-baselined 2026-08-25 with the same pass, 76/76/72/47 -> 85/85/84/58. Two named
+# sources, both geometric and both the direction this tier is supposed to move in:
+# the carbine's stock is now three swept chains (body, comb, toe) where it was four
+# stacked cuboids, and a chain BURIED ALONGSIDE another chain grazes it for its whole
+# length — the same trade fig_joint's own note records (+12 at the close tiers) and for
+# the same reason. The sniper adds a 340 mm barrel inside a fore-end and a folded bipod
+# under it. A stack of boxes has no shallow crossings because it has no curved skin;
+# that is the only thing it was better at.
+# +1 at DIST 30 only, from the AR butt pad's rear node moving -0.2185 -> -0.2220 so the
+# drawn pad and GUN_BUTT_Z agree again (figbury-butt is what measures that, and it was
+# 3.5 mm out). The pad's rolled edge then grazes the stock body's own last band for
+# 3.5 mm more, at the coarsest profile tier where both are k=6.
+WANT_CROSS="85 85 84 58"
 [ "${CROSS:-}" = "$WANT_CROSS" ] || { say "GATE cross '${CROSS:-}' != baseline '$WANT_CROSS'"; fail=1; }
 
 # parity: no MISMATCH in the shared-code rows

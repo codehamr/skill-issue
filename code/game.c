@@ -11609,7 +11609,13 @@ static int net_cl_poll(void) {
   /* GGX + Smith, once. Every light — sun, viewmodel fill, viewmodel rim — is the
      same call with a different direction and radiance, which is the only way
      three lights stay consistent with each other. */ \
-  "vec3 lit(vec3 n, vec3 V, vec3 L, vec3 diff, vec3 F0, float rough, vec3 rad){\n" \
+  /* F90 IS THE OTHER END OF THE FRESNEL AND IT WAS HARDCODED TO WHITE. Schlick is
+     mix(F0, F90, (1-VoH)^5); writing it as F0 + (1-F0)*x pins F90 at 1 and costs
+     exactly the same instructions as mix(F0, F90, x). Making it a parameter is
+     therefore FREE, and it is what a coated lens needs: an AR coating is a notch
+     filter, so its grazing colour is not its normal-incidence colour. Everything that
+     is not glass passes vec3(1.0) and is bit-identical. */ \
+  "vec3 lit(vec3 n, vec3 V, vec3 L, vec3 diff, vec3 F0, vec3 f90, float rough, vec3 rad){\n" \
   "  float NoL = max(dot(n, L), 0.0);\n" \
   "  if (NoL <= 0.0) return vec3(0.0);\n" \
   "  float NoV = max(dot(n, V), 1e-4);\n" \
@@ -11620,7 +11626,56 @@ static int net_cl_poll(void) {
   "  float D = a2 / (3.14159265 * dn * dn);\n" \
   "  float kv = a * 0.5;\n" \
   "  float Vis = 0.25 / max((NoL*(1.0-kv)+kv) * (NoV*(1.0-kv)+kv), 1e-4);\n" \
-  "  vec3 F = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);\n" \
+  /* NOT pow(x, 5.0). Mesa's nir_opt_algebraic lowers fpow for exponents 1, 2, 3 and
+     4 only — the exponent-5 rule matches an ALREADY-lowered exp2(log2(a)*5), and
+     llvmpipe does not set lower_fpow. So `pow(x, 5.0)` here is a real
+     exp2(log2_safe(x)*y), i.e. two polynomial evaluations, and THIS function is called
+     three to four times per viewmodel pixel (sun, fill, rim, muzzle flash). Three muls
+     instead, and the Schlick term is exact either way. */ \
+  "  float fv = 1.0 - VoH, fv2 = fv * fv;\n" \
+  "  vec3 F = mix(F0, f90, fv2 * fv2 * fv);\n" \
+  "  return (diff + D * Vis * F) * NoL * rad;\n" \
+  "}\n" \
+  /* THE TOOL DECIDES WHICH WAY THE HIGHLIGHT RUNS. `lit` models a surface whose
+     micro-facets are isotropic; a machined one's are not, and the half of that a STILL
+     frame shows is a roughness wobble while the half that reads in MOTION is the
+     stretch. This is GGX with two widths (Burley 2012 / Filament's
+     D_GGX_Anisotropic), and it is `lit` EXACTLY when the two are equal — substituting
+     at == ab == a gives dot(d,d) = a2*(1 + NoH^2*(a2-1)) = a2*dn, so D = a2/(pi*dn^2),
+     which is the isotropic line verbatim. Arithmetic, not a claim, and it is what lets
+     the world keep the cheap call.
+     IT MAY ONLY SPREAD A LOBE, NEVER SHARPEN ONE. The textbook remap stretches one
+     axis by (1+k) and squeezes the other by (1-k); the squeezed axis then ends up
+     TIGHTER than any isotropic surface on the weapon — at k = 0.5 a 0.44 receiver's
+     cross-tool lobe comes out at an effective 0.31, narrower than the barrel's
+     authored 0.24 and brighter than isotropic at the same time. The micro-structure
+     block writes per-pixel noise into `rough` a few lines earlier, and a 19% wobble
+     through a lobe that tight is a binary in/out decision: the receiver comes out
+     under a black-and-white dither. Spreading only is also energy-exact, because the
+     NDF carries its own 1/(pi*at*ab): the peak dims by exactly 1/(1+k) as the streak
+     lengthens by (1+k), which is what a tool mark does.
+     THE STREAK RUNS PERPENDICULAR TO THE GROOVES. A surface grooved along x has
+     h = h(y) alone, so its normals tilt only toward y and the lobe spreads in y. It is
+     the same statement as a CD's radial glare across its circular tracks, and it is
+     why a TURNED barrel — circumferential marks — throws its streak ALONG the bore. */ \
+  "vec3 lit_ax(vec3 n, vec3 V, vec3 L, vec3 diff, vec3 F0, vec3 f90, float rough,\n" \
+  "            vec3 T, float aniso, vec3 rad){\n" \
+  "  float NoL = max(dot(n, L), 0.0);\n" \
+  "  if (NoL <= 0.0) return vec3(0.0);\n" \
+  "  float NoV = max(dot(n, V), 1e-4);\n" \
+  "  vec3 H = normalize(L + V);\n" \
+  "  float NoH = max(dot(n, H), 0.0), VoH = max(dot(V, H), 0.0);\n" \
+  "  vec3 B = cross(n, T);\n" \
+  "  float a = rough * rough;\n" \
+  "  float at = a * (1.0 + aniso), ab = a;\n" \
+  "  float a2 = at * ab;\n" \
+  "  vec3 dv = vec3(ab * dot(T, H), at * dot(B, H), a2 * NoH);\n" \
+  "  float b2 = a2 / max(dot(dv, dv), 1e-12);\n" \
+  "  float D = a2 * b2 * b2 * (1.0 / 3.14159265);\n" \
+  "  float kv = a * 0.5;\n" \
+  "  float Vis = 0.25 / max((NoL*(1.0-kv)+kv) * (NoV*(1.0-kv)+kv), 1e-4);\n" \
+  "  float fv = 1.0 - VoH, fv2 = fv * fv;\n" \
+  "  vec3 F = mix(F0, f90, fv2 * fv2 * fv);\n" \
   "  return (diff + D * Vis * F) * NoL * rad;\n" \
   "}\n" \
   "vec3 tonemap(vec3 x){\n" \
@@ -11690,7 +11745,18 @@ static const char *WORLD_FS =
   // 4x4 taps of a hardware-compared shadow map: each tap is itself bilinear, so sixteen
   // of them at half-texel spacing give a penumbra about three texels wide — enough that
   // a 48 m arena in one map still reads as a soft edge instead of a staircase.
-  "float vhash1(float x){ return fract(sin(x * 127.1) * 43758.5453); }\n"
+  // NO SINE HERE EITHER — the same argument GLSL_ENV's vhash2 already carries, and this
+  // is the one survivor. vnoise1 calls this twice and the weapon block calls vnoise1
+  // twice, so a weapon fragment was paying FOUR transcendentals. The multiply-fract
+  // construction is pure ALU and distributes BETTER at the large arguments this block
+  // works at (xb * 3400), where sin's argument reduction runs out of mantissa and the
+  // "random" numbers start repeating.
+  "float vhash1(float x){\n"
+  "  float p = fract(x * 0.1031);\n"
+  "  p *= p + 33.33;\n"
+  "  p *= p + p;\n"
+  "  return fract(p);\n"
+  "}\n"
   "float vnoise1(float x){\n"
   "  float i = floor(x), f = fract(x);\n"
   "  f = f * f * (3.0 - 2.0 * f);\n"
@@ -11715,7 +11781,12 @@ static const char *WORLD_FS =
   "  vec3 dv = vWorld - uEye;\n"
   "  float d = length(dv);\n"
   "  vec3 V = -dv / d;\n"
-  "  float det = uDetail * exp(-d * 0.035);\n"  // detail fades out with range
+  // ...AND THE RANGE FADE IS NOT COMPUTED WHERE IT IS MULTIPLIED BY ZERO. `uDetail` is
+  // 0 for every figure and the whole viewmodel and 1 for the two world draws, so this
+  // exp ran on every weapon and every body to be scaled to nothing. The branch is
+  // uniform-valued per draw, so taking it costs nothing.
+  "  float det = 0.0;\n"
+  "  if (uDetail > 0.0) det = exp(-d * 0.035);\n"
   // GATED ON uDetail, WHICH IS ZERO FOR EVERY FIGURE AND THE WHOLE VIEWMODEL. uDetail
   // has three writers: the sky pass sets 0, the two world draws set 1.
   "  float rough;\n"
@@ -11730,35 +11801,59 @@ static const char *WORLD_FS =
   "  alb *= 1.0 + (h - 0.5) * 0.075 * det + (h2 - 0.5) * 0.085 * uDetail;\n"
   "  rough = clamp(vMat.x + (h2 - 0.5) * 0.16 * uDetail, 0.045, 1.0);\n"
   "  } else rough = clamp(vMat.x, 0.045, 1.0);\n"
-  "  float metal = vMat.y, ao = vMat.z;\n"
+  // ...and the metalness is its MAGNITUDE: the sign is the tool direction. See
+  // mat_lathe. Nothing outside gun_build writes a negative, so the world is unchanged.
+  "  float metal = abs(vMat.y), ao = vMat.z;\n"
   // --- WEAPON MICRO-STRUCTURE, IN THE WEAPON'S OWN FRAME --------------------
   // One roughness and one albedo per PART makes a receiver flat a single unbroken sweep
   // of highlight however good the BRDF over it is, which is most of why the rifle read
   // as one charcoal casting.
+  "  vec3 gT = uMdlX;\n"
+  "  float gani = 0.0;\n"
   "  if (uVm > 0.5 && metal > 0.35) {\n"
   "    vec3 q = vWorld - uMdlO;\n"
-  "    float zb = dot(q, uMdlZ);\n"                 // along the bore
+  "    float zb = dot(q, uMdlZ);\n"
   // The coordinate ACROSS the bore and IN this face's own surface is the cross product
   // of the two, which needs neither a UV set nor a triplanar blend to be right on every
   // face of every part.
+  //
+  // ...AND ITS GUARD IS 0.06, NOT 1e-3. |cross(uMdlZ, n)| is the sine of the angle
+  // between the face and the bore, so normalizing it amplifies whatever noise the
+  // interpolator left in `n` by 1/|tv|: at the old 1e-3 that is a thousandfold, i.e. a
+  // per-pixel RANDOM tangent basis on every face square to the bore — every end cap,
+  // the muzzle crown, the butt pad. As a noise LOOKUP, which is all this coordinate
+  // used to be, that was invisible; as a TANGENT FRAME it is the loudest defect on the
+  // weapon. The anisotropy fades out across the same span, so the lobe is exactly
+  // isotropic where the frame has no direction.
   "    vec3 tv = cross(uMdlZ, n);\n"
-  "    float tl = length(tv);\n"
-  "    float xb = tl > 1e-3 ? dot(q, tv) / tl : dot(q, uMdlX);\n"
+  "    float tl2 = dot(tv, tv);\n"
+  "    vec3 Tx = tl2 > 1.0e-6 ? tv * inversesqrt(tl2) : uMdlX;\n"
+  "    float xb = tl2 > 1.0e-6 ? dot(q, Tx) : dot(q, uMdlX);\n"
   "    float bore = 1.0 - abs(dot(n, uMdlZ));\n"
-  // Phosphate mottle: ~1.5 mm cells, INTERPOLATED. A hard-edged cell grid at
-  // this size is a checker, not a crystal coating.
-  "    float gh = vnoise2(vec2(xb, zb) * 670.0);\n"
-  // Brushing, drawing and broaching all run ALONG the bore, so what varies is the
-  // coordinate across it — soft-edged strokes about a third of a millimetre apart.
-  "    float br = vnoise1(xb * 3400.0) - 0.5;\n"
-  // Turning marks run the OTHER way.
-  "    float la = 0.0;\n"
-  "    if (vMat.x < 0.40)\n"
-  "      la = (vnoise1(zb * 2100.0) - 0.5)\n"
-  "         * (1.0 - smoothstep(0.26, 0.40, vMat.x));\n"
-  // Amplitudes, backed off from the first pass that made them visible at all.
+  // TURNED marks run AROUND the bore, so the lobe spreads ALONG it; broached marks run
+  // along it, so the lobe spreads across. Tx is already perpendicular to n, so the
+  // cross of the two is unit length and needs no normalize.
+  "    gT = vMat.y < 0.0 ? cross(n, Tx) : Tx;\n"
+  "    gani = 0.55 * smoothstep(0.0036, 0.09, tl2);\n"
+  // THE TOOL MARKS WERE UNDER NYQUIST IN NORMAL PLAY, which is worse than absent: at
+  // 3400 strokes/m the wavelength is 0.29 mm and an ADS frame puts 0.35 mm in a pixel,
+  // so the term was 0.85 pixels per wavelength — broadband noise, and the reason its
+  // amplitude had already been "backed off from the first pass that made them visible
+  // at all". It was backed off because it was aliasing. The octave now snaps to the
+  // pixel footprint in power-of-two steps (the same construction the floor's glitter
+  // uses, and for the same reason: a frequency that slides makes the pattern swim),
+  // holding 3-9 pixels per wavelength at every framing from the ADS view to a 40 mm
+  // macro.
+  "    vec2 duv = vec2(dFdx(xb), dFdx(zb)), dvv = vec2(dFdy(xb), dFdy(zb));\n"
+  "    float fp = sqrt(max(dot(duv, duv), dot(dvv, dvv)));\n"
+  "    float oct = exp2(floor(log2(max(fp * 13600.0, 1.0))));\n"
+  "    float gh = vnoise2(vec2(xb, zb) * (670.0 / max(oct * 0.25, 1.0)));\n"
+  "    float br = vnoise1(xb * (3400.0 / oct)) - 0.5;\n"
+  "    float la = (vnoise1(zb * (2100.0 / oct)) - 0.5) * (1.0 - bore * 0.55);\n"
+  // Amplitudes: the mottle is multiplicative because the grooves are cut INTO the
+  // coating, the tooling is additive because it is cut through it.
   "    rough = clamp(rough * (0.90 + 0.19 * gh)\n"
-  "                  + br * 0.042 * bore + la * 0.075, 0.035, 1.0);\n"
+  "                  + br * 0.055 * bore + la * 0.048, 0.035, 1.0);\n"
   "    alb *= 1.0 + (gh - 0.5) * 0.085 + br * 0.040 * bore;\n"
   "  }\n"
   // Geometric specular antialiasing.
@@ -11908,21 +12003,77 @@ static const char *WORLD_FS =
   "      wet = pool;\n"
   "    }\n"
   "  }\n"
-  // Geometric specular antialiasing, now downstream of every term that touches a
-  // normal. See the note above the seam block.
+  // GEOMETRIC SPECULAR ANTIALIASING, IN THE SPACE THE DERIVATION IS IN. This added the
+  // normal variance to ALPHA (rough*rough); Tokuyoshi & Kaplanyan add it to ALPHA
+  // SQUARED, and the difference is not cosmetic. Measured against the authored
+  // roughnesses in this file, adding to alpha multiplies a 0.44 receiver's roughness by
+  // 1.01 and a 0.05 lens's by 1.02 — i.e. the term did essentially nothing on the
+  // smooth parts it exists for. In alpha^2 the same variance takes the lens to 2.4x.
+  // And the KAPPA CLAMP bounds the KERNEL, where min(1.0, ...) bounded the RESULT: a
+  // 45-degree chamfer band gives |dn| = 0.765 inside the one quad that straddles it,
+  // which drove the old form to a fully matte 1.0 — a one-pixel dead line down every
+  // arris on the weapon, i.e. down the parts this pass is about.
   "  vec3 dnx = dFdx(n), dny = dFdy(n);\n"
-  "  rough = min(1.0, sqrt(rough * rough + 0.55 * (dot(dnx, dnx) + dot(dny, dny))));\n"
+  "  float saa = min(0.3183099 * (dot(dnx, dnx) + dot(dny, dny)), 0.18);\n"
+  "  float ral = rough * rough;\n"
+  "  rough = sqrt(clamp(ral * ral + saa, 0.0, 1.0));\n"
+  "  rough = sqrt(rough);\n"
   // Water is a dielectric with an index of 1.33, so its reflectance at normal incidence
   // is 0.02 — HALF the 0.04 the substrate under it has.
   "  vec3 F0 = mix(mix(vec3(0.04), alb, metal), vec3(0.02), wet);\n"
   "  vec3 diff = alb * (1.0 - metal);\n"
+  "  vec3 f90 = vec3(1.0);\n"
+  // A COATED LENS IS THE ONE SURFACE WHOSE WHOLE BEHAVIOUR LIVES IN THE FRESNEL. It was
+  // authored as a dielectric with a dark blue-green albedo, which under metalness 0
+  // lands in `diff` — where a lens has none, and where the colour can only be a
+  // near-black diffuse tint. Uncoated crown glass reflects 4.3% on axis; a broadband
+  // multilayer coating takes that under 0.5%, which is exactly why a scope's pupil is
+  // the darkest thing on a rifle. So: F0 goes to the coating's residual, the AUTHORED
+  // colour becomes F90 — the rim, where the coating's notch has walked off its design
+  // wavelength — and the diffuse goes away. Zero extra instructions; the existing
+  // env * Fe path then gives a near-black reflection on axis rising to a coloured one
+  // at the edge, which is the whole cue.
+  "  if (vMat.x < 0.14 && metal < 0.5) {\n"
+  "    F0 = vec3(0.004, 0.010, 0.006);\n"
+  "    f90 = alb * 8.0;\n"
+  "    diff = vec3(0.0);\n"
+  "  }\n"
   "  float NoV = max(dot(n, V), 1e-4);\n"
   // Diffuse irradiance: the same sky, smoothed to a hemisphere lobe. Sun-facing AO is
   // only partly applied — a crease is dark in ambient light, not in a direct beam.
   "  vec3 amb = mix(uAmbD, uAmbU, n.y * 0.5 + 0.5);\n"
   "  vec3 irr = amb * ao;\n"
-  "  float fr = pow(1.0 - NoV, 5.0);\n"
-  "  vec3 Fe = F0 + (max(vec3(1.0 - rough), F0) - F0) * fr;\n"
+  // THE ENVIRONMENT TERM *IS* THE METAL — a metal has no diffuse, so with only a sun
+  // lobe it is black everywhere the highlight is not — and on the weapon it was closed
+  // with a fudge: a Schlick rim against max(1-rough, F0), times a flat (1 - 0.62*rough)
+  // further on to stand in for the energy a rough lobe loses. The analytic split-sum
+  // fit is the actual hemispherical integral of GGX x Fresnel and carries both of those
+  // honestly, for one exp2 against the pow it replaces.
+  //
+  // ...AND IT IS GATED ON uVm, WHICH IS THE POINT. This is a WEAPON pass. The fit and
+  // the fudge disagree most at GRAZING angles on ROUGH surfaces — which is the distant
+  // floor, i.e. half of every frame — and swapping them moved the arena by 0.09/255
+  // over 8.9% of its subpixels. The arena's look is settled and tuned; a change to it
+  // has to be argued on its own, not smuggled in behind a rifle. The branch is
+  // uniform-valued per draw, so it costs nothing to take.
+  "  vec3 Fe;\n"
+  "  if (uVm > 0.5) {\n"
+  "    vec4 dfr = rough * vec4(-1.0, -0.0275, -0.572, 0.022)\n"
+  "             + vec4(1.0, 0.0425, 1.04, -0.04);\n"
+  "    float a004 = min(dfr.x * dfr.x, exp2(-9.28 * NoV)) * dfr.x + dfr.y;\n"
+  "    vec2 dfg = vec2(-1.04, 1.04) * a004 + dfr.zw;\n"
+  "    Fe = F0 * dfg.x + dfg.y;\n"
+  "  } else {\n"
+  "    float f5 = 1.0 - NoV, f5s = f5 * f5;\n"
+  "    Fe = (F0 + (max(vec3(1.0 - rough), F0) - F0) * (f5s * f5s * f5))\n"
+  "       * (1.0 - 0.62 * rough);\n"
+  "  }\n"
+  // NO MULTIPLE-SCATTERING COMPENSATION. The standard form is 1 + F0 * (1/Ess - 1),
+  // which wants the DIRECTIONAL ALBEDO out of a real DFG lookup table; `dfg.y` from the
+  // analytic fit is the split-sum BIAS, not Ess, and it falls to 0.0014 at the floor's
+  // own roughness — so the "compensation" came out at 29x and 46% of the frame clipped
+  // to white. `dfg.x` already carries the roughness-dependent energy loss, which is the
+  // half that was actually missing.
   // SIXTEEN SHADOW TAPS ONLY WHERE THE ANSWER IS READ. `sh` has exactly three readers:
   // lit() with SUN_COL * sh (and lit returns vec3(0) before it touches its radiance
   // argument when dot(n, SUN_DIR) <= 0), the glint term, and the puddle term — both
@@ -11954,9 +12105,18 @@ static const char *WORLD_FS =
   // ...AND SIDEWAYS, which is what the down-facing version was missing.
   "  float bncs = (1.0 - abs(n.y)) * exp(-max(vWorld.y, 0.0) * 2.2);\n"
   "  vec3 bounce = diff * (bnc + bncs * 0.55) * uBounce;\n"
-  "  vec3 col = lit(n, V, SUN_DIR, diff, F0, rough, SUN_COL * sh)\n"
+  // THE TERNARY IS PARENTHESISED, and the reason is a bug this file has now paid for
+  // twice in two forms: written as `col = c ? a : b;` followed by the four continuation
+  // lines, the SEMICOLON ended the statement and turned `+ diff * irr + env * Fe +
+  // sheen + bounce` into a dead expression statement that compiles clean. The frame
+  // then carried the direct sun lobe and nothing else — black shadows, black on every
+  // face the sun did not reach — and the SKY was pixel-identical, which is what made it
+  // read as a material change rather than as a dropped statement.
+  "  vec3 col = (gani > 0.0\n"
+  "     ? lit_ax(n, V, SUN_DIR, diff, F0, f90, rough, gT, gani, SUN_COL * sh)\n"
+  "     : lit(n, V, SUN_DIR, diff, F0, f90, rough, SUN_COL * sh))\n"
   "           + diff * irr\n"
-  "           + env * Fe * (1.0 - 0.62 * rough)\n"
+  "           + env * Fe\n"
   "           + sheen * mix(0.55, 1.0, ao) + bounce;\n"
   // The glitter rides in AS A LIGHT, after the shadow term and scaled by it: a
   // spark in a wall's shadow is a spark with no sun on it, and adding this
@@ -11965,13 +12125,18 @@ static const char *WORLD_FS =
   // The viewmodel is not in the world: it has its own projection and its own depth
   // clear, and the world shadow map does not cover it.
   "  if (uVm > 0.5) {\n"
-  "    col += lit(n, V, uFill, diff, F0, rough, VM_FILL);\n"
-  "    col += lit(n, V, uRim, diff, F0, rough, VM_RIM);\n"
+  "    if (gani > 0.0) {\n"
+  "      col += lit_ax(n, V, uFill, diff, F0, f90, rough, gT, gani, VM_FILL);\n"
+  "      col += lit_ax(n, V, uRim, diff, F0, f90, rough, gT, gani, VM_RIM);\n"
+  "    } else {\n"
+  "      col += lit(n, V, uFill, diff, F0, f90, rough, VM_FILL);\n"
+  "      col += lit(n, V, uRim, diff, F0, f90, rough, VM_RIM);\n"
+  "    }\n"
   // A shot is the brightest light source in the player's world for two ticks, and it
   // used to illuminate nothing: the additive flash ribbon was drawn in front of a rifle
   // that stayed exactly as dark as it had been the tick before, so firing read as a
   // decal stuck on the screen rather than as an event happening to the weapon.
-  "    if (uMuzC.r > 0.001) col += lit(n, V, uMuzL, diff, F0, rough, uMuzC);\n"
+  "    if (uMuzC.r > 0.001) col += lit(n, V, uMuzL, diff, F0, f90, rough, uMuzC);\n"
   "  }\n"
   // ...AND THE SAME SHOT LIGHTS THE WORLD, which it did not: a wall 1.4 m in front of
   // the muzzle brightened by 0.07% on the bright flash frame.
@@ -11983,7 +12148,7 @@ static const char *WORLD_FS =
   // flash frame (it was +0.25%, i.e. nothing), 8 m at 0.0% and 24 m at 0.0%.
   "    float att = 1.0 / (1.0 + md2 * 0.6);\n"
   "    if (att > 0.002)\n"
-  "      col += lit(n, V, normalize(md), diff, F0, rough, uMuzC * att);\n"
+  "      col += lit(n, V, normalize(md), diff, F0, f90, rough, uMuzC * att);\n"
   "  }\n"
   // --- AERIAL PERSPECTIVE -------------------------------------------------
   // NOT A FUNCTION OF DISTANCE. The old term was 1 - exp(-d*d*k), which says
@@ -12681,6 +12846,19 @@ static void mat_set(float rough, float metal) {
   g_mat_rough = rough;
   g_mat_metal = metal;
 }
+// THE TOOL DIRECTION RIDES IN THE SIGN OF THE METALNESS, and that is a free channel
+// rather than a trick. A machined surface's highlight STRETCHES, and which way it
+// stretches is decided by which way the tool ran — a turned barrel throws its streak
+// along the bore, a broached receiver flat throws one across it — so the shader needs
+// exactly one bit per surface. The vertex is 12 floats and was deliberately not
+// widened; every writer in this file authors metalness in [0,1], so the sign is unused.
+//
+// ROUGHNESS CANNOT CARRY THIS BIT, and that is not a preference: cham_arris scales a
+// part's roughness by MAT_ARRIS_R for its bevel bands, which walks a broached
+// receiver's own arris straight across any threshold that separated it from the turned
+// family — so the two opposite lobe directions would be decided, per pixel, by the
+// interpolator's last bit on the most visible edge of the weapon.
+static void mat_lathe(float rough, float metal) { mat_set(rough, -metal); }
 static void ao_set(float base, float rate, float min_v) {
   g_ao_base = base;
   g_ao_rate = rate;
@@ -12724,6 +12902,30 @@ static float g_ao_mul = 1.0f;
 #define MAT_STEEL_R    0.24f   // barrel, bolt, turrets: bright metal
 #define MAT_STEEL_M    1.00f
 #define MAT_GLASS_R    0.05f
+// Hard-anodized 7075: the receiver/handguard family. Between the two above, and it
+// has to BE between them — an AR is mostly aluminium, and while the receivers were
+// authored in the polymer family the four biggest parts on the weapon shared one
+// value with the grip.
+// 0.40, not 0.34: at 0.34 the receiver's raking macro clipped 27.8% of its own crop to
+// white once the F0 correction landed. A Type III hard anodize is a porous oxide and
+// every published gloss figure for a service finish is in the flat band; 0.34 was a
+// semi-gloss number on the one part with the most sky above it.
+#define MAT_ALLOY_R    0.40f
+#define MAT_ALLOY_M    0.92f
+#define MAT_ALLOY2_R   0.425f   // the second run, one step matter again
+// AN ARRIS IS A MATERIAL, NOT A SHADE OF THE ONE IT JOINS. A broken edge is what every
+// hand and every doorway has burnished, so it is SMOOTHER than either face it joins —
+// and on a metal a conversion coating is thinnest there, often gone, so what shows is
+// the substrate at three times the reflectance. Both halves are authored into vertices
+// that ALREADY EXIST (scene_box_cham's bevel bands, fig_cap's), so this is the one
+// surface change in the whole pass that costs exactly zero fragment instructions.
+#define MAT_ARRIS_R    0.55f   // ...of the part's own roughness
+#define MAT_ARRIS_MIX  0.26f   // ...of the way to the bare substrate, on a METAL
+// Bare steel's colour, as ONE constant with two readers: gun_build authors the barrel
+// and the bolt with it, and scene_box_cham/fig_cap wear a metal's edges toward it.
+// Written out rather than shared through a v3 because it has to be usable as an
+// initialiser in both places.
+#define MAT_BARE_C ((v3){{0.740f, 0.726f, 0.700f}})
 
 // The ramp itself, as a pure function.
 static float ao_ramp(float y, float base, float rate, float min_v) {
@@ -16684,6 +16886,24 @@ static int fig_diss_cut(v3 p);   // defined with the figure; see the dissolve
 // Every machined or moulded part has its arrises broken, so a renderer emitting perfect
 // 90-degree corners models the one thing that is never there.
 static float g_cham;
+// ...and a SECOND flag, because dec_stone borrows the same primitive and a burnished
+// arris on a tumbled rock is worse than a sharp one. `g_cham` says an edge is broken;
+// this says the edge was broken by a MACHINE and has been handled since.
+static int g_cham_polish;
+
+// THE HERO TIER: the jewellery a weapon has at 30 cm and cannot show at 25 m. One flag,
+// ONE writer (vm_build, beside g_cham), and it is an LOD decision of exactly the same
+// kind as g_fig_k rather than a second weapon model — every part behind it is built
+// from the same stations as the parts around it, so nothing can drift.
+//
+// It EARNS its cost twice over, because the third-person weapon had no tier at all: a
+// figure is 7260 tris at k=16 and the gun was 1384 of them, built from faceted boxes
+// that the profile tier never touched, so at 25 m it was 23 % of a body forty pixels
+// tall. The rail teeth are the proof — they were made 2.6 mm proud ONLY to keep their
+// top face out of the depth buffer's noise at 28 m, i.e. a part deformed to survive a
+// range at which it cannot be read. They are hero-only now, and the bar they sit on
+// carries the rail's whole silhouette past that range.
+static int g_gun_hero;
 
 // One quad and one triangle with the winding REPAIRED against a stated outward normal.
 static void scene_poly4(v3 a, v3 b, v3 c, v3 d, v3 n, v3 col) {
@@ -16698,6 +16918,24 @@ static void scene_poly3(v3 a, v3 b, v3 c, v3 n, v3 col) {
   } else {
     scene_push(a, n, col); scene_push(b, n, col); scene_push(c, n, col);
   }
+}
+
+// The arris's own surface, and the ONE copy of it: scene_box_cham and fig_cap both
+// emit bevel bands and must not disagree about what a broken edge is made of. Returns
+// the band's colour and writes its roughness through `rough`; restore the caller's own
+// value after the band. `g_cham_polish` gates it, so decor keeps a plain sharp edge.
+static v3 cham_arris(v3 col, float *rough) {
+  if (!g_cham_polish) return v3_scale(col, 1.16f);
+  *rough *= MAT_ARRIS_R;
+  // The bevel keeps its part's TOOL DIRECTION (the sign of the metalness) untouched: an
+  // arris is a cut on the same part by the same machine, and flipping the lobe there
+  // is the defect mat_lathe's own note is about.
+  if (fabsf(g_mat_metal) > 0.5f) {
+    v3 bare = MAT_BARE_C;
+    return v3_add(v3_scale(col, 1.0f - MAT_ARRIS_MIX),
+                  v3_scale(bare, MAT_ARRIS_MIX));
+  }
+  return v3_scale(col, 1.16f);
 }
 
 // The chamfered box: six inset axis faces, twelve edge bevels, eight corner triangles.
@@ -16722,11 +16960,9 @@ static void scene_box_cham(v3 c, v3 nx, v3 ny, v3 nz,
             v3_add(v3_scale(uy, ay - t), v3_scale(uz, az))));
   }
   #define CIDX(I, J, K) (((I) > 0) | (((J) > 0) << 1) | (((K) > 0) << 2))
-  // The bevels and the corners are the surfaces that WEAR. A coating is thinnest
-  // on an arris and the substrate shows through there first, so the broken edge
-  // is a shade brighter than the faces it joins — which also means the edge
-  // reads when the sun is nowhere near it, instead of only when it is.
-  v3 ecol = v3_scale(col, 1.16f);
+  // The bevels and the corners are the surfaces that WEAR — see MAT_ARRIS_R. The six
+  // axis faces go out FIRST, under the part's own surface state, and everything after
+  // this line is the arris.
   for (int s = -1; s <= 1; s += 2) {
     float f = (float)s;
     scene_poly4(px[CIDX(s, -1, -1)], px[CIDX(s, 1, -1)],
@@ -16736,6 +16972,8 @@ static void scene_box_cham(v3 c, v3 nx, v3 ny, v3 nz,
     scene_poly4(pz[CIDX(-1, -1, s)], pz[CIDX(1, -1, s)],
                 pz[CIDX(1, 1, s)],   pz[CIDX(-1, 1, s)], v3_scale(nz, f), col);
   }
+  float rsave = g_mat_rough;
+  v3 ecol = cham_arris(col, &g_mat_rough);
   for (int a = -1; a <= 1; a += 2)
     for (int b = -1; b <= 1; b += 2) {
       float fa = (float)a, fb = (float)b;
@@ -16756,6 +16994,7 @@ static void scene_box_cham(v3 c, v3 nx, v3 ny, v3 nz,
            v3_add(v3_scale(ny, sy), v3_scale(nz, sz))));
     scene_poly3(px[i], py[i], pz[i], n, ecol);
   }
+  g_mat_rough = rsave;
   #undef CIDX
 }
 
@@ -17079,6 +17318,20 @@ static int g_fig_k = FIG_KMAX;
 // mat_set/ao_set/g_fig_diss. 0 = whatever the distance says.
 static int g_fig_kcap;
 
+// ...AND THE TIER ITSELF, because "hero or not" is two states and a weapon needs three.
+// 2 = the first-person view, which can resolve a 3 mm pin. 1 = a third-person figure
+// inside about twelve metres, where a control still covers a pixel. 0 = past that,
+// where every small part is sub-pixel and its only remaining cost is the vertex and the
+// shadow-map triangle. It is derived from g_fig_k rather than carrying its own distance,
+// so it can never disagree with the profile tier the same figure is being built at.
+//
+// THIS IS THE LOD THE THIRD-PERSON WEAPON NEVER HAD. A figure is 7260 tris at k=16 and
+// the gun was 1384 of them — built from faceted boxes, which the profile tier does not
+// touch — so at 25 m it was 23 % of a body forty pixels tall. Both weapons roughly
+// doubled their part count in this pass; without a tier that would have been +8 % of
+// scene geometry at 20 bots, which is exactly the wrong place to spend it.
+static int gun_tier(void) { return g_gun_hero ? 2 : (g_fig_k >= 12 ? 1 : 0); }
+
 static int fig_pi(int k) {
   return k <= 4 ? 0 : k <= 6 ? 1 : k <= 8 ? 2 : k <= 12 ? 3 : k <= 16 ? 4 : 5;
 }
@@ -17207,10 +17460,10 @@ static void fig_cap(const fring_t *r, float sign, v3 col_in) {
       for (int i = 0; i < r->k; i++)
         in.v[i] = v3_add(v3_add(r->c, v3_scale(v3_sub(r->v[i], r->c), sc)),
                          v3_scale(n, g_cham));
-      // The bevel band, and the same wear argument the box's edges carry: an
-      // arris is where a finish is thinnest, so it is a shade brighter than the
-      // two surfaces it joins.
-      v3 ecol = v3_scale(col_in, 1.16f);
+      // The bevel band, through the SAME cham_arris the box's edges use — spelling
+      // the wear argument out a second time here is how the two silently drift.
+      float rsave = g_mat_rough;
+      v3 ecol = cham_arris(col_in, &g_mat_rough);
       for (int i = 0; i < r->k; i++) {
         int j = (i + 1) % r->k;
         if (fig_diss_cut(r->v[i])) continue;
@@ -17221,6 +17474,7 @@ static void fig_cap(const fring_t *r, float sign, v3 col_in) {
         v3 bn = v3_norm(v3_add(v3_norm(rad), n));
         scene_poly4(r->v[i], r->v[j], in.v[j], in.v[i], bn, ecol);
       }
+      g_mat_rough = rsave;
       f = &in;
     }
   }
@@ -18030,7 +18284,11 @@ static const float GUN_GRIP[2][3] = {{0.0f, -0.034f, 0.006f},    // AR
 // shooting from the eye.
 #define GUN_GIRTH_3P 1.05f
 static const float GUN_MUZ[2][3] = {{0.0f, 0.0225f, 0.494f},     // AR
-                                    {0.0f, 0.016f,  0.498f}};    // SR
+                                    // 0.782, not 0.498: the bolt gun is a CLASS longer
+                                    // than the carbine now (1.44x against 1.04x), and
+                                    // this row is where the tracer and the flash learn
+                                    // that. See the note at the top of the SR branch.
+                                    {0.0f, 0.0160f, 0.7820f}};   // SR
 
 // HOW FAR THE MODEL HANGS BELOW ITS OWN ORIGIN, in model units, per weapon.
 static float g_gun_low[2];
@@ -18134,13 +18392,15 @@ static const float GUN_HOLD[2][4][7] = {
     { 0.0f,  0.0190f,   0.1780f, 0.0135f,  0.0f, 0.0f,    1.0f   } }, // AR fore, 3p
   // 10.4-14.1 mm measured the same way; 12.6 is the mean over the finger row.
   { { 0.0f, -0.0510f,  -0.0444f, 0.0126f,  0.0f, 0.900f,  0.436f },   // SR grip
-    { 0.0f,  0.0130f,   0.2080f, 0.0121f,  0.0f, 0.0f,    1.0f   },   // SR fore-end
+    // 0.0139, not 0.0121: the fore-end is a k=8 chassis now, and on that profile the
+    // touchable radius is min(rx, rz) * cos(pi/8) at the finger row — 0.0150 * 0.924.
+    { 0.0f,  0.0130f,   0.2080f, 0.0139f,  0.0f, 0.0f,    1.0f   },   // SR fore-end
     // The sniper changes a magazine too now.
-    { 0.0f, -0.0480f,   0.0640f, 0.0130f,  0.0f, 0.9997f, -0.0256f },   // SR mag
+    { 0.0f, -0.0480f,   0.0640f, 0.0129f,  0.0f, 0.9997f, -0.0256f },   // SR mag
     // The sniper's fore-end is already 100 mm nearer its butt than the AR's, so
     // the third-person station moves less; it still moves, because the sniper's
     // butt is further back again.
-    { 0.0f,  0.0130f,   0.1480f, 0.0128f,  0.0f, 0.0f,    1.0f   } }, // SR fore, 3p
+    { 0.0f,  0.0130f,   0.1480f, 0.0152f,  0.0f, 0.0f,    1.0f   } }, // SR fore, 3p
 };
 // The magazine's reload travel (down, camera-side) per weapon, published ONCE beside
 // the grip surfaces for the same reason they are: the model (gun_build), the
@@ -18184,15 +18444,19 @@ static void gun_bolt_phase(float bolt01, float *lift, float *draw) {
 // ...and the knob's world position for that phase. The rotation is about the weapon's
 // own right axis through the bolt's centreline at y = 0.014.
 #define BOLT_LIFT_A  -1.22f   // rad of bolt lift at full phase (~70 degrees)
-#define BOLT_PIVOT_Y  0.014f  // the bolt axis the handle rotates about
-#define BOLT_KNOB_U   0.030f  // knob station along the receiver's right
+// 0.016, not 0.014: the bore, the barrel chain and the bolt axis are ONE line, and
+// they disagreed by 2 mm — so the handle rotated about an axis the bolt is not on.
+#define BOLT_PIVOT_Y  0.016f  // the bolt axis the handle rotates about
+#define BOLT_KNOB_U   0.0310f // knob station along the receiver's right
 #define BOLT_KNOB_Z  -0.037f  // ...and along the bore
-#define BOLT_DRAW_M   0.034f  // rearward throw of a full draw
+// 0.044: a .338 bolt travels further than a .308 one. Capped by the cheek piece — the
+// shroud's rear at full draw is -0.152 against the riser's front face at -0.156.
+#define BOLT_DRAW_M   0.044f  // rearward throw of a full draw
 static v3 gun_bolt_knob(float bolt01, v3 org, v3 gx, v3 gy, v3 gz, float gg) {
   float lift, draw;
   gun_bolt_phase(bolt01, &lift, &draw);
   float ba = lift * BOLT_LIFT_A, u = BOLT_KNOB_U,
-        vy = -0.004f - BOLT_PIVOT_Y,   // -0.004 = the knob chain's VY midpoint
+        vy = -0.0055f - BOLT_PIVOT_Y,  // -0.0055 = the knob BALL's VY midpoint
         wz = BOLT_KNOB_Z - draw * BOLT_DRAW_M;
   return v3_add(org, v3_add(v3_scale(gx, (u * cosf(ba) - vy * sinf(ba)) * gg),
                 v3_add(v3_scale(gy, (u * sinf(ba) + vy * cosf(ba) + BOLT_PIVOT_Y) * gg),
@@ -18220,32 +18484,52 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
   float sight_y = gun_sight_y(cur);
   v3 muzzle = org;
   // Shared palette: slim two-tone polymer/graphite with cool steel accents.
-  v3 body  = {{0.152f, 0.163f, 0.178f}};  // dark polymer (dielectric), COOL
-  // ...AND FOR A METAL THE ALBEDO IS ITS SPECULAR REFLECTANCE, F0, not a paint colour —
-  // which is the term these two were being authored as.
-  v3 upper = {{0.365f, 0.359f, 0.344f}};  // parkerized alloy: dark, but metal
-  v3 steel = {{0.520f, 0.502f, 0.462f}};  // bare steel: reflectance, not paint
-  v3 black = {{0.128f, 0.126f, 0.124f}};  // rubber / dead-black — nothing real
+  // THE PALETTE IS A VALUE LADDER AND A MATERIAL LADDER AT THE SAME TIME, because at
+  // 25 m hue is gone and value is not. Six steps, three material families:
+  //   dielectric   black 0.115 -> body 0.180 -> mag 0.250 (-> chas 0.320 on the SR)
+  //   METAL        alloy 0.400 -> park  0.470 -> steel 0.740
+  // and the two metal coatings are told apart by ROUGHNESS as much as by value —
+  // anodize is a smooth oxide, phosphate is a crystalline rough one — which is what
+  // keeps a receiver and a gas block different objects when they are the same colour.
+  v3 body  = {{0.180f, 0.192f, 0.206f}};  // glass-filled polymer (dielectric), COOL
+  // ...AND FOR A METAL THE ALBEDO IS ITS SPECULAR REFLECTANCE, F0, not a paint colour.
+  // TWO THIRDS OF THIS WEAPON WAS A METAL WITH NO REFLECTANCE. The top rail, the lower
+  // receiver, the magwell, the ejection port, every control, the muzzle brake and the
+  // gas block were all drawn under mat_set(MAT_PARK_M) — metalness 0.90 to 1.00 — while
+  // carrying `body` (0.023 linear) or `black` (0.016 linear) as their albedo. A metal
+  // has NO DIFFUSE at all, so those surfaces returned 1.6-2.3% of what struck them in
+  // the one lobe they have and nothing anywhere else: not a dark metal, a light sink.
+  // That, and not the geometry, is why the whole weapon read as one charcoal moulding.
+  v3 alloy = {{0.400f, 0.404f, 0.412f}};  // hard-anodized 7075: upper, rail,
+                                          // handguard, buffer tube. Deep and SMOOTH.
+  // TWO ANODIZING RUNS NEVER MATCH, and that is the most famous cosmetic fact about a
+  // real AR. It is also the fix for what the metal correction above COST: once the
+  // receivers, the magwell, the handguard, the rail and the optic mount all became one
+  // honest alloy, twenty-nine of the weapon's parts carried one albedo at one roughness
+  // and the whole thing read as a single billet — the upper/lower line, which is the
+  // strongest horizontal on a rifle and runs through the middle of the first-person
+  // frame, disappeared. One palette entry, five call sites, ZERO vertices.
+  v3 alloy2 = {{0.312f, 0.315f, 0.321f}};  // ...the lower's batch: darker, matter
+  v3 upper = {{0.470f, 0.462f, 0.444f}};  // manganese phosphate over steel: barrel
+                                          // furniture, gas block, brake. ROUGH, and a
+                                          // touch warm — it is an etched crystal layer
+  v3 steel = MAT_BARE_C;                  // bare steel: real iron's reflectance, and
+                                          // the one copy of it (see MAT_BARE_C)
+  v3 black = {{0.115f, 0.114f, 0.117f}};  // rubber / dead-black polymer — nothing real
                                           // sits at 0.005 linear
-  // THE MAGAZINE IS POLYMER AND IT WAS BORROWING THE RECEIVER'S ALBEDO. That
-  // worked only while `upper` was being authored as a paint colour; the moment
-  // it became a metal's F0 (see the note above) the magazine — a DIELECTRIC,
-  // metalness 0 — inherited a number chosen for a reflectance it does not have
-  // and rendered as the brightest object on the weapon. It gets its own tone,
-  // keeping the thing the borrowed one was for: ONE VALUE STEP lighter than the
-  // magwell it hangs out of, so a reload has a silhouette, in the furniture's
-  // own cool family rather than the receiver's warm one.
-  v3 mag   = {{0.232f, 0.246f, 0.263f}};  // magazine body: polymer, one step up
-  v3 chas  = {{0.298f, 0.330f, 0.268f}};  // SR chassis polymer: the AWM's
-                                          // olive-drab — the one color that
-                                          // says "precision rifle" on sight
+  // THE MAGAZINE IS POLYMER AND IT WAS BORROWING THE RECEIVER'S ALBEDO. It gets its own
+  // tone, keeping the thing the borrowed one was for: ONE VALUE STEP lighter than the
+  // magwell it hangs out of, so a reload has a silhouette.
+  v3 mag   = {{0.250f, 0.264f, 0.282f}};  // magazine body: polymer, one step up
+  v3 chas  = {{0.320f, 0.352f, 0.286f}};  // SR chassis polymer: the AWM's olive-drab —
+                                          // the one colour that says "precision rifle"
   v3 glass = {{0.045f, 0.055f, 0.070f}};  // coated lens: dark pupil, bright rim
   v3 lens  = {{0.086f, 0.112f, 0.118f}};  // multi-coated objective: blue-green
   float gg = g_gun_girth;                 // cross-section chunk (1.0 in first person)
   g_gun_trig_s = trig01;                  // published once, at the top, so a
                                           // third weapon cannot forget it
   ao_off();                               // a gun at arm's length sees open sky
-  mat_set(MAT_PARK_R, MAT_PARK_M);
+  mat_lathe(MAT_PARK_R, MAT_PARK_M);
   #define GUNP(u, vy, wz) v3_add(org, v3_add(v3_scale(gx, (u) * gg), \
                           v3_add(v3_scale(gy, (vy) * gg), v3_scale(gz, (wz) * gg))))
   #define GBOX(u, vy, wz, hx, hy, hz, col) \
@@ -18283,34 +18567,116 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
 
   if (cur == WPN_AR) {
     // ---- receiver group (flat-sided: boxes) ----
-    mat_set(MAT_PARK_R, MAT_PARK_M);
-    GBOX(0,  0.021f,  0.085f, 0.0155f, 0.0145f, 0.105f, upper);  // upper receiver
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    // THE UPPER RECEIVER IS A SECTION, NOT A BOX. It was one 31 x 29 x 210 mm cuboid,
+    // so its flank was a single unbroken plane 21 cm long and took one unbroken
+    // gradient — the largest flat on the weapon and most of why it read as a slab.
+    // The k=8 profile is the chamfered square, i.e. flat sides, a flat top under the
+    // rail, a flat bottom onto the lower, and 45-degree SHOULDERS between them: that
+    // shoulder is the single most characteristic line an AR upper has, and a cuboid
+    // has none of it. Flat-shaded, because the facet IS the look on a machined part.
+    // The taper is real too — an upper is deepest at the charging-handle raceway and
+    // thins toward the barrel nut — and it is what stops the receiver and the
+    // handguard reading as one continuous bar.
+    GCH(8, 1, 1, gy, {
+      GN(0, 0.0210f, -0.0195f, 0.0155f, 0.0150f, alloy),  // rear, into the tube
+      GN(0, 0.0210f,  0.0300f, 0.0158f, 0.0152f, alloy),  // the raceway: deepest
+      GN(0, 0.0208f,  0.1250f, 0.0151f, 0.0145f, alloy),
+      GN(0, 0.0206f,  0.1900f, 0.0145f, 0.0138f, alloy),  // barrel-nut shoulder
+    });
     // ONE CONTINUOUS TOP RAIL, receiver rear to handguard end — the monolithic rail
     // line that makes an HK416 read as one machine (ref: commons HK416N).
-    GBOX(0,  0.0375f, 0.155f, 0.0082f, 0.0030f, 0.169f, black);  // top rail
-    GBOX(0, -0.005f,  0.058f, 0.0145f, 0.0135f, 0.072f, body);   // lower receiver
+    // A PICATINNY RAIL IS THE RECEIVER'S OWN MATERIAL, not a black rubber strip: it
+    // is machined into, or bolted to, the same anodized alloy. At `black` under
+    // metalness 0.90 the most visible 27 cm on the weapon reflected 1.6%.
+    //
+    // AND IT IS A DOVETAIL, WHICH IS THE WHOLE REASON A RAIL READS AS A RAIL. One bar
+    // has no section; two — a wider base with a narrower crown on it — gives the
+    // trapezoid its 45-degree flanks, and the arris between them runs the entire
+    // length of the weapon catching light. Two boxes for the most-looked-at line on
+    // the gun.
+    // THE THREE WIDTHS ARE A LADDER AND EACH RUNG IS 1.5 mm. A real rail's slots are
+    // cut across a bar of constant width, so a tooth's flank is CONTINUOUS with the
+    // bar's — which is the one thing figcheck cannot tell apart from a z-fight. At a
+    // tooth 0.2 mm proud of the crown, 24 teeth put 285 parallel-within-1-mm pairs into
+    // vmcheck's near tier. Base 10.2, crown 7.2, tooth 8.7: every neighbouring pair is
+    // 1.5 mm apart, which is outside the near band on both sides.
+    GBOX(0,  0.0356f, 0.155f, 0.0102f, 0.0018f, 0.169f, alloy);  // rail base
+    // ...and the crown is INSET 2.5 mm at both ends for the same reason the sight's
+    // hood bridge is: two boxes that share a z plane and overlap in projection are a
+    // z-fight wherever they meet, and a rail sitting on a rail shares both ends.
+    // The crown is the SLOT FLOOR, and a recess that sees less sky than the teeth
+    // standing on it is 16% darker. Free: ao_off() is on for the whole weapon, so a
+    // machined step gets no contact darkening unless it is authored.
+    GBOX(0,  0.0384f, 0.155f, 0.0072f, 0.0021f, 0.1665f,
+         v3_scale(alloy, 0.84f));                                // rail crown
+    mat_set(MAT_ALLOY2_R, MAT_ALLOY_M);
+    GBOX(0, -0.005f,  0.058f, 0.0145f, 0.0135f, 0.072f, alloy2); // lower receiver
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // Every small control is CENTRED on the face it sits on and at least 2.6 mm thick,
     // so both of its own side faces clear that face by more than the depth buffer can
     // lose at across-the-arena range.
-    GBOX(0.0155f, 0.020f, 0.055f, 0.0028f, 0.0075f, 0.026f, black); // ejection port
+    // A PORT IS A HOLE. Authored `alloy` on an `alloy` receiver at the same roughness
+    // and metalness, this rendered as literally nothing — the one gun-like feature on
+    // the flank, gone. With no CSG a cut is a proud FRAME with a dark plate inside it,
+    // which is also what a dust cover looks like when it is closed.
+    GBOX(0.0158f, 0.020f, 0.055f, 0.0032f, 0.0079f, 0.0264f, alloy);  // port frame
+    GBOX(0.0176f, 0.020f, 0.055f, 0.0026f, 0.0056f, 0.0224f, black);  // ...and its cut
     // ...AND THE SAME GROUP ON THE SIDE THE PLAYER CAN ACTUALLY SEE. Measured with per-
     // part recolour masks on the hip frame, the AR's ejection port, its bolt catch and
     // its four +x M-LOK boxes render EXACTLY 0 px, while their -x twins render 164-384
     // px: the first-person camera sits on the weapon's LEFT (the file states this
     // itself where the charging handle is placed), so the single most gun-like feature
     // on a rifle is invisible for the whole match.
-    GBOX(-0.0150f, 0.0195f, 0.0550f, 0.0034f, 0.0068f, 0.0240f, black);  // port well
-    // Picatinny ribs.
-    for (int r = 0; r < 6; r++)
-      // 2.6 mm proud of the rail's top, not 0.9: at 0.9 the tooth's top face and the
-      // rail's are inside the depth buffer's resolution from 28 m out, and this is a 27
-      // cm bar across the top of the gun — the most visible flicker on the whole model.
-      GBOX(0, 0.0415f, -0.005f + 0.021f * (float)r, 0.0104f, 0.0020f, 0.0042f, upper);
-    GBOX(0.0145f, -0.004f, 0.040f, 0.0030f, 0.0044f, 0.0050f, black);  // bolt catch
-    GBOX(0.0168f, 0.0210f, 0.0275f, 0.0028f, 0.0042f, 0.0062f, upper);  // brass deflector
-    GBOX(-0.0145f, -0.006f, 0.078f, 0.0030f, 0.0038f, 0.0042f, black); // mag release
-    GBOX(-0.0155f, 0.028f, 0.056f, 0.0030f, 0.0040f, 0.0060f, upper);  // forward assist
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
+    GBOX(-0.0158f, 0.0195f, 0.0550f, 0.0038f, 0.0072f, 0.0244f, alloy);  // port frame
+    GBOX(-0.0176f, 0.0195f, 0.0550f, 0.0026f, 0.0052f, 0.0210f, black);  // ...and its cut
+    // MIL-STD-1913 TEETH, AT THE PITCH THE STANDARD ACTUALLY SPECIFIES. Six teeth on
+    // 21 mm centres across 338 mm of rail is half the real density, and a rhythm at
+    // half rate does not read as a rail, it reads as six blocks. The standard is a
+    // 10.008 mm slot pitch; at this weapon's scale that is 33 teeth, so the pitch here
+    // is 14 mm — 24 teeth — which keeps the RHYTHM fine enough to read as machining
+    // while staying inside a sane vertex count.
+    //
+    // HERO TIER, and that is the trade this flag exists for: 24 chamfered teeth are
+    // 3168 verts in the one view that can resolve a 4.7 mm land, and ZERO in the view
+    // that put them 2.6 mm proud purely to stop them z-fighting at 28 m. The dovetail
+    // bar above carries the rail's silhouette at every other range.
+    if (g_gun_hero)
+      for (int r = 0; r < 24; r++)
+        GBOX(0, 0.0400f, -0.0090f + 0.0140f * (float)r,
+             0.0087f, 0.0026f, 0.0033f, alloy);
+    // The controls are phosphated STEEL parts in an alloy receiver, which is a real
+    // material step and the only thing that makes them read as separate pieces.
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
+    if (gun_tier()) {
+      GBOX(0.0145f, -0.004f, 0.040f, 0.0030f, 0.0044f, 0.0050f, upper); // bolt catch
+    GBOX(0.0168f, 0.0210f, 0.0275f, 0.0028f, 0.0042f, 0.0062f, alloy);  // brass deflector
+      GBOX(-0.0145f, -0.006f, 0.078f, 0.0030f, 0.0038f, 0.0042f, upper); // mag release
+      GBOX(-0.0155f, 0.028f, 0.056f, 0.0030f, 0.0040f, 0.0060f, upper);  // forward assist
+    }
+    // THE SELECTOR IS THE MOST RECOGNISABLE CONTROL ON AN AR'S LEFT FLANK, and the
+    // first-person camera sits on the weapon's left — so it is the one small part with
+    // a guaranteed audience, and the model had none. A boss and a lever.
+    GCH(12, 1, 1, gx, {
+      GN(-0.0130f, -0.0040f, 0.0270f, 0.0062f, 0.0062f, upper),
+      GN(-0.0168f, -0.0040f, 0.0270f, 0.0058f, 0.0058f, upper),
+    });
+    if (gun_tier())
+      GBOX(-0.0186f, -0.0072f, 0.0234f, 0.0022f, 0.0038f, 0.0090f, upper); // lever
+    if (g_gun_hero) {
+      // ...and the two takedown pins, which is how an AR comes apart. On an alloy face
+      // it is the MATERIAL step that makes them read, not the 1 mm of relief.
+      GCH(12, 1, 1, gx, {
+        GN(-0.0132f, -0.0040f, 0.0100f, 0.0050f, 0.0050f, upper),
+        GN(-0.0170f, -0.0040f, 0.0100f, 0.0046f, 0.0046f, upper),
+      });
+      GCH(12, 1, 1, gx, {
+        GN(-0.0132f, -0.0040f, 0.1280f, 0.0050f, 0.0050f, upper),
+        GN(-0.0170f, -0.0040f, 0.1280f, 0.0046f, 0.0046f, upper),
+      });
+    }
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     // THE CHARGING HANDLE MOVES. The AR's reload went visually dead from the magazine
     // seating to the end — measured, 45 changed pixels of 921600 between prog 0.921 and
     // the standing idle frame — and the audio layer had already patched the same hole
@@ -18321,17 +18687,23 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
       float dr = ch < 0.18f ? smooth01(ch / 0.18f)
                : ch < 0.62f ? 1.0f - 0.05f * (ch - 0.18f) / 0.44f
                : 1.0f - 0.95f * smooth01((ch - 0.62f) / 0.38f);
-      GBOX(-0.0155f, 0.026f, 0.020f - dr * 0.030f, 0.0040f, 0.0035f, 0.010f, steel);
+      mat_set(MAT_ALLOY_R, MAT_ALLOY_M);   // the handle itself is aluminium
+      GBOX(-0.0155f, 0.026f, 0.020f - dr * 0.030f, 0.0040f, 0.0035f, 0.010f, alloy);
+      mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
       // The latch paddle, which is the part a hand actually hooks: it rides
       // with the handle and is what makes the pull read at all from the eye.
-      GBOX(-0.0205f, 0.026f, 0.026f - dr * 0.030f, 0.0026f, 0.0032f, 0.0052f, black);
+      GBOX(-0.0205f, 0.026f, 0.026f - dr * 0.030f, 0.0026f, 0.0032f, 0.0052f, steel);
     }
-    mat_set(MAT_PARK_R, MAT_PARK_M);
-    GBOX(0, -0.020f, 0.108f, 0.0146f, 0.011f, 0.0292f, body);    // magwell
+    mat_set(MAT_ALLOY2_R, MAT_ALLOY_M);
+    // 23.2 mm of half-length, not 29.2: the well was 58 mm long feeding a 39 mm
+    // magazine, so it presented a 9.4 mm ledge behind the mag and an 11.4 mm one in
+    // front. A real fence stands about 3.5 mm proud of the body it wraps.
+    GBOX(0, -0.020f, 0.1070f, 0.0146f, 0.011f, 0.0232f, alloy2); // magwell
     // Flared feed collar, proud of the well on every side — the aggressive
     // competition-magwell silhouette, and a real thickness step (>2.6 mm
     // through the well's top face) so nothing grazes.
-    GBOX(0, -0.0122f, 0.1085f, 0.0158f, 0.0036f, 0.0310f, black); // magwell flare
+    GBOX(0, -0.0122f, 0.1070f, 0.0158f, 0.0036f, 0.0250f, alloy2); // magwell flare
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // ---- stock group ----
     // THE BUFFER TUBE DID NOT COME OUT OF THE MIDDLE OF THE RECEIVER, and that
     // is a y offset the whole stock group carries. The tube's axis sat at 0.014
@@ -18361,27 +18733,79 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
       // starts. `vmcheck` cannot see this: it tests the mesh against ITSELF for
       // manifoldness and coplanarity, and two parts that never touch are a perfectly
       // valid mesh.
-      GN(0, 0.021f, -0.198f, 0.0114f, 0.0119f, upper),
+      GN(0, 0.021f, -0.198f, 0.0114f, 0.0119f, alloy),
       // ...and the front cap goes INSIDE the receiver rather than ON its rear plane.
-      GN(0, 0.021f, -0.0155f, 0.0126f, 0.0121f, upper),
+      GN(0, 0.021f, -0.0155f, 0.0126f, 0.0121f, alloy),
     });
-    mat_set(MAT_POLY_R * 1.7f, 0.0f);   // rubber recoil pad: dead matte
-    // 14.2 mm of half-width, not 12.8: the buffer tube now ends INSIDE this pad (see
-    // the node above) and a 11.9 mm ring inside a 12.8 mm box leaves 0.9 mm of
-    // clearance, which is inside figcheck's 1 mm `near` tier along the whole buried
-    // length.
-    GBOX(0,  0.017f, -0.203f, 0.0142f, 0.0265f, 0.011f, black);  // butt pad
-    GBOX(0,  0.017f, -0.2175f, 0.0148f, 0.0242f, 0.0045f, body); // pad rib plate
     mat_set(MAT_POLY_R, 0.0f);
-    // HK-SLIDER STOCK (ref: commons HK416N): ~5 cm of bare buffer tube shows behind the
-    // receiver, then the sliding stock BODY takes over — nose wedge climbing onto the
-    // tube, straight cheek line, body flaring to the pad.
-    GBOX(0,  0.0165f, -0.156f, 0.0136f, 0.0208f, 0.0410f, body); // stock body
-    GBOX(0,  0.0355f, -0.1285f, 0.0100f, 0.0088f, 0.0125f, body); // nose wedge
-    GBOX(0,  0.0408f, -0.160f, 0.0088f, 0.0048f, 0.0345f, body); // cheek line
-    // (front face 3 mm BEHIND the body's — z -0.115 on both was the same-
-    // facing coplanar z-fight the stock has already paid for twice)
-    GBOX(0, -0.0085f, -0.1515f, 0.0098f, 0.0072f, 0.0335f, body); // toe spur
+    // THE STOCK WAS FOUR NESTED SLABS AND IT READ AS LUGGAGE. Body, nose wedge, cheek
+    // line and toe spur were four axis-aligned cuboids stacked on one another, so every
+    // join was a hard step between two parallel planes and the whole assembly had one
+    // value and no draft anywhere. A stock is a SWEPT shape: it grows out of the buffer
+    // tube at the nose and flares into the pad, and a chain gives that for free —
+    // fig_chain fillets every node geometrically, which is the difference between a
+    // transition and a seam.
+    GCH(8, 1, 1, gy, {   // stock body: tube collar -> flared butt
+      // ...AND IT IS 41 mm WIDE AT THE BUTT, NOT 28.6. On a k=8 profile only 0.42 of
+      // the half-extent is flat flank before the chamfers start, so a 28.6 mm body is
+      // 10 mm of flat between two big bevels — which is the "thermos flask" read. The
+      // rz column is what fixes it; rx is unchanged, so the comb and the pad still
+      // meet the same top line.
+      GN(0, 0.0210f, -0.1160f, 0.0128f, 0.0130f, body),  // rides the tube
+      GN(0, 0.0205f, -0.1380f, 0.0168f, 0.0155f, body),
+      GN(0, 0.0195f, -0.1720f, 0.0212f, 0.0185f, body),
+      GN(0, 0.0185f, -0.1975f, 0.0248f, 0.0205f, body),  // into the pad
+    });
+    // The COMB is its own chain riding the body's top line, rising toward the butt the
+    // way a cheek weld does. Buried in the body at every node.
+    // ...and BOTH of these start INSIDE the body. A chain's end cap is a flat disc, so
+    // a comb whose first node sits on the body's own surface shows that disc as a step
+    // and the part reads as a plate glued on — which is exactly what the four slabs did
+    // and exactly what this rebuild exists to stop. Buried, the chain emerges out of
+    // the body instead of landing on it.
+    GCH(8, 1, 1, gy, {   // comb: rises toward the butt, the way a cheek weld does
+      GN(0, 0.0250f, -0.1180f, 0.0048f, 0.0078f, body),   // interior
+      GN(0, 0.0350f, -0.1450f, 0.0060f, 0.0090f, body),
+      GN(0, 0.0405f, -0.1750f, 0.0068f, 0.0094f, body),
+      GN(0, 0.0415f, -0.1960f, 0.0064f, 0.0090f, body),
+    });
+    GCH(8, 1, 1, gy, {   // toe: what stops the butt reading as a rectangle from the side
+      GN(0, 0.0120f, -0.1320f, 0.0055f, 0.0088f, body),   // interior
+      GN(0, -0.0040f, -0.1700f, 0.0070f, 0.0098f, body),
+      GN(0, -0.0105f, -0.1950f, 0.0076f, 0.0100f, body),
+    });
+    // The sling bar and the adjustment lever — the two things a hand touches on a
+    // carbine stock, and both hero tier: at 25 m a 4 mm bar is sub-pixel.
+    if (g_gun_hero) {
+      // BOTH OF THESE WERE FLOATING, and each in its own way. The lever's top face sat
+      // at -11.8 while the toe chain's underside at that station is -9.2 rising to -2.7
+      // — its forward two thirds hung in open air. The sling bar engaged the toe by
+      // 0.19 mm at its front face, against this function's own 1 mm minimum, and stood
+      // 4.1 mm proud of the toe on each side, which reads as a battery pack. Both are
+      // pulled rearward under the toe's deepest run and cut to the toe's own width.
+      GBOX(0, -0.0048f, -0.1560f, 0.0092f, 0.0044f, 0.0058f, black);  // sling bar
+      GBOX(0, -0.0118f, -0.1730f, 0.0058f, 0.0044f, 0.0115f, black);  // adjust lever
+    }
+    mat_set(MAT_POLY_R * 1.7f, 0.0f);   // rubber recoil pad: dead matte
+    // THE PAD IS A CHAIN TOO, so its face is DISHED rather than flat — a butt pad is
+    // moulded to a shoulder, and a flat slab across the back of a stock is the one
+    // shape that says "box". 14.2 mm of half-width and up: the buffer tube ends INSIDE
+    // this pad (see the node above) and a 11.9 mm ring inside a 12.8 mm box leaves
+    // 0.9 mm of clearance, which is inside figcheck's 1 mm `near` tier.
+    GCH(8, 1, 1, gy, {
+      // ...and the PAD COVERS THE TOE. At y 0.0175 the toe's underside (-17.5) poked
+      // 7.5 mm below the pad and ended in a flat disc hanging in mid-air 23 mm ahead of
+      // the butt. Dropped and grown, the pad spans -19.0 to +44.0 and buries both the
+      // toe and the body's top line by more than a millimetre.
+      GN(0, 0.0125f, -0.1930f, 0.0315f, 0.0195f, black),
+      GN(0, 0.0125f, -0.2085f, 0.0330f, 0.0205f, black),
+      // -0.2220 and not -0.2185: GUN_BUTT_Z[AR] is the seat pose_gun_frame lands BOTH
+      // weapons' pads on, and figbury-butt is what measures whether the model agrees
+      // with it. The old pad was a box plus a rib plate ending at -0.2220; this chain
+      // replaced both, and at -0.2185 the declared seat and the drawn pad were 3.5 mm
+      // apart — a length contract quietly broken, not a look.
+      GN(0, 0.0125f, -0.2220f, 0.0300f, 0.0185f, black),  // the dish rolls off
+    });
     // ---- grip, trigger, magazine ----
     mat_set(MAT_POLY_R, 0.0f);
     // A PISTOL GRIP HAS TO BE AS LONG AS THE HAND ON IT. This was 62 mm from the
@@ -18393,21 +18817,47 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
       GN(0, -0.052f, -0.0100f, 0.0114f, 0.0126f, body),
       GN(0, -0.090f, -0.0239f, 0.0095f, 0.0105f, black),
     });
+    // THE BEAVERTAIL is the only part of a grip that is NEVER under the hand and always
+    // in the first-person frame — the camera sits above and to the left of it. Highest
+    // return per box on the whole grip, and it changes no hold station.
+    scene_box(GUNP(0, -0.0215f, -0.0055f), v3_scale(gx, 0.0100f * gg),
+              v3_scale(gy, 0.0092f * gg), v3_scale(gz, 0.0044f * gg), body);
+    if (g_gun_hero) {
+      // Texture panels as a VALUE STEP, not as holes: the magazine already taught this
+      // function that `black` against the body reads as a window punched through it.
+      v3 pan = v3_scale(body, 0.80f);
+      for (int gp = 0; gp < 3; gp++) {
+        float t = 0.24f + 0.26f * (float)gp;
+        scene_box(GUNP(0, -0.014f - 0.076f * t, 0.008f - 0.0319f * t),
+                  v3_scale(gx, 0.0124f * gg), v3_scale(gy, 0.0052f * gg),
+                  v3_scale(gz, 0.0040f * gg), pan);
+      }
+    }
     // THE TRIGGER GROUP. A FINGER HAS TO FIT THROUGH THE GUARD, and this one's opening
     // was 25 x 10 mm — a curled index finger's distal phalanx is 17-19 mm thick, so
     // there was no pose in which the digit could be inside the bow rather than through
     // it.
-    mat_set(MAT_POLY_R, 0.0f);
-    GCH_PUB(6, 1, 1, gy, 0.0034f, {   // ...and publishes g_gun_guard for vmtrig
-      GN(0, -0.0170f, 0.0140f, 0.0034f, 0.0030f, body),   // buried in the receiver
-      GN(0, -0.0500f, 0.0186f, 0.0032f, 0.0028f, body),
-      GN(0, -0.0510f, 0.0596f, 0.0032f, 0.0028f, body),
-      GN(0, -0.0180f, 0.0660f, 0.0034f, 0.0030f, body),   // buried
+    mat_set(MAT_ALLOY2_R, MAT_ALLOY_M);  // a trigger guard is part of the LOWER
+    // A TRAPEZOID, AND A STRAP RATHER THAN A WIRE. Four right angles on a k=6 near-round
+    // section is a coat hanger, and that is what it read as: fig_chain's bevel needs an
+    // angle to ease, and at 90 degrees it has nothing to work with. Raking the front
+    // upright forward opens both front corners to about 120 degrees, so the bow becomes
+    // an arc; and a real guard is a flat strap, WIDER ACROSS than it is deep.
+    // The front node also lands inside the shortened magwell instead of stopping 12.8 mm
+    // short of it in open air.
+    // FOUR NODES, and that is a contract: GCH_PUB copies exactly nd_[0..3] into
+    // g_gun_guard, so a fifth node would leave vmtrig testing half the bow.
+    GCH_PUB(6, 1, 1, gy, 0.0042f, {   // ...and publishes g_gun_guard for vmtrig
+      GN(0, -0.0170f, 0.0140f, 0.0034f, 0.0034f, alloy2),  // buried in the receiver
+      GN(0, -0.0505f, 0.0255f, 0.0026f, 0.0042f, alloy2),
+      GN(0, -0.0510f, 0.0530f, 0.0026f, 0.0042f, alloy2),
+      GN(0, -0.0180f, 0.0790f, 0.0034f, 0.0034f, alloy2),  // buried in the magwell
     });
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // The blade: a real curved trigger on a pivot inside the receiver, not a
     // 5 mm box. `trig01` rotates it about that pivot — 7.2 degrees, which is
     // 4.4 mm of travel at the toe, the distance a finger actually moves.
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     {
       // 0.0375 and not 0.0330: the blade used to sit hard against the REAR of its own
       // bow with 2.67 mm of clearance and 30 mm of empty bow in FRONT of it, so once
@@ -18475,6 +18925,25 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
         GN(mdx, -0.090f - md, 0.089f, 0.0190f, 0.0117f, mag),
         GN(mdx, -0.140f - md, 0.074f, 0.0184f, 0.0114f, mag),
       });
+      // GRIP RIBS. A polymer magazine is moulded with a texture panel down each flank —
+      // it is the one surface on the weapon that exists to be held with a wet hand, and
+      // it was a bare 110 mm plane. Four shallow bands, on the magazine's OWN rake
+      // (20.6 degrees forward), because axis-aligned ribs on a raked body walk off its
+      // face — the same lesson the floor plate below is written up for.
+      if (g_gun_hero) {
+        v3 rup = v3_norm(v3_add(v3_scale(gy, 0.9580f), v3_scale(gz, 0.2870f)));
+        v3 rfw = v3_norm(v3_add(v3_scale(gy, -0.2870f), v3_scale(gz, 0.9580f)));
+        // A VALUE STEP, NOT A HOLE. At `black` against `mag` these read as four
+        // rectangular windows punched through the magazine; a moulded grip panel is
+        // one step down from the body it is moulded into, not four stops down.
+        v3 rib = v3_scale(mag, 0.74f);
+        for (int rb = 0; rb < 5; rb++) {
+          v3 rc = GUNP(mdx, -0.046f - md - 0.0192f * (float)rb,
+                       0.1020f - 0.0058f * (float)rb);
+          scene_box(rc, v3_scale(gx, 0.0123f * gg), v3_scale(rup, 0.0030f * gg),
+                    v3_scale(rfw, 0.0128f * gg), rib);
+        }
+      }
       // Floor plate: proud of the body on every side, which is what gives a magazine
       // its one hard horizontal line and the thing a hand actually grips when it pulls
       // one out.
@@ -18495,32 +18964,69 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     }
     // ---- handguard, barrel, muzzle ----
     mat_set(MAT_POLY_R, 0.0f);
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // QUAD-RAIL HANDGUARD: a chunky faceted block (k=8 — the facet IS the look),
     // SHORTER than the old tube so real barrel shows ahead of it (ref: the HK416's
     // exposed muzzle end), entered through a delta-ring taper at the receiver.
     GCH(8, 1, 1, gy, {
-      GN(0, 0.019f, 0.178f, 0.0170f, 0.0154f, body),   // delta ring
-      GN(0, 0.019f, 0.196f, 0.0138f, 0.0148f, body),
-      GN(0, 0.019f, 0.300f, 0.0136f, 0.0144f, body),
-      GN(0, 0.019f, 0.330f, 0.0132f, 0.0140f, body),
+      // THE RAIL WAS NOT TOUCHING THE HANDGUARD. The guard's top sat at 32.8 mm and
+      // the rail base's underside at 33.8 — a millimetre of open sky along the whole
+      // 134 mm of guard, widening to 2.4 once both parts' 0.7 mm arrises were cut. It
+      // is the gas-block sliver defect on a part fourteen times as long. The fix is the
+      // guard's `rx` ALONE (0.0138 -> 0.0158), because the hand stations GH_FORE and
+      // GH_FORE3 are pinned to y 0.0190 and may not move: the top rises 2 mm into the
+      // rail and the bottom drops 2 mm, which the 6 o'clock stub already covers.
+      GN(0, 0.019f, 0.178f, 0.0180f, 0.0154f, alloy),  // delta ring
+      GN(0, 0.019f, 0.196f, 0.0158f, 0.0148f, alloy),
+      GN(0, 0.019f, 0.300f, 0.0156f, 0.0144f, alloy),
+      GN(0, 0.019f, 0.330f, 0.0152f, 0.0140f, alloy),
     });
-    // Side + bottom rail strips on the guard (the quad in quad-rail).
-    GBOX( 0.0150f, 0.019f, 0.262f, 0.0028f, 0.0032f, 0.0560f, black);
-    GBOX(-0.0150f, 0.019f, 0.262f, 0.0028f, 0.0032f, 0.0560f, black);
-    GBOX(0, 0.0027f, 0.262f, 0.0044f, 0.0038f, 0.0560f, black);
+    // M-LOK, NOT THREE SLABS. The guard used to carry one 112 mm bar per side and one
+    // underneath — three long unbroken strips on the one part whose whole job is to be
+    // GRIPPED, so the hand's own surface was the smoothest thing on the weapon. A
+    // modern free-float rail is a slotted tube, and what a slot row reads as at any
+    // range is a RHYTHM of dark lands: five short bars beat one long one for the same
+    // vertex count, and the gaps between them do the work the slabs could not.
+    mat_set(MAT_POLY_R, 0.0f);
+    for (int m = 0; gun_tier() && m < 5; m++) {
+      float mz = 0.2140f + 0.0225f * (float)m;
+      GBOX( 0.0152f, 0.019f, mz, 0.0026f, 0.0038f, 0.0082f, black);
+      GBOX(-0.0152f, 0.019f, mz, 0.0026f, 0.0038f, 0.0082f, black);
+    }
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    // The 6 o'clock position keeps a REAL rail stub, because that is where a grip or a
+    // light goes and it is the one place on the guard a bolt-on section belongs.
+    GBOX(0, 0.0034f, 0.2620f, 0.0048f, 0.0034f, 0.0330f, alloy);
+    if (g_gun_hero) {
+      for (int r = 0; r < 5; r++)
+        GBOX(0, 0.0006f, 0.2340f + 0.0140f * (float)r,
+             0.0034f, 0.0026f, 0.0033f, alloy);
+      // The QD sling cup at the guard's rear, on the side the camera can see: the
+      // first-person camera sits on the weapon's LEFT, so furniture on +x is furniture
+      // nobody renders.
+      mat_lathe(MAT_PARK_R, MAT_PARK_M);
+      GBOX(-0.0141f, 0.0100f, 0.2080f, 0.0026f, 0.0044f, 0.0044f, upper);
+      mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    }
     // Gas tube running from the low block back under the rail into the guard.
     GCH(8, 1, 1, gy, {
       GN(0, 0.0306f, 0.186f, 0.0019f, 0.0019f, steel),
       GN(0, 0.0306f, 0.368f, 0.0019f, 0.0019f, steel),
     });
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
+    // AN EXPOSED BARREL IS NITRIDED OR PHOSPHATED, NOT BARE. At MAT_BARE_C (0.740) and
+    // MAT_STEEL_R this was brighter and smoother than the receiver, the optic and the
+    // brake put together, and it sits dead centre-right of the hip frame — the value
+    // PEAK of the weapon was 121 mm of undifferentiated tube. `steel` is now kept for
+    // the parts that really are in the white: the crown land, the charging-handle latch
+    // and the bolt.
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
     GCH(16, 1, 1, gy, {  // barrel: real exposure from the guard mouth out,
-      GN(0, 0.0225f, 0.334f, 0.0086f, 0.0084f, steel),  // heavy at the chamber
-      GN(0, 0.0225f, 0.368f, 0.0077f, 0.0075f, steel),
-      GN(0, 0.0225f, 0.404f, 0.0069f, 0.0067f, steel),
-      GN(0, 0.0225f, 0.432f, 0.0062f, 0.0061f, steel),
-      GN(0, 0.0225f, 0.450f, 0.0058f, 0.0057f, steel),
-      GN(0, 0.0225f, 0.462f, 0.0055f, 0.0054f, steel),
+      GN(0, 0.0225f, 0.334f, 0.0086f, 0.0084f, upper),  // heavy at the chamber
+      GN(0, 0.0225f, 0.368f, 0.0077f, 0.0075f, upper),
+      GN(0, 0.0225f, 0.404f, 0.0069f, 0.0067f, upper),
+      GN(0, 0.0225f, 0.432f, 0.0062f, 0.0061f, upper),
+      GN(0, 0.0225f, 0.450f, 0.0058f, 0.0057f, upper),
+      GN(0, 0.0225f, 0.462f, 0.0055f, 0.0054f, upper),
     });
     // THE GAS BLOCK HAS TO CLAMP THE BARREL, and it was hovering over it. At
     // y 0.036 with 6.2 mm of half-height its underside sat at 0.0298 while the
@@ -18532,86 +19038,241 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // and never re-checked against it. Now 5.7 mm of overlap, and it grew a
     // little because a block that straddles a barrel is wider than one perched
     // on it.
-    GBOX(0, 0.0325f, 0.368f, 0.0074f, 0.0080f, 0.011f, black);   // gas block
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
+    GBOX(0, 0.0325f, 0.368f, 0.0074f, 0.0080f, 0.011f, upper);   // gas block
+    // ...and a low front sight base ON it. Filled black, this weapon's silhouette was a
+    // straight serrated bar 1100 px long with one block on it — a rail with a gun
+    // attached. One 6.4 mm incident 170 mm ahead of the optic is what breaks the line,
+    // and it lands 44 mm forward of the rail's end so it collides with nothing.
+    GBOX(0, 0.0430f, 0.368f, 0.0038f, 0.0032f, 0.0080f, upper);  // front sight base
     // Sling loop at the guard's mouth — the quad-rail block carries the rail
     // furniture now, so the loop is the guard's one remaining jewel.
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     fig_tube(GUNP(-0.0130f, 0.0090f, 0.196f), GUNP(-0.0182f, 0.0090f, 0.196f),
              0.0068f * gg, 0.0068f * gg, 0.0040f * gg, 0.0040f * gg, 12, steel, gy);   // front sling loop
-    mat_set(MAT_PARK_R, MAT_PARK_M);
-    GCH(16, 1, 1, gy, {  // muzzle: a drawn-out, purposeful head — mass
-      GN(0, 0.0225f, 0.455f, 0.0090f, 0.0087f, black),  // without bluntness
-      GN(0, 0.0225f, 0.474f, 0.0100f, 0.0097f, black),
-      GN(0, 0.0225f, 0.486f, 0.0100f, 0.0097f, black),
-      GN(0, 0.0225f, 0.489f, 0.0082f, 0.0080f, upper),
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
+    // A THREE-CHAMBER BRAKE, AND THE CHAMBERS ARE WHAT MAKE IT ONE. The old head was a
+    // smooth cone with two 5 mm fins stuck on its flanks: fins point OUT of a brake and
+    // a brake's ports are cut IN. Stepping the radius three times gives three real
+    // baffle walls with a groove between each pair — that is the silhouette, and every
+    // groove is a place the arris highlight lands.
+    GCH(12, 1, 1, gy, {  // muzzle: stepped, so the baffles read
+      GN(0, 0.0225f, 0.4550f, 0.0092f, 0.0089f, upper),
+      GN(0, 0.0225f, 0.4610f, 0.0104f, 0.0101f, upper),   // baffle 1
+      GN(0, 0.0225f, 0.4655f, 0.0088f, 0.0085f, black),  // groove: the port
+      GN(0, 0.0225f, 0.4720f, 0.0104f, 0.0101f, upper),   // baffle 2
+      GN(0, 0.0225f, 0.4765f, 0.0088f, 0.0085f, black),  // groove: the port
+      GN(0, 0.0225f, 0.4840f, 0.0104f, 0.0101f, upper),   // baffle 3
+      GN(0, 0.0225f, 0.4890f, 0.0084f, 0.0082f, steel),   // the crown's land
     });
-    // Side ports, proud of the head — the detail that says COMPENSATOR.
-    GBOX( 0.0092f, 0.0225f, 0.478f, 0.0026f, 0.0022f, 0.0070f, black);
-    GBOX(-0.0092f, 0.0225f, 0.478f, 0.0026f, 0.0022f, 0.0070f, black);
-    // ...and a real bore down the crown: a solid muzzle face is the one detail
-    // the player looks straight at every time the gun comes up.
-    fig_tube(GUNP(0, 0.0225f, 0.4855f), GUNP(0, 0.0225f, 0.4925f),
-             0.0069f * gg, 0.0069f * gg, 0.0038f * gg, 0.0038f * gg, 16, black, gy);
+    // ...AND THE PORTS ARE THE GROOVES THEMSELVES, drawn dark. Four proud boxes on the
+    // brake's crown were tried first and they are the same defect the old side fins
+    // were: a port is a HOLE, and a box standing on a hole is a fin. Worse, a 12-gon
+    // has a facet centred exactly on the weapon's up axis, so a port box's own top face
+    // landed 0.06 mm under it — parallel, overlapping, and figcheck's zfight tier went
+    // 0 to 16 on that one pair. The groove nodes carry `black` instead: a band a shade
+    // darker than the baffles either side of it reads as an opening, costs no geometry
+    // at all, and cannot z-fight with anything.
+    // THE BORE WAS READING INSIDE OUT, and the fix is a SOLID plug rather than a ring.
+    // The brake caps its front with a bright 16.8 mm disc, and the old bore was an
+    // ANNULUS standing 3.5 mm proud of it — so what the player saw down the muzzle was
+    // a dark ring with the bright cap showing THROUGH it, which is the exact inverse of
+    // a hole. Leaving the chain's cap off instead makes a watertight join with the ring
+    // impossible (figcheck: open=12), so the bore is a dead-matte solid cylinder whose
+    // face stands 1.2 mm past the crown: from the front, a 7.6 mm dark disc in a
+    // 16.8 mm land; from the side, nothing. This is the one detail the player looks
+    // straight at every time the gun comes up.
+    mat_set(MAT_POLY_R * 1.7f, 0.0f);   // no sheen down a barrel
+    GCH(12, 1, 1, gy, {
+      GN(0, 0.0225f, 0.4830f, 0.0040f, 0.0040f, black),   // buried in the brake
+      GN(0, 0.0225f, 0.4902f, 0.0038f, 0.0038f, black),
+    });
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
     // ---- red dot: a thin SQUARE pane, forward over the barrel ----------------
     // A narrow plate, not a housing with a barrel's worth of depth.
-    mat_set(MAT_PARK_R, MAT_PARK_M * 0.75f);
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // Every dimension of this three-piece mount is chosen so that NO face of it lands
     // within a millimetre of a face of its neighbours: widths 0.0136 and 0.0060 against
     // the rail's 0.0092 and its teeth's 0.0106, and the neck's top deliberately ends
     // 1.5 mm ABOVE the window's lower edge — in open air inside the frame — rather than
     // buried 0.8 mm inside a 1.6 mm wall where its top face and the wall's inner face
     // are closer together than the depth buffer can resolve at 25 m.
-    GBOX(0, 0.0424f, 0.1834f, 0.0136f, 0.0060f, 0.0100f, black);  // rail clamp
-    GBOX( 0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, black);  // R post
-    GBOX(-0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, black);  // L post
-    // The window is 16:9 — 21.0 x 37.3 mm — and the frame around it is ONE ring: 1.6 mm
-    // of wall, 3.4 mm deep, in bright steel. That is the whole sight.
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
+    GBOX(0, 0.0424f, 0.1834f, 0.0136f, 0.0060f, 0.0100f, alloy);  // rail clamp
+    GBOX( 0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, alloy);  // R post
+    GBOX(-0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, alloy);  // L post
+    // A SIGHT IS A BODY WITH A WINDOW IN IT, NOT A WINDOW. This was ONE ring — 1.6 mm
+    // of wall, 3.4 mm deep — hung on two posts with open air on both sides of it, so
+    // from every angle it read as a picture frame floating over the barrel, and in ADS,
+    // which is the frame the player looks at all match, it was a rectangular outline
+    // with nothing in it. The window has to stay OPEN (this pass has no alpha, and an
+    // opaque pane where the target goes is the one thing a sight may not be), so
+    // everything that makes it a sight has to live around the aperture rather than
+    // across it: a chassis behind the glass, a hood over it, and the coating at the
+    // rim, which is where a real coating shows anyway.
+    //
+    // The window is 16:9 and the class follows from that: a rectangular window is a
+    // HOLOGRAPHIC sight, so it gets the body a holographic sight has — a long chassis
+    // carrying the laser and the battery, standing well back from the glass.
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    // ...AND IT STANDS UNDER THE WINDOW, NOT ACROSS IT. At y 0.0530 the chassis spanned
+    // 45.0-61.0 mm while the aperture's open span is 51.5-72.5: it ate the bottom 9.5 mm
+    // of a 21.0 mm window and the point of aim passed 1 mm over its top edge, so
+    // everything below the reticle was blocked BY THE SIGHT. That is a gameplay
+    // regression, not a look one — the ADS frame is what the player aims through all
+    // match. 32.0-49.0 now, 2.5 mm clear below the glass, merged into the rail clamp
+    // where a red dot's body actually sits.
+    //
+    // It is also 73 mm long rather than 48. Every real reflex sight is about twice as
+    // long as it is tall; at 0.8 the block reads as a lump on the rail instead of as an
+    // optic, which is the one thing the silhouette has to say from the side.
+    GBOX(0, 0.0405f, 0.1520f, 0.0175f, 0.0085f, 0.0260f, alloy);  // chassis
+    // The hood: two side walls and a bridge, 28 mm deep against the frame's 3.4. This
+    // is what gives the sight a top line and a shadow of its own.
+    // 0.0160 of half-height, not 0.0145: at 0.0145 a wall's top face landed 0.4 mm
+    // over the window frame's own top face — parallel and overlapping in x, i.e. 34 of
+    // figcheck's near pairs from one number. 1.9 mm clear now.
+    // The walls clear the window LATERALLY too: at x 0.0192 their inner faces sat at
+    // 16.4 against the aperture's 17.9 and cropped 1.5 mm off each side. 21.8 now.
+    // They are carried by the chassis rather than by the frame, which is why they can
+    // stand outside the glass at all.
+    GBOX( 0.0248f, 0.0625f, 0.1840f, 0.0030f, 0.0182f, 0.0140f, alloy);  // R wall
+    GBOX(-0.0248f, 0.0625f, 0.1840f, 0.0030f, 0.0182f, 0.0140f, alloy);  // L wall
+    // THE BRIDGE IS INSET FROM THE WALLS ALONG THE BORE. At the walls' own z extents
+    // (centre 0.1840, half 0.0140) its front and rear faces were COPLANAR with theirs
+    // and overlapped them in x and y — figcheck's zfight tier went 0 to 16 on that one
+    // pair. 0.0126 sets both of its z faces 1.4 mm inside the walls'.
+    GBOX(0, 0.0765f, 0.1840f, 0.0290f, 0.0026f, 0.0126f, alloy);         // hood bridge
+    // The two buttons, ON THE SIDE THE PLAYER CAN SEE. The camera sits on the weapon's
+    // left, so a control group on +x renders exactly 0 px for the whole match.
+    mat_set(MAT_POLY_R, 0.0f);
+    if (gun_tier()) {
+      GBOX(-0.0206f, 0.0405f, 0.1420f, 0.0026f, 0.0038f, 0.0038f, black);  // button
+      GBOX(-0.0206f, 0.0405f, 0.1520f, 0.0026f, 0.0038f, 0.0038f, black);  // button
+    }
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0017f),
              GUNP(0, sight_y, AR_APERTURE_Z + 0.0017f),
              0.0121f * gg, 0.02027f * gg, 0.0105f * gg, 0.01867f * gg, 4, steel, gy);
+    // THE COATING, AS AN ANNULUS IN THE FRAME'S OWN WALL. A coated lens reflects almost
+    // nothing on axis — that is what the coating is FOR, and it is why a scope's pupil
+    // is the darkest thing on a rifle — and throws a hard colour at the rim as the
+    // angle opens. So the only part of the glass that can be drawn without a pane is
+    // exactly the part that carries the whole cue. Buried 1.3 mm inside the frame's
+    // wall, which keeps it clear of the house rule's 1 mm minimum at both edges.
+    mat_set(MAT_GLASS_R, 0.0f);
+    // ...and 0.0006 of half-depth, not 0.0011: the glass's own z faces sat 0.6 mm
+    // inside the frame's and parallel to them. 1.1 mm at each end now.
+    fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0006f),
+             GUNP(0, sight_y, AR_APERTURE_Z + 0.0006f),
+             0.0118f * gg, 0.0200f * gg, 0.0100f * gg, 0.0179f * gg, 4, lens, gy);
     g_gun_sight_p = GUNP(0, sight_y, gun_sight_z(cur));   // one copy; see figm weld
-    g_gun_sight_r = 0.0105f;      // the window's inner HALF-HEIGHT, the tighter one
+    // ...and the tighter constraint is now the GLASS's inner edge, not the frame's:
+    // the coating annulus narrows the open aperture from 21.0 to 20.0 mm.
+    g_gun_sight_r = 0.0100f;
     mat_set(MAT_POLY_R, 0.0f);
   } else {
     // ---- bolt-action precision rifle ----
-    mat_set(MAT_PARK_R, MAT_PARK_M);
-    GBOX(0,  0.013f,  0.030f, 0.0138f, 0.0152f, 0.115f, upper);  // receiver
-    GBOX(0,  0.0315f, 0.020f, 0.0076f, 0.0028f, 0.078f, black);  // scope rail
-    // A DETACHABLE BOX MAGAZINE, because the reload is a magazine change now.
-    GBOX(0, -0.010f,  0.052f, 0.0152f, 0.0152f, 0.0242f, body);  // magwell
+    // THE TWO WEAPONS HAVE TO BE DIFFERENT CLASSES, AND LENGTH IS HOW A RIFLE SAYS SO.
+    // This was 746 mm against the carbine's 716 — a ratio of 1.04 — where an AI AWM is
+    // 1200 mm against an M4's 840, i.e. 1.43. At 1.04 the bolt gun was a carbine with a
+    // scope on it: the one cue that reads at 25 m, in silhouette, through smoke and past
+    // the aerial perspective was simply absent. The model is built at 0.852 of real
+    // scale (716/840), so the AWM lands at 1030 mm and the muzzle at z 0.782.
+    //
+    // Everything BEHIND z 0.150 is pinned: the butt (GUN_BUTT_Z), the grip, the trigger
+    // (SRTRIG_Z), the magazine and both fore-end hold stations are the contract with the
+    // pose solver and the hand builder. All 284 mm of the growth is barrel.
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
+    // THE ACTION IS A SECTION, NOT A BOX — the same argument the AR's upper carries.
+    // One 27.6 x 30.4 x 230 mm cuboid has no shoulder line anywhere, and an AI action is
+    // famously FLAT-sided, so k=8 (the chamfered square) is the right family rather than
+    // a round tube.
+    GCH(8, 1, 1, gy, {
+      GN(0, 0.0150f, -0.0880f, 0.0158f, 0.0140f, upper),  // rear: the shroud aperture
+      GN(0, 0.0152f, -0.0300f, 0.0162f, 0.0144f, upper),  // deepest: lug abutments
+      GN(0, 0.0152f,  0.0600f, 0.0160f, 0.0142f, upper),
+      GN(0, 0.0154f,  0.1180f, 0.0152f, 0.0138f, upper),
+      GN(0, 0.0156f,  0.1500f, 0.0140f, 0.0132f, upper),  // front ring
+    });
+    // The ejection port and the bolt raceway, let into the RIGHT flank — this is the one
+    // face a bolt gun shows that a semi-auto does not, and the flank was blank.
+    if (gun_tier()) {
+      GBOX( 0.0134f, 0.0184f, -0.0060f, 0.0022f, 0.0072f, 0.0290f, black);  // port
+      GBOX( 0.0132f, 0.0068f, -0.0330f, 0.0022f, 0.0038f, 0.0230f, black);  // raceway
+    }
+    // A ONE-PIECE 20-MOA RAIL, in the AR's three-rung width ladder (base / tooth /
+    // crown, 1.6 mm a rung) so no two of its faces can land inside figcheck's near band.
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    GBOX(0, 0.0322f, 0.0350f, 0.0094f, 0.0026f, 0.1050f, alloy);  // rail base
+    GBOX(0, 0.0364f, 0.0350f, 0.0062f, 0.0026f, 0.1030f,
+         v3_scale(alloy, 0.84f));                                 // ...and its slot floor
+    if (g_gun_hero)
+      for (int r = 0; r < 5; r++)   // only the run BEHIND the mount is ever seen
+        GBOX(0, 0.0384f, -0.0620f + 0.0140f * (float)r,
+             0.0078f, 0.0026f, 0.0033f, alloy);
+    // THE CHASSIS THE ACTION IS BEDDED IN, and the model had nothing for it: the
+    // receiver hung in open air over the trigger group. Its side plates stand 2.4 mm
+    // proud of the action, which is the AWM's signature line and the reason the class
+    // reads as a chassis rifle rather than as a tube in a stock.
+    mat_set(MAT_POLY_R, 0.0f);
+    GCH(8, 1, 1, gy, {
+      GN(0, 0.0000f, -0.0720f, 0.0132f, 0.0158f, chas),  // rear tang -> the spines
+      GN(0, 0.0010f, -0.0200f, 0.0140f, 0.0164f, chas),
+      GN(0, 0.0016f,  0.0300f, 0.0144f, 0.0166f, chas),
+      GN(0, 0.0020f,  0.1000f, 0.0146f, 0.0166f, chas),
+      GN(0, 0.0060f,  0.1450f, 0.0160f, 0.0170f, chas),  // into the fore-end
+    });
+    // ---- magwell and a magazine that is its own class's length ----------------
+    // 0.0150 and 0.0186, not 0.0166 and 0.0174: at 0.0166 the well's side faces landed
+    // EXACTLY on the chassis's own k=8 side flat (rz 0.0166 over the same z run) —
+    // parallel, overlapping, gap 0.000, i.e. vmcheck's zfight tier in every one of the
+    // sniper's 77 poses. A well steps IN under the chassis and its fence steps back OUT
+    // past it, which is also what the part does.
+    GBOX(0, -0.0090f, 0.0640f, 0.0150f, 0.0158f, 0.0340f, chas);   // magwell
+    GBOX(0, -0.0224f, 0.0640f, 0.0186f, 0.0034f, 0.0352f, chas);   // magwell flare
     {
-      // Same two-component travel as the AR's: down AND toward the camera, so
-      // the magazine gets BIGGER in frame as it leaves rather than sliding off
-      // the bottom edge. See the note on the AR's `mdx`.
+      // Same two-component travel as the AR's: down AND toward the camera, so the
+      // magazine gets BIGGER in frame as it leaves rather than sliding off the bottom
+      // edge. See the note on the AR's `mdx`.
       float md = md01 * GUN_MAG_TRAVEL[WPN_SR][0],
             mdx = md01 * -GUN_MAG_TRAVEL[WPN_SR][1];
       mat_set(MAT_POLY_R, 0.0f);
+      // 70 mm FORE-AFT, not 41. A .338 AICS magazine is ~100 mm front to back; this one
+      // was less than half its class's length, which is why it read as a pistol mag.
+      // rx is the fore-aft half-extent here and rz the width — the chain runs down y
+      // with a gz hint, so the two swap against the AR's convention.
       GCH(8, 1, 1, gz, {
-        GN(mdx, -0.020f - md, 0.052f, 0.0206f, 0.0126f, mag),
-        GN(mdx, -0.048f - md, 0.052f, 0.0202f, 0.0124f, mag),
-        GN(mdx, -0.076f - md, 0.051f, 0.0196f, 0.0121f, mag),
-        GN(mdx, -0.098f - md, 0.050f, 0.0188f, 0.0117f, mag),
+        GN(mdx, -0.0180f - md, 0.0640f, 0.0350f, 0.0140f, mag),
+        GN(mdx, -0.0460f - md, 0.0638f, 0.0344f, 0.0138f, mag),
+        GN(mdx, -0.0720f - md, 0.0634f, 0.0336f, 0.0135f, mag),
+        GN(mdx, -0.0940f - md, 0.0630f, 0.0326f, 0.0132f, mag),
       });
-      // Floor plate, on the magazine's OWN axis: this one is nearly vertical
-      // (z 0.052 -> 0.050 over 78 mm of drop), so `mup` is almost gy — but it is
-      // derived rather than assumed, because the AR learned that lesson as a
-      // 10 mm gap between an axis-aligned plate and a tilted end cap.
+      if (g_gun_hero) {   // witness slots, in the magazine's own frame
+        v3 rib = v3_scale(mag, 0.74f);
+        for (int rb = 0; rb < 4; rb++)
+          scene_box(GUNP(mdx, -0.0300f - md - 0.0200f * (float)rb, 0.0636f),
+                    v3_scale(gx, 0.0141f * gg), v3_scale(gy, 0.0030f * gg),
+                    v3_scale(gz, 0.0250f * gg), rib);
+      }
+      // Floor plate, on the magazine's OWN axis: this one is nearly vertical (76 mm of
+      // drop over 1 mm of z), so `mup` is almost gy — but it is DERIVED rather than
+      // assumed, because the AR learned that lesson as a 10 mm gap between an
+      // axis-aligned plate and a tilted end cap.
       mat_set(MAT_POLY_R * 1.4f, 0.0f);
-      v3 mup = v3_norm(v3_add(v3_scale(gy, 0.99968f), v3_scale(gz, -0.02564f)));
-      v3 mfw = v3_norm(v3_add(v3_scale(gy, 0.02564f), v3_scale(gz, 0.99968f)));
-      v3 mbt = GUNP(mdx, -0.098f - md, 0.050f);
-      scene_box(v3_add(mbt, v3_scale(mup, -0.0026f * gg)),
-                v3_scale(gx, 0.0138f * gg), v3_scale(mup, 0.0056f * gg),
-                v3_scale(mfw, 0.0214f * gg), black);
+      v3 mup = v3_norm(v3_add(v3_scale(gy, 0.99989f), v3_scale(gz, -0.01316f)));
+      v3 mfw = v3_norm(v3_add(v3_scale(gy, 0.01316f), v3_scale(gz, 0.99989f)));
+      v3 mbt = GUNP(mdx, -0.0940f - md, 0.0630f);
+      scene_box(v3_add(mbt, v3_scale(mup, -0.0028f * gg)),
+                v3_scale(gx, 0.0146f * gg), v3_scale(mup, 0.0058f * gg),
+                v3_scale(mfw, 0.0348f * gg), black);
       // The finger hook a shooter actually pulls a stuck AICS mag out by.
       mat_set(MAT_POLY_R, 0.0f);
-      GBOX(mdx, -0.086f - md, 0.0742f, 0.0104f, 0.0112f, 0.0030f, black);
+      GBOX(mdx, -0.0820f - md, 0.1000f, 0.0110f, 0.0116f, 0.0032f, black);
     }
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
-    // The BOLT, and it cycles now. `bolt01` lifts the handle, draws it back and returns
-    // it — one rotation about the receiver's axis plus one translation, so the knob
-    // traces the L a real bolt handle traces.
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
+    // The BOLT, and it cycles. `bolt01` lifts the handle, draws it back and returns it —
+    // one rotation about the receiver's axis plus one translation, so the knob traces
+    // the L a real bolt handle traces.
     {
       float lift, draw;
       gun_bolt_phase(bolt01, &lift, &draw);
@@ -18620,20 +19281,40 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
       #define BOLTP(U, VY, WZ) GUNP((U) * cosf(ba) - ((VY) - BOLT_PIVOT_Y) * sinf(ba), \
                                     (U) * sinf(ba) + ((VY) - BOLT_PIVOT_Y) * cosf(ba) + BOLT_PIVOT_Y, \
                                     (WZ) + bz)
-      fnode_t bh[2] = {
-        {BOLTP(0.012f, 0.014f, -0.030f), steel, steel, 0.0043f * gg, 0.0041f * gg, 0, 0.0f},
-        {BOLTP(0.026f, 0.004f, -0.036f), steel, steel, 0.0038f * gg, 0.0039f * gg, 0, 0.0f}};
+      // THE BOLT SHROUD IS THE SINGLE LOUDEST 30 cm BOLT-GUN CUE and the model had
+      // none: the rear of the action is the only place a bolt gun differs from a
+      // semi-auto at zero range, and it was a flat wall. It rides BOLTP, so it lifts,
+      // draws and returns with the handle.
+      fnode_t bs[4] = {
+        {BOLTP(0, 0.0160f, -0.1080f), steel, steel, 0.0116f*gg, 0.0116f*gg, 0, 0.0f},
+        {BOLTP(0, 0.0160f, -0.0980f), steel, steel, 0.0124f*gg, 0.0124f*gg, 0, 0.0f},
+        {BOLTP(0, 0.0160f, -0.0900f), steel, steel, 0.0112f*gg, 0.0112f*gg, 0, 0.0f},
+        {BOLTP(0, 0.0160f, -0.0760f), steel, steel, 0.0118f*gg, 0.0118f*gg, 0, 0.0f}};
+      fig_chain(bs, 4, 12, 1, 1, gy);
+      // The cocking indicator out its rear face — the one part of a rifle that tells
+      // you, without touching it, whether it is ready.
+      if (gun_tier())
+        scene_box(BOLTP(0, 0.0160f, -0.1128f), v3_scale(gx, 0.0022f * gg),
+                  v3_scale(gy, 0.0022f * gg), v3_scale(gz, 0.0042f * gg), black);
+      fnode_t bh[2] = {   // handle root
+        {BOLTP(0.0110f, 0.0160f, -0.0300f), steel, steel, 0.0048f*gg, 0.0046f*gg, 0, 0.0f},
+        {BOLTP(0.0268f, 0.0052f, -0.0370f), steel, steel, 0.0042f*gg, 0.0042f*gg, 0, 0.0f}};
       fig_chain(bh, 2, 16, 1, 1, gy);
-      fnode_t bk[2] = {   // the knob gun_bolt_knob's grip point is the midpoint of
-        {BOLTP(BOLT_KNOB_U, 0.000f, BOLT_KNOB_Z), upper, upper, 0.0069f * gg, 0.0067f * gg, 0, 0.0f},
-        {BOLTP(BOLT_KNOB_U, -0.008f, BOLT_KNOB_Z), upper, upper, 0.0062f * gg, 0.0062f * gg, 0, 0.0f}};
-      fig_chain(bk, 2, 12, 1, 1, gz);
+      // ...and a BALL on the handle's own axis, not a stub on the gun's. A real AI knob
+      // is 22 mm across; this was 13.8 and stood vertically, so it read as a nub.
+      mat_lathe(MAT_PARK_R, MAT_PARK_M);
+      fnode_t bk[4] = {
+        {BOLTP(0.0250f, -0.0018f, -0.0370f), upper, upper, 0.0056f*gg, 0.0056f*gg, 0, 0.0f},
+        {BOLTP(0.0288f, -0.0042f, -0.0370f), upper, upper, 0.0094f*gg, 0.0094f*gg, 0, 0.0f},
+        {BOLTP(0.0330f, -0.0068f, -0.0370f), upper, upper, 0.0094f*gg, 0.0094f*gg, 0, 0.0f},
+        {BOLTP(0.0362f, -0.0088f, -0.0370f), upper, upper, 0.0058f*gg, 0.0058f*gg, 0, 0.0f}};
+      fig_chain(bk, 4, 12, 1, 1, gz);
       #undef BOLTP
     }
     mat_set(MAT_POLY_R, 0.0f);
-    // Same two fixes as the AR's grip (see there): the top ring floated 8.7 mm
-    // under the receiver it is supposed to hang from, and the bottom ended 6.5 mm
-    // above the little-finger edge of the hand that holds it.
+    // Same two fixes as the AR's grip (see there): the top ring floated 8.7 mm under the
+    // receiver it is supposed to hang from, and the bottom ended 6.5 mm above the
+    // little-finger edge of the hand that holds it.
     GCH(12, 1, 1, gz, {  // grip
       GN(0, -0.0072f, -0.0233f, 0.0117f, 0.0113f, chas),
       GN(0, -0.050f, -0.046f, 0.0108f, 0.0122f, chas),
@@ -18642,18 +19323,18 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // Trigger group — same construction as the AR's, same reason (see there): the guard
     // has to have a finger-sized hole in it.
     mat_set(MAT_POLY_R, 0.0f);
-    // THE REAR UPRIGHT WAS UNDER THE GRIP. Its bottom-rear corner sat at z = -0.0250,
-    // i.e. 25 mm BEHIND the receiver origin and directly below the pistol grip's own
-    // top node (z = -0.0233) — so the wire ran through the palm wrapped round that
-    // grip, measured 7.2 mm inside the hand's mesh by the rewritten vmtrig, and no
-    // amount of clearing the DIGITS could reach it because the offender was the palm.
-    GCH_PUB(6, 1, 1, gy, 0.0034f, {   // ...and publishes g_gun_guard for vmtrig
-      GN(0, -0.0008f, SRTRIG_Z - 0.0290f, 0.0034f, 0.0030f, body),  // in the chassis
-      GN(0, -0.0505f, SRTRIG_Z - 0.0350f, 0.0032f, 0.0028f, body),
-      GN(0, -0.0530f,  0.0272f, 0.0032f, 0.0028f, body),
-      GN(0, -0.0006f,  0.0372f, 0.0034f, 0.0030f, body),   // buried in the magwell
+    // THE REAR UPRIGHT WAS UNDER THE GRIP. Its bottom-rear corner sat 25 mm BEHIND the
+    // receiver origin and directly below the pistol grip's own top node, so the wire ran
+    // through the palm wrapped round that grip — 7.2 mm inside the hand's mesh by the
+    // rewritten vmtrig, and no amount of clearing the DIGITS could reach it because the
+    // offender was the palm.
+    GCH_PUB(6, 1, 1, gy, 0.0042f, {   // ...and publishes g_gun_guard for vmtrig
+      GN(0, -0.0008f, SRTRIG_Z - 0.0290f, 0.0034f, 0.0034f, body),  // in the chassis
+      GN(0, -0.0505f, SRTRIG_Z - 0.0350f, 0.0026f, 0.0042f, body),
+      GN(0, -0.0530f,  0.0272f, 0.0026f, 0.0042f, body),
+      GN(0, -0.0006f,  0.0372f, 0.0034f, 0.0034f, body),   // buried in the magwell
     });
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     {
       v3 tpv = GUNP(0, -0.0010f, SRTRIG_Z);
       float ta = trig01 * 0.150f;    // a match trigger breaks shorter. Sign:
@@ -18683,123 +19364,222 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
       g_gun_body_e[2] = v3_scale(gz, 0.0875f * gg);
     }
     mat_set(MAT_POLY_R, 0.0f);
-    // AWM THUMBHOLE CHASSIS (ref: commons AWM-338-white): an upper and a lower spine
-    // run from receiver and grip heel into a butt block — the OPENING between them IS
-    // the thumbhole, no CSG needed, and every bar is buried at both ends (chain caps
-    // never end ON a block face: the coplanar-cap z-fight class).
-    GCH(8, 1, 1, gy, {   // upper spine, receiver -> butt block
-      GN(0, 0.0125f, -0.070f, 0.0092f, 0.0088f, chas),
-      GN(0, 0.0090f, -0.212f, 0.0086f, 0.0082f, chas),
+    // ---- the skeleton stock -------------------------------------------------
+    // AWM THUMBHOLE CHASSIS: an upper and a lower spine run from the action and the
+    // grip heel into a butt block, and the OPENING between them IS the thumbhole — no
+    // CSG needed. The opening was 142 x 43 mm, which is 2.6 times a real thumbhole and
+    // why the stock read as a LADDER; a web closes its rear half and brings it to
+    // 80 x 52. Every bar is buried at both ends: a chain cap that lands ON a block face
+    // is the coplanar-cap z-fight class.
+    GCH(8, 1, 1, gy, {   // comb / upper spine, action -> butt block
+      GN(0, 0.0125f, -0.0640f, 0.0104f, 0.0128f, chas),
+      GN(0, 0.0150f, -0.1400f, 0.0112f, 0.0132f, chas),   // the thumbhole's rear edge
+      GN(0, 0.0140f, -0.2120f, 0.0116f, 0.0130f, chas),
     });
-    // Lower spine: starts DEEP inside the grip's bottom node (start cap fully
-    // interior) and thinner than the grip, so the two chains cross at a steep
-    // angle instead of running parallel surface-on-surface — the documented
-    // parallel-chain flat-facet z-fight class.
-    GCH(8, 1, 1, gy, {   // lower spine, grip heel -> butt toe
+    GCH(8, 1, 1, gy, {   // toe line / lower spine, grip heel -> web
       // ...and it exits the grip's REAR at mid-height, well above the palm heel:
-      // started at the heel it ran surface-on-surface under the trigger hand's own up-
-      // facing palm chord (vmcheck z-fight at the one spot both are horizontal).
-      GN(0, -0.0560f, -0.0490f, 0.0056f, 0.0052f, chas),
-      GN(0, -0.0300f, -0.2140f, 0.0072f, 0.0068f, chas),
+      // started at the heel it ran surface-on-surface under the trigger hand's own
+      // up-facing palm chord (vmcheck z-fight at the one spot both are horizontal).
+      GN(0, -0.0560f, -0.0500f, 0.0072f, 0.0090f, chas),
+      GN(0, -0.0480f, -0.1000f, 0.0074f, 0.0092f, chas),
+      GN(0, -0.0400f, -0.1520f, 0.0086f, 0.0100f, chas),
     });
-    GBOX(0, -0.0060f, -0.2225f, 0.0112f, 0.0330f, 0.0145f, chas);  // butt block
-    // (rear face 4 mm ahead of the block's — a shared rear plane z-fights)
-    GBOX(0,  0.0300f, -0.194f, 0.0086f, 0.0062f, 0.0390f, chas);   // cheek piece
-    GBOX(0,  0.0225f, -0.172f, 0.0030f, 0.0062f, 0.0030f, black);  // riser post
-    GBOX(0,  0.0225f, -0.214f, 0.0030f, 0.0062f, 0.0030f, black);  // riser post
-    mat_set(MAT_POLY_R * 1.7f, 0.0f);
-    // (half-height 0.0290: at 0.0310 the pad's top landed EXACTLY on the
-    // butt block's own top plane y=0.027 — the shared-top z-fight again)
-    GBOX(0, -0.0040f, -0.2405f, 0.0122f, 0.0290f, 0.0075f, black); // butt pad
+    GBOX(0, -0.0180f, -0.1760f, 0.0118f, 0.0230f, 0.0380f, chas);  // the web
+    GBOX(0, -0.0060f, -0.2200f, 0.0128f, 0.0330f, 0.0175f, chas);  // butt block
+    // The BUTT HOOK — the shooter's support hand goes here, and it is the one shape on
+    // the weapon that says "fired from a bipod" rather than "fired standing".
+    GBOX(0, -0.0400f, -0.2140f, 0.0098f, 0.0190f, 0.0098f, chas);
+    if (gun_tier())
+      GBOX(0, -0.0600f, -0.2140f, 0.0044f, 0.0056f, 0.0044f, black);  // monopod stud
+    // The CHEEK PIECE, on a shaped riser rather than on two 6 mm posts — the posts were
+    // the "plank on stilts" read, and a riser is what actually carries an adjustable comb.
+    GCH(8, 1, 1, gy, {
+      GN(0, 0.0300f, -0.1560f, 0.0072f, 0.0126f, chas),
+      GN(0, 0.0316f, -0.1900f, 0.0078f, 0.0132f, chas),
+      GN(0, 0.0306f, -0.2160f, 0.0074f, 0.0126f, chas),
+    });
+    if (g_gun_hero) {   // the locking wheel, on the side the camera can see
+      mat_lathe(MAT_PARK_R, MAT_PARK_M);
+      fnode_t cw[2] = {
+        {GUNP(-0.0126f, 0.0270f, -0.2020f), black, black, 0.0052f*gg, 0.0052f*gg, 0, 0.0f},
+        {GUNP(-0.0172f, 0.0270f, -0.2020f), black, black, 0.0048f*gg, 0.0048f*gg, 0, 0.0f}};
+      fig_chain(cw, 2, 12, 1, 1, gy);
+    }
     mat_set(MAT_POLY_R, 0.0f);
-    GBOX(0, -0.0040f, -0.2340f, 0.0106f, 0.0270f, 0.0026f, chas);  // pad spacer
-    // Fore-end in the AR's design language: no bolted-on rails where the hand lives — a
-    // muscular shoulder at the receiver flowing through a slight palm swell at the hold
-    // station into the slim AWM nose.
+    if (gun_tier())
+      GBOX(0, -0.0040f, -0.2338f, 0.0134f, 0.0296f, 0.0034f, chas);  // LOP spacer
+    mat_set(MAT_POLY_R * 1.7f, 0.0f);
+    // (top face 1.6 mm below the butt block's own — a shared top plane z-fights)
+    GBOX(0, -0.0040f, -0.2415f, 0.0124f, 0.0294f, 0.0065f, black); // butt pad
+    mat_set(MAT_POLY_R, 0.0f);
+    // ---- fore-end -----------------------------------------------------------
+    // FLAT-SIDED (k=8), NOT A ROUND TUBE. A k=12 ellipse is a hair-dryer; a chassis
+    // fore-end is a machined box with an under-rail, slotted flanks and a barrel channel
+    // you can see daylight through. rx is the vertical half-extent here, rz the
+    // horizontal — the chain runs along z with a gy hint.
+    GCH(8, 1, 1, gy, {
+      GN(0, 0.0116f, 0.1360f, 0.0176f, 0.0170f, chas),  // shoulder, into the chassis
+      GN(0, 0.0124f, 0.1620f, 0.0166f, 0.0158f, chas),  // <- GH_FORE3 station
+      GN(0, 0.0132f, 0.2080f, 0.0156f, 0.0150f, chas),  // <- GH_FORE station
+      GN(0, 0.0142f, 0.2640f, 0.0158f, 0.0162f, chas),
+      GN(0, 0.0152f, 0.3200f, 0.0162f, 0.0176f, chas),  // the bipod bay, widest
+      GN(0, 0.0160f, 0.3600f, 0.0166f, 0.0150f, chas),  // nose, concentric with the bore
+    });
+    // The under-rail, full length, in the same three-rung width ladder as the AR's.
+    GBOX(0, -0.0034f, 0.2560f, 0.0089f, 0.0032f, 0.0900f, chas);
+    GBOX(0, -0.0086f, 0.2560f, 0.0057f, 0.0030f, 0.0880f,
+         v3_scale(chas, 0.84f));
+    if (g_gun_hero)
+      for (int r = 0; r < 11; r++)
+        GBOX(0, -0.0108f, 0.1780f + 0.0150f * (float)r,
+             0.0073f, 0.0026f, 0.0034f, chas);
+    // M-LOK flanks: a rhythm of dark lands, the same construction the AR's guard uses.
+    for (int m = 0; gun_tier() && m < 5; m++) {
+      float mz = 0.1980f + 0.0270f * (float)m;
+      GBOX( 0.0162f, 0.0138f, mz, 0.0028f, 0.0044f, 0.0094f, black);
+      GBOX(-0.0162f, 0.0138f, mz, 0.0028f, 0.0044f, 0.0094f, black);
+    }
+    // ---- barrel -------------------------------------------------------------
+    // A HEAVY MATCH BARREL READS BY *NOT* TAPERING. The AR's visibly does (8.6 -> 5.5 mm
+    // of radius over 128 mm); this one holds 22 mm across 340 mm of exposed length, and
+    // that constancy plus the free-float gap at the nose is the whole "precision" cue.
+    // The chamber swell lives only where the action covers it: a true 34 mm breech does
+    // not fit inside a fore-end the hand contract can also close around.
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
+    GCH(16, 1, 1, gy, {
+      GN(0, 0.0160f, 0.1000f, 0.0126f, 0.0126f, upper),  // tenon, inside the action
+      GN(0, 0.0160f, 0.1440f, 0.0120f, 0.0120f, upper),  // breech face
+      GN(0, 0.0160f, 0.1560f, 0.0112f, 0.0112f, upper),  // chamber step
+      GN(0, 0.0160f, 0.4000f, 0.0110f, 0.0110f, upper),
+      GN(0, 0.0160f, 0.6400f, 0.0107f, 0.0107f, upper),
+      GN(0, 0.0160f, 0.6880f, 0.0106f, 0.0106f, upper),
+      GN(0, 0.0160f, 0.7040f, 0.0090f, 0.0090f, steel),  // the bare thread shank
+    });
+    // Free-float counterbore: 2.4 mm of daylight around the barrel at the nose, which is
+    // the cheapest one-primitive statement of "this barrel touches nothing".
+    if (gun_tier())
+      fig_tube(GUNP(0, 0.0160f, 0.3550f), GUNP(0, 0.0160f, 0.3665f),
+               0.0172f * gg, 0.0158f * gg, 0.0134f * gg, 0.0134f * gg, 12, chas, gy);
+    // ---- bipod: a mount AND legs. Only the stud existed, and at 25 m the bipod is the
+    // third strongest thing in this weapon's silhouette.
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
+    GBOX(0, -0.0060f, 0.3460f, 0.0076f, 0.0096f, 0.0130f, black);  // stud
+    GBOX(0, -0.0140f, 0.3460f, 0.0110f, 0.0044f, 0.0060f, black);  // yoke
+    for (int lg = 0; lg < 2; lg++) {
+      float u = lg ? -1.0f : 1.0f;
+      GCH(8, 1, 1, gy, {   // folded back along the fore-end, as a bipod is carried
+        GN(u * 0.0100f, -0.0150f, 0.3400f, 0.0038f, 0.0040f, black),
+        GN(u * 0.0132f, -0.0128f, 0.2400f, 0.0030f, 0.0032f, black),
+        GN(u * 0.0148f, -0.0112f, 0.1900f, 0.0026f, 0.0028f, black),
+      });
+      if (gun_tier())
+        GBOX(u * 0.0150f, -0.0106f, 0.1830f, 0.0034f, 0.0038f, 0.0044f, black);  // foot
+    }
+    // ---- muzzle brake -------------------------------------------------------
     GCH(12, 1, 1, gy, {
-      GN(0, 0.0134f, 0.146f, 0.0144f, 0.0136f, chas),  // shoulder
-      GN(0, 0.0136f, 0.172f, 0.0136f, 0.0126f, chas),
-      GN(0, 0.0136f, 0.208f, 0.0135f, 0.0123f, chas),  // palm swell
-      GN(0, 0.0142f, 0.245f, 0.0127f, 0.0109f, chas),  // nose
+      GN(0, 0.0160f, 0.6960f, 0.0112f, 0.0110f, upper),  // collar over the thread
+      GN(0, 0.0160f, 0.7120f, 0.0128f, 0.0126f, upper),
+      GN(0, 0.0160f, 0.7380f, 0.0112f, 0.0110f, black),  // groove: a port
+      GN(0, 0.0160f, 0.7500f, 0.0128f, 0.0126f, upper),
+      GN(0, 0.0160f, 0.7640f, 0.0112f, 0.0110f, black),  // groove: a port
+      GN(0, 0.0160f, 0.7740f, 0.0124f, 0.0122f, upper),
+      GN(0, 0.0160f, 0.7800f, 0.0098f, 0.0096f, steel),  // the crown's land
     });
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
-    GCH(16, 1, 1, gy, {  // HEAVY match barrel: near-straight profile
-      GN(0, 0.016f, 0.130f, 0.0098f, 0.0095f, steel),
-      GN(0, 0.016f, 0.170f, 0.0091f, 0.0089f, steel),
-      GN(0, 0.016f, 0.260f, 0.0086f, 0.0084f, steel),
-      GN(0, 0.016f, 0.350f, 0.0081f, 0.0079f, steel),
-      GN(0, 0.016f, 0.420f, 0.0077f, 0.0076f, steel),
-      GN(0, 0.016f, 0.452f, 0.0075f, 0.0074f, steel),
+    mat_set(MAT_POLY_R * 1.7f, 0.0f);   // the bore: no sheen down a barrel
+    GCH(12, 1, 1, gy, {
+      GN(0, 0.0160f, 0.7740f, 0.0046f, 0.0046f, black),
+      GN(0, 0.0160f, 0.7812f, 0.0044f, 0.0044f, black),
     });
-    // Bipod MOUNT under the fore-end — the stud, with no legs on it. The folded legs
-    // are gone.
-    mat_set(MAT_PARK_R, MAT_PARK_M);
-    // Pushed 8 mm forward, to the very front of the fore-end.
-    GBOX(0, -0.006f, 0.2500f, 0.0072f, 0.0090f, 0.0140f, black);
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
-    GCH(16, 1, 1, gy, {  // AWM-class brake: a heavy ported can
-      GN(0, 0.016f, 0.450f, 0.0104f, 0.0100f, black),
-      GN(0, 0.016f, 0.470f, 0.0108f, 0.0104f, black),
-      GN(0, 0.016f, 0.490f, 0.0108f, 0.0104f, black),
-      GN(0, 0.016f, 0.494f, 0.0082f, 0.0080f, upper),
-    });
-    GBOX( 0.0100f, 0.016f, 0.472f, 0.0028f, 0.0025f, 0.0075f, black);  // port
-    GBOX(-0.0100f, 0.016f, 0.472f, 0.0028f, 0.0025f, 0.0075f, black);  // port
-    fig_tube(GUNP(0, 0.016f, 0.4905f), GUNP(0, 0.016f, 0.4985f),
-             0.0075f * gg, 0.0075f * gg, 0.0042f * gg, 0.0042f * gg, 16, black, gy);   // bore
-    // ---- scope: a SOLID round tube now ----
-    // The old scope was four wall slabs with a hole down the middle so ADS could look
-    // through it, which is both fragile geometry and not how a scope works.
-    mat_set(MAT_PARK_R * 0.8f, MAT_PARK_M);   // anodized alloy scope body
+    // ---- the scope, and it is the weapon's second silhouette ------------------
+    // THE OBJECTIVE WAS SMALLER THAN THE OCULAR (18.8 mm against 20.5), which is
+    // backwards on every telescope ever built — a scope's front bell is the whole reason
+    // it is called an objective. It is 26.8 against 19.2 now, and the tube runs 366 mm
+    // rather than 199, so the thing above the barrel reads as an optic instead of as a
+    // pipe. ONE chain: eight of fig_chain's ten nodes, which is worth knowing before
+    // anyone adds a ninth.
+    mat_lathe(MAT_PARK_R * 0.8f, MAT_PARK_M);   // anodized alloy scope body
     GCH(20, 1, 1, gy, {
       GN(0, sight_y, SCOPE_OCU_Z, SCOPE_OCU_R, SCOPE_OCU_R, black),
-      GN(0, sight_y, SCOPE_OCU_Z + 0.026f, SCOPE_TUBE_R + 0.0004f, SCOPE_TUBE_R, upper),
-      GN(0, sight_y, 0.098f, SCOPE_TUBE_R - 0.0004f, SCOPE_TUBE_R + 0.0003f, upper),
-      GN(0, sight_y, 0.116f, 0.0184f, 0.0181f, black),
-      GN(0, sight_y, 0.147f, 0.0188f, 0.0185f, black),
+      GN(0, sight_y, SCOPE_OCU_Z + 0.018f, 0.0197f, 0.0197f, black),
+      GN(0, sight_y, SCOPE_OCU_Z + 0.036f, 0.0190f, 0.0190f, black),
+      GN(0, sight_y, 0.0010f, SCOPE_TUBE_R, SCOPE_TUBE_R, upper),
+      GN(0, sight_y, 0.1990f, SCOPE_TUBE_R + 0.0001f, SCOPE_TUBE_R + 0.0001f, upper),
+      GN(0, sight_y, 0.2500f, 0.0268f, 0.0268f, black),
+      GN(0, sight_y, 0.3060f, 0.0268f, 0.0268f, black),
+      GN(0, sight_y, 0.3140f, 0.0250f, 0.0250f, black),
     });
-    GCH(16, 1, 1, gz, {  // elevation turret, knurled cap
-      GN(0, sight_y + 0.011f, 0.062f, 0.0090f, 0.0087f, upper),
-      GN(0, sight_y + 0.024f, 0.062f, 0.0086f, 0.0084f, upper),
-      GN(0, sight_y + 0.027f, 0.062f, 0.0094f, 0.0092f, black),
-      GN(0, sight_y + 0.034f, 0.062f, 0.0088f, 0.0086f, black),
+    GBOX(0, sight_y, 0.0900f, 0.0234f, 0.0230f, 0.0300f, black);   // turret saddle
+    if (gun_tier())
+      GCH(12, 1, 1, gy, {   // magnification ring
+        GN(0, sight_y, 0.0080f, 0.0158f, 0.0158f, black),
+        GN(0, sight_y, 0.0380f, 0.0158f, 0.0158f, black),
+      });
+    if (g_gun_hero)   // the throw lever, on the side the camera can see
+      GBOX(-0.0205f, sight_y - 0.0050f, 0.0230f, 0.0068f, 0.0040f, 0.0056f, black);
+    GCH(16, 1, 1, gz, {   // ELEVATION turret, capped and knurled
+      GN(0, sight_y + 0.0130f, 0.0900f, 0.0182f, 0.0182f, upper),
+      GN(0, sight_y + 0.0270f, 0.0900f, 0.0179f, 0.0179f, upper),
+      GN(0, sight_y + 0.0360f, 0.0900f, 0.0175f, 0.0175f, upper),
+      GN(0, sight_y + 0.0382f, 0.0900f, 0.0190f, 0.0190f, black),
+      GN(0, sight_y + 0.0409f, 0.0900f, 0.0172f, 0.0172f, black),
     });
-    GCH(16, 1, 1, gy, {  // windage turret
-      GN(0.011f, sight_y, 0.062f, 0.0082f, 0.0079f, upper),
-      GN(0.024f, sight_y, 0.062f, 0.0072f, 0.0073f, black),
+    GCH(16, 1, 1, gy, {   // WINDAGE turret, right
+      GN(0.0200f, sight_y, 0.0900f, 0.0162f, 0.0162f, upper),
+      GN(0.0238f, sight_y, 0.0900f, 0.0158f, 0.0158f, upper),
+      GN(0.0252f, sight_y, 0.0900f, 0.0168f, 0.0168f, black),
+      GN(0.0270f, sight_y, 0.0900f, 0.0152f, 0.0152f, black),
     });
-    // Rings AND the mount posts that carry them down to the rail.
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
+    if (gun_tier())
+      GCH(16, 1, 1, gy, {   // PARALLAX turret — the third knob a tactical scope has
+        GN(-0.0200f, sight_y, 0.0900f, 0.0170f, 0.0170f, upper),
+        GN(-0.0246f, sight_y, 0.0900f, 0.0166f, 0.0166f, upper),
+        GN(-0.0262f, sight_y, 0.0900f, 0.0150f, 0.0150f, black),
+      });
+    // Ocular glass, recessed inside its retaining ring.
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     fig_tube(GUNP(0, sight_y, SCOPE_OCU_Z - 0.0062f),
              GUNP(0, sight_y, SCOPE_OCU_Z + 0.0018f),
-             0.0192f * gg, 0.0190f * gg, 0.0174f * gg, 0.0172f * gg,
-             20, steel, gy);   // ocular retaining ring
+             0.0193f * gg, 0.0191f * gg, 0.0172f * gg, 0.0170f * gg, 20, steel, gy);
     mat_set(MAT_GLASS_R, 0.0f);
-    GCH(20, 1, 1, gy, {  // ocular glass, recessed inside the ring
-      GN(0, sight_y, SCOPE_OCU_Z - 0.0030f, 0.0179f, 0.0177f, glass),
-      GN(0, sight_y, SCOPE_OCU_Z + 0.0024f, 0.0170f, 0.0168f, glass),
+    GCH(20, 1, 1, gy, {
+      GN(0, sight_y, SCOPE_OCU_Z - 0.0030f, 0.0168f, 0.0166f, glass),
+      GN(0, sight_y, SCOPE_OCU_Z + 0.0024f, 0.0160f, 0.0158f, glass),
     });
-    // Objective.
-    mat_set(MAT_STEEL_R, MAT_STEEL_M);
-    fig_tube(GUNP(0, sight_y, 0.1430f), GUNP(0, sight_y, 0.1545f),
-             0.0177f * gg, 0.0175f * gg, 0.0128f * gg, 0.0126f * gg, 20, steel, gy);  // retaining ring
+    // ...and the objective, which is the one lens anyone else ever sees.
+    mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
+    fig_tube(GUNP(0, sight_y, 0.3080f), GUNP(0, sight_y, 0.3160f),
+             0.0256f * gg, 0.0254f * gg, 0.0212f * gg, 0.0210f * gg, 20, steel, gy);
     mat_set(MAT_GLASS_R, 0.0f);
-    GCH(20, 1, 1, gy, {  // objective glass, recessed inside the ring
-      GN(0, sight_y, 0.1462f, 0.0116f, 0.0114f, lens),
-      GN(0, sight_y, 0.1516f, 0.0111f, 0.0109f, lens),
+    GCH(20, 1, 1, gy, {
+      GN(0, sight_y, 0.3096f, 0.0202f, 0.0200f, lens),
+      GN(0, sight_y, 0.3148f, 0.0194f, 0.0192f, lens),
     });
-    mat_set(MAT_PARK_R * 0.8f, MAT_PARK_M);
-    GCH(20, 1, 1, gz, {  // rear ring
-      GN(0, sight_y, 0.030f, 0.0160f, 0.0157f, black),
-      GN(0, sight_y, 0.042f, 0.0156f, 0.0159f, black),
+    // ---- the mount: ONE machined unit, not two wires --------------------------
+    // Rail-top to tube-centre is 46 mm here, which is a night-vision-height mount; two
+    // 45 mm posts under a scope tube read as stilts, and that is what they were. A bar,
+    // two towers, two rings and two caps make the same height read as MASS.
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    GBOX(0, 0.0436f, 0.0780f, 0.0128f, 0.0064f, 0.0680f, alloy);  // rail-clamp bar
+    GBOX(0, 0.0592f, 0.0320f, 0.0122f, 0.0110f, 0.0122f, alloy);  // rear tower
+    GBOX(0, 0.0592f, 0.1360f, 0.0122f, 0.0110f, 0.0122f, alloy);  // front tower
+    GCH(20, 1, 1, gy, {   // rear ring
+      GN(0, sight_y, 0.0210f, 0.0186f, 0.0186f, alloy),
+      GN(0, sight_y, 0.0430f, 0.0186f, 0.0186f, alloy),
     });
-    GCH(20, 1, 1, gz, {  // front ring
-      GN(0, sight_y, 0.076f, 0.0161f, 0.0156f, black),
-      GN(0, sight_y, 0.088f, 0.0155f, 0.0158f, black),
+    GCH(20, 1, 1, gy, {   // front ring
+      GN(0, sight_y, 0.1250f, 0.0186f, 0.0186f, alloy),
+      GN(0, sight_y, 0.1470f, 0.0186f, 0.0186f, alloy),
     });
-    GBOX(0, sight_y - 0.0295f, 0.036f, 0.0058f, 0.0225f, 0.0050f, black); // rear post
-    GBOX(0, sight_y - 0.0295f, 0.082f, 0.0054f, 0.0225f, 0.0046f, black); // front post
-    GBOX(0, sight_y - 0.0475f, 0.059f, 0.0072f, 0.0052f, 0.0295f, upper); // mount base
+    GBOX(0, 0.1002f, 0.0320f, 0.0132f, 0.0048f, 0.0128f, alloy);  // rear ring cap
+    GBOX(0, 0.1002f, 0.1360f, 0.0132f, 0.0048f, 0.0128f, alloy);  // front ring cap
+    if (g_gun_hero) {   // the eight ring screws
+      mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
+      for (int r = 0; r < 2; r++)
+        for (int q = 0; q < 4; q++)
+          GBOX((q & 1) ? 0.0092f : -0.0092f, 0.1046f,
+               (r ? 0.1360f : 0.0320f) + ((q & 2) ? 0.0074f : -0.0074f),
+               0.0024f, 0.0018f, 0.0024f, steel);
+    }
   }
   muzzle = GUNP(GUN_MUZ[cur][0], GUN_MUZ[cur][1], GUN_MUZ[cur][2]);
   #undef GN
@@ -20136,6 +20916,37 @@ static uint32_t fx_hash(uint32_t x) {
   return x;
 }
 
+// THE RED DOT IS ADDITIVE GEOMETRY, NOT A PART, and that is what keeps it clear of
+// every proof in this file: figcheck/vmcheck/vmtrig analyse the SCENE mesh, and a
+// camera-facing quad in the glow submission is not in it. It is also the only way to
+// get a value above the tonemap's shoulder out of a 3 mm object, which no albedo can —
+// the sight pane is authored at 0.045 display precisely because a coated lens is dark,
+// and a dark lens with a dark dot in it is a sight with nothing in it.
+//
+// TWO CROSSED BARS, not one quad: fx_seg builds a hard-edged rectangle (the trap
+// fx_dust's motes are already written up for), and a rectangular red dot is a sticker.
+// Crossed and tapered, the pair reads as a point with a bloom around it.
+//
+// The EYE it spans its quads against is the PROJECTION's, not the player's. Under
+// vmorbit those are different, and the player's eye builds the quads edge-on in exactly
+// the shots that exist to photograph the dot.
+static void fx_sight_dot(v3 pos, v3 rt, v3 up, v3 eye, float r, float gain) {
+  v3 hot = v3_scale((v3){{3.20f, 0.34f, 0.18f}}, gain);
+  v3 dim = v3_scale((v3){{0.62f, 0.045f, 0.02f}}, gain);
+  // The HALO first: two crossed bars, faint and wide, which is the bloom a real emitter
+  // throws into the coating rather than the emitter itself.
+  fx_seg(v3_sub(pos, v3_scale(rt, r * 2.2f)), v3_add(pos, v3_scale(rt, r * 2.2f)),
+         eye, r * 0.20f, r * 0.20f, dim, dim);
+  fx_seg(v3_sub(pos, v3_scale(up, r * 2.2f)), v3_add(pos, v3_scale(up, r * 2.2f)),
+         eye, r * 0.20f, r * 0.20f, dim, dim);
+  // ...then the core, short and fat, so the centre reads as a POINT and the bars are
+  // only its glow. Crossed rather than single: fx_seg draws a hard-edged rectangle.
+  fx_seg(v3_sub(pos, v3_scale(rt, r * 0.42f)), v3_add(pos, v3_scale(rt, r * 0.42f)),
+         eye, r * 0.62f, r * 0.62f, hot, hot);
+  fx_seg(v3_sub(pos, v3_scale(up, r * 0.42f)), v3_add(pos, v3_scale(up, r * 0.42f)),
+         eye, r * 0.62f, r * 0.62f, hot, hot);
+}
+
 // One muzzle-flash star: irregular tapered petals around the bore, a hot core and a
 // forward tongue along it. t1/t2 span the petal plane (perpendicular to the bore), s
 // scales the whole star in metres and f is the 1->0 life fade.
@@ -20686,7 +21497,11 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   // BROKEN EDGES, FIRST PERSON ONLY, and that is an LOD decision of exactly the same
   // kind as g_fig_k above it rather than a second weapon model.
   g_cham = 0.0007f;
+  g_cham_polish = 1;   // ...and this arris was broken by a machine — see cham_arris
+  g_gun_hero = 1;      // ...and this is the one view that can resolve a 4.7 mm land
   g_vm_muzzle = gun_build(cur, org, gx, gy, gz, mdrop, trig, ga_.bolt);
+  g_gun_hero = 0;
+  g_cham_polish = 0;
   g_cham = 0.0f;
   // The tracer re-anchor publish does NOT happen here: vm_build is also the
   // engine of the harness probes (vmcheck/vmsight/vmhand), which build forced
@@ -21755,6 +22570,9 @@ static void render_frame(const player_t *p, float alpha, int fps,
       g_vm_muz_cam = (v3){{v3_dot(mc, rgt), v3_dot(mc, upv), v3_dot(mc, fwd)}};
       g_vm_muz_tick = g_tick;
     }
+    // The eye the glow submission spans its quads against: the PROJECTION's, which
+    // under vmorbit is not the player's. See fx_sight_dot.
+    v3 veye = eye;
     if (g_vmorb.on) {
       // Re-aim the projection at one hand, keeping the pose that was just built.
       v3 of, orr, ou;
@@ -21806,6 +22624,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
       // looking from.
       v3 oeye = v3_sub(piv, v3_scale(of, g_vmorb.dist));
       glUniform3f(R.u_eye, oeye.x, oeye.y, oeye.z);
+      veye = oeye;   // ...and the glow submission below spans its quads against it
     }
     // The weapon's own frame, uploaded AFTER vm_build so it describes the pose
     // that was just emitted rather than the previous frame's.
@@ -21818,19 +22637,38 @@ static void render_frame(const player_t *p, float alpha, int fps,
     // not inherit the orbit's eye; the next world draw sets it from the camera.
     glUniform3f(R.u_eye, eye.x, eye.y, eye.z);
     glUniform3f(R.u_muzc, 0.0f, 0.0f, 0.0f);
-    if ((g_muzzle_t > 0 || mfresh) && !g_vmorb.on) {
-      // The same star the world pass gives every other shooter, on the drawn barrel tip
-      // in the viewmodel's own projection.
-      scene_reset();
-      float mf01 = mfresh ? 1.0f : (float)g_muzzle_t / 3.0f;
-      g_muzzle_fresh = 0;
-      float fs = 1.0f - 0.55f * ads;
-      fx_flash(g_vm_muzzle, fwd, rgt, upv, eye,
-               0.11f * fs * (0.55f + 0.45f * mf01), mf01,
-               (uint32_t)p->wp.idx * 61u + 17u);
-      fx_pass_begin();
-      scene_draw();
-      fx_pass_end();
+    // ONE ADDITIVE SUBMISSION FOR THE WHOLE VIEWMODEL, and it now runs on every frame
+    // the AR is up rather than only on the three frames after a shot: the red dot lives
+    // in it. Depth TEST is still on (only the write is off), so the sight's own housing
+    // occludes the dot as the weapon turns away, which is what makes it read as a thing
+    // inside the tube rather than a decal on the screen.
+    {
+      int shot_fx = (g_muzzle_t > 0 || mfresh) && !g_vmorb.on;
+      int dot_fx  = p->wp.idx == WPN_AR;
+      if (shot_fx || dot_fx) {
+        scene_reset();
+        if (dot_fx) {
+          // 1.4 mm, on the aperture plane g_gun_sight_p publishes — one copy, so the
+          // dot cannot drift from the window the geometry actually draws. The gain
+          // rides the ADS blend: a sight the player is not looking through does not
+          // need to be the brightest thing on the screen, and at the hip it would be.
+          fx_sight_dot(g_gun_sight_p, g_vm_mdl_x, g_vm_mdl_y, veye,
+                       0.0021f, 0.62f + 0.38f * ads);
+        }
+        if (shot_fx) {
+          // The same star the world pass gives every other shooter, on the drawn barrel
+          // tip in the viewmodel's own projection.
+          float mf01 = mfresh ? 1.0f : (float)g_muzzle_t / 3.0f;
+          g_muzzle_fresh = 0;
+          float fs = 1.0f - 0.55f * ads;
+          fx_flash(g_vm_muzzle, fwd, rgt, upv, eye,
+                   0.11f * fs * (0.55f + 0.45f * mf01), mf01,
+                   (uint32_t)p->wp.idx * 61u + 17u);
+        }
+        fx_pass_begin();
+        scene_draw();
+        fx_pass_end();
+      }
     }
   }
 
@@ -23743,6 +24581,9 @@ static void usage(void) {
        "  vmhand             wrist bend / forearm-to-bore / palm length, per hand\n"
        "  vmorbit YAW PIT D W  viewmodel turntable, deg+m, W=0 trigger wrist\n"
        "                     1 support wrist  2 both  3 the trigger blade\n"
+       "  vmbore YAW PIT D BORE RISE FOV  the same turntable pivoted ON THE\n"
+       "                     BORE (gun-local metres along it and off it) with a\n"
+       "                     real lens: the macro instrument for weapon detail\n"
        "  camaim Y           height on the bot that cambot looks at (default 0.9)\n"
        "machine-checked proofs (each must read 0 / ok):\n"
        "  figcheck N [DIST]  bot 0 figure over N ticks: open/flip/dup/zfight/\n"
@@ -28171,6 +29012,24 @@ static void run_script(char *script, sim_ctx_t *s) {
         exit(1);
       }
       g_vmorb.which = wsel;
+    } else if (!strcmp(t, "vmbore")) {
+      // THE SAME TURNTABLE, PIVOTED ON THE BORE instead of on a wrist — the macro
+      // lens HOME's close-ups already use (`home_shot_t`'s piv_on/bore/rise/fov),
+      // exposed to a script. `vmorbit` pivots on a HAND, so nothing forward of the
+      // support hand can be framed: the AR's muzzle is 190 mm past that wrist and
+      // leaves the frame before the lens is close enough to read a chamfer. Every
+      // detail argument in this pass was settled through this command.
+      g_vmorb.on = 1;
+      g_vmorb.which = 2;
+      g_vmorb.piv_on = 1;
+      g_vmorb.comp = 0.0f;
+      g_vmorb.yaw = next_f() * DEG2RAD;
+      g_vmorb.pit = next_f() * DEG2RAD;
+      g_vmorb.dist = next_f();
+      g_vmorb.bore = next_f();    // station ALONG the bore, gun-local metres
+      g_vmorb.rise = next_f();    // ...and off it, along the weapon's own up
+      float bfov = next_f();
+      g_vmorb.fov = bfov > 1.0f ? bfov : 24.0f;
     } else if (!strcmp(t, "camaim")) {
       s->cam.blook = next_f();  // cambot look height (default .9)
     } else if (!strcmp(t, "cambot")) {
