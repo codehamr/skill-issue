@@ -438,8 +438,8 @@ static const param_def_t MV_DEF[MV_COUNT] = {
 typedef enum { WPN_AR, WPN_SR, WPN_COUNT } wpn_id_t;
 
 typedef enum {
-  WP_RPM, WP_KICK_UP, WP_KICK_SIDE, WP_RECOVER_MS, WP_SPREAD, WP_BLOOM,
-  WP_ADS_MS, WP_ADS_ZOOM, WP_PUNCH, WP_SWAY, WP_COUNT
+  WP_RPM, WP_KICK_UP, WP_KICK_SIDE, WP_RECOVER_MS, WP_HIP_SPREAD, WP_SPREAD,
+  WP_BLOOM, WP_ADS_MS, WP_ADS_ZOOM, WP_PUNCH, WP_SWAY, WP_COUNT
 } wp_param_t;
 
 // `def` is deliberately 0: defaults are PER-WEAPON, in WP_DEFAULTS, the one
@@ -449,6 +449,10 @@ static const param_def_t WP_DEF[WP_COUNT] = {
   [WP_KICK_UP]    = {"kick_up",    "KICK UP",    0,   0.0f,    3.0f,  0.05f},
   [WP_KICK_SIDE]  = {"kick_side",  "KICK SIDE",  0,   0.0f,    1.0f,  0.05f},
   [WP_RECOVER_MS] = {"recover_ms", "RECOVERY",   0,  50.0f,  800.0f, 10.0f},
+  // Promoted from wpn_def_t.hip_spread on 2026-08-25: the DEV page had an ADS
+  // spread slider and no hip one, on a pair of weapons whose entire hip/ADS
+  // trade lives in this number.
+  [WP_HIP_SPREAD] = {"hip_spread", "HIP SPREAD", 0,   0.0f,    4.0f,  0.05f},
   [WP_SPREAD]     = {"spread",     "ADS SPREAD", 0,   0.0f,    0.5f,  0.01f},
   [WP_BLOOM]      = {"bloom",      "BLOOM/SHOT", 0,   0.0f,    0.4f,  0.01f},
   [WP_ADS_MS]     = {"ads_ms",     "ADS TIME",   0,  80.0f,  500.0f, 10.0f},
@@ -459,11 +463,13 @@ static const param_def_t WP_DEF[WP_COUNT] = {
 
 // The AR is a controllable full-auto laser, the sniper a violent single shot.
 static const float WP_DEFAULTS[WPN_COUNT][WP_COUNT] = {
-  [WPN_AR] = {750, 0.25f, 0.15f, 200, 0.05f, 0.05f, 180, 80, 0.50f, 1.0f},
+  [WPN_AR] = {750, 0.25f, 0.15f, 200, 0.12f, 0.05f, 0.05f, 180, 80, 0.50f, 1.0f},
   // ads_zoom 80 not 100: the scope's PiP pass owns the magnification; 80 only
   // sells the transition. rpm caps the semi-auto trigger interval at 60 ms; it
   // is not a fire rate (fire mode is structural, in WPN_DEF).
-  [WPN_SR] = {1000, 1.80f, 0.20f, 500, 0.03f, 0.03f, 200, 80, 1.00f, 1.0f},
+  // hip_spread 3.00: a scoped bolt gun fired from the hip is a coin toss, and
+  // that is the design, now as a slider instead of a struct field.
+  [WPN_SR] = {1000, 1.80f, 0.20f, 500, 3.00f, 0.03f, 0.03f, 200, 80, 1.00f, 1.0f},
 };
 
 // Structural weapon identity — not sliders: these change WHAT the weapon is.
@@ -474,7 +480,8 @@ typedef struct {
   // bolt gun works its action either way, so the sniper's two are identical.
   int   reload_tac_ticks;
   int   full_auto;      // 0 = one shot per trigger press (bolt/semi)
-  float hip_spread;     // deg added at ads 0, fading out toward full ADS
+  // hip_spread left this struct for WP_HIP_SPREAD: it is a FEEL number the DEV
+  // page tunes, not structural identity.
   int   sfx_fire;       // which synth buffer a shot triggers
   int   sfx_reload;     // ...and which reload; a bolt gun does not change a mag
   float sfx_hit_t;      // s to delay the hit/kill confirmation by: it must clear
@@ -504,9 +511,9 @@ enum {
 };
 
 static const wpn_def_t WPN_DEF[WPN_COUNT] = {
-  [WPN_AR] = {"AR",     "ar", 30,  26, 2, 152, 124, 1, 0.12f, SFX_FIRE_AR,
+  [WPN_AR] = {"AR",     "ar", 30,  26, 2, 152, 124, 1, SFX_FIRE_AR,
               SFX_RELOAD_AR, 0.045f, 900.0f},
-  [WPN_SR] = {"SNIPER", "sr",  5, 150, 2, 214, 214, 0, 3.00f, SFX_FIRE_SR,
+  [WPN_SR] = {"SNIPER", "sr",  5, 150, 2, 214, 214, 0, SFX_FIRE_SR,
               SFX_RELOAD_SR, 0.130f, 840.0f},
 };
 
@@ -4375,7 +4382,9 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 // PROTO is byte 0-1 of EVERY packet, hand-bumped on any wire change.
-#define NET_PROTO 8
+// 9: WP_HIP_SPREAD joined the wp table ACCEPT carries (hip spread became a sim
+// tunable; it was a wpn_def_t constant).
+#define NET_PROTO 9
 // Floor on an UNVERIFIED request, so the answer to one is always smaller than the
 // request was and the responder cannot be pointed at a forged source address:
 // NET_CONNECT_MIN 16 against the 7-byte COOKIE reply.
@@ -8132,7 +8141,8 @@ static float gun_spread(const weapon_t *w, v3 vel, int grounded) {
   float hs = sqrtf(vel.x * vel.x + vel.z * vel.z);
   // ADS spread is the tuned base; the structural hip penalty fades out as
   // the sight comes up. Movement and air penalties on top.
-  float s = g_sim_wp[w->cur][WP_SPREAD] + WPN_DEF[w->cur].hip_spread * (1.0f - w->ads_s)
+  float s = g_sim_wp[w->cur][WP_SPREAD]
+          + g_sim_wp[w->cur][WP_HIP_SPREAD] * (1.0f - w->ads_s)
           + w->bloom + GUN_MOVE_SPREAD * f_clamp(hs / g_sim_mv[MV_RUN], 0.0f, 1.5f);
   if (!grounded) s *= GUN_AIR_SPREAD;
   return s < 6.0f ? s : 6.0f;
@@ -15175,18 +15185,23 @@ static void ui_menu(void) {
     ui_subsel(wopts, WPN_COUNT, &g_ui_wpn, px, pw, y, click, cx, cy);
     y += 18;
 
+    // VIEW PUNCH and BLOOM/SHOT keep their config keys and their mechanics but
+    // lost their rows (2026-08-25): the punch is a camera-feel constant the
+    // unified player-model pass settled, and per-shot bloom is spray identity —
+    // neither is a knob anyone turned twice. What was missing was HIP SPREAD:
+    // the page offered ADS spread on a pair of weapons whose whole hip/ADS
+    // trade is the hip number.
     ui_section("RECOIL", px, pw, y);
     y += 14;
     y = ui_wp_row(WP_KICK_UP, px, y, click, cx, cy);
     y = ui_wp_row(WP_KICK_SIDE, px, y, click, cx, cy);
     y = ui_wp_row(WP_RECOVER_MS, px, y, click, cx, cy);
-    y = ui_wp_row(WP_PUNCH, px, y, click, cx, cy);
 
     y += 4;
     ui_section("SPREAD", px, pw, y);
     y += 14;
+    y = ui_wp_row(WP_HIP_SPREAD, px, y, click, cx, cy);
     y = ui_wp_row(WP_SPREAD, px, y, click, cx, cy);
-    y = ui_wp_row(WP_BLOOM, px, y, click, cx, cy);
 
     y += 4;
     // SWAY rides in HANDLING rather than its own one-row FEEL section: the
