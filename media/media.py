@@ -752,14 +752,27 @@ def die(msg):
 #            aim is a fixed `aim` at PIVOT's head: aimbot snaps to the
 #            NEAREST bot, the wrong one at long range.
 STILLS = {
-    "fight.png": (20348, "bots 12; skill hard; fraglimit 1000; wait 1400; "
+    # Re-staged 2026-08-25 after the map-gen v2 seed break re-rolled every
+    # arena: the old seeds/coords photographed the ELIMINATED screen (fight)
+    # and a wall one metre past the muzzle (scope). Both recipes aim by
+    # AIMBOT now, never by fixed world coordinates — a layout change then
+    # re-frames instead of breaking. Seeds were scanned for "player alive at
+    # the freeze + a bot 8-16 m down the muzzle" (php>0 in `match`, bang d=).
+    # 20350: grit QUARRY + collapse signature — tracer to a hit-lit bot who
+    # is aiming BACK, three more behind, a corpse and brick spill in frame.
+    "fight.png": (20350, "bots 12; skill hard; fraglimit 1000; wait 1400; "
                   "botfreeze on; wait 4; weapon ar; sun 7 -75; aimbot; "
                   "shot {tmp}; +fire; wait 1; shot {tmp}; wait 1; "
                   "shot media/fight.png"),
-    "scope.png": (80468, "bots 12; skill hard; fraglimit 1000; wait 1350; "
-                  "botfreeze on; wait 4; weapon sr; sun 14 -55; "
-                  "aim 18.76 1.58 15.70; +ads; wait 130; +fire; wait 1; "
-                  "look 0 90; shot media/scope.png"),
+    # 31337: grit SWEPT — the second aimbot AFTER the ADS ramp re-centres
+    # the scope on the head; the frame lands two ticks after the trigger,
+    # impact star on the target in the glass, the kill already atop the
+    # killfeed, casing in the air. The warm shots stay: the tracer needs a
+    # RENDERED frame before the trigger or it anchors at the 3P muzzle.
+    "scope.png": (31337, "bots 12; skill hard; fraglimit 1000; wait 1350; "
+                  "botfreeze on; wait 4; weapon sr; sun 14 -55; aimbot; "
+                  "+ads; wait 130; aimbot; shot {tmp}; +fire; wait 1; "
+                  "shot {tmp}; wait 1; shot media/scope.png"),
 }
 
 

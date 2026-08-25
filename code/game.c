@@ -1871,147 +1871,6 @@ static v3 col_tint(v3 c, float lo, float hi) {
   return (v3){{c.x * t, c.y * t, c.z * t}};
 }
 
-// --- A LONG WALL IS NOT ONE BOX --------------------------------------------
-// At twenty metres the only thing that reads about a wall is its top line against the
-// sky, and eight identical horizontal lines is what makes a procedural arena look
-// authored by a for-loop.
-//
-// THE DAMAGE IS REAL GEOMETRY, NOT A DECAL: `g_solids` is the collision set AND the
-// render mesh, so a chip that exists only in the picture is cover that is not there and
-// a death nobody can explain. Every piece below is a solid.
-//
-// The pieces ABUT EXACTLY rather than overlapping: two collinear boxes that overlap
-// share BOTH long side planes and `mapcheck` counts that as the z-fighting it is, while
-// at zero overlap every pair falls out of its area test and one of the two coincident
-// faces is always culled.
-//
-// Only about a third of the walls are damaged — if every wall is broken then none of
-// them is, and the break stops reading as something that HAPPENED.
-static void wall_piece(v3 mn, v3 mx, int ax, float a, float b,
-                       float y0, float y1, v3 col) {
-  v3 p0 = mn, p1 = mx;
-  if (ax) { p0.x = a; p1.x = b; } else { p0.z = a; p1.z = b; }
-  p0.y = y0; p1.y = y1;
-  map_add_sym(p0, p1, col);
-}
-
-// Rubble at the foot of a break.
-static void wall_rubble(v3 mn, v3 mx, int ax, float at, float dir, int count,
-                        float hcap, v3 col) {
-  float H = ARENA_HALF;
-  float cz = ax ? (mn.z + mx.z) * 0.5f : (mn.x + mx.x) * 0.5f;
-  for (int k = 0; k < count; k++) {
-    // THIS COLLISION HAS NO STEP-UP. move_axis is a per-axis AABB sweep and nothing in
-    // the file auto-climbs: a 0.25 m block is not a kerb you walk over, it is a wall
-    // you have to JUMP, and a scatter of them in open ground is the clutter that gets
-    // removed from competitive maps for exactly that reason.
-    float rw = rng_range(0.22f, 0.34f), rd = rng_range(0.22f, 0.30f);
-    // Capped by whatever it fell OFF. A rubble block taller than the stub it sits under
-    // is not a collapse, it is a second wall — and on the low height class (a 1.0 m
-    // wall breaks to a 0.4 m stub) an uncapped 0.62 would be exactly that.
-    float rh = rng_range(0.34f, 0.58f);
-    if (rh > hcap) rh = hcap;
-    if (rh < 0.18f) continue;
-    float side = rng_range(-0.06f, 0.06f);
-    // Slots along the run, spaced wider than two blocks can ever be. dir 0 is the
-    // breach, whose spill sits in front of the hole rather than beyond an end, so its
-    // blocks step sideways from the centre instead. ...AND IT SITS ON THE WALL'S OWN
-    // LINE, immediately at the break, rather than being thrown clear of it.
-    float slot = dir != 0.0f ? dir * (0.30f + rw + 0.34f * (float)k)
-                             : ((float)k - 0.5f * (float)(count - 1)) * 0.86f;
-    v3 p0, p1;
-    if (ax) {
-      p0 = (v3){{at + slot - rw, 0.0f, cz + side - rd}};
-      p1 = (v3){{at + slot + rw, rh,   cz + side + rd}};
-    } else {
-      p0 = (v3){{cz + side - rd, 0.0f, at + slot - rw}};
-      p1 = (v3){{cz + side + rd, rh,   at + slot + rw}};
-    }
-    // The same corridor bound the step crates get: the RING_W lane is documented
-    // cover-free, and a knee-high block a bullet stops is still cover.
-    if (p0.x < -(H - RING_W) || p0.z < -(H - RING_W) ||
-        p1.x > H - RING_W || p1.z > H - RING_W) continue;
-    if (!map_sym_free(p0, p1, 0.012f)) continue;
-    map_add_sym(p0, p1, col_tint(col, 0.84f, 0.96f));
-  }
-}
-
-static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
-  float lo = ax ? mn.x : mn.z, hi = ax ? mx.x : mx.z;
-  float len = hi - lo, h = mx.y;
-  uint32_t roll = rng_u32();
-  // A short wall has no room for a story, and a LOW wall has no room for a hole
-  // with material above and below it.
-  int kind = (len >= 3.2f && (roll % 3u) == 0u) ? (int)((roll >> 5) % 3u) : -1;
-  if (kind == 1 && h < 1.8f) kind = 2;
-  switch (kind) {
-  case 0: {  // BROKEN END: the last stretch has come down to a climbable stub
-    float bl = rng_range(0.9f, 1.6f);
-    // A FRACTION of the wall, never an absolute height.
-    float hs = h * rng_range(0.34f, 0.52f);
-    // NOT `far`. windef.h defines `far` and `near` as macros, so a local of
-    // either name compiles clean on gcc and fails only the Windows build.
-    int hi_end = (int)((roll >> 9) & 1u);
-    float cut = hi_end ? hi - bl : lo + bl;
-    if (hi_end) {
-      wall_piece(mn, mx, ax, lo, cut, 0.0f, h, col);
-      wall_piece(mn, mx, ax, cut, hi, 0.0f, hs, col);
-      wall_rubble(mn, mx, ax, hi, 1.0f, 1, hs * 0.82f, col);
-    } else {
-      wall_piece(mn, mx, ax, lo, cut, 0.0f, hs, col);
-      wall_piece(mn, mx, ax, cut, hi, 0.0f, h, col);
-      wall_rubble(mn, mx, ax, lo, -1.0f, 1, hs * 0.82f, col);
-    }
-  } break;
-  case 1: {  // BREACH: material above and below, nothing between. A real hole.
-    float bw = rng_range(0.85f, 1.45f);
-    float mid = rng_range(lo + bw * 0.6f + 0.5f, hi - bw * 0.6f - 0.5f);
-    float a = mid - bw * 0.5f, b = mid + bw * 0.5f;
-    // The SILL is a ledge you can mount and the LINTEL leaves a port you can fire
-    // through standing or crouched.
-    float y0 = rng_range(0.72f, 0.94f);
-    float y1 = y0 + rng_range(0.62f, 0.86f);
-    if (y1 > h - 0.28f) y1 = h - 0.28f;
-    if (y1 - y0 < 0.35f) { y0 = h * 0.34f; y1 = h * 0.72f; }
-    wall_piece(mn, mx, ax, lo, a, 0.0f, h, col);
-    // THE HOLE IS RAGGED, and it is ragged in the collision set as well as in the
-    // picture.
-    int cols = 2 + (int)((roll >> 13) & 1u);
-    for (int c = 0; c < cols; c++) {
-      float ca = a + (b - a) * (float)c / (float)cols;
-      float cb = a + (b - a) * (float)(c + 1) / (float)cols;
-      float jy0 = y0 * rng_range(0.80f, 1.14f);
-      float jy1 = y1 + (h - y1) * rng_range(-0.42f, 0.34f);
-      if (jy1 > h - 0.14f) jy1 = h - 0.14f;
-      if (jy1 - jy0 < 0.30f) jy1 = jy0 + 0.30f;
-      if (jy1 > h - 0.14f) { jy1 = h - 0.14f; jy0 = jy1 - 0.30f; }
-      // THE LINTEL MAY NOT LAND ON THE EYE — the curated-wall-height rule one boundary
-      // out.
-      if (jy1 > 1.48f && jy1 < 1.78f)
-        jy1 = (h - 0.14f >= 1.82f && ((roll >> 17) & 1u)) ? 1.82f : 1.44f;
-      if (jy1 - jy0 < 0.30f) jy0 = jy1 - 0.30f;
-      if (jy0 < 0.34f) jy0 = 0.34f;
-      if (jy1 - jy0 < 0.30f) jy1 = jy0 + 0.30f;
-      wall_piece(mn, mx, ax, ca, cb, 0.0f, jy0, col);
-      wall_piece(mn, mx, ax, ca, cb, jy1, h, col);
-    }
-    wall_piece(mn, mx, ax, b, hi, 0.0f, h, col);
-    wall_rubble(mn, mx, ax, mid, 0.0f, 1, y0 * 0.72f, col);
-  } break;
-  case 2: {  // STEPPED TOP: one section has come down to a lower course
-    float cut = rng_range(lo + 1.1f, hi - 1.1f);
-    // The drop must clear the height bands the arena curates: a top that lands between
-    // them is the awkward in-between the whole height table exists to avoid, so the low
-    // course is a fixed FRACTION of the wall rather than a free draw.
-    float hs = h * rng_range(0.46f, 0.62f);
-    int hi_end = (int)((roll >> 9) & 1u);   // see the note on `far` above
-    wall_piece(mn, mx, ax, lo, cut, 0.0f, hi_end ? h : hs, col);
-    wall_piece(mn, mx, ax, cut, hi, 0.0f, hi_end ? hs : h, col);
-    wall_rubble(mn, mx, ax, cut, hi_end ? 1.0f : -1.0f, 1, hs * 0.82f, col);
-  } break;
-  default: map_add_sym(mn, mx, col); break;
-  }
-}
 
 // Curated arena themes — light, high-value surfaces so the dark bot silhouettes always
 // pop; muted accents, one saturated landmark colour.
@@ -2180,6 +2039,379 @@ static void sun_set(float elev_deg, float azi_rad) {
   S->sh_centre = (v3){{-dh.x * smear * 0.5f, 1.6f, -dh.z * smear * 0.5f}};
 }
 
+// THE MOOD IS MAP STATE, the sun's and the wind's sibling: three latents in
+// [0,1] that the generator and the scatter pass read so their features move
+// TOGETHER (a ruined arena has more damaged walls AND more rubble AND more
+// brick spill — one number, many readers, or the correlations that make a
+// place read as one place cannot exist). Hashed off the seed, never drawn
+// from g_rng, for the wind's reason: a draw here would re-roll every
+// recorded layout — although the mood DOES feed probabilities inside the
+// generator's own g_rng consumption, which is why introducing it was the
+// one deliberate seed break of the 2026-08-25 layout window.
+//
+// DISCRETE PRESETS ON TOP, JITTER BELOW: three named moods per theme, each a
+// latent triple plus one LOUD LEVER (the construction that names the mood
+// from a single frame). A free latent draw gives every seed the same beige
+// average; presets are what make a seed a nameable place while every seed
+// stays one game. The latents jitter ±0.15 off two more hash lanes;
+// ELIGIBILITY decisions (signatures) read the DISCRETE preset, pre-jitter,
+// so a jittered latent crossing a threshold can never flip a signature on.
+typedef struct { float ruin, growth, strew; } mood_t;
+typedef struct { const char *name; mood_t m; } mood_def_t;
+// Indexed [surf][preset] — surf is the theme's own enum (GRIT/WET/SAND).
+static const mood_def_t MOOD_DEF[3][3] = {
+  {{"QUARRY",     {0.70f, 0.10f, 0.70f}},   // heavy damage, talus, brick spill
+   {"SWEPT",      {0.15f, 0.20f, 0.25f}},   // near-empty: the minimalist mood
+   {"STEPPE",     {0.25f, 0.65f, 0.35f}}},  // straw tuft bands along the walls
+  {{"DOWNPOUR",   {0.35f, 0.00f, 0.45f}},   // max water + waterline bands
+   {"DRAINED",    {0.50f, 0.00f, 0.65f}},   // scree fans, water pulled low
+   {"MOSSTONE",   {0.30f, 0.15f, 0.50f}}},  // moss on cobble and wall base
+  {{"BURIED",     {0.55f, 0.10f, 0.35f}},   // oversized drifts, half-sunk reads
+   {"STONEFIELD", {0.25f, 0.15f, 0.80f}},   // ventifact clusters + pavement
+   {"THORNS",     {0.20f, 0.75f, 0.40f}}},  // grass + low cactus; the tree
+};
+static mood_t g_mood = {0.5f, 0.5f, 0.5f};
+static int    g_mood_preset;   // discrete row, 0..2 within the theme
+static mood_t g_mood_forced;
+static int    g_mood_force;          // 1 = latents forced (preset stays)
+static int    g_mood_force_preset = -1;   // >= 0 = preset index forced
+// Needs the THEME, so it runs after the theme draw — the preset table is
+// per-theme and the theme is deliberately still the first g_rng draw (the
+// same seed keeps its theme across the layout break).
+static void mood_build(uint32_t seed, int surf) {
+  uint32_t h = seed * 2654435761u + 0x300Du;
+  h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+  int preset = (int)(h % 3u);
+  if (g_mood_force_preset >= 0) preset = g_mood_force_preset;
+  g_mood_preset = preset;
+  mood_t m = MOOD_DEF[surf][preset].m;
+  uint32_t h2 = h * 2246822519u + 1u;
+  h2 ^= h2 >> 13; h2 *= 3266489917u; h2 ^= h2 >> 16;
+  uint32_t h3 = h2 * 2654435761u + 0x9E37u;
+  h3 ^= h3 >> 15; h3 *= 2246822519u; h3 ^= h3 >> 13;
+  float j1 = ((float)(h2 >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.30f;
+  float j2 = ((float)(h3 >> 8) * (1.0f / 16777216.0f) - 0.5f) * 0.30f;
+  m.ruin   = f_clamp(m.ruin + j1, 0.0f, 1.0f);
+  m.growth = f_clamp(m.growth + j2, 0.0f, 1.0f);
+  m.strew  = f_clamp(m.strew + (j1 - j2) * 0.5f, 0.0f, 1.0f);
+  if (g_mood_force_preset >= 0) m = MOOD_DEF[surf][preset].m;  // exact, reviewable
+  g_mood = g_mood_force ? g_mood_forced : m;
+}
+
+// --- the layout -> dressing data channel -----------------------------------
+// Everything the generator decides that a LATER pass consumes: the mood
+// preset, the signature, the damage edges the brick/stain dressing attaches
+// to, and where the special solids sit. Re-deriving any of this from
+// g_solids is guesswork; the struct is the contract. Canonical-half data —
+// the dressing passes mint the 180-degree twins themselves.
+typedef enum {
+  SIG_NONE = 0,
+  SIG_TREE,      // a twinned pair of dead trees: solid trunks, casting crowns
+  SIG_COLLAPSE,  // one long wall fully down to a jumpable stub + brick field
+  SIG_BOULDERS,  // a twinned pair of ~1.1 m boulders: solids, chamfered render
+  SIG_FALLEN,    // the monolith toppled: a lying slab + shattered-tip rubble
+  SIG_SPLIT      // the split wall: two depth-offset columns, an advertised
+                 // oblique sight corridor (see its gates at the build site)
+} mapsig_t;      // NOT sig_t: signal.h owns that name
+// [[maybe_unused]] for upd_status_line's reason: the only reader is the
+// harness `map` print, which is Linux-only.
+[[maybe_unused]] static const char *SIG_NAME[] = {
+  "none", "tree", "collapse", "boulders", "fallen", "split"};
+typedef enum { ME_FOOT = 0, ME_SILL, ME_TOP } medge_kind_t;
+typedef struct { v3 a, b; uint8_t kind, ax; } medge_t;
+#define META_EDGE_MAX 48
+typedef struct {
+  uint8_t sig;
+  int16_t bould[2];     // solid indices of the boulder pair, else -1
+  int16_t tree[2];      // solid indices of the two trunks, else -1
+  int     nedge;
+  medge_t edge[META_EDGE_MAX];
+} map_meta_t;
+static map_meta_t g_meta;
+
+static void meta_edge(v3 a, v3 b, int kind, int ax) {
+  if (g_meta.nedge >= META_EDGE_MAX) return;   // dressing degrades, never UB
+  g_meta.edge[g_meta.nedge++] = (medge_t){a, b, (uint8_t)kind, (uint8_t)ax};
+}
+
+// THE SIGNATURE IS ONE SLOT, hash-gated off the seed with ordered rolls —
+// first hit wins, later features skip. Rarity is spent on silhouettes: a
+// signature must be nameable from the play camera, so two on one map would
+// compete and neither would read. Eligibility reads the DISCRETE preset.
+static void sig_build(uint32_t seed, int surf, int preset) {
+  memset(&g_meta, 0, sizeof g_meta);
+  g_meta.bould[0] = g_meta.bould[1] = -1;
+  g_meta.tree[0] = g_meta.tree[1] = -1;
+  uint32_t h = seed * 3266489917u + 0x51Cu;
+  h ^= h >> 15; h *= 2654435761u; h ^= h >> 13; h *= 2246822519u; h ^= h >> 16;
+  float u[5];
+  for (int i = 0; i < 5; i++) {
+    u[i] = (float)(h >> 8) * (1.0f / 16777216.0f);
+    h = h * 2654435761u + 1u; h ^= h >> 15; h *= 3266489917u; h ^= h >> 13;
+  }
+  int ruinous = (surf == SURF_GRIT && preset == 0) ||   // QUARRY
+                (surf == SURF_WET && preset == 1) ||    // DRAINED
+                (surf == SURF_SAND && preset == 0);     // BURIED
+  if ((surf != SURF_WET && preset == 2) && u[0] < 0.20f) g_meta.sig = SIG_TREE;
+  else if (ruinous && u[1] < 1.0f / 6.0f) g_meta.sig = SIG_COLLAPSE;
+  else if (((surf == SURF_SAND && preset == 1) ||
+            (surf == SURF_GRIT && preset == 0)) && u[2] < 0.22f)
+    // 0.22, not 1/6: measured over 500 seeds the slot competition pushed the
+    // pair under the ~1/30 namable floor — rarity below that is wasted.
+    g_meta.sig = SIG_BOULDERS;
+  else if (u[3] < 0.125f) g_meta.sig = SIG_FALLEN;
+  else if (ruinous && u[4] < 0.125f) g_meta.sig = SIG_SPLIT;
+  else g_meta.sig = SIG_NONE;
+}
+
+// THE ONE COPY of the lean/eye-band rule, for every horizontal edge a player
+// can shoot over or duck under. Leaning drops the eye 91 mm (1.620 -> 1.529,
+// the `lean` proof), so an edge inside the OPEN interval (1.48, 1.78) flips
+// a sightline open/shut on the lean alone with nothing on the wall saying
+// which way — the one thing leaning is for, inverted. Escapes are the two
+// curated stations: 1.82 (stand-and-shoot) where the wall has the room and
+// the coin says so, 1.44 (crouch-only) otherwise.
+static float map_eyeband(float y, float ymax, uint32_t coin) {
+  if (y > 1.48f && y < 1.78f)
+    return (ymax >= 1.82f && coin) ? 1.82f : 1.44f;
+  return y;
+}
+
+// --- A LONG WALL IS NOT ONE BOX --------------------------------------------
+// At twenty metres the only thing that reads about a wall is its top line against the
+// sky, and eight identical horizontal lines is what makes a procedural arena look
+// authored by a for-loop.
+//
+// THE DAMAGE IS REAL GEOMETRY, NOT A DECAL: `g_solids` is the collision set AND the
+// render mesh, so a chip that exists only in the picture is cover that is not there and
+// a death nobody can explain. Every piece below is a solid.
+//
+// The pieces ABUT EXACTLY rather than overlapping: two collinear boxes that overlap
+// share BOTH long side planes and `mapcheck` counts that as the z-fighting it is, while
+// at zero overlap every pair falls out of its area test and one of the two coincident
+// faces is always culled.
+//
+// HOW MANY walls are damaged is the mood's call now — P = 0.15 + 0.55*ruin —
+// because "how ruined is this place" is exactly what the ruin latent IS. At the
+// QUARRY end most walls carry a story; on a SWEPT map almost none do, and both
+// read as places rather than as settings of a slider.
+static void wall_piece(v3 mn, v3 mx, int ax, float a, float b,
+                       float y0, float y1, v3 col) {
+  v3 p0 = mn, p1 = mx;
+  if (ax) { p0.x = a; p1.x = b; } else { p0.z = a; p1.z = b; }
+  p0.y = y0; p1.y = y1;
+  map_add_sym(p0, p1, col);
+}
+
+// Rubble at the foot of a break.
+static void wall_rubble(v3 mn, v3 mx, int ax, float at, float dir, int count,
+                        float hcap, v3 col) {
+  float H = ARENA_HALF;
+  float cz = ax ? (mn.z + mx.z) * 0.5f : (mn.x + mx.x) * 0.5f;
+  for (int k = 0; k < count; k++) {
+    // THIS COLLISION HAS NO STEP-UP. move_axis is a per-axis AABB sweep and nothing in
+    // the file auto-climbs: a 0.25 m block is not a kerb you walk over, it is a wall
+    // you have to JUMP, and a scatter of them in open ground is the clutter that gets
+    // removed from competitive maps for exactly that reason.
+    float rw = rng_range(0.22f, 0.34f), rd = rng_range(0.22f, 0.30f);
+    // Capped by whatever it fell OFF. A rubble block taller than the stub it sits under
+    // is not a collapse, it is a second wall — and on the low height class (a 1.0 m
+    // wall breaks to a 0.4 m stub) an uncapped 0.62 would be exactly that.
+    float rh = rng_range(0.34f, 0.58f);
+    if (rh > hcap) rh = hcap;
+    if (rh < 0.18f) continue;
+    float side = rng_range(-0.06f, 0.06f);
+    // Slots along the run, spaced wider than two blocks can ever be. dir 0 is the
+    // breach, whose spill sits in front of the hole rather than beyond an end, so its
+    // blocks step sideways from the centre instead. ...AND IT SITS ON THE WALL'S OWN
+    // LINE, immediately at the break, rather than being thrown clear of it.
+    float slot = dir != 0.0f ? dir * (0.30f + rw + 0.34f * (float)k)
+                             : ((float)k - 0.5f * (float)(count - 1)) * 0.86f;
+    v3 p0, p1;
+    if (ax) {
+      p0 = (v3){{at + slot - rw, 0.0f, cz + side - rd}};
+      p1 = (v3){{at + slot + rw, rh,   cz + side + rd}};
+    } else {
+      p0 = (v3){{cz + side - rd, 0.0f, at + slot - rw}};
+      p1 = (v3){{cz + side + rd, rh,   at + slot + rw}};
+    }
+    // The same corridor bound the step crates get: the RING_W lane is documented
+    // cover-free, and a knee-high block a bullet stops is still cover.
+    if (p0.x < -(H - RING_W) || p0.z < -(H - RING_W) ||
+        p1.x > H - RING_W || p1.z > H - RING_W) continue;
+    if (!map_sym_free(p0, p1, 0.012f)) continue;
+    map_add_sym(p0, p1, col_tint(col, 0.84f, 0.96f));
+  }
+}
+
+// A point on a wall's centre line, for the meta edges the dressing pass reads.
+static v3 wall_pt(v3 mn, v3 mx, int ax, float t, float y) {
+  float cz = ax ? (mn.z + mx.z) * 0.5f : (mn.x + mx.x) * 0.5f;
+  return ax ? (v3){{t, y, cz}} : (v3){{cz, y, t}};
+}
+
+static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
+  float lo = ax ? mn.x : mn.z, hi = ax ? mx.x : mx.z;
+  float len = hi - lo, h = mx.y;
+  uint32_t roll = rng_u32();
+  // A short wall has no room for a story, and a LOW wall has no room for a hole
+  // with material above and below it.
+  int kind = (len >= 3.2f &&
+              (float)(roll & 1023u) * (1.0f / 1024.0f) <
+                  0.15f + 0.55f * g_mood.ruin)
+             ? (int)((roll >> 10) % 3u) : -1;
+  if (kind == 1 && h < 1.8f) kind = 2;
+  switch (kind) {
+  case 0: {  // BROKEN END: the last stretch has come down to a climbable stub
+    float bl = rng_range(0.9f, 1.6f);
+    // A FRACTION of the wall, never an absolute height.
+    float hs = h * rng_range(0.34f, 0.52f);
+    // NOT `far`. windef.h defines `far` and `near` as macros, so a local of
+    // either name compiles clean on gcc and fails only the Windows build.
+    int hi_end = (int)((roll >> 13) & 1u);
+    float cut = hi_end ? hi - bl : lo + bl;
+    if (hi_end) {
+      wall_piece(mn, mx, ax, lo, cut, 0.0f, h, col);
+      wall_piece(mn, mx, ax, cut, hi, 0.0f, hs, col);
+      wall_rubble(mn, mx, ax, hi, 1.0f, 1, hs * 0.82f, col);
+      meta_edge(wall_pt(mn, mx, ax, cut, hs), wall_pt(mn, mx, ax, hi, hs),
+                ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, cut, 0.0f),
+                wall_pt(mn, mx, ax, cut + 0.9f, 0.0f), ME_FOOT, ax);
+    } else {
+      wall_piece(mn, mx, ax, lo, cut, 0.0f, hs, col);
+      wall_piece(mn, mx, ax, cut, hi, 0.0f, h, col);
+      wall_rubble(mn, mx, ax, lo, -1.0f, 1, hs * 0.82f, col);
+      meta_edge(wall_pt(mn, mx, ax, lo, hs), wall_pt(mn, mx, ax, cut, hs),
+                ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, cut - 0.9f, 0.0f),
+                wall_pt(mn, mx, ax, cut, 0.0f), ME_FOOT, ax);
+    }
+  } break;
+  case 1: {  // BREACH: material above and below, nothing between. A real hole.
+    float bw = rng_range(0.85f, 1.45f);
+    float mid = rng_range(lo + bw * 0.6f + 0.5f, hi - bw * 0.6f - 0.5f);
+    float a = mid - bw * 0.5f, b = mid + bw * 0.5f;
+    // The SILL is a ledge you can mount and the LINTEL leaves a port you can fire
+    // through standing or crouched.
+    float y0 = rng_range(0.72f, 0.94f);
+    float y1 = y0 + rng_range(0.62f, 0.86f);
+    if (y1 > h - 0.28f) y1 = h - 0.28f;
+    if (y1 - y0 < 0.35f) { y0 = h * 0.34f; y1 = h * 0.72f; }
+    wall_piece(mn, mx, ax, lo, a, 0.0f, h, col);
+    // THE HOLE IS RAGGED, and it is ragged in the collision set as well as in the
+    // picture.
+    int cols = 2 + (int)((roll >> 14) & 1u);
+    for (int c = 0; c < cols; c++) {
+      float ca = a + (b - a) * (float)c / (float)cols;
+      float cb = a + (b - a) * (float)(c + 1) / (float)cols;
+      float jy0 = y0 * rng_range(0.80f, 1.14f);
+      float jy1 = y1 + (h - y1) * rng_range(-0.42f, 0.34f);
+      if (jy1 > h - 0.14f) jy1 = h - 0.14f;
+      if (jy1 - jy0 < 0.30f) jy1 = jy0 + 0.30f;
+      if (jy1 > h - 0.14f) { jy1 = h - 0.14f; jy0 = jy1 - 0.30f; }
+      // THE LINTEL MAY NOT LAND ON THE EYE — map_eyeband is the one copy of
+      // the rule every horizontal edge in this generator now goes through.
+      jy1 = map_eyeband(jy1, h - 0.14f, (roll >> 17) & 1u);
+      if (jy1 - jy0 < 0.30f) jy0 = jy1 - 0.30f;
+      if (jy0 < 0.34f) jy0 = 0.34f;
+      if (jy1 - jy0 < 0.30f) jy1 = jy0 + 0.30f;
+      wall_piece(mn, mx, ax, ca, cb, 0.0f, jy0, col);
+      wall_piece(mn, mx, ax, ca, cb, jy1, h, col);
+      if (jy0 >= 0.50f)  // a sill worth a brick is a ledge, not a kerb
+        meta_edge(wall_pt(mn, mx, ax, ca, jy0), wall_pt(mn, mx, ax, cb, jy0),
+                  ME_SILL, ax);
+    }
+    wall_piece(mn, mx, ax, b, hi, 0.0f, h, col);
+    wall_rubble(mn, mx, ax, mid, 0.0f, 1, y0 * 0.72f, col);
+    meta_edge(wall_pt(mn, mx, ax, a, 0.0f), wall_pt(mn, mx, ax, b, 0.0f),
+              ME_FOOT, ax);
+  } break;
+  case 2: {  // CRENELLATION: the top comes down by QUANTIZED courses.
+    // Continuous noise on a wall top reads as melted; masonry gives way a
+    // course at a time, so the drops are exactly -0.15 and -0.35 — and at
+    // most three distinct heights per wall (the eye-band remap uses ONE coin
+    // per wall so it cannot mint a fourth). Damage biases toward the ENDS,
+    // where a real wall fails first.
+    float segt[18], segh[17];
+    int ns = 0;
+    float t = lo;
+    uint32_t coin = (roll >> 13) & 1u;
+    while (t < hi - 0.4f && ns < 16) {
+      segt[ns] = t;
+      t += rng_range(0.45f, 0.95f);
+      if (t > hi - 0.35f) t = hi;
+      float mid = (segt[ns] + t) * 0.5f;
+      float dend = fminf(mid - lo, hi - mid);
+      float endb = 1.0f + 0.9f * (1.0f - fminf(dend, 2.0f) * 0.5f);
+      float pd = (0.22f + 0.36f * g_mood.ruin) * endb;
+      float ch = h;
+      if (rng_range(0.0f, 1.0f) < pd)
+        ch = map_eyeband(rng_range(0.0f, 1.0f) < 0.40f ? h - 0.15f : h - 0.45f,
+                         h, coin);
+      segh[ns++] = ch;
+    }
+    segt[ns] = hi;
+    if (ns == 0) { map_add_sym(mn, mx, col); break; }
+    float dmin = h, dat = lo;
+    int i0 = 0;
+    for (int i = 1; i <= ns; i++) {
+      if (i == ns || segh[i] != segh[i0]) {
+        wall_piece(mn, mx, ax, segt[i0], segt[i], 0.0f, segh[i0], col);
+        if (segh[i0] < h - 0.01f) {
+          meta_edge(wall_pt(mn, mx, ax, segt[i0], segh[i0]),
+                    wall_pt(mn, mx, ax, segt[i], segh[i0]), ME_TOP, ax);
+          if (segh[i0] < dmin) { dmin = segh[i0]; dat = (segt[i0] + segt[i]) * 0.5f; }
+        }
+        i0 = i;
+      }
+    }
+    if (dmin < h - 0.01f) {
+      wall_rubble(mn, mx, ax, dat, 0.0f, 1, dmin * 0.55f, col);
+      meta_edge(wall_pt(mn, mx, ax, dat - 0.5f, 0.0f),
+                wall_pt(mn, mx, ax, dat + 0.5f, 0.0f), ME_FOOT, ax);
+    }
+  } break;
+  default: {
+    // ERODED CORNER — an intact wall may still lose the top of ONE end: a
+    // stepped diagonal in silhouette, the highest-value damage feature per
+    // solid spent, because the top line against the sky is all that reads at
+    // twenty metres. Never both ends: a wall missing all its corners is the
+    // collapsed-wall SIGNATURE's job, and corners read as structure.
+    uint32_t er = (roll >> 12) & 1023u;
+    if (h >= 1.4f &&
+        (float)er * (1.0f / 1024.0f) < 0.10f + 0.28f * g_mood.ruin) {
+      int hi_end = (int)((roll >> 22) & 1u);
+      uint32_t coin = (roll >> 23) & 1u;
+      float e = rng_range(0.30f, 0.70f);
+      float w1 = rng_range(0.28f, 0.50f), w2 = rng_range(0.25f, 0.45f);
+      float h1 = map_eyeband(h - e * 0.45f, h, coin);
+      float h2 = map_eyeband(h - e, h, coin);
+      if (h2 > h1) h2 = h1 - 0.15f;   // the steps must descend
+      float c1 = hi_end ? hi - w1 - w2 : lo + w1 + w2;
+      float c2 = hi_end ? hi - w2 : lo + w2;
+      if (hi_end) {
+        wall_piece(mn, mx, ax, lo, c1, 0.0f, h, col);
+        wall_piece(mn, mx, ax, c1, c2, 0.0f, h1, col);
+        wall_piece(mn, mx, ax, c2, hi, 0.0f, h2, col);
+        meta_edge(wall_pt(mn, mx, ax, c1, h1), wall_pt(mn, mx, ax, c2, h1),
+                  ME_TOP, ax);
+        meta_edge(wall_pt(mn, mx, ax, c2, h2), wall_pt(mn, mx, ax, hi, h2),
+                  ME_TOP, ax);
+      } else {
+        wall_piece(mn, mx, ax, lo, c2, 0.0f, h2, col);
+        wall_piece(mn, mx, ax, c2, c1, 0.0f, h1, col);
+        wall_piece(mn, mx, ax, c1, hi, 0.0f, h, col);
+        meta_edge(wall_pt(mn, mx, ax, lo, h2), wall_pt(mn, mx, ax, c2, h2),
+                  ME_TOP, ax);
+        meta_edge(wall_pt(mn, mx, ax, c2, h1), wall_pt(mn, mx, ax, c1, h1),
+                  ME_TOP, ax);
+      }
+    } else map_add_sym(mn, mx, col);
+  } break;
+  }
+}
+
 // THE AIR OVER THIS ARENA, per theme — the tint of the dust it carries and how
 // much of it there is. ONE pair of numbers feeds BOTH halves of the atmosphere:
 // the haze band the sky pass draws along the horizon and the aerial perspective
@@ -2215,7 +2447,12 @@ static v3 surf_params(void) {
   // A wet floor has no ripples (water flattens loose material) and no glitter
   // (the film buries the crystal faces that would catch the sun) — the two are
   // off because the surface is telling a different story, not to save the ALU.
-  case SURF_WET:  return (v3){{0.00f, 0.00f, 0.30f}};
+  // The WATER LEVEL is the SLATE moods' loudest scalar: DOWNPOUR floods it,
+  // DRAINED pulls it low so the scree fans own the floor, MOSSTONE keeps the
+  // old middle. uSurf.z already carries it; nothing else changes.
+  case SURF_WET:
+    return (v3){{0.00f, 0.00f, g_mood_preset == 0 ? 0.38f
+                              : g_mood_preset == 1 ? 0.18f : 0.30f}};
   // Dry concrete gets NO ripples.
   default:        return (v3){{0.00f, 0.22f, 0.00f}};
   }
@@ -2237,6 +2474,11 @@ static void map_generate(uint32_t seed) {
   g_num_solids = 0;
   sun_build(seed);   // hashed off the seed, like the wind; see sun_build
   g_theme = THEMES[rng_u32() % (sizeof THEMES / sizeof THEMES[0])];
+  // Mood then signature, both seed-hashed, both AFTER the theme (their
+  // tables are per-theme) and BEFORE any geometry (their numbers feed the
+  // generator's own probabilities).
+  mood_build(seed, g_theme.surf);
+  sig_build(seed, g_theme.surf, g_mood_preset);
   {  // see wind_dir(): hashed off the seed, never drawn from the map stream
     uint32_t wh = seed * 2246822519u;
     wh ^= wh >> 13; wh *= 3266489917u; wh ^= wh >> 16;
@@ -2261,38 +2503,92 @@ static void map_generate(uint32_t seed) {
   for (int i = 0; i < g_num_solids; i++) g_solids[i].pen = 0;
 
   // Mid landmark, self-symmetric: the map's one saturated color anchor.
-  switch (rng_u32() % 4) {
-  case 0: {  // monolith: full block, splits mid into two lanes
-    float mx_ = rng_range(2.0f, 3.2f), mz = rng_range(2.0f, 3.2f);
-    float mh = rng_range(2.5f, 3.0f);
-    map_add((v3){{-mx_, 0, -mz}}, (v3){{mx_, mh, mz}}, g_theme.mid);
-  } break;
-  case 1: {  // plaza: mountable low platform, pillar marks the center
-    float pw = rng_range(3.4f, 4.4f);
-    map_add((v3){{-pw, 0, -pw}}, (v3){{pw, 0.55f, pw}},
-            col_tint(g_theme.crate_b, 0.97f, 1.03f));
-    map_add((v3){{-0.7f, 0.55f, -0.7f}}, (v3){{0.7f, 3.0f, 0.7f}}, g_theme.mid);
-  } break;
-  case 2: {  // gate: two parallel walls, a fought-over corridor through mid
-    float gx = rng_range(2.6f, 3.6f), gl = rng_range(3.5f, 5.0f);
-    float gh = rng_range(2.1f, 2.5f);
-    map_add_sym((v3){{gx - 0.35f, 0, -gl}}, (v3){{gx + 0.35f, gh, gl}}, g_theme.mid);
-  } break;
-  default: {  // four pillars: porous mid, peek duels
-    float d = rng_range(2.6f, 3.8f), r = rng_range(0.45f, 0.6f);
-    float h = rng_range(2.4f, 2.8f);
-    map_add_sym((v3){{d - r, 0, d - r}},  (v3){{d + r, h, d + r}},  g_theme.mid);
-    map_add_sym((v3){{d - r, 0, -d - r}}, (v3){{d + r, h, -d + r}}, g_theme.mid);
-  } break;
+  if (g_meta.sig == SIG_FALLEN) {
+    // THE FALLEN MONOLITH — the signature that replaces the mid roll: the
+    // anchor toppled into a lying slab (0.9 m: mountable cover, a completely
+    // different mid fight) with shattered-tip blocks at both ends. Centred,
+    // so the slab is self-symmetric; the tip blocks land as symmetric pairs.
+    int fax = (int)(rng_u32() & 1u);
+    float fl = rng_range(2.6f, 3.2f), fw = rng_range(1.0f, 1.4f);
+    v3 smn = fax ? (v3){{-fl, 0, -fw}} : (v3){{-fw, 0, -fl}};
+    v3 smx = fax ? (v3){{fl, 0.9f, fw}} : (v3){{fw, 0.9f, fl}};
+    map_add(smn, smx, g_theme.mid);
+    // The shattered tip: blocks placed SEQUENTIALLY along the fall line, each
+    // past the last — two independent draws overlapped about one seed in
+    // three hundred and shared a plane when they did, which is exactly the
+    // defect class mapcheck exists to catch.
+    float tip = fl + rng_range(0.10f, 0.30f);
+    for (int k = 0; k < 2; k++) {
+      float bw = rng_range(0.30f, 0.48f), bh = rng_range(0.30f, 0.52f);
+      float off = tip + bw;
+      tip = off + bw + rng_range(0.08f, 0.24f);
+      float side = rng_range(-0.5f, 0.5f);
+      v3 bmn = fax ? (v3){{off - bw, 0, side - bw}} : (v3){{side - bw, 0, off - bw}};
+      v3 bmx = fax ? (v3){{off + bw, bh, side + bw}} : (v3){{side + bw, bh, off + bw}};
+      map_add_sym(bmn, bmx, col_tint(g_theme.mid, 0.80f, 0.92f));
+    }
+    // The shatter line gets the brick/stone dressing.
+    meta_edge(fax ? (v3){{fl, 0, -fw}} : (v3){{-fw, 0, fl}},
+              fax ? (v3){{fl, 0, fw}} : (v3){{fw, 0, fl}}, ME_FOOT, !fax);
+  } else {
+    float gx0 = 0.0f, gz0 = 0.0f;   // the standing landmark's base corner
+    switch (rng_u32() % 4) {
+    case 0: {  // monolith: full block, splits mid into two lanes
+      float mx_ = rng_range(2.0f, 3.2f), mz = rng_range(2.0f, 3.2f);
+      float mh = rng_range(2.5f, 3.0f);
+      map_add((v3){{-mx_, 0, -mz}}, (v3){{mx_, mh, mz}}, g_theme.mid);
+      gx0 = mx_; gz0 = mz;
+    } break;
+    case 1: {  // plaza: mountable low platform, pillar marks the center
+      float pw = rng_range(3.4f, 4.4f);
+      map_add((v3){{-pw, 0, -pw}}, (v3){{pw, 0.55f, pw}},
+              col_tint(g_theme.crate_b, 0.97f, 1.03f));
+      map_add((v3){{-0.7f, 0.55f, -0.7f}}, (v3){{0.7f, 3.0f, 0.7f}}, g_theme.mid);
+      gx0 = pw; gz0 = pw;
+    } break;
+    case 2: {  // gate: two parallel walls, a fought-over corridor through mid
+      float gx = rng_range(2.6f, 3.6f), gl = rng_range(3.5f, 5.0f);
+      float gh = rng_range(2.1f, 2.5f);
+      map_add_sym((v3){{gx - 0.35f, 0, -gl}}, (v3){{gx + 0.35f, gh, gl}}, g_theme.mid);
+      meta_edge((v3){{gx + 0.35f, 0, -gl * 0.5f}}, (v3){{gx + 0.35f, 0, gl * 0.5f}},
+                ME_FOOT, 0);
+    } break;
+    default: {  // four pillars: porous mid, peek duels
+      float d = rng_range(2.6f, 3.8f), r = rng_range(0.45f, 0.6f);
+      float h = rng_range(2.4f, 2.8f);
+      map_add_sym((v3){{d - r, 0, d - r}},  (v3){{d + r, h, d + r}},  g_theme.mid);
+      map_add_sym((v3){{d - r, 0, -d - r}}, (v3){{d + r, h, -d + r}}, g_theme.mid);
+    } break;
+    }
+    // THE LANDMARK STOPS FLOATING (the grounding rule): the two big-mass
+    // forms take an eroded plinth corner — 1-2 shrinking steps off ONE base
+    // corner, in the WALL family's tint so the accent face itself stays
+    // pristine: an old thing maintained, not a new thing dropped in. The
+    // steps abut the landmark's own planes exactly, and the twin pair lands
+    // on the opposite corner, which is what 180-degree fairness means here.
+    if (gx0 > 0.0f) {
+      float s1 = rng_range(0.45f, 0.70f), s2 = rng_range(0.35f, 0.55f);
+      v3 pc = col_tint(g_theme.wall, 0.86f, 0.94f);
+      map_add_sym((v3){{gx0, 0, gz0 - s1}}, (v3){{gx0 + s1 * 0.8f, 0.34f, gz0}}, pc);
+      map_add_sym((v3){{gx0, 0, gz0 - s1 - s2}},
+                  (v3){{gx0 + s2 * 0.55f, 0.16f, gz0 - s1}}, pc);
+      meta_edge((v3){{gx0, 0, -gz0 * 0.6f}}, (v3){{gx0, 0, gz0 * 0.6f}},
+                ME_FOOT, 0);
+    }
   }
 
   // Long tactical walls. Heights are curated, never eye-level: LOW you shoot
   // over standing, HIGH blocks fully — no awkward in-between clutter.
   int nwalls = 3 + (int)(rng_u32() % 2);
+  int sig_wall_done = 0;
   for (int i = 0; i < nwalls; i++) {
     for (int t = 0; t < 24; t++) {
       float hl = rng_range(1.8f, 3.4f);
       float h = (rng_u32() & 1) ? rng_range(1.95f, 2.25f) : rng_range(0.95f, 1.10f);
+      // The split wall needs material above the corridor, so its host is
+      // always the HIGH height class.
+      if (i == 0 && g_meta.sig == SIG_SPLIT && h < 1.95f)
+        h = rng_range(1.95f, 2.25f);
       float cx = rng_range(-(H - RING_W - 1.5f), H - RING_W - 1.5f);
       float cz = rng_range(-(H - RING_W - 1.5f), H - RING_W - 1.5f);
       if (cx * cx + cz * cz < 64.0f) continue;  // leave mid to the landmark
@@ -2302,9 +2598,114 @@ static void map_generate(uint32_t seed) {
       if (mn.x < -(H - RING_W) || mn.z < -(H - RING_W) ||
           mx.x > H - RING_W || mx.z > H - RING_W) continue;
       if (!map_sym_free(mn, mx, 1.4f)) continue;
-      map_add_wall_sym(mn, mx, col_tint(g_theme.cover, 0.94f, 1.06f), ax);
+      v3 wcol = col_tint(g_theme.cover, 0.94f, 1.06f);
+      float wlo = ax ? mn.x : mn.z, whi = ax ? mx.x : mx.z;
+      if (i == 0 && g_meta.sig == SIG_COLLAPSE) {
+        // THE COLLAPSED WALL — one long wall fully down to a 0.4-0.6 m stub:
+        // still a solid, still jumpable, and the brick field along its line
+        // is where the ruin identity gets its loudest sentence.
+        float hs = rng_range(0.40f, 0.60f);
+        wall_piece(mn, mx, ax, wlo, whi, 0.0f, hs, wcol);
+        wall_rubble(mn, mx, ax, (wlo + whi) * 0.5f, 0.0f, 4, hs * 0.9f, wcol);
+        meta_edge(wall_pt(mn, mx, ax, wlo, hs), wall_pt(mn, mx, ax, whi, hs),
+                  ME_TOP, ax);
+        meta_edge(wall_pt(mn, mx, ax, wlo, 0.0f),
+                  wall_pt(mn, mx, ax, whi, 0.0f), ME_FOOT, ax);
+        sig_wall_done = 1;
+      } else if (i == 0 && g_meta.sig == SIG_SPLIT && h >= 1.95f) {
+        // THE SPLIT WALL — the advertised wallbang station. Two columns,
+        // each 60 % of the wall's depth, SHIFTED OUT of the wall line in
+        // opposite directions and overlapping 0.10-0.18 along the run: from
+        // the perpendicular the wall reads broken and doubled (and "broken
+        // wall" already means "shootable" here — the breach taught it),
+        // while the 0.12 m depth gap at the joint is an oblique sight
+        // corridor no body can pass (PLAYER_RADIUS 0.35). Both columns are
+        // ordinary pen=1 solids; no shared planes by construction. Its
+        // gates (wallbang sweep, bot census, picture review) ran at the
+        // 2026-08-25 layout window — the pre-agreed fallback is to cut it.
+        float m = (wlo + whi) * 0.5f + rng_range(-0.6f, 0.6f);
+        float ov = rng_range(0.10f, 0.18f) * 0.5f;
+        float dmid = ax ? (mn.z + mx.z) * 0.5f : (mn.x + mx.x) * 0.5f;
+        float dsh = 0.12f;   // each column's outward shift; gap = 2*dsh - 0.12
+        // The columns poke 0.12 m proud of the wall line, and the RING_W
+        // corridor is documented cover-free: a host that close to the ring
+        // stays an ordinary damaged wall instead.
+        if (fabsf(dmid) + 0.44f > H - RING_W) {
+          g_meta.sig = SIG_NONE;   // the print may not claim what is not built
+          map_add_wall_sym(mn, mx, wcol, ax);
+          break;
+        }
+        v3 amn = mn, amx = mx, bmn = mn, bmx = mx;
+        if (ax) {
+          amx.x = m + ov; bmn.x = m - ov;
+          amn.z = dmid - 0.30f - dsh; amx.z = dmid + 0.30f - dsh - 0.24f;
+          bmn.z = dmid - 0.30f + dsh + 0.24f; bmx.z = dmid + 0.30f + dsh;
+        } else {
+          amx.z = m + ov; bmn.z = m - ov;
+          amn.x = dmid - 0.30f - dsh; amx.x = dmid + 0.30f - dsh - 0.24f;
+          bmn.x = dmid - 0.30f + dsh + 0.24f; bmx.x = dmid + 0.30f + dsh;
+        }
+        map_add_sym(amn, amx, wcol);
+        map_add_sym(bmn, bmx, col_tint(g_theme.cover, 0.90f, 1.00f));
+        // Advertisement on BOTH faces: spill lines at the joint, both sides.
+        meta_edge(wall_pt(mn, mx, ax, m - 0.8f, 0.0f),
+                  wall_pt(mn, mx, ax, m + 0.8f, 0.0f), ME_FOOT, ax);
+        sig_wall_done = 1;
+      } else {
+        map_add_wall_sym(mn, mx, wcol, ax);
+      }
       break;
     }
+  }
+  if ((g_meta.sig == SIG_COLLAPSE || g_meta.sig == SIG_SPLIT) && !sig_wall_done)
+    g_meta.sig = SIG_NONE;   // placement starved out: no phantom signature
+
+  // THE DEAD TREES — a signature PAIR, because a solid must be symmetric to
+  // be fair cover and a single off-centre trunk is neither: two dead trees
+  // facing each other across the arena, which reads as composition rather
+  // than as accident. The trunk is the SOLID (0.16 m of path — every round
+  // crosses it, only bodies stop); the crown is cast-only world geometry
+  // built by mesh_build off g_meta, wind-swept like everything else here.
+  if (g_meta.sig == SIG_TREE) {
+    for (int t = 0; t < 24; t++) {
+      float r = rng_range(11.0f, H - RING_W - 1.2f);
+      float a = rng_range(0.0f, 2.0f * F_PI);
+      float tx = cosf(a) * r, tz = sinf(a) * r;
+      // Sun-side preferred: golden-hour seeds should throw the crown's REAL
+      // shadow across the floor, and the sun is a fixed world direction.
+      if (t < 12 && tx * g_sun.dir.x + tz * g_sun.dir.z < 0.0f) continue;
+      float th_ = rng_range(2.2f, 3.0f);
+      v3 tmn = {{tx - 0.08f, 0, tz - 0.08f}}, tmx = {{tx + 0.08f, th_, tz + 0.08f}};
+      if (!map_sym_free(tmn, tmx, 2.2f)) continue;
+      g_meta.tree[0] = (int16_t)g_num_solids;
+      g_meta.tree[1] = (int16_t)(g_num_solids + 1);
+      map_add_sym(tmn, tmx, (v3){{0.30f, 0.26f, 0.21f}});
+      break;
+    }
+    if (g_meta.tree[0] < 0) g_meta.sig = SIG_NONE;   // no room: no signature
+  }
+
+  // THE BOULDER PAIR — two ~1.1 m twinned boulders, ordinary solids with a
+  // chamfered RENDER (mesh_build reads the indices): real cover that did not
+  // come off a truck.
+  if (g_meta.sig == SIG_BOULDERS) {
+    for (int t = 0; t < 24; t++) {
+      float hx = rng_range(0.50f, 0.62f), hz = rng_range(0.46f, 0.60f);
+      float bh = rng_range(1.00f, 1.20f);
+      float cx = rng_range(-(H - RING_W - 1.2f), H - RING_W - 1.2f);
+      float cz = rng_range(-(H - RING_W - 1.2f), H - RING_W - 1.2f);
+      if (cx * cx + cz * cz < 52.0f) continue;
+      v3 bmn = {{cx - hx, 0, cz - hz}}, bmx = {{cx + hx, bh, cz + hz}};
+      if (!map_sym_free(bmn, bmx, 1.8f)) continue;
+      g_meta.bould[0] = (int16_t)g_num_solids;
+      g_meta.bould[1] = (int16_t)(g_num_solids + 1);
+      // Granite grey, NOT the cover family's rust: orange means man-made
+      // cover in this arena's grammar, and a rock may not borrow it.
+      { v3 gr = v3_lerp(g_theme.wall, (v3){{0.42f, 0.41f, 0.40f}}, 0.55f);
+        map_add_sym(bmn, bmx, col_tint(gr, 0.94f, 1.04f)); }
+      break;
+    }
+    if (g_meta.bould[0] < 0) g_meta.sig = SIG_NONE;
   }
 
   // Crate clusters: anchor crate + optional jump-step + optional top box.
@@ -12982,7 +13383,10 @@ static float ao_at(float y) {
 // GROUND is a function of where the WALLS are — sand piles in the lee of an obstacle,
 // traffic packs the open lanes, and the metre nearest a wall is dirtier and darker than
 // the middle of a lane.
-#define GROUND_CELLS 32
+// 48, not 32: at 1.5 m cells a brick-foot stain was one smeared vertex; at
+// 1.0 m the stamps read. 13824 static verts, zero fragment cost, never casts
+// — and the "4608 triangles" note at the cast latch is exact again.
+#define GROUND_CELLS 48
 #define GROUND_STEP  (2.0f * ARENA_HALF / (float)GROUND_CELLS)
 #define GROUND_VERTS (GROUND_CELLS * GROUND_CELLS * 6)
 
@@ -13084,6 +13488,530 @@ static float ground_skirt_ao(float x, float z) {
   return 1.0f - 0.34f * ground_sample(x, z).skirt;
 }
 
+// ===========================================================================
+// THE SCATTER PLAN — placement decided as DATA before any geometry exists.
+// ===========================================================================
+// PLAN -> STAMP -> EMIT. mesh_build runs the plan BEFORE the ground bake so a
+// later pass can stamp what was planned into the floor (a stain under a rock
+// needs the rock's position before the ground verts are written), and the
+// emitters in mesh_decor read the same array. The budget fills top-down by
+// silhouette value — rocks are planned before stones before pebbles before
+// tufts, so when SCAT_MAX runs out what is dropped is a pebble, never a rock.
+//
+// DETERMINISM IS PER-CANDIDATE HASHING, NOT A STREAM. Every candidate's
+// randomness is a pure function of (map seed, family, cell identity, k):
+// adding a family or reordering passes can never re-roll another family,
+// which is the fragility a serial rng stream has. uint32 mixing only — the
+// fhash2 lesson: a float-scaled cast to int32 is UB and -ffast-math is
+// entitled to eat it.
+//
+// THE SYMMETRY CONTRACT (statistical, not geometric). The plan works on the
+// CANONICAL half (z > 0, or x > 0 on the z = 0 strip); the emitter mints both
+// 180-degree twins from each site, so twins always match in count, family and
+// size — fairness by construction. Wind cues cannot survive that rotation
+// geometrically (a lee side maps onto the twin's windward side), so they are
+// split: AXIS cues (elongation, band alignment) rotate exactly; SIDE cues are
+// re-derived per twin — free-field items build their geometry against
+// dec_rot(wind) so the rotated copy leans down the TRUE wind, and
+// face-attached items emit the twin on the twin solid's own SAME-NORMAL face
+// (scat_reflect + rotation), which is its true lee. The freedom test runs on
+// BOTH twins' real positions at plan time; if either fails, the pair drops —
+// so the fairness invariant is structural, never flaky.
+typedef struct {
+  v3       pos;    // canonical-half emit position
+  float    s;      // the family's size scalar (also the footprint margin)
+  uint32_t h;      // the candidate's own hash: emit derives detail from it
+  int16_t  host;   // attached face's solid, or -1 = free-field (twin = -pos)
+  uint8_t  fam, var;  // var: face axis for attached sites, variant bits else
+} scat_t;
+enum { SCAT_ROCK, SCAT_STONE, SCAT_PEBBLE, SCAT_TUFT, SCAT_PAVE, SCAT_SHRUB,
+       SCAT_CACTUS, SCAT_TUMBLE, SCAT_BRICK, SCAT_FAM_COUNT };
+// [[maybe_unused]] for upd_status_line's reason: its only reader is the
+// harness `scat` command, which is Linux-only — on MinGW that is
+// -Wunused-variable, i.e. a broken release build.
+[[maybe_unused]] static const char *SCAT_FAM_NAME[SCAT_FAM_COUNT] = {
+  "rock", "stone", "pebble", "tuft", "pave", "shrub", "cactus", "tumble",
+  "brick"};
+#define SCAT_MAX 768
+static scat_t g_scat[SCAT_MAX];
+static int    g_scat_n;
+static int    g_scat_fam[SCAT_FAM_COUNT];
+static float  g_scat_ms;    // plan CPU time; the harness `scat` prints it
+static float  g_scat_top;   // tallest proud decor point; `scat` prints it —
+                            // the two-class cover rule (< 0.30 m) as a number
+
+static uint32_t scat_h(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  uint32_t h = g_map_seed * 2654435761u ^ 0xA3C59AC3u;
+  h ^= a * 2246822519u; h = (h ^ (h >> 15)) * 2654435761u;
+  h ^= b * 3266489917u; h = (h ^ (h >> 13)) * 2246822519u;
+  h ^= c * 2654435761u; h = (h ^ (h >> 16)) * 3266489917u;
+  h ^= d * 2246822519u; h ^= h >> 15; h *= 2654435761u; h ^= h >> 13;
+  return h;
+}
+static float scat01(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  return (float)(scat_h(a, b, c, d) >> 8) * (1.0f / 16777216.0f);
+}
+
+// The one copy of "does this solid dress its surroundings": tall enough to be
+// a wall (rubble dresses nothing), actually tall (not a thin slab), and
+// standing on the ground (a stacked top box would collect debris in mid-air).
+static int scat_host_ok(const solid_t *s) {
+  return s->max.y >= 0.42f && s->max.y - s->min.y >= 0.42f &&
+         s->min.y <= 0.05f;
+}
+
+// 2D distance from a point to a solid's footprint, 0 inside.
+static float scat_box_d(const solid_t *s, float x, float z) {
+  float dx = fmaxf(fmaxf(s->min.x - x, x - s->max.x), 0.0f);
+  float dz = fmaxf(fmaxf(s->min.z - z, z - s->max.z), 0.0f);
+  return sqrtf(dx * dx + dz * dz);
+}
+
+// Hard exclusions: outside the arena, inside a spawn box, or overlapping ANY
+// low solid's footprint (rubble included — a rock half inside a rubble block
+// is the coplanar defect in decor form). Symmetric by construction for
+// free-field sites, because the solid set and the spawn boxes are.
+static int scat_free(float x, float z, float r) {
+  float H = ARENA_HALF;
+  if (fabsf(x) > H - 0.30f - r || fabsf(z) > H - 0.30f - r) return 0;
+  for (int s = -1; s <= 1; s += 2)
+    if (fabsf(x - SPAWN_POS.x) < 4.0f + r &&
+        fabsf(z - SPAWN_POS.z * (float)s) < 4.0f + r)
+      return 0;
+  for (int i = 0; i < g_num_solids; i++) {
+    const solid_t *so = &g_solids[i];
+    if (so->min.y > 0.40f) continue;   // a floating box shadows no floor
+    if (scat_box_d(so, x, z) < r + 0.05f) return 0;
+  }
+  return 1;
+}
+
+// Nearest two QUALIFYING walls: distance to the nearest (the wall mask), the
+// nearest one's index (its colour seeds the stone tint), and whether the point
+// sits in a concave corner — two walls close on differing axes, where debris
+// drifts and the wall/floor line is hardest to hide.
+static float scat_wall(float x, float z, int *idx, int *corner) {
+  float d1 = 1e9f, d2 = 1e9f;
+  v3 n1 = {{0, 0, 0}}, n2 = {{0, 0, 0}};
+  int best = -1;
+  for (int i = 0; i < g_num_solids; i++) {
+    const solid_t *s = &g_solids[i];
+    if (!scat_host_ok(s)) continue;
+    float d = scat_box_d(s, x, z);
+    float cx = f_clamp(x, s->min.x, s->max.x);
+    float cz = f_clamp(z, s->min.z, s->max.z);
+    v3 n = {{x - cx, 0.0f, z - cz}};
+    float l = sqrtf(n.x * n.x + n.z * n.z);
+    if (l > 1e-4f) n = v3_scale(n, 1.0f / l);
+    if (d < d1) { d2 = d1; n2 = n1; d1 = d; n1 = n; best = i; }
+    else if (d < d2) { d2 = d; n2 = n; }
+  }
+  if (idx) *idx = best;
+  if (corner)
+    *corner = d1 < 1.0f && d2 < 1.0f &&
+              fabsf(n1.x * n2.x + n1.z * n2.z) < 0.70f;
+  return d1;
+}
+
+// The symmetric lee mask: "near a wall ALONG the wind axis, either side" —
+// max(ws(p), ws(-p)) is trivially the same for both twins, so it may sit in
+// the accept product; which side of its wall a site's geometry favours is
+// decided per twin at emit, never here.
+static float scat_lee_sym(float x, float z, v3 w) {
+  float best = 0.0f;
+  for (int i = 0; i < g_num_solids; i++) {
+    const solid_t *s = &g_solids[i];
+    if (!scat_host_ok(s)) continue;
+    for (int sg = -1; sg <= 1; sg += 2) {
+      float t = wind_shadow(s, x, z, w, (float)sg);
+      if (t >= 0.0f) {
+        float a = expf(-t / 3.0f);
+        if (a > best) best = a;
+      }
+    }
+  }
+  return best;
+}
+
+// A face site's twin: reflect through the host's centre along the face axis,
+// then the emitter's 180-degree rotation lands it on the twin solid's
+// same-normal face — its true lee. See the symmetry contract above.
+static v3 scat_reflect(v3 p, const solid_t *s, int axis) {
+  if (axis == 0) p.x = s->min.x + s->max.x - p.x;
+  else           p.z = s->min.z + s->max.z - p.z;
+  return p;
+}
+
+static void scat_push(v3 pos, float s, uint32_t h, int host, int fam,
+                      int var) {
+  if (g_scat_n >= SCAT_MAX) return;
+  g_scat[g_scat_n++] = (scat_t){pos, s, h, (int16_t)host, (uint8_t)fam,
+                                (uint8_t)var};
+  g_scat_fam[fam]++;
+}
+
+// The plan pass. Density is a PRODUCT of physical factors — wall distance,
+// corners, the wind slab, 7 m patch noise — so the placement explains itself;
+// uniform scatter is banned. Children cluster on parents (golden-angle
+// offsets, sizes falling by generation) because detail attracts detail.
+static void scat_plan(void) {
+  clock_t t0 = clock();
+  g_scat_n = 0;
+  memset(g_scat_fam, 0, sizeof g_scat_fam);
+  v3 w = wind_dir();
+  float H = ARENA_HALF;
+  float strew = g_mood.strew, growth = g_mood.growth;
+  int grass = g_theme.surf != SURF_WET;
+
+  // ROCK — jittered grid, cell 3.0 m, canonical half. The theme's bedrock:
+  // each accepted rock immediately seeds its children (stones), a pebble ring
+  // and a facilitation tuft or two, all keyed off the rock's own cell so no
+  // ordering can re-roll them.
+  for (int iz = 0; iz < 8; iz++)
+    for (int ix = -8; ix < 8; ix++) {
+      uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+      float x = ((float)ix + 0.075f + 0.85f * scat01(SCAT_ROCK, cx, cz, 1)) * 3.0f;
+      float z = ((float)iz + 0.075f + 0.85f * scat01(SCAT_ROCK, cx, cz, 2)) * 3.0f;
+      if (z < 0.45f) continue;
+      if (x * x + z * z < 6.5f * 6.5f) continue;            // the mid reserve
+      if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W) continue; // the wall ring
+      int wi, corner;
+      float wd = scat_wall(x, z, &wi, &corner);
+      // A full cluster in the open middle is the most detailed thing this
+      // pass makes, parked exactly where the fair-silhouette rule wants calm
+      // — so the open floor gets a 4 % tail, not a 32 % base. The middle
+      // belongs to pebbles.
+      float wallM = 0.04f + 0.96f * f_smoothstep(3.8f, 0.6f, wd);
+      float noiseM = f_smoothstep(0.30f, 0.62f,
+                                  fnoise2(x * 0.143f + 17.0f, z * 0.143f - 9.0f));
+      float cornerM = corner ? 2.2f : 1.0f;
+      float viab = (0.22f + 0.42f * strew) * wallM * noiseM * cornerM;
+      if (scat01(SCAT_ROCK, cx, cz, 0) > viab) continue;
+      uint32_t h = scat_h(SCAT_ROCK, cx, cz, 3);
+      uint64_t st = (uint64_t)h * 2654435761u + 1;
+      float ry = rng_rangef(&st, 0.09f, 0.185f);
+      if (!scat_free(x, z, ry * 1.7f)) continue;
+      scat_push((v3){{x, 0.0f, z}}, ry, h, -1, SCAT_ROCK, 0);
+      // children: 2-5 stones at golden-angle offsets, one pebble ring, and —
+      // on grass themes — the tuft or two that collects beside a stone.
+      int nc = 2 + (int)(scat_h(SCAT_STONE, cx, cz, 90) % 4u);
+      for (int k = 0; k < nc; k++) {
+        uint64_t cs = (uint64_t)scat_h(SCAT_STONE, cx, cz, (uint32_t)k) *
+                      2654435761u + 1;
+        float ang = (float)k * 2.39996f + rng_rangef(&cs, -0.5f, 0.5f);
+        float u = rng_rangef(&cs, 0.0f, 1.0f);
+        float dist = ry * (2.2f + 3.4f * u * u);
+        float sx = x + cosf(ang) * dist, sz = z + sinf(ang) * dist;
+        float sr = ry * rng_rangef(&cs, 0.35f, 0.60f);
+        if (sz < 0.30f || !scat_free(sx, sz, sr * 1.6f)) continue;
+        if (sx * sx + sz * sz < 6.5f * 6.5f) continue;
+        scat_push((v3){{sx, 0.0f, sz}}, sr,
+                  scat_h(SCAT_STONE, cx, cz, (uint32_t)k + 8), -1,
+                  SCAT_STONE, 0);
+      }
+      int np = 4 + (int)(scat_h(SCAT_PEBBLE, cx, cz, 91) % 5u);
+      for (int k = 0; k < np; k++) {
+        uint64_t cs = (uint64_t)scat_h(SCAT_PEBBLE, cx, cz, (uint32_t)k) *
+                      2654435761u + 1;
+        float ang = rng_rangef(&cs, 0.0f, 6.283f);
+        float dist = ry * rng_rangef(&cs, 3.2f, 5.6f);
+        float sx = x + cosf(ang) * dist, sz = z + sinf(ang) * dist;
+        if (sz < 0.15f || !scat_free(sx, sz, 0.05f)) continue;
+        if (sx * sx + sz * sz < 5.5f * 5.5f) continue;
+        scat_push((v3){{sx, 0.0f, sz}}, rng_rangef(&cs, 0.012f, 0.028f),
+                  scat_h(SCAT_PEBBLE, cx, cz, (uint32_t)k + 16), -1,
+                  SCAT_PEBBLE, 0);
+      }
+      if (grass && scat01(SCAT_TUFT, cx, cz, 92) < 0.20f + 0.65f * growth) {
+        int nt = 1 + (int)(scat_h(SCAT_TUFT, cx, cz, 93) % 2u);
+        for (int k = 0; k < nt; k++) {
+          uint64_t cs = (uint64_t)scat_h(SCAT_TUFT, cx, cz, (uint32_t)k + 24) *
+                        2654435761u + 1;
+          float ang = rng_rangef(&cs, 0.0f, 6.283f);
+          // Tight against the rock: at 4 radii the tuft read as orphaned.
+          float dist = ry * rng_rangef(&cs, 1.8f, 3.2f);
+          float sx = x + cosf(ang) * dist, sz = z + sinf(ang) * dist;
+          if (sz < 0.15f || !scat_free(sx, sz, 0.09f)) continue;
+          if (sx * sx + sz * sz < 6.5f * 6.5f) continue;
+          // 1-in-8 draws the green variant, and only HERE — beside a rock is
+          // where the moisture logic puts it (var bit 1).
+          int green = (scat_h(SCAT_TUFT, cx, cz, (uint32_t)k + 32) & 7u) == 0;
+          scat_push((v3){{sx, 0.0f, sz}}, rng_rangef(&cs, 0.7f, 1.15f),
+                    scat_h(SCAT_TUFT, cx, cz, (uint32_t)k + 40), -1,
+                    SCAT_TUFT, green ? 2 : 0);
+        }
+      }
+    }
+
+  // STONE, field tier — the wall-hugging clutter the old clump walk placed,
+  // now mask-driven: smoothstep(1.5, 0.2, d) IS the recipe, near-zero in the
+  // open middle.
+  for (int iz = 0; iz < 11; iz++)
+    for (int ix = -11; ix < 11; ix++) {
+      uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+      float x = ((float)ix + 0.075f + 0.85f * scat01(SCAT_STONE, cx, cz, 101)) * 2.2f;
+      float z = ((float)iz + 0.075f + 0.85f * scat01(SCAT_STONE, cx, cz, 102)) * 2.2f;
+      if (z < 0.30f) continue;
+      if (x * x + z * z < 6.5f * 6.5f) continue;
+      if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W) continue;
+      int wi, corner;
+      float wd = scat_wall(x, z, &wi, &corner);
+      float wallM = f_smoothstep(1.5f, 0.2f, wd);
+      float noiseM = 0.35f + 0.65f * fnoise2(x * 0.62f, z * 0.62f);
+      float cornerM = corner ? 2.6f : 1.0f;
+      // DRAINED promotes the wall-foot stones to scree fans — THE identity of
+      // that mood; QUARRY's talus takes a smaller lift on top of its strew.
+      float scree = (g_theme.surf == SURF_WET && g_mood_preset == 1) ? 1.9f
+                  : (g_theme.surf == SURF_GRIT && g_mood_preset == 0) ? 1.4f
+                                                                      : 1.0f;
+      float viab = (0.16f + 0.34f * strew) * wallM * noiseM * cornerM * scree;
+      if (scat01(SCAT_STONE, cx, cz, 100) > viab) continue;
+      uint32_t h = scat_h(SCAT_STONE, cx, cz, 103);
+      uint64_t st = (uint64_t)h * 2654435761u + 1;
+      float r = rng_rangef(&st, 0.035f, 0.095f);
+      if (!scat_free(x, z, r * 1.7f)) continue;
+      scat_push((v3){{x, 0.0f, z}}, r, h, -1, SCAT_STONE, 0);
+    }
+
+  // PEBBLE, field tier — the fines that survive as mesh. Sparse everywhere
+  // walls are near; allowed closer to the middle than anything else (they
+  // obstruct nothing and the landmark should not stand on swept concrete).
+  for (int iz = 0; iz < 22; iz++)
+    for (int ix = -22; ix < 22; ix++) {
+      uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+      float x = ((float)ix + 0.075f + 0.85f * scat01(SCAT_PEBBLE, cx, cz, 111)) * 1.1f;
+      float z = ((float)iz + 0.075f + 0.85f * scat01(SCAT_PEBBLE, cx, cz, 112)) * 1.1f;
+      if (z < 0.15f) continue;
+      if (x * x + z * z < 5.5f * 5.5f) continue;
+      float ring = fmaxf(fabsf(x), fabsf(z));
+      int wi, corner;
+      float wd = scat_wall(x, z, &wi, &corner);
+      if (ring > H - RING_W && wd > 0.9f) continue;  // ring: wall base only
+      float wallM = 0.28f + 0.72f * f_smoothstep(2.0f, 0.3f, wd);
+      float noiseM = 0.30f + 0.70f * fnoise2(x * 0.62f + 5.0f, z * 0.62f - 3.0f);
+      float viab = (0.10f + 0.26f * strew) * wallM * noiseM *
+                   (corner ? 2.0f : 1.0f);
+      if (scat01(SCAT_PEBBLE, cx, cz, 110) > viab) continue;
+      uint32_t h = scat_h(SCAT_PEBBLE, cx, cz, 113);
+      uint64_t st = (uint64_t)h * 2654435761u + 1;
+      float r = rng_rangef(&st, 0.012f, 0.028f);
+      if (!scat_free(x, z, r + 0.02f)) continue;
+      scat_push((v3){{x, 0.0f, z}}, r, h, -1, SCAT_PEBBLE, 0);
+    }
+
+  // TUFT, band tier — tiger-bush logic: grass collects along wall FEET, and
+  // preferentially on each wall's LEE side. Acceptance is per canonical FACE
+  // (a face and its twin share a normal, so they share a lee — the pair draws
+  // one roll), which is what keeps the twins fair while each face's own
+  // density follows its own lee.
+  if (grass)
+    for (int i = 0; i < g_num_solids; i++) {
+      const solid_t *s = &g_solids[i];
+      if (!scat_host_ok(s)) continue;
+      // Not the shell: its twin is the OPPOSITE wall, which breaks the
+      // scat_reflect pairing (see the drift walk's note) — every shell pair
+      // was silently dropped by the both-twins-free test anyway, so this is
+      // the same outcome without the wasted planning.
+      if (s->pen == 0) continue;
+      for (int f = 0; f < 4; f++) {
+        v3 o = {{f == 0 ? 1.0f : f == 1 ? -1.0f : 0.0f, 0.0f,
+                 f == 2 ? 1.0f : f == 3 ? -1.0f : 0.0f}};
+        float base = f == 0 ? s->max.x : f == 1 ? s->min.x
+                   : f == 2 ? s->max.z : s->min.z;
+        float lo = (f < 2) ? s->min.z : s->min.x;
+        float hi = (f < 2) ? s->max.z : s->max.x;
+        if (hi - lo < 0.7f) continue;
+        // the canonical face of the pair
+        float cmx = (f < 2) ? base : (lo + hi) * 0.5f;
+        float cmz = (f < 2) ? (lo + hi) * 0.5f : base;
+        if (cmz < -0.001f || (fabsf(cmz) <= 0.001f && cmx <= 0.0f)) continue;
+        float lee01 = f_clamp(-(o.x * w.x + o.z * w.z), 0.0f, 1.0f);
+        // High enough that a lee face actually reads as a BAND: at the first
+        // rate a 5 m face held ~2 tufts and the review could not find the
+        // bands at all.
+        float rate = growth * (0.16f + 0.92f * lee01);
+        int k = 0;
+        for (float t = lo + 0.35f; t < hi - 0.35f; t += 0.85f, k++) {
+          if (scat01(SCAT_TUFT, (uint32_t)i, (uint32_t)f, (uint32_t)k) > rate)
+            continue;
+          uint32_t h = scat_h(SCAT_TUFT, (uint32_t)i, (uint32_t)f,
+                              (uint32_t)k + 200);
+          uint64_t st = (uint64_t)h * 2654435761u + 1;
+          float off = rng_rangef(&st, 0.14f, 0.36f);
+          float tt = t + rng_rangef(&st, -0.25f, 0.25f);
+          v3 p = (f < 2) ? (v3){{base + o.x * off, 0.0f, tt}}
+                         : (v3){{tt, 0.0f, base + o.z * off}};
+          int axis = f < 2 ? 0 : 1;
+          v3 q = scat_reflect(p, s, axis);
+          // both twins' REAL positions must be free, or the pair drops
+          if (!scat_free(p.x, p.z, 0.05f) || !scat_free(-q.x, -q.z, 0.05f))
+            continue;
+          scat_push(p, rng_rangef(&st, 0.7f, 1.15f), h, i, SCAT_TUFT, axis);
+        }
+      }
+    }
+
+  // TUFT, field tier — the patchy fill between the bands: grass collects in
+  // NOISE PATCHES near any cover, never in the open middle, and it is what
+  // makes a growth mood read as growth from twenty metres rather than only
+  // in a crop. Band + facilitation tufts alone were 11-39 sites against the
+  // 40-90 the budget prices; this pass is the difference.
+  if (grass)
+    for (int iz = 0; iz < 18; iz++)
+      for (int ix = -18; ix < 18; ix++) {
+        uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+        float x = ((float)ix + 0.075f + 0.85f * scat01(SCAT_TUFT, cx, cz, 301)) * 1.3f;
+        float z = ((float)iz + 0.075f + 0.85f * scat01(SCAT_TUFT, cx, cz, 302)) * 1.3f;
+        if (z < 0.2f) continue;
+        if (x * x + z * z < 6.5f * 6.5f) continue;
+        if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W) continue;
+        int wi2, c2;
+        float wd = scat_wall(x, z, &wi2, &c2);
+        float patch = f_smoothstep(0.36f, 0.60f,
+                                   fnoise2(x * 0.19f - 23.0f, z * 0.19f + 41.0f));
+        // Grass reaches FURTHER off the walls than mineral clutter does —
+        // tiger-bush bands are metres wide — so the growth moods can be read
+        // from the play camera; the mid reserve above still keeps the true
+        // middle calm, and the patch noise keeps the reach from being a wash.
+        float viab = growth * (0.05f + 0.50f * f_smoothstep(5.5f, 0.8f, wd)) *
+                     patch;
+        if (scat01(SCAT_TUFT, cx, cz, 300) > viab) continue;
+        uint32_t h = scat_h(SCAT_TUFT, cx, cz, 303);
+        uint64_t st = (uint64_t)h * 2654435761u + 1;
+        if (!scat_free(x, z, 0.09f)) continue;
+        scat_push((v3){{x, 0.0f, z}}, rng_rangef(&st, 0.65f, 1.10f), h, -1,
+                  SCAT_TUFT, 0);
+      }
+
+  // PAVE — desert pavement / scree sheet: one or two 2.8-4 m patches of flat
+  // embedded stones, the STONEFIELD and DRAINED moods' open-floor identity.
+  // The one family that WANTS the open field, which is fair because nothing
+  // in it stands over two centimetres proud.
+  int pave_on = (g_theme.surf == SURF_SAND && g_mood_preset == 1) ||
+                (g_theme.surf == SURF_WET && g_mood_preset == 1);
+  if (pave_on) {
+    int npatch = 0;
+    for (int iz = 0; iz < 3 && npatch < 2; iz++)
+      for (int ix = -3; ix < 3 && npatch < 2; ix++) {
+        uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+        float x = ((float)ix + 0.15f + 0.7f * scat01(SCAT_PAVE, cx, cz, 1)) * 8.0f;
+        float z = ((float)iz + 0.15f + 0.7f * scat01(SCAT_PAVE, cx, cz, 2)) * 8.0f;
+        if (z < 1.8f) continue;
+        if (x * x + z * z < 8.0f * 8.0f) continue;
+        if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W - 1.2f) continue;
+        int wi2, c2;
+        if (scat_wall(x, z, &wi2, &c2) < 2.0f) continue;   // open-field family
+        if (scat01(SCAT_PAVE, cx, cz, 0) > 0.85f) continue;
+        uint32_t h = scat_h(SCAT_PAVE, cx, cz, 3);
+        uint64_t st = (uint64_t)h * 2654435761u + 1;
+        float pr = rng_rangef(&st, 1.4f, 2.0f);
+        if (!scat_free(x, z, 0.3f)) continue;
+        scat_push((v3){{x, 0.0f, z}}, pr, h, -1, SCAT_PAVE, 0);
+        npatch++;
+      }
+  }
+
+  // SHRUB — dry openwork sticks at wall bases and beside rocks, never the
+  // open field; the growth latent's woody half. Dry themes only.
+  if (grass)
+    for (int iz = 0; iz < 9; iz++)
+      for (int ix = -9; ix < 9; ix++) {
+        uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+        float x = ((float)ix + 0.075f + 0.85f * scat01(SCAT_SHRUB, cx, cz, 1)) * 2.6f;
+        float z = ((float)iz + 0.075f + 0.85f * scat01(SCAT_SHRUB, cx, cz, 2)) * 2.6f;
+        if (z < 0.3f) continue;
+        if (x * x + z * z < 6.5f * 6.5f) continue;
+        if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W) continue;
+        int wi2, c2;
+        float wd = scat_wall(x, z, &wi2, &c2);
+        float viab = growth * (0.06f + 0.55f * f_smoothstep(1.7f, 0.3f, wd)) *
+                     (c2 ? 1.8f : 1.0f);
+        if (scat01(SCAT_SHRUB, cx, cz, 0) > viab) continue;
+        uint32_t h = scat_h(SCAT_SHRUB, cx, cz, 3);
+        uint64_t st = (uint64_t)h * 2654435761u + 1;
+        float r = rng_rangef(&st, 0.14f, 0.22f);
+        if (!scat_free(x, z, r * 0.6f)) continue;
+        scat_push((v3){{x, 0.0f, z}}, r, h, -1, SCAT_SHRUB, 0);
+      }
+
+  // CACTUS — SAND, THORNS only: the one green mass in the desert, rare by
+  // identity. Low pear fans and squat barrels; no saguaro, ever — a humanoid
+  // silhouette at 25 m is the exact false positive the cover rule exists for.
+  if (g_theme.surf == SURF_SAND && g_mood_preset == 2)
+    for (int iz = 0; iz < 6; iz++)
+      for (int ix = -6; ix < 6; ix++) {
+        uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+        float x = ((float)ix + 0.1f + 0.8f * scat01(SCAT_CACTUS, cx, cz, 1)) * 4.0f;
+        float z = ((float)iz + 0.1f + 0.8f * scat01(SCAT_CACTUS, cx, cz, 2)) * 4.0f;
+        if (z < 0.4f) continue;
+        if (x * x + z * z < 7.0f * 7.0f) continue;
+        if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W) continue;
+        if (scat01(SCAT_CACTUS, cx, cz, 0) > 0.17f) continue;
+        uint32_t h = scat_h(SCAT_CACTUS, cx, cz, 3);
+        if (!scat_free(x, z, 0.16f)) continue;
+        scat_push((v3){{x, 0.0f, z}}, 0.13f, h, -1, SCAT_CACTUS,
+                  (int)(h & 1u));
+      }
+
+  // TUMBLEWEED — 0-2, resting where a tumbleweed actually stops: a concave
+  // corner on the lee side. THORNS, STEPPE and SWEPT only (a dry-wind story).
+  int tumble_on = (g_theme.surf == SURF_SAND && g_mood_preset == 2) ||
+                  (g_theme.surf == SURF_GRIT && g_mood_preset != 0);
+  if (tumble_on) {
+    int nt = 0;
+    for (int iz = 0; iz < 8 && nt < 2; iz++)
+      for (int ix = -8; ix < 8 && nt < 2; ix++) {
+        uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
+        float x = ((float)ix + 0.1f + 0.8f * scat01(SCAT_TUMBLE, cx, cz, 1)) * 3.0f;
+        float z = ((float)iz + 0.1f + 0.8f * scat01(SCAT_TUMBLE, cx, cz, 2)) * 3.0f;
+        if (z < 0.4f) continue;
+        if (x * x + z * z < 6.5f * 6.5f) continue;
+        if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W) continue;
+        int wi2, c2;
+        float wd = scat_wall(x, z, &wi2, &c2);
+        float viab = (c2 ? 0.55f : 0.06f) * f_smoothstep(1.2f, 0.3f, wd) *
+                     (0.4f + 0.6f * scat_lee_sym(x, z, w));
+        if (scat01(SCAT_TUMBLE, cx, cz, 0) > viab) continue;
+        uint32_t h = scat_h(SCAT_TUMBLE, cx, cz, 3);
+        uint64_t st = (uint64_t)h * 2654435761u + 1;
+        float r = rng_rangef(&st, 0.13f, 0.165f);
+        if (!scat_free(x, z, r)) continue;
+        scat_push((v3){{x, 0.0f, z}}, r, h, -1, SCAT_TUMBLE, 0);
+        nt++;
+      }
+  }
+
+  // BRICK — the damage dressing: spill at every recorded FOOT line, rotated
+  // edge bricks on the sills and lowered tops. Bricks attach to the meta
+  // edges the generator published; count rides the ruin latent, because a
+  // brick field is what "ruined" literally means here.
+  for (int e = 0; e < g_meta.nedge; e++) {
+    const medge_t *ed = &g_meta.edge[e];
+    int nb = ed->kind == ME_FOOT
+                 ? 2 + (int)(scat_h(SCAT_BRICK, (uint32_t)e, 90, 0) %
+                             (uint32_t)(2.0f + 4.0f * g_mood.ruin))
+                 : 2 + (int)(scat_h(SCAT_BRICK, (uint32_t)e, 91, 0) % 3u);
+    for (int k = 0; k < nb; k++) {
+      uint32_t h = scat_h(SCAT_BRICK, (uint32_t)e, (uint32_t)k, 7);
+      uint64_t st = (uint64_t)h * 2654435761u + 1;
+      float u = rng_rangef(&st, 0.05f, 0.95f);
+      v3 p = v3_lerp(ed->a, ed->b, u);
+      if (ed->kind == ME_FOOT) {
+        // the spill spreads off the wall's line, never past a rubble's throw
+        float side = rng_rangef(&st, -0.55f, 0.55f);
+        if (ed->ax) p.z += side; else p.x += side;
+        p.y = 0.0f;
+        if (!scat_free(p.x, p.z, 0.10f)) continue;
+      }
+      if (g_scat_n >= SCAT_MAX) break;
+      scat_push(p, rng_rangef(&st, 0.85f, 1.10f), h, -1, SCAT_BRICK,
+                (int)ed->kind | ((int)ed->ax << 4));
+    }
+  }
+
+  g_scat_ms = (float)(clock() - t0) * (1000.0f / (float)CLOCKS_PER_SEC);
+}
+
 #define DECOR_MAX_VERTS 49152
 static float g_mesh[(MAX_SOLIDS * 36 + GROUND_VERTS + DECOR_MAX_VERTS) * VERT_FLOATS];
 static int   g_mesh_floats;
@@ -13132,12 +14060,58 @@ static void mesh_quad(v3 a, v3 b, v3 c, v3 d, v3 n, v3 col) {
 // adjacent vertices disagree by more than the eye's threshold: the quad diagonal
 // becomes a visible crease. One 3x3 pass removes exactly the vertex-to-vertex
 // component the interpolation cannot hide, and costs nothing at runtime.
-typedef struct { float tint, rough, ao; } gvert_t;
+// The tint is a VECTOR now, not a value: the SLATE moods' waterline and moss
+// bands are hue shifts, and a scalar multiplier cannot cool a band or green
+// a foot line without also just darkening it.
+typedef struct { v3 tint; float rough, ao; } gvert_t;
 static gvert_t g_gbake[(GROUND_CELLS + 1) * (GROUND_CELLS + 1)];
+
+// One stamp into the bake: multiply the cell's tint toward `to` and darken
+// its AO, falling off over r from p. PAINT CONTINUES WHERE MESH BUDGET
+// STOPS — the fines under a rock, the dust at a damage foot and the shadow a
+// decor rock cannot cast are all cheaper as pigment than as vertices.
+static void gbake_stamp(v3 p, float r, v3 to, float amt, float ao_amt) {
+  float H = ARENA_HALF;
+  int N = GROUND_CELLS + 1;
+  int x0 = (int)((p.x - r + H) / GROUND_STEP), x1 = (int)((p.x + r + H) / GROUND_STEP) + 1;
+  int z0 = (int)((p.z - r + H) / GROUND_STEP), z1 = (int)((p.z + r + H) / GROUND_STEP) + 1;
+  if (x0 < 0) x0 = 0;
+  if (z0 < 0) z0 = 0;
+  if (x1 >= N) x1 = N - 1;
+  if (z1 >= N) z1 = N - 1;
+  for (int iz = z0; iz <= z1; iz++)
+    for (int ix = x0; ix <= x1; ix++) {
+      float x = -H + (float)ix * GROUND_STEP, z = -H + (float)iz * GROUND_STEP;
+      float d = sqrtf((x - p.x) * (x - p.x) + (z - p.z) * (z - p.z));
+      float k = f_smoothstep(r, r * 0.25f, d) * amt;
+      if (k <= 0.0f) continue;
+      gvert_t *g = &g_gbake[iz * N + ix];
+      g->tint = v3_lerp(g->tint, (v3){{g->tint.x * to.x, g->tint.y * to.y,
+                                       g->tint.z * to.z}}, k);
+      g->ao *= 1.0f - ao_amt * k;
+    }
+}
+
+// The same stamp smeared along a SEGMENT — the sun-shadow smears and the
+// damage-foot dust lines. The same slab idea wind_shadow and shadow_foot
+// already use, in its third suit.
+static void gbake_smear(v3 a, v3 b, float r, v3 to, float amt, float ao_amt) {
+  v3 d = v3_sub(b, a);
+  float l = sqrtf(d.x * d.x + d.z * d.z);
+  int n = (int)(l / (GROUND_STEP * 0.55f)) + 1;
+  for (int i = 0; i <= n; i++) {
+    float u = (float)i / (float)n;
+    // the smear thins and fades toward its far end, the way a shadow does
+    gbake_stamp(v3_lerp(a, b, u), r * (1.0f - 0.4f * u), to,
+                amt * (1.0f - 0.65f * u), ao_amt * (1.0f - 0.65f * u));
+  }
+}
 
 static void ground_bake(void) {
   float H = ARENA_HALF;
   int N = GROUND_CELLS + 1;
+  v3 w = wind_dir();
+  int wet = g_theme.surf == SURF_WET;
   for (int iz = 0; iz < N; iz++)
     for (int ix = 0; ix < N; ix++) {
       float x = -H + (float)ix * GROUND_STEP, z = -H + (float)iz * GROUND_STEP;
@@ -13145,28 +14119,118 @@ static void ground_bake(void) {
       float t = 1.0f + 0.33f * g.drift - 0.11f * g.compact - 0.15f * g.skirt;
       t *= 0.965f + 0.07f * fnoise2(x * 0.11f, z * 0.11f);
       float r = WORLD_GROUND_R + 0.13f * g.drift - 0.08f * g.compact;
-      g_gbake[iz * N + ix] = (gvert_t){t, r, 1.0f - 0.34f * g.skirt};
+      v3 tv = {{t, t, t}};
+      // THE SLATE MOODS' FOOT BANDS live on the skirt the sample already
+      // computed: DOWNPOUR's waterline is a cool dark band along every wall
+      // base (rain ran off the walls); MOSSTONE's is a green one (the foot
+      // of a wall is where damp lasts). Hue work, which is why tint is a v3.
+      if (wet && g_mood_preset == 0) {
+        float k = g.skirt * 0.9f;
+        tv.x *= 1.0f - 0.30f * k; tv.y *= 1.0f - 0.22f * k; tv.z *= 1.0f - 0.10f * k;
+      } else if (wet && g_mood_preset == 2) {
+        float k = g.skirt * 0.65f;
+        tv.x *= 1.0f - 0.14f * k; tv.z *= 1.0f - 0.20f * k;
+      } else if (wet && g_mood_preset == 1) {
+        // DRAINED: runoff ran SOMEWHERE — dark streamlines lying along the
+        // wind, strongest in the wall-adjacent band the water came off.
+        float along = x * w.x + z * w.z, across = -x * w.z + z * w.x;
+        float streak = fnoise2(along * 0.33f + 31.0f, across * 1.9f - 7.0f);
+        float band = g.skirt * (1.0f - g.skirt);   // near walls, not under them
+        tv.x *= 1.0f - 0.34f * streak * band;
+        tv.y *= 1.0f - 0.32f * streak * band;
+        tv.z *= 1.0f - 0.28f * streak * band;
+        // And the TIDE LINE: a pale mineral crust ring where the water stood
+        // and left. The naming test could pick DRAINED only by elimination —
+        // its identity was an absence; this is the positive mark.
+        float crust = f_smoothstep(0.42f, 0.62f, g.skirt) *
+                      (1.0f - f_smoothstep(0.78f, 0.94f, g.skirt));
+        tv.x *= 1.0f + 0.13f * crust;
+        tv.y *= 1.0f + 0.11f * crust;
+        tv.z *= 1.0f + 0.05f * crust;
+      }
+      g_gbake[iz * N + ix] = (gvert_t){tv, r, 1.0f - 0.34f * g.skirt};
     }
+  // THE PLAN STAMPS THE BAKE — placement is data and ran before this pass.
+  // Every stamped site marks BOTH twins (the emit rule, in pigment).
+  float elev = asinf(f_clamp(g_sun.dir.y, -1.0f, 1.0f));
+  float smear_len = f_clamp(0.30f / tanf(fmaxf(elev, 0.06f)), 0.0f, 2.5f);
+  float smear_amt = 0.55f * (1.0f - f_smoothstep(0.30f, 0.75f, elev));
+  v3 sdir = v3_norm((v3){{-g_sun.dir.x, 0.0f, -g_sun.dir.z}});
+  v3 dust = {{0.86f, 0.85f, 0.84f}};
+  for (int n = 0; n < g_scat_n; n++) {
+    const scat_t *sc = &g_scat[n];
+    v3 p1 = sc->pos;
+    v3 p2 = sc->host >= 0
+                ? v3_scale(scat_reflect(p1, &g_solids[sc->host], sc->var & 1), -1.0f)
+                : v3_scale(p1, -1.0f);
+    v3 pp[2] = {p1, p2};
+    for (int t = 0; t < 2; t++) {
+      float s = sc->s;
+      switch (sc->fam) {
+      case SCAT_ROCK:
+        gbake_stamp(pp[t], s * 4.0f, dust, 0.7f, 0.30f);
+        if (smear_amt > 0.02f)
+          gbake_smear(pp[t], v3_add(pp[t], v3_scale(sdir, smear_len * s * 6.0f)),
+                      s * 1.8f, dust, smear_amt, 0.22f);
+        break;
+      case SCAT_STONE:
+        gbake_stamp(pp[t], s * 3.2f, dust, 0.5f, 0.20f);
+        if (smear_amt > 0.02f)
+          gbake_smear(pp[t], v3_add(pp[t], v3_scale(sdir, smear_len * s * 4.0f)),
+                      s * 1.5f, dust, smear_amt * 0.8f, 0.15f);
+        break;
+      case SCAT_TUFT:   // dry-straw warmth under the grass
+        gbake_stamp(pp[t], 0.45f, (v3){{1.03f, 1.00f, 0.90f}}, 0.5f, 0.06f);
+        break;
+      case SCAT_PAVE:   // the pavement's ground is packed dark under it
+        gbake_stamp(pp[t], s * 1.15f, (v3){{0.88f, 0.88f, 0.87f}}, 0.55f, 0.10f);
+        break;
+      case SCAT_SHRUB:
+        gbake_stamp(pp[t], s * 2.2f, dust, 0.4f, 0.14f);
+        if (smear_amt > 0.02f)
+          gbake_smear(pp[t], v3_add(pp[t], v3_scale(sdir, smear_len * s * 3.0f)),
+                      s * 1.2f, dust, smear_amt * 0.6f, 0.10f);
+        break;
+      default: break;
+      }
+    }
+  }
+  // The damage lines: brick dust in the host wall's own cast at every foot.
+  for (int n = 0; n < g_meta.nedge; n++) {
+    const medge_t *e = &g_meta.edge[n];
+    if (e->kind != ME_FOOT) continue;
+    int wi = -1;
+    scat_wall((e->a.x + e->b.x) * 0.5f, (e->a.z + e->b.z) * 0.5f, &wi, NULL);
+    v3 wc2 = wi >= 0 ? g_solids[wi].color : g_theme.wall;
+    v3 to = {{f_clamp(0.85f + 0.15f * wc2.x / fmaxf(g_theme.ground.x, 0.05f), 0.7f, 1.15f),
+              f_clamp(0.85f + 0.15f * wc2.y / fmaxf(g_theme.ground.y, 0.05f), 0.7f, 1.15f),
+              f_clamp(0.85f + 0.15f * wc2.z / fmaxf(g_theme.ground.z, 0.05f), 0.7f, 1.15f)}};
+    gbake_smear(e->a, e->b, 0.8f, to, 0.65f, 0.25f);
+    gbake_smear(v3_scale(e->a, -1.0f), v3_scale(e->b, -1.0f), 0.8f, to, 0.65f, 0.25f);
+  }
   static gvert_t tmp[(GROUND_CELLS + 1) * (GROUND_CELLS + 1)];
   memcpy(tmp, g_gbake, sizeof tmp);
   for (int iz = 0; iz < N; iz++)
     for (int ix = 0; ix < N; ix++) {
-      float st = 0.0f, sr = 0.0f, sa = 0.0f, w = 0.0f;
+      v3 st = {{0, 0, 0}};
+      float sr = 0.0f, sa = 0.0f, wsum = 0.0f;
       for (int dz = -1; dz <= 1; dz++)
         for (int dx = -1; dx <= 1; dx++) {
           int jx = ix + dx, jz = iz + dz;
           if (jx < 0 || jz < 0 || jx >= N || jz >= N) continue;
           float k = (dx == 0 && dz == 0) ? 4.0f : (dx == 0 || dz == 0) ? 2.0f : 1.0f;
           const gvert_t *q = &tmp[jz * N + jx];
-          st += q->tint * k; sr += q->rough * k; sa += q->ao * k; w += k;
+          st = v3_add(st, v3_scale(q->tint, k));
+          sr += q->rough * k; sa += q->ao * k; wsum += k;
         }
-      g_gbake[iz * N + ix] = (gvert_t){st / w, sr / w, sa / w};
+      g_gbake[iz * N + ix] =
+          (gvert_t){v3_scale(st, 1.0f / wsum), sr / wsum, sa / wsum};
     }
 }
 
 static void mesh_ground_vert(int ix, int iz, v3 base) {
   const gvert_t *g = &g_gbake[iz * (GROUND_CELLS + 1) + ix];
-  v3 c = {{base.x * g->tint, base.y * g->tint, base.z * g->tint}};
+  v3 c = {{base.x * g->tint.x, base.y * g->tint.y, base.z * g->tint.z}};
   float r = g->rough < 0.05f ? 0.05f : g->rough > 1.0f ? 1.0f : g->rough;
   mesh_vert((v3){{-ARENA_HALF + (float)ix * GROUND_STEP, 0.0f,
                   -ARENA_HALF + (float)iz * GROUND_STEP}},
@@ -13177,6 +14241,11 @@ static void mesh_ground_vert(int ix, int iz, v3 base) {
 // boxes, tapered blades and sloped wedges, and every one of those already exists as a
 // scene_* primitive.
 static void mesh_decor(void);
+// The CASTING specials — the boulder pair's chamfered render and the dead
+// trees' crowns — live down there too (same primitives), but must be emitted
+// BEFORE the shadow prefix latch: a boulder without a shadow is a sticker,
+// and the crown's long shadow is the whole reason the tree signature exists.
+static void mesh_cast_extra(void);
 
 static void mesh_build(void) {
   g_mesh_floats = 0;
@@ -13192,6 +14261,11 @@ static void mesh_build(void) {
   ao_set(0.0f, WORLD_AO_RATE, WORLD_AO_MIN);
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
+    // The boulder pair collides as its AABB but RENDERS chamfered (0.04 m —
+    // under the wire quantization players already live with); the plain
+    // six-quad emit would fight the chamfered copy, so it is skipped here
+    // and mesh_cast_extra owns the draw.
+    if (i == g_meta.bould[0] || i == g_meta.bould[1]) continue;
     v3 mn = s->min, mx = s->max, c = s->color;
     // +x -x +y -y +z -z faces, wound counter-clockwise from outside.
     mesh_quad((v3){{mx.x,mn.y,mn.z}},(v3){{mx.x,mx.y,mn.z}},(v3){{mx.x,mx.y,mx.z}},(v3){{mx.x,mn.y,mx.z}},(v3){{1,0,0}},c);
@@ -13202,11 +14276,16 @@ static void mesh_build(void) {
     mesh_quad((v3){{mx.x,mn.y,mn.z}},(v3){{mn.x,mn.y,mn.z}},(v3){{mn.x,mx.y,mn.z}},(v3){{mx.x,mx.y,mn.z}},(v3){{0,0,-1}},c);
   }
   ao_off();
+  mesh_cast_extra();   // boulder render + tree crowns: casters, so pre-latch
   // EVERYTHING THAT CASTS IS NOW BEHIND US. The floor cannot: it is the lowest surface
   // in the world and there is nothing under it to shadow, so its 4608 triangles were
   // being rasterised into a 4096-square depth map every frame to decide the shadowing
   // of nothing at all.
   R.world_cast_verts = g_mesh_floats / VERT_FLOATS;
+  // The scatter plan runs BEFORE the bake on purpose: placement is data, and
+  // the ground pass is entitled to read it (a stain under a planned rock is
+  // paint continuing where the mesh budget stops).
+  scat_plan();
   mat_set(WORLD_GROUND_R, 0.0f);
   ao_off();
   ground_bake();
@@ -17080,23 +18159,26 @@ static void scene_box(v3 c, v3 ex, v3 ey, v3 ez, v3 col) {
 // Everything here is ankle height ON PURPOSE: a knee-high visual rock a round
 // passes through is a lie you can die to, and a free-standing 300-800 mm mass reads as
 // a crouched player at range whether it is one or not.
-static uint64_t g_rng_dec;
-
-static float dr(float lo, float hi) { return rng_rangef(&g_rng_dec, lo, hi); }
 static v3 dec_rot(v3 p, float sg) { return (v3){{p.x * sg, p.y, p.z * sg}}; }
 
 // A tumbled stone. The TILT is the whole point: everything else in this arena is an
 // axis-aligned box, so a few degrees off vertical is the single cue that separates "a
 // thing that fell here" from "a thing that was built here".
+// chamk is the decor chamfer ladder — 0.30 for tumbled dry stone, 0.45 for the
+// wet theme's water-worn cobbles — a global language constant per theme, never
+// a per-seed draw.
 static void dec_stone(v3 at, float rx, float ry, float rz, float yaw,
-                      float tilt, v3 col, float sg) {
+                      float tilt, v3 col, float sg, float chamk) {
   // A STONE HAS NO ARRIS, and g_cham is already the primitive that says so — the same
-  // flag the viewmodel turns on for its 0.7 mm broken edges, here at 18% of the minor
-  // half-extent because a weathered stone is nearly round at its corners.
+  // flag the viewmodel turns on for its 0.7 mm broken edges, here as a fraction of the
+  // minor half-extent because a weathered stone is nearly round at its corners.
   float mn3 = rx < ry ? (rx < rz ? rx : rz) : (ry < rz ? ry : rz);
-  // 0.28 of the minor half-extent, not 0.18: at the smaller number the bevel was a
-  // machined arris and every stone still read as a small crate.
-  float cham = mn3 > 0.072f ? mn3 * 0.30f : 0.0f;
+  // 0.30 of the minor half-extent, not 0.18: at the smaller number the bevel was a
+  // machined arris and every stone still read as a small crate. The size floor
+  // is 0.032 (was 0.072, tuned when the smallest stone was twice this size):
+  // above it every stone gets its bevel — an unbevelled 5 cm cube on the floor
+  // reads as a DIE, which is the review note that moved it.
+  float cham = mn3 > 0.032f ? mn3 * chamk : 0.0f;
   float save_cham = g_cham;
   g_cham = cham;
   float cy = cosf(yaw), sy = sinf(yaw), ct = cosf(tilt), st = sinf(tilt);
@@ -17108,30 +18190,145 @@ static void dec_stone(v3 at, float rx, float ry, float rz, float yaw,
   g_cham = save_cham;
 }
 
-// A dry grass tuft: five tapered blades from one root.
-static void dec_tuft(v3 at, float h, v3 wind, float lean, v3 col, float sg) {
-  for (int b = 0; b < 5; b++) {
-    float a = (float)b * 1.2566f + dr(-0.44f, 0.44f);
-    float bh = h * dr(0.62f, 1.0f);
-    float bw = dr(0.010f, 0.017f);
+// A dry grass tuft: tapered blades from one root. The caller owns the
+// randomness (a per-site hash stream, re-seeded per twin so both hold the
+// same tuft) and pre-rotates the WIND for the mirrored copy — dec_rot maps a
+// downwind lean onto an upwind one, which is exactly the half-arena tell the
+// old signature shipped.
+static void dec_tuft(v3 at, float h, v3 wind, float lean, v3 col, float sg,
+                     uint64_t *st, int nb) {
+  for (int b = 0; b < nb; b++) {
+    float a = (float)b * (6.2832f / (float)nb) + rng_rangef(st, -0.44f, 0.44f);
+    float bh = h * rng_rangef(st, 0.62f, 1.0f);
+    float bw = rng_rangef(st, 0.010f, 0.017f);
     v3 dir = {{cosf(a), 0.0f, sinf(a)}};
     v3 perp = {{-sinf(a), 0.0f, cosf(a)}};
     // Splay out from the root, then lean downwind. The splay is what gives the
     // tuft a silhouette; the lean is what gives the field a direction.
-    v3 root = v3_add(at, v3_scale(dir, dr(0.0f, 0.022f)));
+    v3 root = v3_add(at, v3_scale(dir, rng_rangef(st, 0.0f, 0.022f)));
     v3 tip = v3_add(root, (v3){{0.0f, bh, 0.0f}});
-    tip = v3_add(tip, v3_scale(dir, bh * dr(0.16f, 0.42f)));
+    tip = v3_add(tip, v3_scale(dir, bh * rng_rangef(st, 0.16f, 0.42f)));
     tip = v3_add(tip, v3_scale(wind, bh * lean));
     v3 b0 = v3_add(root, v3_scale(perp, bw));
     v3 b1 = v3_sub(root, v3_scale(perp, bw));
     // Up-and-outward, so the blade catches the sky the way a standing leaf does
     // rather than going flat-dark like a card lying on the ground.
     v3 n = v3_norm(v3_add((v3){{0.0f, 1.0f, 0.0f}}, v3_scale(perp, 0.35f)));
-    v3 tint = v3_scale(col, dr(0.88f, 1.12f));
+    v3 tint = v3_scale(col, rng_rangef(st, 0.88f, 1.12f));
     v3 r0 = dec_rot(b0, sg), r1 = dec_rot(b1, sg), rt = dec_rot(tip, sg);
     v3 rn = dec_rot(n, sg);
     scene_poly3(r0, r1, rt, rn, tint);
     scene_poly3(r1, r0, rt, rn, tint);
+  }
+}
+
+// ONE TWIG — a tapered double-sided blade, the tuft blade's woody sibling:
+// what the shrub and the tumbleweed are made of. Six verts, because at
+// 6-10 mm across a full prism is thirty spent below one pixel.
+static void dec_twig(v3 root, v3 dir, float len, float w0, v3 col, float sg) {
+  v3 tip = v3_add(root, v3_scale(dir, len));
+  v3 up = fabsf(dir.y) > 0.9f ? (v3){{1, 0, 0}} : (v3){{0, 1, 0}};
+  v3 perp = v3_scale(v3_norm(v3_cross(dir, up)), w0);
+  v3 n = v3_norm(v3_add((v3){{0.0f, 1.0f, 0.0f}}, v3_scale(perp, 0.3f)));
+  v3 b0 = dec_rot(v3_add(root, perp), sg), b1 = dec_rot(v3_sub(root, perp), sg);
+  v3 rt = dec_rot(tip, sg), rn = dec_rot(n, sg);
+  scene_poly3(b0, b1, rt, rn, col);
+  scene_poly3(b1, b0, rt, rn, col);
+}
+
+// An ANGULAR rock — the chamfered box's sibling for stone that broke rather
+// than tumbled. Eight box corners, some pulled toward the centroid, every
+// face split into two flat triangles: a "worn corner" is one vertex moved, the
+// mesh stays closed by construction, and flat shading is the house facet
+// language. `keel` is the SAND theme's ventifact cue: the two top corners on
+// the local -X side (the caller aligns +X downwind) pulled hard down, which is
+// the wind-carved slope every desert photo of one shows.
+static void dec_rock(v3 at, float rx, float ry, float rz, float yaw,
+                     float tilt, uint32_t cuts, float cutf, int keel,
+                     v3 col, float sg) {
+  float cy = cosf(yaw), sy = sinf(yaw), ct = cosf(tilt), tst = sinf(tilt);
+  v3 X = {{cy, 0.0f, -sy}}, Y = {{0.0f, 1.0f, 0.0f}}, Z = {{sy, 0.0f, cy}};
+  v3 Xt = v3_add(v3_scale(X, ct), v3_scale(Y, tst));
+  v3 Yt = v3_sub(v3_scale(Y, ct), v3_scale(X, tst));
+  v3 ex = v3_scale(Xt, rx), ey = v3_scale(Yt, ry), ez = v3_scale(Z, rz);
+  v3 p[8];
+  for (int i = 0; i < 8; i++) {
+    v3 q = at;
+    q = v3_add(q, v3_scale(ex, i & 1 ? 1.0f : -1.0f));
+    q = v3_add(q, v3_scale(ey, i & 2 ? 1.0f : -1.0f));
+    q = v3_add(q, v3_scale(ez, i & 4 ? 1.0f : -1.0f));
+    p[i] = q;
+  }
+  if (keel) {   // -x (bit 0 clear) top (bit 1 set) corners: 2 and 6
+    p[2] = v3_lerp(p[2], at, 0.44f);
+    p[6] = v3_lerp(p[6], at, 0.44f);
+  }
+  for (int i = 0; i < 8; i++)
+    if ((cuts >> i) & 1u)
+      p[i] = v3_lerp(p[i], at, cutf * (0.75f + 0.5f * (float)((cuts >> (i + 8)) & 1u)));
+  // scene_box's own face table, CCW from outside; the split diagonal is a-c.
+  static const int F[6][4] = {{1, 3, 7, 5}, {4, 6, 2, 0}, {2, 6, 7, 3},
+                              {4, 0, 1, 5}, {4, 5, 7, 6}, {0, 2, 3, 1}};
+  for (int f = 0; f < 6; f++) {
+    v3 a = p[F[f][0]], b = p[F[f][1]], c = p[F[f][2]], d = p[F[f][3]];
+    for (int half = 0; half < 2; half++) {
+      v3 t0 = a, t1 = half ? c : b, t2 = half ? d : c;
+      v3 n = v3_cross(v3_sub(t1, t0), v3_sub(t2, t0));
+      float l = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+      if (l < 1e-9f) continue;   // a cut can degenerate one half-face
+      n = v3_scale(n, 1.0f / l);
+      v3 mid = v3_scale(v3_add(v3_add(t0, t1), t2), 1.0f / 3.0f);
+      // The face table is authored CCW-outside, but a deep cut can turn a
+      // half-face over — culling is on, so a flip must swap the WINDING with
+      // the normal or the face simply vanishes.
+      if (v3_dot(n, v3_sub(mid, at)) < 0.0f) {
+        v3 tmp = t1; t1 = t2; t2 = tmp;
+        n = v3_scale(n, -1.0f);
+      }
+      scene_poly3(dec_rot(t0, sg), dec_rot(t1, sg), dec_rot(t2, sg),
+                  dec_rot(n, sg), col);
+    }
+  }
+}
+
+// A pebble: a squashed six-vertex octahedron, eight flat faces, 24 verts —
+// the smallest closed thing this mesh can afford, for the tier where any more
+// would be spent below one pixel.
+static void dec_pebble(v3 at, float r, uint64_t *st, v3 col, float sg) {
+  float rx = r * rng_rangef(st, 0.85f, 1.30f);
+  float rz = r * rng_rangef(st, 0.85f, 1.30f);
+  float ry = r * rng_rangef(st, 0.55f, 0.80f);
+  float yaw = rng_rangef(st, 0.0f, 6.283f);
+  float sink = rng_rangef(st, 0.15f, 0.40f);
+  at.y = ry * (1.0f - 2.0f * sink);
+  float cy = cosf(yaw), sy = sinf(yaw);
+  v3 X = {{cy, 0.0f, -sy}}, Z = {{sy, 0.0f, cy}};
+  v3 e[4];   // the equator, each spoke its own length
+  e[0] = v3_add(at, v3_scale(X, rx * rng_rangef(st, 0.85f, 1.15f)));
+  e[1] = v3_add(at, v3_scale(Z, rz * rng_rangef(st, 0.85f, 1.15f)));
+  e[2] = v3_sub(at, v3_scale(X, rx * rng_rangef(st, 0.85f, 1.15f)));
+  e[3] = v3_sub(at, v3_scale(Z, rz * rng_rangef(st, 0.85f, 1.15f)));
+  v3 top = v3_add(at, (v3){{0.0f, ry, 0.0f}});
+  v3 bot = v3_sub(at, (v3){{0.0f, ry, 0.0f}});
+  // Each face's winding is derived from its own cross product, so the normal
+  // and the vertex order can never disagree (culling is on).
+  for (int i = 0; i < 4; i++) {
+    v3 a = e[i], b = e[(i + 1) & 3];
+    v3 apex[2] = {top, bot};
+    for (int hb = 0; hb < 2; hb++) {
+      v3 t0 = apex[hb], t1 = hb ? a : b, t2 = hb ? b : a;
+      v3 n = v3_cross(v3_sub(t1, t0), v3_sub(t2, t0));
+      float l = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+      if (l < 1e-9f) continue;
+      n = v3_scale(n, 1.0f / l);
+      v3 mid = v3_scale(v3_add(v3_add(t0, t1), t2), 1.0f / 3.0f);
+      if (v3_dot(n, v3_sub(mid, at)) < 0.0f) {
+        v3 tmp = t1; t1 = t2; t2 = tmp;
+        n = v3_scale(n, -1.0f);
+      }
+      scene_poly3(dec_rot(t0, sg), dec_rot(t1, sg), dec_rot(t2, sg),
+                  dec_rot(n, sg), col);
+    }
   }
 }
 
@@ -17157,7 +18354,14 @@ static void dec_drift(v3 a0, v3 a1, v3 o, float len, float hgt, v3 col,
     v3 out = v3_add(base, v3_scale(o, len * bell));
     v3 rt = dec_rot(top, sg), rb = dec_rot(out, sg);
     if (i > 0) {
-      v3 n = v3_norm(v3_cross(v3_sub(rb, pt), v3_sub(pb, pt)));
+      // The END segments are degenerate by construction (the bell starts at
+      // zero, so the previous top and out coincide) and v3_norm of a zero
+      // cross is NaN under -ffast-math — a TRUE-BLACK triangle at every
+      // drift's tip. At 20 cm it hid for months; on a long face it was a
+      // black wedge lying in the open.
+      v3 cr = v3_cross(v3_sub(rb, pt), v3_sub(pb, pt));
+      float cl = sqrtf(cr.x * cr.x + cr.y * cr.y + cr.z * cr.z);
+      v3 n = cl > 1e-8f ? v3_scale(cr, 1.0f / cl) : (v3){{0.0f, 1.0f, 0.0f}};
       if (n.y < 0.0f) n = v3_scale(n, -1.0f);
       scene_poly4(pt, rt, rb, pb, n, col);
     }
@@ -17165,69 +18369,381 @@ static void dec_drift(v3 a0, v3 a1, v3 o, float len, float hgt, v3 col,
   }
 }
 
-// One dressing site: a clump, never a single object.
-static void dec_clump(v3 at, v3 o, v3 wind, const theme_t *th, v3 host,
-                      int grass, float sg) {
-  // A stone is the GROUND it broke off, not the cover it sits beside: at 0.42 toward
-  // the cover tone it came out a saturated red-brown slab on beige sand, which is the
-  // loudest thing a 6 cm object can be.
-  v3 stone = v3_lerp(v3_lerp(th->ground, th->cover, 0.20f), host, 0.34f);
+// The stone tint — ONE copy (it was dec_clump's, and dec_clump is gone): a
+// stone is the GROUND it broke off, not the cover it sits beside — at 0.42
+// toward the cover tone it came out a saturated red-brown slab on beige sand,
+// which is the loudest thing a 6 cm object can be. Pulled a third of the way
+// toward its host wall, then desaturated hard.
+static v3 dec_stone_col(v3 host, uint64_t *st) {
+  const theme_t *th = &g_theme;
+  // Anchored on the FLOOR, not the walls: a desert rock is dust-coated and
+  // sits close to its own ground. The first recipe pulled 0.34 toward the
+  // host wall and then darkened twice — on sand the rocks came out PINK (the
+  // wall family's hue) with shadow sides near black, i.e. exactly the value a
+  // distant player presents, which is a readability tax and not a look.
+  v3 stone = v3_lerp(th->ground, host, 0.14f);
   float sl = stone.x * 0.30f + stone.y * 0.59f + stone.z * 0.11f;
-  stone = v3_lerp(stone, (v3){{sl, sl, sl}}, 0.45f);
-  stone = v3_scale(stone, dr(0.80f, 0.98f));
-  int n = 1 + (int)(rng_next(&g_rng_dec) % 3u);
-  // FEWER SITES, BIGGER PILES. Sites spaced along every face at a metre and dressed at
-  // half of them gave an evenly spaced ROW of pebbles down the foot of each crate line
-  // — the exact lattice-with-jitter read that uniform scatter always produces.
-  float rmax = dr(0.062f, 0.112f);
-  for (int i = 0; i < n; i++) {
-    // Each child is a fraction of the one before it, thrown a little further
-    // out. Strongly skewed small: a uniform size range reads as machine output.
-    float f = powf(0.66f, (float)i) * dr(0.85f, 1.15f);
-    float r = rmax * f;
-    if (r < 0.028f) continue;
-    v3 p = v3_add(at, v3_scale(o, dr(-0.05f, 0.34f)));
-    v3 side = {{-o.z, 0.0f, o.x}};
-    p = v3_add(p, v3_scale(side, dr(-0.36f, 0.36f) * (1.0f + (float)i * 0.5f)));
-    p.y = r * dr(0.55f, 0.80f);   // half-buried, never balanced on a point
-    // BULK, not a slab.
-    dec_stone(p, r * dr(0.85f, 1.35f), r * dr(0.72f, 1.05f), r * dr(0.85f, 1.25f),
-              dr(0.0f, 6.283f), dr(-0.20f, 0.20f),
-              v3_scale(stone, dr(0.92f, 1.08f)), sg);
-  }
-  if (!grass) return;
-  int g = 1 + (int)(rng_next(&g_rng_dec) % 2u);
+  stone = v3_lerp(stone, (v3){{sl, sl, sl}}, 0.30f);
+  // 0.86-1.00 of the floor, not 0.74-0.90: the visible side of a rock is
+  // mostly its SHADED side, so the lighting already supplies the value step —
+  // an albedo step on top of it read as a black blob at twenty metres.
+  return v3_scale(stone, rng_rangef(st, 0.86f, 1.00f));
+}
+
+// EMIT — mint both 180-degree twins of every planned site. The per-site hash
+// stream is re-seeded for each twin so both hold the SAME object; the wind is
+// pre-rotated for the mirrored copy (see the symmetry contract at scat_plan);
+// a face-attached site's twin goes through scat_reflect first so the rotation
+// lands it on the twin solid's own lee face.
+static void scat_emit(void) {
+  const theme_t *th = &g_theme;
+  g_scat_top = 0.0f;   // emit owns this number: the tallest proud decor point
+  v3 w = wind_dir();
+  int sand = th->surf == SURF_SAND, wet = th->surf == SURF_WET;
+  // The decor chamfer ladder: 0.30 tumbled dry, 0.45 water-worn — a language
+  // constant per theme, never a per-seed draw.
+  float chamk = wet ? 0.45f : 0.30f;
   // Dead dry grass, and it must stay UNDER the floor in value: a tuft brighter
-  // than the sand it stands in is the brightest thing in the lower third of the
-  // frame, which is exactly where a player's eye is looking for a prone figure.
+  // than the sand it stands in is the brightest thing in the lower third of
+  // the frame, which is exactly where a player's eye is looking for a prone
+  // figure. The green variant exists only beside rocks (the plan gates it).
   v3 dry = v3_lerp(th->ground, (v3){{0.34f, 0.31f, 0.17f}}, 0.62f);
-  for (int i = 0; i < g; i++) {
-    v3 p = v3_add(at, v3_scale(o, dr(0.02f, 0.30f)));
-    v3 side = {{-o.z, 0.0f, o.x}};
-    p = v3_add(p, v3_scale(side, dr(-0.42f, 0.42f)));
-    p.y = 0.0f;
-    // Log-uniform biased small: many short tufts, a few tall ones.
-    float u = dr(0.0f, 1.0f);
-    float h = 0.085f * powf(0.235f / 0.085f, u * u);
-    dec_tuft(p, h, wind, dr(0.16f, 0.34f), v3_scale(dry, dr(0.90f, 1.10f)), sg);
+  // STEPPE lifts the straw 8 % — its identity IS the tuft bands, and they
+  // must read from the play camera, not only in a crop.
+  if (th->surf == SURF_GRIT && g_mood_preset == 2) dry = v3_scale(dry, 1.08f);
+  v3 green = v3_lerp(dry, (v3){{0.30f, 0.34f, 0.14f}}, 0.55f);
+  for (int n = 0; n < g_scat_n; n++) {
+    const scat_t *sc = &g_scat[n];
+    // The host tint once per PAIR, off the canonical position — a stone takes
+    // its wall's cast only when it plausibly broke off one.
+    v3 host = th->cover;
+    int wi;
+    if (scat_wall(sc->pos.x, sc->pos.z, &wi, NULL) < 3.5f && wi >= 0)
+      host = g_solids[wi].color;
+    for (int t = 0; t < 2; t++) {
+      float sg = t ? -1.0f : 1.0f;
+      v3 at = sc->pos;
+      if (t && sc->host >= 0)
+        at = scat_reflect(at, &g_solids[sc->host], sc->var & 1);
+      v3 w2 = dec_rot(w, sg);
+      uint64_t st = (uint64_t)sc->h * 2654435761u + 1;
+      switch (sc->fam) {
+      case SCAT_ROCK: {
+        float ry = sc->s, rx, rz, yaw;
+        if (sand) {
+          // A ventifact: elongated ALONG the wind (an axis cue, safe under
+          // the rotation) with the keel facet carved on its windward end.
+          yaw = atan2f(-w2.z, w2.x) + rng_rangef(&st, -0.22f, 0.22f);
+          rx = ry * rng_rangef(&st, 1.35f, 1.75f);
+          rz = ry * rng_rangef(&st, 0.85f, 1.10f);
+        } else {
+          yaw = rng_rangef(&st, 0.0f, 6.283f);
+          rx = ry * rng_rangef(&st, 0.90f, 1.40f);
+          rz = ry * rng_rangef(&st, 0.80f, 1.20f);
+        }
+        float tilt = rng_rangef(&st, -0.14f, 0.14f);
+        float sink = rng_rangef(&st, 0.25f, 0.30f);
+        // The two-class cover rule as arithmetic: whatever the tilt and
+        // aspect drew, the proud top stays strictly under 0.30 m — scaled
+        // uniformly so the shape survives the clamp.
+        float ct = cosf(tilt), stt = fabsf(sinf(tilt));
+        float top = ry * (1.0f - 2.0f * sink) + ct * ry + stt * rx;
+        float k = top > 0.295f ? 0.295f / top : 1.0f;
+        rx *= k; ry *= k; rz *= k; top *= k;
+        at.y = ry * (1.0f - 2.0f * sink);
+        if (top > g_scat_top) g_scat_top = top;
+        v3 col = dec_stone_col(host, &st);
+        // MOSSTONE: one cobble in three takes a films-of-moss lerp — the
+        // growth a mineral theme is allowed.
+        if (wet && g_mood_preset == 2 && (sc->h % 3u) == 0u)
+          col = v3_lerp(col, (v3){{0.30f, 0.36f, 0.20f}}, 0.20f);
+        if (wet)   // a cobble tumbled round, not broken sharp
+          dec_stone(at, rx, ry, rz, yaw, tilt, col, sg, chamk);
+        else
+          dec_rock(at, rx, ry, rz, yaw, tilt,
+                   (sc->h & 0x2Du) | (sc->h & 0xFF00u),
+                   rng_rangef(&st, 0.16f, 0.28f), sand, col, sg);
+      } break;
+      case SCAT_STONE: {
+        float r = sc->s;
+        float rx = r * rng_rangef(&st, 0.85f, 1.35f);
+        float ry = r * rng_rangef(&st, 0.72f, 1.05f);
+        float rz = r * rng_rangef(&st, 0.85f, 1.25f);
+        float sink = rng_rangef(&st, 0.12f, 0.30f);
+        v3 col = v3_scale(dec_stone_col(host, &st),
+                          rng_rangef(&st, 0.92f, 1.08f));
+        if (wet && g_mood_preset == 2 && (sc->h % 3u) == 0u)
+          col = v3_lerp(col, (v3){{0.30f, 0.36f, 0.20f}}, 0.20f);
+        at.y = ry * (1.0f - 2.0f * sink);
+        float top = at.y + ry + 0.2f * rx;
+        if (top > g_scat_top) g_scat_top = top;
+        // The satellites speak the SAME language as their hero: on the dry
+        // themes that is the cut-corner rock — a chamfered cube at this size
+        // reads as a die beside an angular parent (P6, from inside the
+        // family). Wet keeps the tumbled cobble.
+        if (wet)
+          dec_stone(at, rx, ry, rz, rng_rangef(&st, 0.0f, 6.283f),
+                    rng_rangef(&st, -0.20f, 0.20f), col, sg, chamk);
+        else
+          dec_rock(at, rx, ry, rz, rng_rangef(&st, 0.0f, 6.283f),
+                   rng_rangef(&st, -0.20f, 0.20f),
+                   (sc->h & 0x2Du) | (sc->h & 0xFF00u),
+                   rng_rangef(&st, 0.14f, 0.26f), 0, col, sg);
+      } break;
+      case SCAT_PEBBLE: {
+        // A pebble only needs to exist inside 3 m — at range a dark speck on
+        // a lit floor reads as a bullet hole. Most of the way back toward the
+        // floor's own colour.
+        v3 col = v3_lerp(th->ground, dec_stone_col(host, &st), 0.60f);
+        dec_pebble(at, sc->s, &st, col, sg);
+      } break;
+      case SCAT_TUFT: {
+        // Log-uniform biased small: many short tufts, a few tall ones.
+        float u = rng_rangef(&st, 0.0f, 1.0f);
+        float h = 0.085f * powf(0.235f / 0.085f, u * u) * sc->s;
+        v3 col = (sc->var & 2) ? green : dry;
+        float lean = rng_rangef(&st, 0.16f, 0.34f);
+        // Band tufts (face-attached) get the 7-blade build — they are what a
+        // player walks past at arm's length; field tufts keep 5.
+        dec_tuft(at, h, w2, lean, v3_scale(col, rng_rangef(&st, 0.90f, 1.10f)),
+                 sg, &st, sc->host >= 0 ? 7 : 5);
+      } break;
+      case SCAT_PAVE: {
+        // Desert pavement: ~40 flat plates a centimetre proud, noise-ragged
+        // boundary — a mid-value texture zone from range that resolves into
+        // stones up close. The bake darkens the ground beneath it.
+        float prad = sc->s;
+        v3 col = v3_scale(dec_stone_col(host, &st), 0.96f);
+        int np2 = 52 + (int)(rng_next(&st) % 13u);
+        for (int k = 0; k < np2; k++) {
+          float rr = prad * sqrtf(rng_rangef(&st, 0.0f, 1.0f));
+          float ang = rng_rangef(&st, 0.0f, 6.283f);
+          v3 p = v3_add(at, (v3){{cosf(ang) * rr, 0.0f, sinf(ang) * rr}});
+          uint32_t ph = (uint32_t)rng_next(&st);
+          float ry = rng_rangef(&st, 0.012f, 0.018f);
+          float rx = rng_rangef(&st, 0.060f, 0.100f);
+          float rz = rx * rng_rangef(&st, 0.7f, 1.1f);
+          float yaw = rng_rangef(&st, 0.0f, 6.283f);
+          if (fnoise2(p.x * 0.9f + 3.0f, p.z * 0.9f - 8.0f) < 0.22f) continue;
+          p.y = ry * 0.30f;
+          dec_rock(p, rx, ry, rz, yaw, rng_rangef(&st, -0.06f, 0.06f),
+                   ph & 0xFFFFu, 0.22f, 0, v3_scale(col, rng_rangef(&st, 0.92f, 1.06f)),
+                   sg);
+        }
+      } break;
+      case SCAT_SHRUB: {
+        // A dry shrub: openwork twigs up-and-out from one root, leaning a
+        // little downwind. It never exceeds 0.35 m and you can see through
+        // it — which is what keeps it honestly outside the cover language.
+        int ns2 = 7 + (int)(rng_next(&st) % 4u);
+        v3 wcol2 = (v3){{0.24f, 0.21f, 0.17f}};
+        for (int k = 0; k < ns2; k++) {
+          float ya = rng_rangef(&st, 0.0f, 6.283f);
+          float el = rng_rangef(&st, 0.35f, 1.15f);
+          v3 dir = {{cosf(ya) * cosf(el), sinf(el), sinf(ya) * cosf(el)}};
+          dir = v3_norm(v3_add(dir, v3_scale(w2, 0.18f)));
+          float len = sc->s * rng_rangef(&st, 0.75f, 1.35f);
+          v3 root = v3_add(at, (v3){{rng_rangef(&st, -0.02f, 0.02f), 0.0f,
+                                     rng_rangef(&st, -0.02f, 0.02f)}});
+          // tips read lighter: sun-bleached dead wood
+          v3 c2 = v3_scale(wcol2, rng_rangef(&st, 0.88f, 1.06f) +
+                                      0.4f * len / sc->s * 0.15f);
+          dec_twig(root, dir, len, rng_rangef(&st, 0.005f, 0.009f), c2, sg);
+        }
+      } break;
+      case SCAT_CACTUS: {
+        // Sage over the desert floor — desaturated enough to stay out of the
+        // soldier's olive band, audited at both sun extremes.
+        v3 sage = v3_scale((v3){{0.34f, 0.38f, 0.27f}},
+                           rng_rangef(&st, 0.92f, 1.06f));
+        if (sc->var & 1) {
+          // barrel: a squat all-corners-cut lump, sunk like a stone
+          float ry = rng_rangef(&st, 0.11f, 0.14f);
+          float rx = rng_rangef(&st, 0.09f, 0.12f);
+          float rz = rx * rng_rangef(&st, 0.9f, 1.1f);
+          at.y = ry * 0.70f;
+          float top = at.y + ry;
+          if (top > g_scat_top) g_scat_top = top;
+          dec_rock(at, rx, ry, rz, rng_rangef(&st, 0.0f, 6.283f), 0.0f,
+                   0xFFFFu, 0.30f, 0, sage, sg);
+        } else {
+          // prickly pear: 3-5 flat pads fanned low from the root
+          int np3 = 3 + (int)(rng_next(&st) % 3u);
+          for (int k = 0; k < np3; k++) {
+            float ya = rng_rangef(&st, 0.0f, 6.283f);
+            v3 d = {{cosf(ya), 0.0f, sinf(ya)}};
+            float rx = rng_rangef(&st, 0.06f, 0.09f);
+            float ry = rng_rangef(&st, 0.07f, 0.10f);
+            v3 c3 = v3_add(at, (v3){{d.x * rng_rangef(&st, 0.04f, 0.08f),
+                                     rng_rangef(&st, 0.07f, 0.12f),
+                                     d.z * rng_rangef(&st, 0.04f, 0.08f)}});
+            v3 yy = v3_norm(v3_add((v3){{0, 1, 0}},
+                                   v3_scale(d, rng_rangef(&st, 0.25f, 0.6f))));
+            v3 zz = v3_norm(v3_cross(d, yy));
+            v3 xx = v3_cross(yy, zz);
+            float top = c3.y + ry;
+            if (top > g_scat_top) g_scat_top = top;
+            scene_box(dec_rot(c3, sg), v3_scale(dec_rot(xx, sg), rx),
+                      v3_scale(dec_rot(yy, sg), ry),
+                      v3_scale(dec_rot(zz, sg), 0.014f),
+                      v3_scale(sage, rng_rangef(&st, 0.94f, 1.05f)));
+          }
+        }
+      } break;
+      case SCAT_TUMBLE: {
+        // A tumbleweed at rest: pale twigs on a sphere, parked in the lee
+        // corner the plan found for it. It does not roll — a resting one is
+        // 90 % of the read at 2 % of the cost.
+        float r = sc->s;
+        at.y = r * 0.92f;
+        v3 pale = v3_lerp(dry, (v3){{0.55f, 0.50f, 0.36f}}, 0.55f);
+        int ns3 = 14 + (int)(rng_next(&st) % 5u);
+        for (int k = 0; k < ns3; k++) {
+          float ya = rng_rangef(&st, 0.0f, 6.283f);
+          float cy = rng_rangef(&st, -1.0f, 1.0f);
+          float sy = sqrtf(fmaxf(1.0f - cy * cy, 0.0f));
+          v3 dir = {{sy * cosf(ya), cy, sy * sinf(ya)}};
+          dec_twig(v3_sub(at, v3_scale(dir, r * 0.2f)), dir, r * 1.2f,
+                   rng_rangef(&st, 0.004f, 0.006f),
+                   v3_scale(pale, rng_rangef(&st, 0.9f, 1.1f)), sg);
+        }
+      } break;
+      case SCAT_BRICK: {
+        // The house brick module, 0.30 x 0.14 x 0.10, in the host wall's own
+        // cast: rotated on the ledges, spilled and part-buried at the feet.
+        int kind = sc->var & 0xF, bax = (sc->var >> 4) & 1;
+        float s = sc->s;
+        float bx = 0.15f * s, by = 0.05f * s, bz = 0.07f * s;
+        float yaw = (bax ? 0.0f : 1.5708f) + rng_rangef(&st, -0.6f, 0.6f);
+        if (rng_rangef(&st, 0.0f, 1.0f) < 0.18f)
+          yaw += rng_rangef(&st, 0.8f, 1.6f);   // the outlier that sells it
+        float tilt = kind == ME_FOOT ? rng_rangef(&st, -0.30f, 0.30f)
+                                     : rng_rangef(&st, 0.08f, 0.45f);
+        v3 bcol = v3_scale(host, rng_rangef(&st, 0.84f, 0.96f));
+        if (kind == ME_FOOT) {
+          float sink = rng_rangef(&st, 0.20f, 0.40f);
+          at.y = by * (1.0f - 2.0f * sink);
+        } else {
+          at.y = sc->pos.y + by * 0.75f;
+        }
+        dec_rock(at, bx, by, bz, yaw, tilt, 0u, 0.0f, 0, bcol, sg);
+      } break;
+      }
+    }
   }
 }
 
+// ONE STICK — a thin oriented prism from a to b. The dead tree's branches,
+// the shrub's stems and the tumbleweed all speak this one construction (P6:
+// a second stick vocabulary would be a second plant kingdom).
+static void dec_stick(v3 a, v3 b, float r, v3 col, float sg) {
+  v3 d = v3_sub(b, a);
+  float l = sqrtf(v3_dot(d, d));
+  if (l < 1e-5f) return;
+  d = v3_scale(d, 1.0f / l);
+  v3 up = fabsf(d.y) > 0.9f ? (v3){{1, 0, 0}} : (v3){{0, 1, 0}};
+  v3 s1 = v3_norm(v3_cross(d, up)), s2 = v3_cross(d, s1);
+  v3 c = v3_scale(v3_add(a, b), 0.5f);
+  scene_box(dec_rot(c, sg), v3_scale(dec_rot(d, sg), l * 0.5f),
+            v3_scale(dec_rot(s1, sg), r), v3_scale(dec_rot(s2, sg), r), col);
+}
+
+// The CASTING specials, emitted into the pre-latch region of the world mesh:
+// the boulder pair's chamfered render (its collision stays the AABB — the
+// 0.04 m bevel is under the wire quantization players already live with) and
+// the dead trees' crowns. The crown is the deliberate THIRD class — casts,
+// does not collide — because a branch two metres overhead can never be
+// mistaken for cover, and a tree whose long shadow is a bare post's is the
+// headless-shadow defect wearing bark. Branches are 40+ mm across, over the
+// shadow map's own texel floor; the sub-texel twigs live in the decor pass.
+static void mesh_cast_extra(void) {
+  if (g_meta.bould[0] < 0 && g_meta.tree[0] < 0) return;
+  int save_floats = g_scene_floats, save_want = g_scene_want;
+  int save_peak = g_scene_peak;
+  long save_drops = g_scene_drops;
+  g_scene_floats = 0;
+  g_ao_mul = 1.0f;
+  mat_set(WORLD_SOLID_R, 0.0f);
+  ao_set(0.0f, WORLD_AO_RATE, WORLD_AO_MIN);
+  for (int b = 0; b < 2; b++)
+    if (g_meta.bould[b] >= 0) {
+      const solid_t *s = &g_solids[g_meta.bould[b]];
+      v3 c = v3_scale(v3_add(s->min, s->max), 0.5f);
+      float save_cham = g_cham;
+      g_cham = 0.04f;
+      scene_box(c, (v3){{(s->max.x - s->min.x) * 0.5f, 0, 0}},
+                (v3){{0, (s->max.y - s->min.y) * 0.5f, 0}},
+                (v3){{0, 0, (s->max.z - s->min.z) * 0.5f}}, s->color);
+      g_cham = save_cham;
+    }
+  if (g_meta.tree[0] >= 0) {
+    const solid_t *s = &g_solids[g_meta.tree[0]];
+    v3 base = {{(s->min.x + s->max.x) * 0.5f, s->max.y,
+                (s->min.z + s->max.z) * 0.5f}};
+    v3 w = wind_dir();
+    v3 wood = {{0.30f, 0.26f, 0.21f}};
+    ao_off();
+    mat_set(0.86f, 0.0f);   // weathered dead wood: matte, near the floor's R
+    for (int t = 0; t < 2; t++) {
+      float sg = t ? -1.0f : 1.0f;
+      v3 w2 = dec_rot(w, sg);
+      // KRUMMHOLZ: the crown leans DOWNWIND — a dead tree in this arena's
+      // one climate wears the same wind the drifts, tufts and clouds do.
+      float wyaw = atan2f(w2.z, w2.x);
+      int np = 3;
+      uint64_t st = (uint64_t)scat_h(0x72EEu, 1, 2, 3) * 2654435761u + 1;
+      // One low dead stub halfway up the trunk: the gnarl that keeps a
+      // straight sixteen-centimetre post from reading as a telephone pole.
+      {
+        float sya = wyaw + rng_rangef(&st, 1.8f, 4.4f);
+        float sel = rng_rangef(&st, 0.10f, 0.35f);
+        v3 sd = {{cosf(sya) * cosf(sel), sinf(sel), sinf(sya) * cosf(sel)}};
+        v3 sa = {{base.x, s->max.y * rng_rangef(&st, 0.45f, 0.62f), base.z}};
+        dec_stick(sa, v3_add(sa, v3_scale(sd, rng_rangef(&st, 0.35f, 0.60f))),
+                  0.040f, v3_scale(wood, 0.92f), sg);
+      }
+      for (int p = 0; p < np; p++) {
+        float ya = wyaw + ((float)p - (float)(np - 1) * 0.5f) * 1.15f +
+                   rng_rangef(&st, -0.35f, 0.35f);
+        float el = rng_rangef(&st, 0.62f, 1.05f);
+        float ln = rng_rangef(&st, 0.85f, 1.35f);
+        v3 dir = {{cosf(ya) * cosf(el), sinf(el), sinf(ya) * cosf(el)}};
+        v3 a = v3_add(base, (v3){{0.0f, rng_rangef(&st, -0.28f, -0.05f), 0.0f}});
+        v3 b2 = v3_add(a, v3_scale(dir, ln));
+        dec_stick(a, b2, 0.055f, wood, sg);
+        int nsec = 2 + (int)(rng_next(&st) % 2u);
+        for (int q = 0; q < nsec; q++) {
+          float ya2 = ya + rng_rangef(&st, -0.9f, 0.9f);
+          float el2 = el - rng_rangef(&st, 0.45f, 0.85f);   // dead wood sags
+          float ln2 = ln * rng_rangef(&st, 0.55f, 0.75f);
+          v3 d2 = {{cosf(ya2) * cosf(el2), sinf(el2), sinf(ya2) * cosf(el2)}};
+          dec_stick(b2, v3_add(b2, v3_scale(d2, ln2)), 0.040f,
+                    v3_scale(wood, 0.94f), sg);
+        }
+      }
+    }
+  }
+  ao_off();
+  int n = g_scene_floats;
+  int cap = (int)(sizeof g_mesh / sizeof g_mesh[0]);
+  if (g_mesh_floats + n > cap) n = cap - g_mesh_floats;
+  if (n < g_scene_floats && !g_mesh_drops++)
+    fprintf(stderr, "mesh: world vertex budget exhausted — geometry dropped\n");
+  memcpy(g_mesh + g_mesh_floats, g_scene, (size_t)n * sizeof(float));
+  g_mesh_floats += n;
+  g_scene_floats = save_floats; g_scene_want = save_want;
+  g_scene_peak = save_peak; g_scene_drops = save_drops;
+}
+
 static void mesh_decor(void) {
-  // Its OWN stream, seeded off the map seed. g_rng belongs to the sim's map
-  // generation and a single draw from it here would re-roll the layout of every
-  // recorded seed for a handful of pebbles.
-  g_rng_dec = (uint64_t)(g_map_seed ^ 0xD3C0u) * 2654435761u + 1;
   int save_floats = g_scene_floats, save_want = g_scene_want;
   int save_peak = g_scene_peak;
   long save_drops = g_scene_drops;
   g_scene_floats = 0;
 
   const theme_t *th = &g_theme;
-  int grass = th->surf != SURF_WET;   // nothing dry grows in standing water
   int drifts = th->surf == SURF_SAND;
   v3 wind = wind_dir();
-  float H = ARENA_HALF;
   mat_set(WORLD_GROUND_R, 0.0f);
   // scene_push multiplies its AO by g_ao_mul, which is FIGURE state: a global the
   // corpse bands write per band, and world_upload runs at the top of a frame with
@@ -17236,52 +18752,147 @@ static void mesh_decor(void) {
   // A six-centimetre stone does not self-occlude the way a wall does.
   ao_set(0.0f, 1.0f / 0.16f, 0.78f);
 
-  for (int i = 0; i < g_num_solids; i++) {
-    const solid_t *s = &g_solids[i];
-    if (s->max.y < 0.42f) continue;                 // rubble dresses nothing
-    if (s->max.y - s->min.y < 0.42f) continue;
-    // AND IT HAS TO STAND ON THE GROUND. A stacked top box or a step crate
-    // perched on an anchor is a solid like any other, and dressing its foot put
-    // a clump of stones at y = 0 — under the box, floating in the open air
-    // beneath a crate that starts a metre up.
-    if (s->min.y > 0.05f) continue;
-    for (int f = 0; f < 4; f++) {
-      v3 o = {{f == 0 ? 1.0f : f == 1 ? -1.0f : 0.0f, 0.0f,
-               f == 2 ? 1.0f : f == 3 ? -1.0f : 0.0f}};
-      float base = f == 0 ? s->max.x : f == 1 ? s->min.x
-                 : f == 2 ? s->max.z : s->min.z;
-      float lo = (f < 2) ? s->min.z : s->min.x;
-      float hi = (f < 2) ? s->max.z : s->max.x;
-      if (hi - lo < 0.35f) continue;
-      // The lee face gets the drift. One per face at most: a wall banked on all
-      // four sides has no wind in it.
-      float lee = -(o.x * wind.x + o.z * wind.z);
-      if (drifts && lee > 0.35f && hi - lo > 0.9f) {
-        float dl = dr(0.30f, 0.62f), dh = dr(0.055f, 0.135f) * lee;
-        float c0 = lo + dr(0.05f, 0.35f) * (hi - lo);
-        float c1 = hi - dr(0.05f, 0.35f) * (hi - lo);
-        if (c1 - c0 > 0.5f) {
-          v3 a0 = (f < 2) ? (v3){{base, 0.0f, c0}} : (v3){{c0, 0.0f, base}};
-          v3 a1 = (f < 2) ? (v3){{base, 0.0f, c1}} : (v3){{c1, 0.0f, base}};
-          if (a0.z + a1.z > 0.0f)
-            for (int sg = 0; sg < 2; sg++)
-              dec_drift(a0, a1, o, dl, dh,
-                        v3_scale(th->ground, 1.06f), sg ? -1.0f : 1.0f);
+  // Sand drifts stay face-attached (a drift IS its wall's wind shadow), but
+  // the walk is canonical-face + reflected-twin now: the old form rotated the
+  // planned drift verbatim, which put every mirrored drift on its wall's
+  // WINDWARD side — half the arena's loudest wind cue pointing the wrong way.
+  if (drifts)
+    for (int i = 0; i < g_num_solids; i++) {
+      const solid_t *s = &g_solids[i];
+      if (!scat_host_ok(s)) continue;
+      // THE SHELL BREAKS THE TWIN-REFLECTION RULE: wall 0's twin is wall 1,
+      // and the "same-normal face of the twin" is then the OUTER face — the
+      // reflected drift landed outside the arena or as a mirror-wound black
+      // sliver at the inner base (found as exactly that). The boundary gets
+      // the honest treatment instead: its INNER face banks a drift when the
+      // wind says so, emitted once, wind-true — the edge of the world may be
+      // asymmetric because it is not cover.
+      int shell = s->pen == 0;
+      for (int f = 0; f < 4; f++) {
+        v3 o = {{f == 0 ? 1.0f : f == 1 ? -1.0f : 0.0f, 0.0f,
+                 f == 2 ? 1.0f : f == 3 ? -1.0f : 0.0f}};
+        float base = f == 0 ? s->max.x : f == 1 ? s->min.x
+                   : f == 2 ? s->max.z : s->min.z;
+        float lo = (f < 2) ? s->min.z : s->min.x;
+        float hi = (f < 2) ? s->max.z : s->max.x;
+        if (hi - lo < 0.9f) continue;
+        float cmx = (f < 2) ? base : (lo + hi) * 0.5f;
+        float cmz = (f < 2) ? (lo + hi) * 0.5f : base;
+        if (shell) {
+          // inner face only: outward normal points at the arena centre
+          if (o.x * cmx + o.z * cmz > 0.0f) continue;
+        } else if (cmz < -0.001f || (fabsf(cmz) <= 0.001f && cmx <= 0.0f))
+          continue;
+        // The lee face gets the drift. One per face at most: a wall banked on
+        // all four sides has no wind in it. BURIED is the drift mood: bigger
+        // lenses, and faces that would not bank elsewhere bank here — the
+        // "half-sunk" read is drifts doing the swallowing.
+        int buried = th->surf == SURF_SAND && g_mood_preset == 0;
+        float lee = -(o.x * wind.x + o.z * wind.z);
+        if (lee <= (buried ? 0.22f : 0.35f)) continue;
+        uint64_t st = (uint64_t)scat_h(0xD81Fu, (uint32_t)i, (uint32_t)f, 0) *
+                      2654435761u + 1;
+        float dl = rng_rangef(&st, 0.30f, 0.62f) * (buried ? 1.7f : 1.0f);
+        float dh = rng_rangef(&st, 0.055f, 0.135f) * lee * (buried ? 1.5f : 1.0f);
+        float c0 = lo + rng_rangef(&st, 0.05f, 0.35f) * (hi - lo);
+        float c1 = hi - rng_rangef(&st, 0.05f, 0.35f) * (hi - lo);
+        if (c1 - c0 <= 0.5f) continue;
+        // A drift is a LENS, not a levee: on the shell's 48 m faces the
+        // fractional draw made twenty-metre monsters. Cap the run and let
+        // the window land where the draw says.
+        if (c1 - c0 > 4.5f) {
+          float m0 = rng_rangef(&st, c0, c1 - 4.5f);
+          c0 = m0; c1 = m0 + 4.5f;
         }
+        v3 a0 = (f < 2) ? (v3){{base, 0.0f, c0}} : (v3){{c0, 0.0f, base}};
+        v3 a1 = (f < 2) ? (v3){{base, 0.0f, c1}} : (v3){{c1, 0.0f, base}};
+        v3 col = v3_scale(th->ground, 1.06f);
+        dec_drift(a0, a1, o, dl, dh, col, 1.0f);
+        if (shell) continue;   // the boundary emits once, wind-true
+        // A host centred on the origin is its own twin: the reflection maps
+        // this face onto ITSELF, so a second emit would overlap the first —
+        // one drift on the one lee face is already the whole pair.
+        if (fabsf(s->min.x + s->max.x) < 0.01f &&
+            fabsf(s->min.z + s->max.z) < 0.01f)
+          continue;
+        // The twin: reflect through the host's centre along the face axis and
+        // NEGATE the outward direction — after the rotation the drift then
+        // extends off the twin solid's same-normal face, its true lee. The
+        // endpoints are REVERSED because reflect-then-rotate is an improper
+        // transform: without the swap every twin drift is mirror-wound, and
+        // with culling on that is a black hole in the ground, not a drift.
+        int axis = f < 2 ? 0 : 1;
+        v3 q0 = scat_reflect(a0, s, axis), q1 = scat_reflect(a1, s, axis);
+        dec_drift(q1, q0, v3_scale(o, -1.0f), dl, dh, col, -1.0f);
       }
-      // Clump sites along the face.
-      for (float t = lo + 0.25f; t < hi - 0.15f; t += dr(0.95f, 2.30f)) {
-        v3 p = (f < 2) ? (v3){{base, 0.0f, t}} : (v3){{t, 0.0f, base}};
-        if (p.z <= 0.0f) continue;                   // one half, then rotate
-        if (fabsf(p.x) > H - 0.4f || fabsf(p.z) > H - 0.4f) continue;
-        float m = fnoise2(p.x * 0.21f, p.z * 0.21f) * 0.68f +
-                  fnoise2(p.x * 0.62f, p.z * 0.62f) * 0.32f;
-        // Corners collect from two directions and get roughly twice the density,
-        // which is also where the wall/floor line is hardest to hide.
-        float corner = fminf(t - lo, hi - t) < 0.55f ? 0.14f : 0.0f;
-        if (m + corner < 0.645f) continue;
-        for (int sg = 0; sg < 2; sg++)
-          dec_clump(p, o, wind, th, s->color, grass, sg ? -1.0f : 1.0f);
+    }
+  scat_emit();
+
+  // BEYOND THE SHELL — two to four mesa-scale silhouette prisms, 60-100 m
+  // out and 8 m or taller, never in g_solids: render-only mass for the
+  // horizon third of every eye-level frame, sold for free by the aerial
+  // perspective's height falloff. Emitted as symmetric PAIRS so both
+  // players' horizons are equivalent; well inside ZFAR from any eye.
+  {
+    ao_off();
+    // ONE pair, deep in the haze: a second pair doubled the fragment bill of
+    // every sky-heavy frame (the world shader is not cheap, and a prism's
+    // pixels are exactly the sky pixels that used to cost one gradient) —
+    // measured +9.5 % on a one-thread llvmpipe sky frame with two pairs,
+    // which over-reports fragment cost but points the right way.
+    int npr = 1;
+    for (int k = 0; k < npr; k++) {
+      uint64_t st = (uint64_t)scat_h(0xE110u, (uint32_t)k, 1, 2) *
+                    2654435761u + 1;
+      float ang = rng_rangef(&st, 0.0f, 2.0f * F_PI);
+      float r = rng_rangef(&st, 74.0f, 100.0f);
+      float hgt = rng_rangef(&st, 9.0f, 14.0f);
+      float wx = rng_rangef(&st, 4.0f, 9.0f), wz = rng_rangef(&st, 2.5f, 5.0f);
+      // The prisms run 20 m BELOW the floor plane: there is no terrain out
+      // there, so a base sitting at y = 0 showed a base LINE against the
+      // sky's below-horizon gradient from any raised camera — levitating
+      // scenery. With the base buried, every camera reads them as standing
+      // behind the shell. A CRANE camera (harness/media, 8 m+) can still see
+      // a soft seam where the prism's fogged lower half meets the darker
+      // below-horizon sky — priced and accepted: a PLAY camera never can,
+      // because the eye (max ~3.1 m on a crate) never clears the 3.2 m
+      // shell, which occludes everything below its own top line out there.
+      v3 c = {{cosf(ang) * r, (hgt - 20.0f) * 0.5f, sinf(ang) * r}};
+      v3 mesa = v3_scale(th->wall, rng_rangef(&st, 0.82f, 0.94f));
+      float sh = hgt * rng_rangef(&st, 0.45f, 0.65f);   // the lower shoulder
+      float sx = wx * rng_rangef(&st, 0.5f, 0.8f);
+      float sof = wx + sx * 0.9f;
+      for (int t = 0; t < 2; t++) {
+        float sg = t ? -1.0f : 1.0f;
+        scene_box(dec_rot(c, sg), (v3){{wx * sg, 0, 0}},
+                  (v3){{0, (hgt + 20.0f) * 0.5f, 0}}, (v3){{0, 0, wz * sg}}, mesa);
+        v3 c2 = {{c.x + sof, (sh - 20.0f) * 0.5f, c.z}};
+        scene_box(dec_rot(c2, sg), (v3){{sx * sg, 0, 0}},
+                  (v3){{0, (sh + 20.0f) * 0.5f, 0}},
+                  (v3){{0, 0, wz * 0.8f * sg}}, v3_scale(mesa, 0.96f));
+      }
+    }
+  }
+
+  // What a dead tree sheds: a few fallen sticks at each trunk's base — the
+  // ground story that ties the crown to the floor without any aerial twigs.
+  if (g_meta.tree[0] >= 0) {
+    const solid_t *ts = &g_solids[g_meta.tree[0]];
+    v3 base = {{(ts->min.x + ts->max.x) * 0.5f, 0.0f,
+                (ts->min.z + ts->max.z) * 0.5f}};
+    v3 wood = {{0.28f, 0.24f, 0.19f}};
+    for (int t = 0; t < 2; t++) {
+      float sg = t ? -1.0f : 1.0f;
+      uint64_t st = (uint64_t)scat_h(0x716Cu, 4, 5, 6) * 2654435761u + 1;
+      int ntw = 3 + (int)(rng_next(&st) % 3u);
+      for (int k = 0; k < ntw; k++) {
+        float ang = rng_rangef(&st, 0.0f, 6.283f);
+        float d = rng_rangef(&st, 0.25f, 0.90f);
+        v3 a = v3_add(base, (v3){{cosf(ang) * d, 0.012f, sinf(ang) * d}});
+        float ya2 = rng_rangef(&st, 0.0f, 6.283f);
+        v3 dir = {{cosf(ya2), 0.05f, sinf(ya2)}};
+        dec_stick(a, v3_add(a, v3_scale(dir, rng_rangef(&st, 0.18f, 0.42f))),
+                  0.014f, v3_scale(wood, rng_rangef(&st, 0.9f, 1.05f)), sg);
       }
     }
   }
@@ -25129,6 +26740,13 @@ static void usage(void) {
        "                     shadow box. With two arguments it MOVES the sun —\n"
        "                     the whole 6.5..54 range is reviewable without\n"
        "                     hunting seeds for it\n"
+       "  mood [P|R G S|off] the mood: print, or FORCE it and regenerate the\n"
+       "                     arena. One number = PRESET index 0..2 within the\n"
+       "                     arena's theme (exact latents, reviewable); three\n"
+       "                     = raw ruin/growth/strew latents in 0..1; off =\n"
+       "                     back to the seed's own draw\n"
+       "  scat               the scatter plan's census: per-family site counts\n"
+       "                     and what planning cost in ms\n"
        "  trace N            advance N ticks, printing pos each tick\n"
        "  shot PATH.png      render + write screenshot\n"
        "  capture V.rgb A.wav FPS N  RGB24+WAV capture at FPS=60|120 for N frames\n"
@@ -29458,7 +31076,13 @@ static void run_script(char *script, sim_ctx_t *s) {
           char *e;
           float ed = strtof(a, &e);
           if (e == a || *e || f_is_nonfinite(ed)) g_tok_pushback = a;
-          else sun_set(ed, next_f() * (F_PI / 180.0f));
+          else {
+            sun_set(ed, next_f() * (F_PI / 180.0f));
+            // The ground bake reads the sun (its shadow smears), so a moved
+            // sun re-bakes: an instrument that disagrees with the world it
+            // measures is the shimmer-rig trap in a different hat.
+            g_world_dirty = 1;
+          }
         } }
       { const sun_t *S = &g_sun;
         printf("sun elev=%.2f azi=%.2f dir=(%.3f %.3f %.3f) "
@@ -29474,9 +31098,10 @@ static void run_script(char *script, sim_ctx_t *s) {
       // out which one a seed rolled by photographing it.
       { v3 sp = surf_params();
         static const char *SN[] = {"grit", "wet", "sand"};
-        printf("map theme=%s wind=%.3f ripple=%.2f glint=%.2f water=%.2f "
-               "haze=%.2f sun_elev=%.2f\n",
-               SN[g_theme.surf], (double)g_wind_ang,
+        printf("map theme=%s mood=%s sig=%s wind=%.3f ripple=%.2f glint=%.2f "
+               "water=%.2f haze=%.2f sun_elev=%.2f\n",
+               SN[g_theme.surf], MOOD_DEF[g_theme.surf][g_mood_preset].name,
+               SIG_NAME[g_meta.sig], (double)g_wind_ang,
                (double)sp.x, (double)sp.y, (double)sp.z, (double)atmo_haze(),
                (double)(asinf(f_clamp(g_sun.dir.y, -1.0f, 1.0f))
                         * (180.0f / F_PI))); }
@@ -29484,6 +31109,71 @@ static void run_script(char *script, sim_ctx_t *s) {
         printf("solid %d min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f)\n", i,
                (double)g_solids[i].min.x, (double)g_solids[i].min.y, (double)g_solids[i].min.z,
                (double)g_solids[i].max.x, (double)g_solids[i].max.y, (double)g_solids[i].max.z);
+    } else if (!strcmp(t, "mood")) {
+      // The mood is seed-hashed like the sun, so without this command a
+      // specific latent setting can only be reached by hunting seeds — and the
+      // whole latent cube has to be reviewable (nine presets x two sun
+      // extremes is the acceptance battery for any of them). With three
+      // arguments it FORCES the latents and regenerates; `mood off` hands the
+      // seed its own values back.
+      { char *a = take_tok();
+        if (!a) { /* bare `mood` prints */ }
+        else if (!strcmp(a, "off")) {
+          g_mood_force = 0;
+          g_mood_force_preset = -1;
+          map_generate(g_map_seed);
+          g_world_dirty = 1;
+        } else {
+          char *e;
+          float ru = strtof(a, &e);
+          if (e == a || *e || f_is_nonfinite(ru)) g_tok_pushback = a;
+          else {
+            // ONE numeric argument is a PRESET index (0..2 within the
+            // arena's own theme, exact latents, no jitter — the reviewable
+            // form the 9-mood sweep drives); THREE are raw latents. The
+            // second token is parse-TESTED before it is committed, or the
+            // next command's own name gets eaten as a float.
+            char *b2 = take_tok();
+            float g2 = 0.0f;
+            int has2 = 0;
+            if (b2) {
+              char *e2;
+              g2 = strtof(b2, &e2);
+              if (e2 != b2 && !*e2 && !f_is_nonfinite(g2)) has2 = 1;
+              else g_tok_pushback = b2;
+            }
+            if (!has2) {
+              int pi = (int)ru;
+              g_mood_force_preset = pi >= 0 && pi <= 2 ? pi : -1;
+              g_mood_force = 0;
+            } else {
+              g_mood_forced = (mood_t){f_clamp(ru, 0.0f, 1.0f),
+                                       f_clamp(g2, 0.0f, 1.0f),
+                                       f_clamp(next_f(), 0.0f, 1.0f)};
+              g_mood_force = 1;
+              g_mood_force_preset = -1;   // raw latents, the seed's own preset
+            }
+            map_generate(g_map_seed);
+            g_world_dirty = 1;
+          }
+        } }
+      printf("mood ruin=%.2f growth=%.2f strew=%.2f preset=%s forced=%d\n",
+             (double)g_mood.ruin, (double)g_mood.growth, (double)g_mood.strew,
+             MOOD_DEF[g_theme.surf][g_mood_preset].name,
+             g_mood_force || g_mood_force_preset >= 0);
+    } else if (!strcmp(t, "scat")) {
+      // The scatter plan's census: what the placement pass decided, per
+      // family, and what deciding cost — a printed number, because "startup
+      // feels fine" is not a measurement and the plan runs on every map.
+      // Re-planned here so the print always reflects the LOADED arena — the
+      // upload's own run happens at the next rendered frame, which a script
+      // that just moved the mood has not produced yet. Pure, so it is free.
+      scat_plan();
+      printf("scat plan_ms=%.3f sites=%d/%d max_top=%.3f", (double)g_scat_ms,
+             g_scat_n, SCAT_MAX, (double)g_scat_top);
+      for (int i = 0; i < SCAT_FAM_COUNT; i++)
+        printf(" %s=%d", SCAT_FAM_NAME[i], g_scat_fam[i]);
+      printf("\n");
     } else if (!strcmp(t, "trace")) {
       long n = next_n();
       while (n-- > 0) { sim_advance(s); sim_print(s); }

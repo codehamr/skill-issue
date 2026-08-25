@@ -73,10 +73,16 @@ done
 #   window frame, and they are not going away: the frame's wall is 1.6 mm of
 #   real thickness, so a lens ring buried in it is inside a millimetre of
 #   BOTH of its faces by construction.
-# - Last move: -1 at DIST 30 (2026-08-25 joint/arm pass — thigh and shin now
-#   narrow into the knee), verified by pair-histogram diff against HEAD:
-#   exactly `thigh/shin 2 -> 1`, nothing else moved on any tier.
-WANT_NEAR="80 80 80 64"
+# - 2026-08-25 joint/arm pass: -1 at DIST 30 (thigh and shin now narrow into
+#   the knee), verified by pair-histogram diff against HEAD: exactly
+#   `thigh/shin 2 -> 1`, nothing else moved on any tier.
+# - Last move: -1 at DIST 12 and 30 (2026-08-25 default retune — the dev-tuned
+#   config.cfg became MV_DEF/WP_DEFAULTS). No geometry changed: the SAME binary
+#   under the OLD values reproduces the old quadruple exactly, and the mover is
+#   mv_accel_ms 100 -> 200 alone (the 60-tick sweep spends longer in the
+#   accelerating gait phases, so the worst-scoring tick lands on a different
+#   pose). figv pair families are identical old vs new.
+WANT_NEAR="80 80 79 63"
 [ "$NEAR" = "$WANT_NEAR" ] || { say "GATE near '$NEAR' != baseline '$WANT_NEAR'"; fail=1; }
 
 # `cross` — surfaces passing THROUGH each other at 1.8-15 degrees, the tier
@@ -106,9 +112,16 @@ WANT_NEAR="80 80 80 64"
 #   and strap-on-torso families regain a few pairs at the eight-flat tiers;
 #   skull/goggle at DIST 12 is 300 on both HEAD and this build, so what
 #   earlier passes retired stays retired).
+# - Last move (2026-08-25 default retune, see the `near` note): 83/83/74/66 ->
+#   97/97/82/59. Entirely mv_accel_ms 100 -> 200 (single-param isolation:
+#   reverting accel alone gives 85 at DIST 0, reverting all movement gives the
+#   old quadruple byte-exact on the same binary; weapon values move nothing).
+#   cross is a per-tier MAX over the sweep, so more ticks spent in the
+#   accelerating gait raise the close tiers (limbs graze the weapon/torso in
+#   the ramp-up poses) and drop the k=6 tier. figv pair families identical.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_CROSS="83 83 74 66"
+WANT_CROSS="97 97 82 59"
 [ "${CROSS:-}" = "$WANT_CROSS" ] || { say "GATE cross '${CROSS:-}' != baseline '$WANT_CROSS'"; fail=1; }
 
 # parity: no MISMATCH in the shared-code rows
