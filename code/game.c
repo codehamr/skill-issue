@@ -15712,7 +15712,7 @@ static_assert(PARTS_SKID_LO < MAX_PARTICLES, "skid region must be inside the poo
 #define MAX_MARKS     64
 #define MAX_FLASHES   8
 #define TRACER_TICKS  8
-#define FLASH_TICKS   3
+#define FLASH_TICKS   7   // flame in the first half, sparks + dust glow after
 // 14 and 26, not 10 and 20 (117 ms / 217 ms).
 #define HITMARK_TICKS 14
 #define KILLMARK_TICKS 26
@@ -15811,7 +15811,7 @@ static float fx_range_k(float d) {
 typedef struct { v3 a, b; int life, src; } tracer_t;
 // `fresh` is a render latch, not a lifetime: it marks a flash no frame has shown yet
 // and is cleared by the first draw.
-typedef struct { v3 pos, dir; int life, src; long t0; uint32_t seed; int fresh; } flash_t;
+typedef struct { v3 pos, dir; int life, src, wpn; long t0; uint32_t seed; int fresh; } flash_t;
 // kind: 0 = world impact spark, 1 = skid dust, 2 = skid spark, 3 = contact flare,
 // 4 = body hitspark, 5 = kill burst, 6 = brass. `life0` is the spawn life, because the
 // fade must normalise against the particle's OWN lifetime once lifetimes vary — a hero
@@ -16145,7 +16145,7 @@ static void vfx_on_event(const event_t *e) {
         g_tracers[slot] = (tracer_t){muz, e->a, TRACER_TICKS, e->src};
     }
     if (e->src == g_local_ent) {
-      g_muzzle_t = 3;
+      g_muzzle_t = FLASH_TICKS;
       g_muzzle_fresh = 1;             // one guaranteed bright frame, any fps
       g_muzzle_fire_tick = g_tick;
     }
@@ -16155,7 +16155,7 @@ static void vfx_on_event(const event_t *e) {
     // CONFIG here left a free-cam film of the player firing with no flash.
     for (int i = 0; i < MAX_FLASHES; i++)
       if (g_flashes[i].life <= 0) {
-        g_flashes[i] = (flash_t){muz, e->b, FLASH_TICKS, e->src, g_tick,
+        g_flashes[i] = (flash_t){muz, e->b, FLASH_TICKS, e->src, e->wpn, g_tick,
                                  (uint32_t)(e->i * 61 + e->src * 7), 1};
         break;
       }
@@ -20334,7 +20334,7 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
       {v3_add(P->sho[i], v3_scale(ua, 0.240f)), kt->sleeve, kt->sleeve, 0.0650f, 0.0675f, 0, 0.0f},
       {v3_add(P->sho[i], v3_scale(ua, 0.500f)), kt->sleeve, kt->sleeve, 0.0580f, 0.0605f, 0, 0.0f},
       {v3_add(P->sho[i], v3_scale(ua, 0.680f)), kt->sleeve, kt->sleeve, 0.0590f, 0.0620f, 0, 0.0f},
-      {P->elb[i], kt->sleeve, kt->sleeve, 0.0440f, 0.0460f, 0, 0.0f}};   // elbow
+      {P->elb[i], kt->sleeve, kt->sleeve, 0.0425f, 0.0445f, 0, 0.0f}};   // elbow
     // First bone runs chest-outward, so `spine` is the stable roll reference.
     // k=8 faceted: the sleeve family joins the crate language of the torso.
     probe("uarm");
@@ -20344,15 +20344,18 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     {  // The elbow ball survives only as the cap-swallower between the two arm
       // chains, and it wears the SLEEVE, near-host value: the old 0.68x dark
       // rubber made every elbow the darkest accent on the arm — an
-      // articulation dot. What marks the joint now is SHAPE: swell 0.18 puts
-      // the mass on the olecranon side of the bend, where an elbow point is —
-      // 0.34 was tried and made a SPIKE of it, a flat-shaded facet corner
-      // standing off the arm like a spur.
+      // articulation dot. SWELL IS NEAR-ZERO (0.05) ON PURPOSE, third try:
+      // fig_joint's swell stretches the ellipsoid along OUT while the fold
+      // SHORTENS it 30% along the bisector, and on the k=8 profile the out
+      // extreme is a facet EDGE — so any meaningful swell turns a bent elbow
+      // into a beak (0.34 was a spur, 0.18 still a point). A bent elbow's
+      // corner is as blunt as the arm itself; fig_joint's built-in 0.22*bend
+      // outward shift alone marks the olecranon side.
       v3 hinge = v3_cross(ua, fa);
       if (v3_dot(hinge, hinge) < 1e-8f) hinge = spine;
       probe("elbow");
       fig_joint(P->elb[i], ua, v3_sub(P->wri[i], P->elb[i]),
-                0.0520f, 0.0600f, 0.18f, 8, v3_scale(kt->sleeve, 0.96f));
+                0.0505f, 0.0570f, 0.05f, 8, v3_scale(kt->sleeve, 0.96f));
     }
     // Hand: the SAME wrap the viewmodel uses, closed round the SAME published grip
     // cylinder of the SAME rifle.
@@ -20492,12 +20495,17 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
       // Cavity AO down the face: under the jaw and up under the helmet's brim are both
       // places light does not reach, and a head lit as if it were a free-floating ball
       // is most of why the face read as a flat patch.
-      // THE CHIN PROJECTS. At c 0.021 the mentum sat 11.5 mm BEHIND the mouth
-      // band above it — a receding chin on every 3/4 view. Forward to within
-      // ~3 mm of the mouth plane and 4 mm wider across: a masculine jaw is
-      // square and it ends under the lips, not under the ears.
-      {HP(0, -0.0885f, 0.0270f), kt.bala, kt.bala, 0.0545f, 0.0590f, 0, 0.74f},
-      {HP(0, -0.0645f, 0.0105f), kt.bala, kt.bala, 0.0700f, 0.0830f, 0, 0.80f},
+      // THE CHIN PROJECTS PAST THE MOUTH. Two passes taught the lesson in
+      // steps: at c 0.021 the mentum sat 11.5 mm BEHIND the mouth band (a
+      // receding chin on every 3/4 view), at 0.027 it was still 3 mm shy and
+      // the face read soft. A masculine head is a JAW: the chin stands 1.5 mm
+      // PROUD of the mouth plane, sits 1.5 mm lower (a longer face), and the
+      // jaw ring is 9 mm wider across than the first cut — the gonial corner
+      // under the ear, not a taper — with its own front 8 mm ahead of the
+      // old one, so the jawline overhangs the throat band and throws the
+      // shadow a jaw throws.
+      {HP(0, -0.0900f, 0.0310f), kt.bala, kt.bala, 0.0585f, 0.0600f, 0, 0.74f},
+      {HP(0, -0.0650f, 0.0135f), kt.bala, kt.bala, 0.0745f, 0.0840f, 0, 0.80f},
       {HP(0, -0.0400f, -0.0035f), kt.bala, kt.bala, 0.0752f, 0.0930f, 0, 0.88f},
       {HP(0, -0.0056f, -0.0090f), kt.bala, kt.bala, 0.0790f, 0.0980f, 0, 0.94f},
       {HP(0, 0.0372f, -0.0110f), kt.bala, kt.bala, 0.0780f, 0.0965f, 0, 0.78f},
@@ -21186,31 +21194,127 @@ static uint32_t fx_hash(uint32_t x) {
   return x;
 }
 
-// One muzzle-flash star: irregular tapered petals around the bore, a hot core and a
-// forward tongue along it. t1/t2 span the petal plane (perpendicular to the bore), s
-// scales the whole star in metres and f is the 1->0 life fade.
+// One muzzle blast. Rewritten 2026-08-25 from the six-spike star: a clean radial
+// star of thin straight bars is the CARTOON glyph for a gunshot — real flash
+// photography of a braked rifle shows a fat layered FIREBALL at the crown, two
+// hard lateral JETS out of the brake's ports (both of this game's rifles wear
+// ported brakes, and the ports own the real flash's shape), a couple of ragged
+// short flame lobes, ballistic sparks, and then a frame or three of dim dust
+// glow where the blast lit the air — the flame is one frame, the impression is
+// five. Everything is stateless off (seed, f): two runs of one script stay
+// byte-identical, and a windowed session can render any frame rate through it.
+// t1/t2 are kept for the degenerate fallback; the jet frame is rebuilt
+// HORIZONTAL inside (cross with world up), because axis_frame's basis is
+// arbitrary and a brake never vents into the dirt.
 static void fx_flash(v3 pos, v3 fw, v3 t1, v3 t2, v3 eye, float s, float f,
-                     uint32_t seed) {
-  uint32_t h = fx_hash(seed);
-  float a0 = (float)(h & 255) * (F_TAU / 256.0f);
-  v3 hot = v3_scale((v3){{2.10f, 1.55f, 0.85f}}, f);
-  v3 mid = v3_scale((v3){{1.10f, 0.46f, 0.12f}}, f);
-  v3 tip = v3_scale((v3){{0.45f, 0.13f, 0.03f}}, f);
-  for (int k = 0; k < 6; k++) {
-    float ang = a0 + (float)k * (F_TAU / 6.0f);
-    float lk = s * (0.35f + 0.65f *
-               (float)((fx_hash(seed * 5u + (uint32_t)k) >> 4) & 255) / 255.0f);
-    v3 rd = v3_add(v3_scale(t1, cosf(ang)), v3_scale(t2, sinf(ang)));
-    fx_seg(v3_add(pos, v3_scale(rd, 0.04f * s)), v3_add(pos, v3_scale(rd, lk)),
-           eye, s * 0.11f, s * 0.010f, hot, tip);
+                     uint32_t seed, int wpn) {
+
+  float sr = wpn == WPN_SR ? 1.0f : 0.0f;      // the .338 blast dwarfs the 5.56's
+  // The FLAME lives in the first half of the life; the tail of the life is
+  // sparks and dust glow only. f runs 1 (birth) -> 0.
+  float flame = f_clamp((f - 0.50f) / 0.50f, 0.0f, 1.0f);
+  float age = 1.0f - f;
+  v3 side = v3_cross(fw, (v3){{0, 1, 0}});
+  float sl = v3_dot(side, side);
+  side = sl > 1e-6f ? v3_scale(side, 1.0f / sqrtf(sl)) : t1;
+  v3 vup = v3_cross(side, fw);
+  (void)t2;
+  if (flame > 0.001f) {
+    float fl2 = flame * flame;
+    // FIREBALL: a dense fan of short ragged ribbons, NEVER a fat constant
+    // quad. An additive quad's rim is a hard step (the dust-mote note: "a
+    // single quad is a hard-edged RECTANGLE"), and a fireball authored as
+    // three of them read as stickers with visible card edges — measured, a
+    // +60 red step in two pixels against the sand. Each ribbon FADES TO ZERO
+    // at its tip and tapers to a hair at its end, so no edge anywhere carries
+    // a step; the overlap at the centre is what makes the hot core, and only
+    // that overlap crosses the bloom knee — a single authored blob at 3.1
+    // was the largest flat-255 mass in the game.
+    v3 fhot = v3_scale((v3){{2.05f, 1.70f, 1.20f}}, fl2);
+    v3 fzero = {{0, 0, 0}};
+    v3 bc = v3_add(pos, v3_scale(fw, 0.08f * s));
+    for (int k = 0; k < 9; k++) {
+      uint32_t hk = fx_hash(seed * 17u + (uint32_t)k * 29u);
+      float ang = (float)(hk & 255) * (F_TAU / 256.0f);
+      float lr = s * (0.11f + 0.24f * (float)((hk >> 8) & 255) / 255.0f);
+      v3 rd = v3_add(v3_scale(side, cosf(ang)), v3_scale(vup, sinf(ang)));
+      fx_seg(v3_add(bc, v3_scale(rd, 0.010f * s)), v3_add(bc, v3_scale(rd, lr)),
+             eye, s * 0.055f, s * 0.006f, fhot, fzero);
+    }
+    // ...and a dim burnt-orange halo fan under it, one octave wider. LOW blue
+    // on purpose: the desaturated middle band is what read salmon/plastic.
+    v3 fhalo = v3_scale((v3){{0.55f, 0.21f, 0.055f}}, fl2 * 0.6f);
+    for (int k = 0; k < 5; k++) {
+      uint32_t hk = fx_hash(seed * 23u + (uint32_t)k * 31u);
+      float ang = (float)(hk & 255) * (F_TAU / 256.0f);
+      float lr = s * (0.20f + 0.30f * (float)((hk >> 8) & 255) / 255.0f);
+      v3 rd = v3_add(v3_scale(side, cosf(ang)), v3_scale(vup, sinf(ang)));
+      fx_seg(v3_add(bc, v3_scale(rd, 0.02f * s)), v3_add(bc, v3_scale(rd, lr)),
+             eye, s * 0.085f, s * 0.010f, fhalo, fzero);
+    }
+    // BRAKE JETS: 2-3 staggered ribbons per side, each a hashed length, so
+    // the leading edge is ragged — one clean taper read as a decal wedge on
+    // the .338. Canted a shade forward; the sniper's run half again as long.
+    v3 jhot = v3_scale((v3){{2.10f, 1.45f, 0.68f}}, fl2);
+    int nj = 2 + (int)sr;
+    for (int j = 0; j < 2; j++) {
+      float js = j ? 1.0f : -1.0f;
+      for (int m = 0; m < nj; m++) {
+        uint32_t hj = fx_hash(seed * 3u + (uint32_t)(j * 5 + m) * 41u);
+        float jl = s * (0.55f + 0.42f * sr) *
+                   (0.55f + 0.45f * (float)(hj & 255) / 255.0f);
+        float cant = 0.20f + 0.20f * (float)((hj >> 8) & 255) / 255.0f;
+        float lift = 0.16f * ((float)((hj >> 16) & 255) / 255.0f - 0.5f);
+        v3 jd = v3_norm(v3_add(v3_scale(side, js),
+                v3_add(v3_scale(fw, cant), v3_scale(vup, lift))));
+        fx_seg(v3_add(pos, v3_scale(jd, 0.05f * s)), v3_add(pos, v3_scale(jd, jl)),
+               eye, s * (0.075f - 0.015f * (float)m), s * 0.008f, jhot, fzero);
+      }
+    }
+    // Forward cone: short — the bore's own blast, mostly eaten by the brake,
+    // longer on the .338. Fades to zero like everything else.
+    fx_seg(v3_add(pos, v3_scale(fw, 0.04f * s)),
+           v3_add(pos, v3_scale(fw, s * (0.80f + 0.45f * sr))),
+           eye, s * 0.11f, s * 0.012f, jhot, fzero);
   }
-  // Forward tongue: the blast leaving the bore, foreshortened to almost nothing in
-  // first person where the star carries the read.
-  fx_seg(pos, v3_add(pos, v3_scale(fw, s * 1.25f)),
-         eye, s * 0.15f, s * 0.02f, hot, mid);
-  // Hot core blob over the crown.
-  fx_seg(v3_add(pos, v3_scale(t1, -0.07f * s)), v3_add(pos, v3_scale(t1, 0.07f * s)),
-         eye, s * 0.14f, s * 0.14f, v3_scale(hot, 1.35f), v3_scale(hot, 1.35f));
+  // SPARKS: a few incandescent grains thrown forward-out, ballistic off the
+  // seed — they outlive the flame and are what the eye keeps. FEWER and
+  // FATTER than the first cut: seven 1-px dots sat under the film grain's
+  // own amplitude and the whole decay half of the life read empty.
+  int ns = 4 + (int)(2.0f * sr);
+  for (int k = 0; k < ns; k++) {
+    uint32_t hk = fx_hash(seed * 13u + (uint32_t)k * 101u);
+    float r1 = (float)(hk & 1023) / 1023.0f;
+    float r2 = (float)((hk >> 10) & 1023) / 1023.0f;
+    float r3 = (float)((hk >> 20) & 1023) / 1023.0f;
+    v3 sd2 = v3_norm(v3_add(v3_scale(fw, 0.55f + 0.9f * r1),
+             v3_add(v3_scale(side, (r2 - 0.5f) * 1.1f),
+                    v3_scale(vup, (r3 - 0.5f) * 0.8f))));
+    float sp = s * (2.4f + 3.2f * r1);
+    v3 p = v3_add(pos, v3_scale(sd2, 0.12f * s + sp * age));
+    p.y -= 2.6f * s * age * age;                        // the grain falls
+    v3 scol = v3_scale((v3){{2.45f, 1.20f, 0.30f}}, f * f * (0.6f + 0.4f * r2));
+    fx_teardrop(p, v3_sub(p, v3_scale(sd2, s * (0.14f + 0.14f * age))), eye,
+                s * 0.019f, s * 0.042f, scol, fx_warm_halo(scol));
+  }
+  // DUST GLOW: after the flame dies — and ONLY after it: at tick 0 the puff
+  // doubled the flash's footprint and fogged the aim point, which is the one
+  // place this game never puts haze it didn't price. A soft CROSS of four
+  // tapered ribbons fading to zero (a single card here showed its rectangle
+  // against the trousers in third person), dim, expanding, cooling.
+  if (age > 0.45f) {
+    float gs = s * (0.70f + 1.40f * age);
+    v3 gcol = v3_scale((v3){{0.115f, 0.050f, 0.016f}}, f * f);
+    v3 gzero = {{0, 0, 0}};
+    v3 gc = v3_add(pos, v3_add(v3_scale(fw, 0.30f * s), v3_scale(vup, 0.12f * s * age)));
+    for (int k = 0; k < 4; k++) {
+      float ang = 0.7854f + (float)k * 1.5708f +
+                  0.5f * ((float)((fx_hash(seed * 29u + (uint32_t)k) >> 5) & 255) / 255.0f - 0.5f);
+      v3 rd = v3_add(v3_scale(side, cosf(ang)), v3_scale(vup, sinf(ang)));
+      fx_seg(gc, v3_add(gc, v3_scale(rd, gs)), eye, gs * 0.36f, gs * 0.04f,
+             gcol, gzero);
+    }
+  }
 }
 
 static void scene_build(const player_t *p, float alpha, int show_player) {
@@ -21474,8 +21578,8 @@ static void fx_build(v3 eye) {
     axis_frame(fl->dir, &t1, &t2);
     uint32_t h = fx_hash(fl->seed ^ 0x9E37u);
     float s = (0.22f + 0.08f * (float)((h >> 8) & 255) / 255.0f) *
-              (0.45f + 0.55f * f);
-    fx_flash(fl->pos, fl->dir, t1, t2, eye, s, f, fl->seed);
+              (0.45f + 0.55f * f) * (fl->wpn == WPN_SR ? 1.45f : 1.0f);
+    fx_flash(fl->pos, fl->dir, t1, t2, eye, s, f, fl->seed, fl->wpn);
   }
   for (int i = 0; i < MAX_PARTICLES; i++)
     if (g_parts[i].life > 0) {
@@ -22671,7 +22775,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
   for (int i = 0; i < MAX_FLASHES; i++)
     if (g_flashes[i].src == g_local_ent && g_tick - g_flashes[i].t0 <= 2 &&
         (g_flashes[i].life > 0 || g_flashes[i].fresh)) {
-      g_world_muz_c = 8.0f;
+      g_world_muz_c = g_flashes[i].wpn == WPN_SR ? 12.0f : 8.0f;
       g_world_muz_p = g_flashes[i].pos;
     }
   if (g_world_muz_c > 0.001f) {
@@ -22794,7 +22898,10 @@ static void render_frame(const player_t *p, float alpha, int fps,
     int mfresh = g_muzzle_fresh && g_tick - g_muzzle_fire_tick <= 12 &&
                  !g_vmorb.on;
     if ((g_muzzle_t > 0 || mfresh) && !g_vmorb.on) {
-      float k = (mfresh ? 3.4f : 1.3f) * (1.0f - 0.45f * ads);
+      // The self-light DECAYS with the flash's new longer life — held at 1.3
+      // for all seven ticks the weapon read as lamp-lit long after the flame.
+      float k = (mfresh ? 3.4f : 2.0f * (float)g_muzzle_t / (float)FLASH_TICKS) *
+                (1.0f - 0.45f * ads);
       v3 ml = v3_norm(v3_add(fwd, v3_scale(upv, 0.16f)));
       glUniform3f(R.u_muzl, ml.x, ml.y, ml.z);
       glUniform3f(R.u_muzc, 1.00f * k, 0.72f * k, 0.38f * k);
@@ -22886,12 +22993,13 @@ static void render_frame(const player_t *p, float alpha, int fps,
       // which is a mark that lies about where the round goes. The honest one is the one
       // that was already there.
       scene_reset();
-      float mf01 = mfresh ? 1.0f : (float)g_muzzle_t / 3.0f;
+      float mf01 = mfresh ? 1.0f : (float)g_muzzle_t / (float)FLASH_TICKS;
       g_muzzle_fresh = 0;
       float fs = 1.0f - 0.55f * ads;
+      float ws = p->wp.cur == WPN_SR ? 0.155f : 0.115f;
       fx_flash(g_vm_muzzle, fwd, rgt, upv, eye,
-               0.11f * fs * (0.55f + 0.45f * mf01), mf01,
-               (uint32_t)p->wp.idx * 61u + 17u);
+               ws * fs * (0.55f + 0.45f * mf01), mf01,
+               (uint32_t)p->wp.idx * 61u + 17u, p->wp.cur);
       fx_pass_begin();
       scene_draw();
       fx_pass_end();

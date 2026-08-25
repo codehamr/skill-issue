@@ -406,7 +406,16 @@ WANT_NEAR="80 80 80 64"
 # hence the drop at DIST 0/3/12. What the coarse tier gains (+4 at DIST 30) is
 # the kneepad plate and the taller boot shaft grazing their hosts at k=6, the
 # designed-burial class as everywhere above.
-WANT_CROSS="84 84 70 66"
+# -2/-2/-1/0 with the ELBOW BLUNTING (same day): swell 0.18 -> 0.05 and a
+# smaller ball (0.0505/0.0570) stop the ellipsoid's out-axis tip grazing the
+# arm tubes it bridges — the beak was also a graze source.
+# +1/+1/+5/0 with the MASCULINE JAW (same day): the chin ring is 8 mm further
+# forward and the jaw ring 9 mm wider, so the goggle-on-skull and
+# strap-on-torso families gain a few pairs back at the tiers where every skin
+# is eight flats — the same advisory classes, still below the pre-player-pass
+# 85/85/84 at three of four tiers (per-pair histogram: skull/goggle at DIST 12
+# is 300 on BOTH HEAD and this build; what this pass retired stays retired).
+WANT_CROSS="83 83 74 66"
 [ "${CROSS:-}" = "$WANT_CROSS" ] || { say "GATE cross '${CROSS:-}' != baseline '$WANT_CROSS'"; fail=1; }
 
 # parity: no MISMATCH in the shared-code rows
