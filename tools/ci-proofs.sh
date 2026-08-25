@@ -99,7 +99,7 @@ done
 # across, so a trouser and a boot cuff that used to pass through each other now
 # graze instead — a crossing became a near-parallel pair, which is the trade
 # this whole pass is about and the direction it should go.
-# Re-baselined 2026-08-25, 40/40/46/36 -> 78/78/78/63, with the WEAPON MODEL PASS:
+# Re-baselined 2026-08-25, 40/40/46/36 -> 80/80/80/65, with the WEAPON MODEL PASS:
 # both rifles were rebuilt from ~30 parts to ~72, so the number of neighbouring
 # surfaces that can be tangent roughly doubled and this tier roughly doubled with it.
 # INVESTIGATED, not bumped — six genuinely coplanar pairs were found and fixed on the
@@ -115,7 +115,16 @@ done
 # ...and 85/70 -> 78/63 at DIST 12 and 30 within the same pass, once gun_tier() took the
 # small parts out past 12 m: every pair those parts contributed at the coarse tiers went
 # with them, which is the LOD doing exactly what it was added for.
-WANT_NEAR="78 78 78 63"
+# +2 at every tier when the red-dot sight was SLIMMED (second pass, same day): the hood
+# bridge is inset from its walls rather than overhanging them, and 1.3 mm is the closest
+# any two of the hood's six faces now get. The sight's other four pairs WERE a defect and
+# were fixed rather than absorbed — the body's underside sat 0.8 mm under the rail base's
+# and parallel to it across the base's whole width.
+# TWELVE of this quadruple are the AR sight's coating annulus against its window frame,
+# and they are not going away: the frame's wall is 1.6 mm of real thickness and a lens
+# ring buried in it is inside a millimetre of BOTH of its faces by construction. That is
+# the "two curved bodies that touch are tangent somewhere" case this tier exists for.
+WANT_NEAR="80 80 80 65"
 [ "$NEAR" = "$WANT_NEAR" ] || { say "GATE near '$NEAR' != baseline '$WANT_NEAR'"; fail=1; }
 
 # `cross` — surfaces passing THROUGH each other at 1.8-15 degrees, the tier the

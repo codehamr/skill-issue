@@ -19125,7 +19125,21 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // It is also 73 mm long rather than 48. Every real reflex sight is about twice as
     // long as it is tall; at 0.8 the block reads as a lump on the rail instead of as an
     // optic, which is the one thing the silhouette has to say from the side.
-    GBOX(0, 0.0405f, 0.1520f, 0.0175f, 0.0085f, 0.0260f, alloy);  // chassis
+    // SLIMMED 2026-08-25 (second pass). It read as bulky, and three numbers carried it:
+    // the hood was 55.6 mm across a 40.5 mm window, the bridge overhung that at 58, and
+    // the body was 52 mm long and 17 tall. It is 51.8 / 49.2 / 42 / 14 now.
+    // The body is also WIDER than the walls it carries, which it has to be: the hood's
+    // inner faces must clear the window frame's outer by more than a millimetre (or
+    // figcheck's near tier takes them, and they crop the sight picture besides), so they
+    // cannot touch the frame — they have to rise off the body. At the old 0.0175 they
+    // touched NOTHING, and 1.5 mm of air on each side is invisible at a millimetre a
+    // pixel, which is how a floating part survives a look pass: figcheck cannot see it
+    // either, because two parts that never meet are a perfectly valid mesh.
+    // ...and its underside clears the RAIL BASE's by 2.4 mm. At 0.0330 the two bottom
+    // faces were 0.8 mm apart and parallel over the whole width of the base — four of
+    // figcheck's near pairs from one number, and the same class as every other one this
+    // pass produced: two parts sized off the same reference.
+    GBOX(0, 0.0392f, 0.1560f, 0.0230f, 0.0078f, 0.0230f, alloy);  // chassis
     // The hood: two side walls and a bridge, 28 mm deep against the frame's 3.4. This
     // is what gives the sight a top line and a shadow of its own.
     // 0.0160 of half-height, not 0.0145: at 0.0145 a wall's top face landed 0.4 mm
@@ -19135,19 +19149,22 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
     // 16.4 against the aperture's 17.9 and cropped 1.5 mm off each side. 21.8 now.
     // They are carried by the chassis rather than by the frame, which is why they can
     // stand outside the glass at all.
-    GBOX( 0.0248f, 0.0625f, 0.1840f, 0.0030f, 0.0182f, 0.0140f, alloy);  // R wall
-    GBOX(-0.0248f, 0.0625f, 0.1840f, 0.0030f, 0.0182f, 0.0140f, alloy);  // L wall
+    GBOX( 0.0237f, 0.0600f, 0.1840f, 0.0022f, 0.0158f, 0.0140f, alloy);  // R wall
+    GBOX(-0.0237f, 0.0600f, 0.1840f, 0.0022f, 0.0158f, 0.0140f, alloy);  // L wall
     // THE BRIDGE IS INSET FROM THE WALLS ALONG THE BORE. At the walls' own z extents
     // (centre 0.1840, half 0.0140) its front and rear faces were COPLANAR with theirs
     // and overlapped them in x and y — figcheck's zfight tier went 0 to 16 on that one
     // pair. 0.0126 sets both of its z faces 1.4 mm inside the walls'.
-    GBOX(0, 0.0765f, 0.1840f, 0.0290f, 0.0026f, 0.0126f, alloy);         // hood bridge
+    // ...and the bridge is INSET from the walls rather than overhanging them, dips
+    // 1.1 mm into the frame's top so it is carried by something, and is 1.6 mm proud of
+    // the walls so no two faces of the three are parallel inside a millimetre.
+    GBOX(0, 0.0752f, 0.1840f, 0.0246f, 0.0022f, 0.0126f, alloy);         // hood bridge
     // The two buttons, ON THE SIDE THE PLAYER CAN SEE. The camera sits on the weapon's
     // left, so a control group on +x renders exactly 0 px for the whole match.
     mat_set(MAT_POLY_R, 0.0f);
     if (gun_tier()) {
-      GBOX(-0.0206f, 0.0405f, 0.1420f, 0.0026f, 0.0038f, 0.0038f, black);  // button
-      GBOX(-0.0206f, 0.0405f, 0.1520f, 0.0026f, 0.0038f, 0.0038f, black);  // button
+      GBOX(-0.0244f, 0.0400f, 0.1440f, 0.0024f, 0.0036f, 0.0036f, black);  // button
+      GBOX(-0.0244f, 0.0400f, 0.1540f, 0.0024f, 0.0036f, 0.0036f, black);  // button
     }
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0017f),
@@ -20916,37 +20933,6 @@ static uint32_t fx_hash(uint32_t x) {
   return x;
 }
 
-// THE RED DOT IS ADDITIVE GEOMETRY, NOT A PART, and that is what keeps it clear of
-// every proof in this file: figcheck/vmcheck/vmtrig analyse the SCENE mesh, and a
-// camera-facing quad in the glow submission is not in it. It is also the only way to
-// get a value above the tonemap's shoulder out of a 3 mm object, which no albedo can —
-// the sight pane is authored at 0.045 display precisely because a coated lens is dark,
-// and a dark lens with a dark dot in it is a sight with nothing in it.
-//
-// TWO CROSSED BARS, not one quad: fx_seg builds a hard-edged rectangle (the trap
-// fx_dust's motes are already written up for), and a rectangular red dot is a sticker.
-// Crossed and tapered, the pair reads as a point with a bloom around it.
-//
-// The EYE it spans its quads against is the PROJECTION's, not the player's. Under
-// vmorbit those are different, and the player's eye builds the quads edge-on in exactly
-// the shots that exist to photograph the dot.
-static void fx_sight_dot(v3 pos, v3 rt, v3 up, v3 eye, float r, float gain) {
-  v3 hot = v3_scale((v3){{3.20f, 0.34f, 0.18f}}, gain);
-  v3 dim = v3_scale((v3){{0.62f, 0.045f, 0.02f}}, gain);
-  // The HALO first: two crossed bars, faint and wide, which is the bloom a real emitter
-  // throws into the coating rather than the emitter itself.
-  fx_seg(v3_sub(pos, v3_scale(rt, r * 2.2f)), v3_add(pos, v3_scale(rt, r * 2.2f)),
-         eye, r * 0.20f, r * 0.20f, dim, dim);
-  fx_seg(v3_sub(pos, v3_scale(up, r * 2.2f)), v3_add(pos, v3_scale(up, r * 2.2f)),
-         eye, r * 0.20f, r * 0.20f, dim, dim);
-  // ...then the core, short and fat, so the centre reads as a POINT and the bars are
-  // only its glow. Crossed rather than single: fx_seg draws a hard-edged rectangle.
-  fx_seg(v3_sub(pos, v3_scale(rt, r * 0.42f)), v3_add(pos, v3_scale(rt, r * 0.42f)),
-         eye, r * 0.62f, r * 0.62f, hot, hot);
-  fx_seg(v3_sub(pos, v3_scale(up, r * 0.42f)), v3_add(pos, v3_scale(up, r * 0.42f)),
-         eye, r * 0.62f, r * 0.62f, hot, hot);
-}
-
 // One muzzle-flash star: irregular tapered petals around the bore, a hot core and a
 // forward tongue along it. t1/t2 span the petal plane (perpendicular to the bore), s
 // scales the whole star in metres and f is the 1->0 life fade.
@@ -22570,9 +22556,6 @@ static void render_frame(const player_t *p, float alpha, int fps,
       g_vm_muz_cam = (v3){{v3_dot(mc, rgt), v3_dot(mc, upv), v3_dot(mc, fwd)}};
       g_vm_muz_tick = g_tick;
     }
-    // The eye the glow submission spans its quads against: the PROJECTION's, which
-    // under vmorbit is not the player's. See fx_sight_dot.
-    v3 veye = eye;
     if (g_vmorb.on) {
       // Re-aim the projection at one hand, keeping the pose that was just built.
       v3 of, orr, ou;
@@ -22624,7 +22607,6 @@ static void render_frame(const player_t *p, float alpha, int fps,
       // looking from.
       v3 oeye = v3_sub(piv, v3_scale(of, g_vmorb.dist));
       glUniform3f(R.u_eye, oeye.x, oeye.y, oeye.z);
-      veye = oeye;   // ...and the glow submission below spans its quads against it
     }
     // The weapon's own frame, uploaded AFTER vm_build so it describes the pose
     // that was just emitted rather than the previous frame's.
@@ -22637,38 +22619,29 @@ static void render_frame(const player_t *p, float alpha, int fps,
     // not inherit the orbit's eye; the next world draw sets it from the camera.
     glUniform3f(R.u_eye, eye.x, eye.y, eye.z);
     glUniform3f(R.u_muzc, 0.0f, 0.0f, 0.0f);
-    // ONE ADDITIVE SUBMISSION FOR THE WHOLE VIEWMODEL, and it now runs on every frame
-    // the AR is up rather than only on the three frames after a shot: the red dot lives
-    // in it. Depth TEST is still on (only the write is off), so the sight's own housing
-    // occludes the dot as the weapon turns away, which is what makes it read as a thing
-    // inside the tube rather than a decal on the screen.
-    {
-      int shot_fx = (g_muzzle_t > 0 || mfresh) && !g_vmorb.on;
-      int dot_fx  = p->wp.idx == WPN_AR;
-      if (shot_fx || dot_fx) {
-        scene_reset();
-        if (dot_fx) {
-          // 1.4 mm, on the aperture plane g_gun_sight_p publishes — one copy, so the
-          // dot cannot drift from the window the geometry actually draws. The gain
-          // rides the ADS blend: a sight the player is not looking through does not
-          // need to be the brightest thing on the screen, and at the hip it would be.
-          fx_sight_dot(g_gun_sight_p, g_vm_mdl_x, g_vm_mdl_y, veye,
-                       0.0021f, 0.62f + 0.38f * ads);
-        }
-        if (shot_fx) {
-          // The same star the world pass gives every other shooter, on the drawn barrel
-          // tip in the viewmodel's own projection.
-          float mf01 = mfresh ? 1.0f : (float)g_muzzle_t / 3.0f;
-          g_muzzle_fresh = 0;
-          float fs = 1.0f - 0.55f * ads;
-          fx_flash(g_vm_muzzle, fwd, rgt, upv, eye,
-                   0.11f * fs * (0.55f + 0.45f * mf01), mf01,
-                   (uint32_t)p->wp.idx * 61u + 17u);
-        }
-        fx_pass_begin();
-        scene_draw();
-        fx_pass_end();
-      }
+    if ((g_muzzle_t > 0 || mfresh) && !g_vmorb.on) {
+      // The same star the world pass gives every other shooter, on the drawn barrel tip
+      // in the viewmodel's own projection.
+      //
+      // AND THE RED DOT IS NOT IN HERE. It was, for one iteration: an emissive quad on
+      // the aperture plane, which is where a real reflex sight's dot physically is. It
+      // was a SECOND dot. The HUD has drawn the point-of-aim dot at screen centre since
+      // long before this pass (`dot_a`, in the HUD block below), and the two agree only
+      // while the weapon is still — the viewmodel sways cosmetically and the SHOT does
+      // not, because gun_shoot fires along the camera axis. So a dot anchored to the
+      // drawn sight separates from the point of aim exactly when the player is moving,
+      // which is a mark that lies about where the round goes. The honest one is the one
+      // that was already there.
+      scene_reset();
+      float mf01 = mfresh ? 1.0f : (float)g_muzzle_t / 3.0f;
+      g_muzzle_fresh = 0;
+      float fs = 1.0f - 0.55f * ads;
+      fx_flash(g_vm_muzzle, fwd, rgt, upv, eye,
+               0.11f * fs * (0.55f + 0.45f * mf01), mf01,
+               (uint32_t)p->wp.idx * 61u + 17u);
+      fx_pass_begin();
+      scene_draw();
+      fx_pass_end();
     }
   }
 
