@@ -4328,7 +4328,10 @@ typedef struct {
   float lean_lag, prev_lean_lag;                   // trails player_t.lean: the
                                                    // weapon is on an arm, not
                                                    // bolted to the helmet
+  float slide_s, prev_slide_s;                     // eased slide 0..1: the FP
+                                                   // tuck-and-cant pose blend
   float last_yaw, last_pitch;
+  float last_eye;                                  // for the crouch/stand settle
   v3    last_vel;
 } vm_t;
 
@@ -5059,6 +5062,13 @@ static void mv_air(v3 *vel, float wx, float wz, float wlen, float sp2d) {
 #define ANIM_FARM     0.265f
 // Half the biacromial breadth (415 mm p50), pulled in slightly to the joint centres.
 #define ANIM_SHO_HALF 0.212f
+// The shouldered shoulder-line blade (rad) and the ARM's two-bone reach guard
+// (the legs have their own, ANIM_REACH_K 0.965 above) — hoisted because the
+// FIRST-PERSON arms (vm_build) anchor their shoulders and clamp their reach
+// off the same numbers, and a retune that moved only one copy would silently
+// split the FP man from the 3P one.
+#define ANIM_BLADE       0.52f
+#define ANIM_ARM_REACH_K 0.96f
 // Swing fraction of the FULL cycle per foot (stance = 1 - duty).
 #define ANIM_DUTY     0.40f   // walking
 #define ANIM_DUTY_RUN 0.78f   // sprinting: >0.5 means BOTH feet leave the ground
@@ -5898,7 +5908,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // every other number fought every other number: with the shoulder line held SQUARE to
   // the target, the butt pad can be in the shoulder pocket or the support hand can be
   // on the handguard, but never both.
-  float blade = 0.52f * a->ready_s + 0.20f * runT * (1.0f - a->ready_s);
+  float blade = ANIM_BLADE * a->ready_s + 0.20f * runT * (1.0f - a->ready_s);
   float blc = cosf(blade), bls = sinf(blade);
   v3 fwdh = v3_norm((v3){{aimd.x, 0.0f, aimd.z}});
   for (int i = 0; i < 2; i++) {
@@ -5927,7 +5937,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
     // being steerable before it stops being solvable.
     {
       v3 aw = v3_sub(wri, sho);
-      float awl = v3_len(aw), amax = (ANIM_UARM + ANIM_FARM) * 0.96f;
+      float awl = v3_len(aw), amax = (ANIM_UARM + ANIM_FARM) * ANIM_ARM_REACH_K;
       if (awl > amax) wri = v3_add(sho, v3_scale(aw, amax / awl));
     }
     P->sho[i] = sho;
@@ -9798,6 +9808,7 @@ static void vm_tick(player_t *p) {
   v->prev_kick = v->kick;
   v->prev_roll = v->roll;
   v->prev_lean_lag = v->lean_lag;
+  v->prev_slide_s = v->slide_s;
 
   // Look sway: the gun trails the view's angular velocity.
   float dyaw = p->yaw - v->last_yaw, dpit = p->pitch - v->last_pitch;
@@ -9816,7 +9827,17 @@ static void vm_tick(player_t *p) {
   a = f_clamp(10.0f * TICK_DT, 0, 1);
   v->lag_x += (f_clamp(-ax * 0.0009f, -0.03f, 0.03f) * sc * damp - v->lag_x) * a;
   v->lag_z += (f_clamp(-az * 0.0007f, -0.035f, 0.035f) * sc * damp - v->lag_z) * a;
-  v->lag_y += (f_clamp(-p->vel.y * 0.006f, -0.035f, 0.035f) * sc * damp - v->lag_y) * a;
+  // The vertical channel reads the EYE's own rate as well as the world's: a
+  // crouch or a stand moves the eye ~2 m/s while p->vel.y stays 0, and a gun
+  // that ignores it teleports through the transition while every jump makes it
+  // float. One channel, both sources, so the settle is the same motion.
+  if (v->last_eye <= 0.0f) v->last_eye = p->eye;
+  float deye = (p->eye - v->last_eye) / TICK_DT;
+  v->last_eye = p->eye;
+  // A respawn snaps the eye scalar in one tick — 150 m/s is not a motion the
+  // gun should answer; the fastest real transition (stand->crouch) is ~2.5.
+  if (fabsf(deye) > 8.0f) deye = 0.0f;
+  v->lag_y += (f_clamp((-p->vel.y - deye) * 0.006f, -0.035f, 0.035f) * sc * damp - v->lag_y) * a;
 
   // Walk bob: the phase advances at a STRIDE CADENCE (~1.6..2.3 Hz), not with distance
   // — at 12 m/s a distance phase would wag the gun at ~10 Hz, pure jitter.
@@ -9837,6 +9858,13 @@ static void vm_tick(player_t *p) {
   // Lean lag. The camera's roll and offset are rigid — the gun is not: it hangs off two
   // arms, so it arrives at the new lean a beat late and settles.
   v->lean_lag += (p->lean - v->lean_lag) * f_clamp(9.0f * TICK_DT, 0, 1);
+
+  // The slide blend: fast in (the drop IS violent), slower out (standing up
+  // from a skid is a push, not a snap). The pose terms it drives live in
+  // vm_build and are all hip-scaled, so ADS keeps its honest sight picture.
+  float st = p->sliding ? 1.0f : 0.0f;
+  v->slide_s += (st - v->slide_s) *
+                f_clamp((p->sliding ? 14.0f : 6.0f) * TICK_DT, 0, 1);
 
   // Roll: slide tilt plus a strafe hint.
   float roll_t = (p->sliding ? 0.09f : 0.0f);
@@ -16852,9 +16880,17 @@ static v3 shadow_foot(v3 c) {
 static frustum_t g_cam_frustum;
 static int       g_cam_cull;
 
+// Floats that CAST a shadow: everything scene_build emits before the local
+// first-person body, which is appended last and casts nothing (the local
+// player has never cast a shadow in first person, and a headless, armless,
+// gunless shadow would be worse than none). -1 = the whole buffer, which is
+// what every other filler of this buffer (vm pass, FX, probes) wants.
+static int g_scene_cast_floats;
+
 static inline void scene_reset(void) {
   g_scene_floats = 0; g_scene_want = 0; g_scene_dirty = 1;
   g_nschunk = 0; g_schunk_open = -1;
+  g_scene_cast_floats = -1;
 }
 
 static void scene_quad(v3 a, v3 b, v3 c, v3 d, v3 n, v3 col) {
@@ -17317,6 +17353,16 @@ static int g_fig_k = FIG_KMAX;
 // A CEILING on the tier the next figure may use, in the same batch-state idiom as
 // mat_set/ao_set/g_fig_diss. 0 = whatever the distance says.
 static int g_fig_kcap;
+// BUILDING THE LOCAL BODY FOR THE FIRST-PERSON CAMERA: the figure minus its
+// head (the camera is inside it), minus its arms and rifle (the viewmodel pass
+// owns both, at hero tier, welded to the camera). What remains — torso, kit,
+// legs, boots — is what a player looking down at himself actually has.
+static int g_fig_fp;
+// The FP body is slid BACK along the aim so the camera sits over the collar
+// instead of inside the chest: the pose is world-space and the camera is the
+// figure's own eye, so drawn in place the near plane lands mid-torso and a
+// look downward photographs the inside of the plate carrier.
+static v3 g_fig_fp_off;
 
 // ...AND THE TIER ITSELF, because "hero or not" is two states and a weapon needs three.
 // 2 = the first-person view, which can resolve a 3 mm pin. 1 = a third-person figure
@@ -20170,7 +20216,10 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     // one pass and moved back the same day — based at the chest its whip stood
     // in front of the neck and crossed the FACE in every side view, and the
     // blade twist made its base read as floating beside the arm.
-    {
+    // ...but not on the FP body: the mast is at the camera's own shoulder
+    // there, and looking down it reads as a bent black prism jammed into the
+    // chest — unidentifiable debris in the one view the FP body exists for.
+    if (!g_fig_fp) {
       v3 ab = v3_add(pb, v3_add(v3_scale(Rc, 0.072f), v3_scale(spine, 0.070f)));
       fnode_t an[3] = {
         {ab, kt->rub, kt->rub, 0.0105f, 0.0072f, 0, 0.62f},
@@ -20449,6 +20498,14 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
     float *po = (float *)&P;
     for (unsigned k = 0; k < sizeof(pose_t) / sizeof(float); k++)
       po[k] = p0[k] + (p1[k] - p0[k]) * alpha;
+    // The FP body rides behind the camera: translate the POSITIONS only —
+    // the flat-array layout is the same property the death topple leans on.
+    if (g_fig_fp)
+      for (int k = 0; k < POSE_NPOS; k++) {
+        po[k * 3 + 0] += g_fig_fp_off.x;
+        po[k * 3 + 1] += g_fig_fp_off.y;
+        po[k * 3 + 2] += g_fig_fp_off.z;
+      }
   }
   // The corpse solve (gravity drape + tip + settle) rewrites the interpolated
   // pose in place; a living figure pays nothing for it, not even the ground ray.
@@ -20464,8 +20521,9 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
   v3 prt = v3_norm(v3_sub(P.hip[1], P.hip[0]));      // pelvis right
 
   fig_torso(&P, &kt, Rc, spine, prt);
-  // Neck + head + helmet, all in the look frame.
-  {
+  // Neck + head + helmet, all in the look frame — unless this build IS the
+  // head's own point of view.
+  if (!g_fig_fp) {
     // The head's basis comes from `pose_head_frame` — ONE copy, shared with the weld
     // proof, because a proof that measures a different head from the one drawn measures
     // nothing.
@@ -20940,6 +20998,10 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
   }
   // The rifle: the SAME model the player's own viewmodel is built from, anchored so the
   // trigger hand lands on the pistol grip and the support hand on the handguard.
+  // The FP body carries neither rifle nor arms — the viewmodel pass draws both,
+  // welded to the camera; a second pair posed for a third-person observer would
+  // stand in the frame beside them.
+  if (!g_fig_fp) {
   v3 g_org, g_rt, g_up, g_fw;
   pose_gun_frame(&P, wpn, &g_org, &g_rt, &g_up, &g_fw);
   g_gun_girth = GUN_GIRTH_3P;
@@ -21014,6 +21076,7 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
   fig_arms(&P, &kt, Rc, spine, g_org, g_rt, g_up, g_fw, wpn,
            A->slide_s, A->slide_dir);
   g_gun_girth = 1.0f;
+  }
   probe(NULL);
   ao_off();
   scene_chunk_end();
@@ -21317,7 +21380,8 @@ static void fx_flash(v3 pos, v3 fw, v3 t1, v3 t2, v3 eye, float s, float f,
   }
 }
 
-static void scene_build(const player_t *p, float alpha, int show_player) {
+static void scene_build(const player_t *p, float alpha, int show_player,
+                        int fp_body) {
   (void)p;   // the roster below covers human 0; parameter kept for callers
   scene_reset();
   // Every human body: the LOCAL one only when the camera is not first-person;
@@ -21362,6 +21426,30 @@ static void scene_build(const player_t *p, float alpha, int show_player) {
       scene_mark(&g_marks[i]);
     }
   ao_off();
+  // THE PLAYER'S OWN BODY, FIRST PERSON: the same figure, the same pose, the
+  // same tick — minus head, arms and rifle (g_fig_fp). Appended LAST so the
+  // shadow pass can stop in front of it (g_scene_cast_floats): the partial
+  // body may be seen, never its shadow.
+  g_scene_cast_floats = g_scene_floats;
+  if (fp_body && g_local_ent >= 0) {
+    int lh = human_of_ent(g_local_ent);
+    if (lh >= 0 && lh < MAX_HUMANS && g_humans_on[lh] && g_players[lh].alive) {
+      const player_t *hp = &g_players[lh];
+      g_fig_fp = 1;
+      // Stance-aware: a crouched trunk already leans 0.46 rad forward, so the
+      // full stand-off pushes the knees out of even a straight-down look —
+      // exactly the frame the crouched body exists for.
+      float bk = 0.21f - 0.04f * g_player_anim[lh].crouch_s;
+      g_fig_fp_off = (v3){{-sinf(hp->yaw) * bk, 0.0f, cosf(hp->yaw) * bk}};
+      scene_draw_figure(&g_player_anim[lh],
+                        v3_lerp(hp->prev_pos, hp->pos, alpha), hp->yaw, NULL,
+                        alpha, ent_flash01(hp->flash, hp->flash_head),
+                        hp->flash_head ? (v3){{1.0f, 0.22f, 0.14f}}
+                                       : (v3){{1, 1, 1}},
+                        1, hp->wp.cur, gun_anim(&hp->wp, alpha));
+      g_fig_fp = 0;
+    }
+  }
 }
 
 // The player's first-person tracer re-anchor: render_frame FOV-remaps the viewmodel's
@@ -21800,36 +21888,64 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   // 0.120 m down; another 0.100 m plus 0.25 rad of muzzle-down pitch took everything
   // but the top rail off screen for the entire 1.8 s.
   int srcyc = cur == WPN_SR;
+  // BREATHING: two incommensurate frequencies (0.30 Hz and its 1.57x partner)
+  // so the idle never visibly loops, walking with the SIM CLOCK — a breath on
+  // the render clock is the caret-blink trap, and every harness shot of an
+  // idle weapon would depend on how many frames preceded it. Mostly bled out
+  // in ADS: what little survives is the hold, not a wander — the HUD dot is
+  // the honest point of aim and a sway that moves the picture but not the
+  // shot would split them.
+  float bt = ((float)g_tick + alpha) * TICK_DT;
+  float swc = g_cfg.wp[cur][WP_SWAY];
+  float br_k = swc * (0.22f + 0.78f * hip);
+  float br_p = (sinf(bt * F_TAU * 0.30f) * 0.7f +
+                sinf(bt * F_TAU * 0.47f) * 0.3f) * 0.0032f * br_k;
+  float br_y = sinf(bt * F_TAU * 0.30f) * 0.0016f * br_k;
+  // The slide pose: tucked in, canted, muzzle up — the one-handed carry's
+  // reading at first-person scale. All of it rides `hip`, so ADS mid-slide
+  // keeps the sight welded to the axis.
+  float sl = VLERP(slide_s);
   float px = 0.158f * hip + VLERP(bob_x) + VLERP(lag_x) - rl * 0.072f
            + rk * 0.011f + rch * (srcyc ? -0.062f : 0.026f)
-           + (lean_d * 0.16f - lean * 0.028f) * hip;
+           + (lean_d * 0.16f - lean * 0.028f - sl * 0.048f) * hip;
   // DOWN a little and NOT toward the eye.
   float py = -0.120f * hip - sight_y * ads + VLERP(bob_y) + VLERP(lag_y)
            // sw * 0.125, not 0.22: THE SWAP PUT THE WHOLE WEAPON BELOW THE FRAME, which
            // is the identical failure the reload dip above was already fixed for.
            - dip * 0.5f + rl * 0.084f + rch * (srcyc ? 0.044f : 0.020f)
-           - rk * 0.020f - sw * 0.125f;
+           - rk * 0.020f - sw * 0.125f + br_y - sl * 0.020f * hip;
   // The sniper pulls closer to the eye in ADS so the scope window opens up. TAKE-UP:
   // the weapon comes back into the grip as the finger closes on it.
   float tkick = cur == WPN_SR ? hip : 0.45f + 0.55f * hip;
   float pz = 0.30f - 0.0015f * trig * tkick
            - 0.022f * hip - (cur == WPN_SR ? 0.152f : 0.06f) * ads - kick
            + VLERP(lag_z) - sw * 0.03f - rl * 0.020f
-           - rch * (srcyc ? 0.062f : 0.030f) + rk * 0.016f;
+           - rch * (srcyc ? 0.062f : 0.030f) + rk * 0.016f
+           - sl * 0.040f * hip;
 
   v3 gx = rgt, gy = upv, gz = fwd;
   // sw * 0.42, not 0.7: 0.7 rad of muzzle-down put the barrel tip a further 0.32 m
   // below an already-off-frame origin — see the note on py above.
+  // The vertical-inertia channel also TILTS: a body that rises or drops under
+  // the gun leaves the muzzle a beat behind in angle as well as height — the
+  // jump float, the fall lead-down and the crouch settle are all this term.
   rot2(&gz, &gy, -(VLERP(sway_p) + kick * (6.0f + 3.2f * hip)
                  + rl * 0.055f - rch * 0.045f
-                 - rk * 0.075f + sw * 0.42f) + 0.045f * hip);              // pitch
+                 - rk * 0.075f + sw * 0.42f) + 0.045f * hip
+                 + br_p + VLERP(lag_y) * 0.9f * (0.15f + 0.85f * hip)
+                 + sl * 0.20f * hip);                                      // pitch
   rot2(&gx, &gz, VLERP(sway_y) + rl * 0.10f
-                 + (-0.075f + lean_d * 0.22f) * hip);                     // yaw
+                 - rch * (srcyc ? 0.13f : 0.0f)
+                 + (-0.075f + lean_d * 0.22f + sl * 0.06f) * hip);        // yaw
   // THE CANT HAS A SIGN, and it decides whether the reload is about the magazine or
-  // about the top rail.
-  float cyroll = cur == WPN_SR ? 0.86f : 0.34f;
+  // about the top rail. The SR's was 0.86, which swept the scope's OCULAR
+  // across the camera at the bolt beat — a black disc dead-centre, the rifle
+  // apparently pointed into the shooter's own face. 0.55 plus the yaw term
+  // above keeps the bolt raceway in view and the glass off-axis.
+  float cyroll = cur == WPN_SR ? 0.40f : 0.34f;
   rot2(&gx, &gy, VLERP(roll) + rl * -0.46f + rch * cyroll - rk * 0.16f +
-                 (0.090f - lean * 0.10f + lean_d * 0.30f) * hip);          // roll
+                 (0.090f - lean * 0.10f + lean_d * 0.30f + sl * 0.10f) * hip
+                 - kick * 1.4f);                                           // roll
   v3 org = v3_add(eye, v3_add(v3_scale(rgt, px),
            v3_add(v3_scale(upv, py), v3_scale(fwd, pz))));
 
@@ -21979,12 +22095,81 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
       // 19.4 degrees off vertical to 7.4 — twelve degrees the WRONG way, straight back
       // toward the perpendicular approach the wrist work was supposed to cure.
       back = v3_norm(v3_add(back, v3_scale(gz, h == 0 ? -0.16f : -0.30f)));
-      g_vm_hdbg[h].bend_deg = acosf(f_clamp(v3_dot(v3_scale(pd, -1.0f), back),
+      // THE ARM IS WHOLE NOW. The forearm used to be a 268 mm stub aimed by the
+      // authored wrist angles above and cut off by the frame edge; the arm now
+      // runs from a real camera-space SHOULDER through a SOLVED ELBOW to the
+      // same wrist — the same ik_solve, the same ANIM_UARM/ANIM_FARM and the
+      // same chain family the third-person figure wears, so first and third
+      // person are one man. The shoulder hangs off the EYE (the camera IS the
+      // figure's eye) and the shoulder line is bladed 0.52 rad exactly as
+      // skel_solve blades it: the trigger shoulder back, the support forward.
+      // In ADS the shoulders ride 70 mm up relative to the eye — the 3P weld
+      // drops the HEAD onto the stock, and a camera that may not drop reads
+      // that same motion as the body rising around it.
+      float bside = hd[h].side;
+      v3 sho = v3_add(eye, v3_add(
+          v3_scale(rgt, bside * ANIM_SHO_HALF * cosf(ANIM_BLADE)),
+          v3_add(v3_scale(fwd, -bside * ANIM_SHO_HALF * sinf(ANIM_BLADE)),
+                 v3_scale(upv, -(0.190f - 0.045f * ads)))));
+      // The body yields to the gun, never the gun to the body: past 96 % of
+      // the arm's real length the SHOULDER rolls forward along the arm's own
+      // line, because the wrist is welded to the grip and may not move.
+      v3 aw = v3_sub(hd[h].wrist, sho);
+      float awl = v3_len(aw), amax = (ANIM_UARM + ANIM_FARM) * ANIM_ARM_REACH_K;
+      if (awl > amax) sho = v3_sub(hd[h].wrist, v3_scale(aw, amax / awl));
+      // skel_solve's pole recipes, expressed in the camera's frame, biased by
+      // the authored forearm direction so the elbow lands in the half-space
+      // the wrist work above already chose.
+      v3 pole = h == 0
+        ? v3_add(v3_scale(rgt, 1.30f),
+                 v3_add(v3_scale(upv, -0.60f), v3_scale(fwd, -0.18f)))
+        : v3_add(v3_scale(rgt, -0.60f),
+                 v3_add(v3_scale(upv, -1.15f), v3_scale(fwd, -0.10f)));
+      // On the magazine the elbow swings out and up, not under the receiver.
+      if (h == 1 && mgv > 0.0f)
+        pole = v3_lerp(pole, v3_add(v3_scale(rgt, -1.05f),
+                                    v3_scale(upv, -0.30f)), mgv);
+      pole = v3_add(pole, v3_scale(back, 0.6f));
+      v3 elb = ik_solve(sho, hd[h].wrist, ANIM_UARM, ANIM_FARM, pole);
+      // Upper arm: the deltoid IS the chain's own fat top, exactly as on the
+      // figure (fig_arms' stations verbatim) — buried toward the chest so the
+      // seam can never show, k=12 like the FP forearm: at arm's length from
+      // the lens a facet is a wall.
+      v3 ua = v3_sub(elb, sho);
+      v3 inb = v3_norm(v3_sub(v3_add(eye, v3_scale(upv, -0.34f)), sho));
+      // The upper arm RAMPS DOWN toward the elbow exactly as the forearm ramps
+      // down toward it from the other side (slv4 is 0.58 of the sleeve): the
+      // fold is where the two chains and the joint ball meet at first-person
+      // range, and a full-value upper arm against a 0.58 forearm end read as
+      // two different garments stitched at the elbow.
+      v3 usl1 = v3_scale(sleeve, 0.80f), usl2 = v3_scale(sleeve, 0.64f);
+      v3 usl3 = v3_scale(sleeve, 0.54f);
+      fnode_t ar[6] = {
+        {v3_add(sho, v3_scale(inb, 0.052f)), sleeve, sleeve, 0.0540f, 0.0580f, 0, 0.74f},
+        {v3_add(sho, v3_scale(ua, 0.020f)), sleeve, sleeve, 0.0680f, 0.0700f, 0, 0.80f},
+        {v3_add(sho, v3_scale(ua, 0.240f)), usl1, usl1, 0.0650f, 0.0675f, 0, 0.0f},
+        {v3_add(sho, v3_scale(ua, 0.500f)), usl2, usl2, 0.0580f, 0.0605f, 0, 0.0f},
+        {v3_add(sho, v3_scale(ua, 0.680f)), usl2, usl2, 0.0590f, 0.0620f, 0, 0.0f},
+        {elb, usl3, usl3, 0.0425f, 0.0445f, 0, 0.0f}};
+      fig_chain(ar, 6, 12, 1, 1, upv);
+      // The elbow ball survives only as the cap-swallower between the two arm
+      // chains, and it wears the VALUE THE TWO CHAINS ARRIVE WITH (0.55), not
+      // the shoulder's. 12 % larger than fig_arms' numbers: at first-person
+      // range a chamfered cap rim poking one millimetre out of the ball is a
+      // bright torn edge across the fold, where at 3P range it is sub-pixel.
+      fig_joint(elb, ua, v3_sub(hd[h].wrist, elb), 0.0565f, 0.0640f, 0.05f, 12,
+                v3_scale(sleeve, 0.55f));
+      // The diagnostics report the arm that is DRAWN: the solved elbow's
+      // direction, not the authored one it replaced.
+      v3 fdir = v3_sub(elb, hd[h].wrist);
+      fdir = v3_dot(fdir, fdir) > 1e-8f ? v3_norm(fdir) : back;
+      g_vm_hdbg[h].bend_deg = acosf(f_clamp(v3_dot(v3_scale(pd, -1.0f), fdir),
                                             -1.0f, 1.0f)) / DEG2RAD;
-      g_vm_hdbg[h].bore_deg = acosf(f_clamp(fabsf(v3_dot(back, gz)),
+      g_vm_hdbg[h].bore_deg = acosf(f_clamp(fabsf(v3_dot(fdir, gz)),
                                             0.0f, 1.0f)) / DEG2RAD;
-      // A WRIST, and this is the change that made the hands exist at all.
-      fig_forearm(hd[h].wrist, back, pd, gx, hd[h].side, sleeve, gnt, NULL, 12);
+      // A WRIST, and this is the change that made the hands exist at all. The
+      // real elbow rescales the chain onto the solved segment.
+      fig_forearm(hd[h].wrist, back, pd, gx, hd[h].side, sleeve, gnt, &elb, 12);
     }
     mat_set(MAT_PARK_R, MAT_PARK_M);
     probe(NULL);
@@ -22036,6 +22221,16 @@ static void scene_draw(void) {
   if (!g_scene_floats) return;
   scene_bind();
   glDrawArrays(GL_TRIANGLES, 0, g_scene_floats / VERT_FLOATS);
+}
+
+// The shadow pass's view of the same buffer: everything up to the local
+// first-person body (see g_scene_cast_floats). Identical to scene_draw when
+// nothing set the mark.
+static void scene_draw_cast(void) {
+  int fl = g_scene_cast_floats >= 0 ? g_scene_cast_floats : g_scene_floats;
+  if (!fl) return;
+  scene_bind();
+  glDrawArrays(GL_TRIANGLES, 0, fl / VERT_FLOATS);
 }
 
 // The same buffer, minus the chunks this frustum cannot see.
@@ -22724,7 +22919,12 @@ static void render_frame(const player_t *p, float alpha, int fps,
   g_cam_eye = eye;
   g_cam_frustum = frustum_of(&vp);
   g_cam_cull = 1;
-  scene_build(p, alpha, cam_free || (third && tp_dist > 0.95f));
+  // The FP body exists only for the player's own live first-person camera:
+  // vmorbit and the HOME macro shots re-aim the lens anywhere, and a torso in
+  // their background band is the "author a close-up against BOTH weapons"
+  // family of trap.
+  scene_build(p, alpha, cam_free || (third && tp_dist > 0.95f),
+              !cam_free && !third && !g_vmorb.on);
   g_cam_cull = 0;
 
   // Sun shadows. One ortho map over the whole arena, centred on it, far enough
@@ -22749,7 +22949,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
     glUniformMatrix4fv(R.u_dvp, 1, GL_FALSE, R.light_vp.m);
     glBindVertexArray(R.vao_world);
     glDrawArrays(GL_TRIANGLES, 0, R.world_cast_verts);
-    scene_draw();   // the same buffer, same guard — the casters ARE the figures
+    scene_draw_cast();   // the same buffer minus the FP body — casters only
     rt_bind(R.msaa_fbo ? R.msaa_fbo : R.present_fbo, R.width, R.height);
     glBindTexture(GL_TEXTURE_2D, R.sm_tex);   // stays bound for every lit pass
   }
@@ -22820,7 +23020,16 @@ static void render_frame(const player_t *p, float alpha, int fps,
     glBindVertexArray(R.vao_world);
     glDrawArrays(GL_TRIANGLES, 0, R.world_verts);
     sky_pass(yaw, pitch, roll, szoom, 1.0f);
-    scene_draw_vp(&svp);              // the figures, still in the buffer
+    // The figures, still in the buffer — capped at the cast mark, so the 9°
+    // lens can never magnify the shooter's own trousers at a steep down
+    // pitch: the FP body is appended after the mark, same contract as the
+    // shadow pass. scene_bind() first, so a pending upload happens at FULL
+    // size before the clamp.
+    scene_bind();
+    { int fl_save = g_scene_floats;
+      if (g_scene_cast_floats >= 0) g_scene_floats = g_scene_cast_floats;
+      scene_draw_vp(&svp);
+      g_scene_floats = fl_save; }
     rt_bind(R.msaa_fbo ? R.msaa_fbo : R.present_fbo, R.width, R.height);
     glUniformMatrix4fv(R.u_vp, 1, GL_FALSE, vp.m);
   }
