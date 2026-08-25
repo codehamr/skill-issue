@@ -421,14 +421,14 @@ typedef enum {
 } mv_param_t;
 
 static const param_def_t MV_DEF[MV_COUNT] = {
-  [MV_RUN]         = {"mv_run_speed",     "RUN SPEED",      7.0f,  2.0f,   14.0f,  0.1f},
-  [MV_CROUCH_SP]   = {"mv_crouch_speed",  "CROUCH SPEED",   3.0f,  0.5f,    6.0f,  0.1f},
-  [MV_ACCEL_MS]    = {"mv_accel_ms",      "ACCEL TIME",   100.0f, 30.0f, 1000.0f, 10.0f},
-  [MV_STOP_MS]     = {"mv_stop_ms",       "STOP TIME",    100.0f, 30.0f, 1000.0f, 10.0f},
+  [MV_RUN]         = {"mv_run_speed",     "RUN SPEED",      6.5f,  2.0f,   14.0f,  0.1f},
+  [MV_CROUCH_SP]   = {"mv_crouch_speed",  "CROUCH SPEED",   2.5f,  0.5f,    6.0f,  0.1f},
+  [MV_ACCEL_MS]    = {"mv_accel_ms",      "ACCEL TIME",   200.0f, 30.0f, 1000.0f, 10.0f},
+  [MV_STOP_MS]     = {"mv_stop_ms",       "STOP TIME",    200.0f, 30.0f, 1000.0f, 10.0f},
   [MV_JUMP_H]      = {"mv_jump_height",   "JUMP HEIGHT",    1.2f,  0.3f,    3.0f,  0.1f},
-  [MV_AIR_CTL]     = {"mv_air_ctl_pct",   "AIR CONTROL",   20.0f,  0.0f,  100.0f,  5.0f},
-  [MV_SLIDE_BOOST] = {"mv_slide_boost_x", "SLIDE BOOST",    3.0f,  1.0f,    5.0f,  0.1f},
-  [MV_SLIDE_LEN]   = {"mv_slide_len",     "SLIDE LENGTH",   8.0f,  2.0f,   20.0f,  0.5f},
+  [MV_AIR_CTL]     = {"mv_air_ctl_pct",   "AIR CONTROL",   30.0f,  0.0f,  100.0f,  5.0f},
+  [MV_SLIDE_BOOST] = {"mv_slide_boost_x", "SLIDE BOOST",    2.5f,  1.0f,    5.0f,  0.1f},
+  [MV_SLIDE_LEN]   = {"mv_slide_len",     "SLIDE LENGTH",  10.0f,  2.0f,   20.0f,  0.5f},
   // 0.0 BY CHOICE, not by an accident of multiplying by zero. Turn it up to 9.0.
   [MV_FOV_KICK]    = {"mv_fov_kick",      "FOV KICK",       0.0f,  0.0f,   20.0f,  0.5f},
 };
@@ -463,13 +463,13 @@ static const param_def_t WP_DEF[WP_COUNT] = {
 
 // The AR is a controllable full-auto laser, the sniper a violent single shot.
 static const float WP_DEFAULTS[WPN_COUNT][WP_COUNT] = {
-  [WPN_AR] = {750, 0.25f, 0.15f, 200, 0.12f, 0.05f, 0.05f, 180, 80, 0.50f, 1.0f},
-  // ads_zoom 80 not 100: the scope's PiP pass owns the magnification; 80 only
-  // sells the transition. rpm caps the semi-auto trigger interval at 60 ms; it
-  // is not a fire rate (fire mode is structural, in WPN_DEF).
+  [WPN_AR] = {750, 0.30f, 0.15f, 200, 1.50f, 0.05f, 0.06f, 180, 80, 1.00f, 0.6f},
+  // ads_zoom 89 not 100: the scope's PiP pass owns the magnification; the base
+  // FOV drop only sells the transition. rpm caps the semi-auto trigger interval
+  // at 60 ms; it is not a fire rate (fire mode is structural, in WPN_DEF).
   // hip_spread 3.00: a scoped bolt gun fired from the hip is a coin toss, and
   // that is the design, now as a slider instead of a struct field.
-  [WPN_SR] = {1000, 1.80f, 0.20f, 500, 3.00f, 0.03f, 0.03f, 200, 80, 1.00f, 1.0f},
+  [WPN_SR] = {1000, 1.80f, 0.20f, 400, 3.00f, 0.02f, 0.10f, 80, 89, 2.20f, 1.0f},
 };
 
 // Structural weapon identity — not sliders: these change WHAT the weapon is.
