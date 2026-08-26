@@ -3812,6 +3812,18 @@ static void sfx_build_all(void) {
   sfx_alloc(SFX_WHIZZ, 0.30f);
   n = sfx_click(0.0025f, 0.00022f, 3600.0f, 3.40f);
   sfx_lay(SFX_WHIZZ, n, 0, 0.0f, 0);                   // the pressure step
+  // AN N-WAVE HAS TWO SHOCKS. The bow and the tail of the pressure profile are
+  // ~1.3 ms apart at rifle calibre, and the ear fuses the pair into one snap
+  // that is distinctly NASTIER than either click alone — the double-shock is
+  // most of why a real near miss sounds like a whip and a synthetic one like a
+  // camera flash.
+  n = sfx_click(0.0022f, 0.00020f, 2900.0f, 2.10f);
+  sfx_lay(SFX_WHIZZ, n, (int)(0.0013f * SFX_HZ), 0.0f, 0);   // the tail shock
+  // ...and the AIR ITSELF gets punched: a short 175 Hz thump under the snap.
+  // Threat lives down here, not in the treble — and it is deliberately small,
+  // because sfx_finish charges the whole buffer for every dB of low end.
+  n = sfx_burst(0.050f, 175.0f, 1.0f, 0.00010f, 0.016f, 1.1f, 0.80f);
+  sfx_lay(SFX_WHIZZ, n, (int)(0.002f * SFX_HZ), 0.0f, 1);    // the air punch
   // KNOWN EXCEPTION to "every generator ends in scr_norm": this wake sweep writes
   // filtered noise straight into the buffer at a hard 3.0, so its level rides the
   // filter's response instead of a normalised peak.
@@ -3830,6 +3842,23 @@ static void sfx_build_all(void) {
   // quotes for a mid burst that has to be heard UNDER something else.
   n = sfx_burst(0.055f, 640.0f, 1.2f, 0.00004f, 0.014f, 1.3f, 1.50f);
   sfx_lay(SFX_WHIZZ, n, (int)(0.005f * SFX_HZ), 0.0f, 2);   // the body
+  // THE ZIP: turbulence in the wake, darker and longer than the bow sweep — the
+  // angry-bee tail that says the round kept going somewhere behind you. 12-15 dB
+  // under the crack it follows, or the whole event turns into a cartoon ricochet.
+  {
+    int m = (int)(0.14f * SFX_HZ);
+    for (int c = 0; c < 2; c++) {
+      svf_t f2 = {0, 0};
+      float *b = g_sfx_buf[SFX_WHIZZ];
+      for (int i = 0; i < m; i++) {
+        float t = (float)i / SFX_HZ;
+        float hz = 980.0f * expf(-t / 0.075f) + 430.0f;
+        float x = svf(&f2, rng_rangef(&g_rng_sfx, -1, 1), hz, 1.6f);
+        b[(i + (int)(0.008f * SFX_HZ)) * SFX_CH + c] +=
+            x * sfx_env(t, 0.004f, 0.055f, 1.2f) * 0.55f;
+      }
+    }
+  }
   // ...AND IT HAPPENS IN THE ARENA. This was one of only three sounds in the file with
   // neither a verb nor a reflection — a supersonic crack in a 48 m concrete box is the
   // single most obviously ROOMED thing in it.
@@ -3886,6 +3915,11 @@ static void sfx_build_all(void) {
     sfx_alloc(SFX_RELOAD_AR, t_ar + 0.22f);
     sfx_mech(SFX_RELOAD_AR, (int)(0.055f * t_ar * SFX_HZ), 1900.0f, 240.0f,
              0.42f, 0.10f);                              // mag release button
+    // ...and the catch snapping back 14 ms later: a button is TWO clicks — in
+    // and out — and one click reads as UI where a click-clack reads as a part.
+    n = sfx_click(0.0030f, 0.00020f, 3300.0f, 0.30f);
+    sfx_lay(SFX_RELOAD_AR, n, (int)(0.055f * t_ar * SFX_HZ + 0.014f * SFX_HZ),
+            0.0f, 0);
     sfx_mech(SFX_RELOAD_AR, (int)(0.175f * t_ar * SFX_HZ), 950.0f, 190.0f,
              0.54f, 0.55f);                              // magazine falls free
     sfx_mech(SFX_RELOAD_AR, (int)(0.360f * t_ar * SFX_HZ), 760.0f, 150.0f,
@@ -3898,11 +3932,32 @@ static void sfx_build_all(void) {
     // measured -43.5 dB at 20-120 Hz against the gunshot's -22.3.
     sfx_mech(SFX_RELOAD_AR, (int)(RELOAD_BEAT[WPN_AR][0] * t_ar * SFX_HZ), 820.0f, 98.0f,
              0.94f, 0.22f);                              // THE SEAT
+    // ...WITH REAL SUB UNDER IT. The whole buffer measured 0% share below
+    // 120 Hz — the 98 Hz mass ring inside sfx_mech is one partial at 0.13 of
+    // the event and it vanishes against the mid. A 63 Hz ring at +7 ms is the
+    // slam FELT in the wrists; deliberately moderate, because sfx_finish's
+    // A-weighted gain stage charges the whole buffer for every dB spent here.
+    n = sfx_ring(0.110f, 63.0f, 96.0f, 0.026f, 0.20f);
+    sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][0] * t_ar * SFX_HZ
+                                    + 0.007f * SFX_HZ), 0.0f, 0);
+    n = sfx_click(0.0025f, 0.00018f, 2100.0f, 0.36f);    // ...and the SNAP on top
+    sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][0] * t_ar * SFX_HZ),
+            0.0f, 0);
     // The bolt has to STAY the loudest event, and that is a contract rather than a
     // preference: `eng` — the energy peak — is the moment the sound says A LIVE WEAPON,
     // and it is the one thing in this sound the player acts on.
     sfx_mech(SFX_RELOAD_AR, (int)(RELOAD_BEAT[WPN_AR][1] * t_ar * SFX_HZ), 2100.0f, 235.0f,
              1.66f, 0.14f);                              // bolt release
+    // The bolt slamming into battery is the heaviest metal-on-metal contact in
+    // the whole mechanism, so it gets MORE weight than the seat (which also
+    // keeps `eng` on this event, the buffer's contract): a 116 Hz chunk at
+    // +6 ms and the buffer/spring SHRING of the carrier running its rails.
+    n = sfx_ring(0.135f, 116.0f, 176.0f, 0.030f, 0.52f);
+    sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][1] * t_ar * SFX_HZ
+                                    + 0.006f * SFX_HZ), 0.0f, 0);
+    n = sfx_burst(0.070f, 3600.0f, 1.6f, 0.00005f, 0.020f, 1.5f, 0.40f);
+    sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][1] * t_ar * SFX_HZ
+                                    + 0.003f * SFX_HZ), 0.06f, 1);
     // A SIXTH EVENT, and it fills the largest hole in the sound: between the magazine
     // seating and the bolt going home there were 386 ms of sample-exact silence in one
     // block — the mechanism stopped existing for a third of a second, in exactly the
@@ -3922,6 +3977,9 @@ static void sfx_build_all(void) {
       sfx_alloc(SFX_RELOAD_AR_TAC, t_tac + 0.22f);
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(0.055f * t_tac * SFX_HZ), 1900.0f, 240.0f,
                0.42f, 0.10f);                            // mag release button
+      n = sfx_click(0.0030f, 0.00020f, 3300.0f, 0.30f);  // the catch, see above
+      sfx_lay(SFX_RELOAD_AR_TAC, n, (int)(0.055f * t_tac * SFX_HZ
+                                          + 0.014f * SFX_HZ), 0.0f, 0);
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(0.185f * t_tac * SFX_HZ), 950.0f, 190.0f,
                0.54f, 0.55f);                            // magazine falls free
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(0.400f * t_tac * SFX_HZ), 760.0f, 150.0f,
@@ -3933,6 +3991,14 @@ static void sfx_build_all(void) {
       // actually ends the mechanism.
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(0.880f * t_tac * SFX_HZ), 820.0f, 98.0f,
                1.55f, 0.22f);                            // THE SEAT
+      // The last event of THIS reload, so it carries the bolt-class weight the
+      // empty reload spends on its bolt: sub chunk plus snap, sized a notch
+      // above the empty seat's.
+      n = sfx_ring(0.150f, 63.0f, 96.0f, 0.034f, 0.38f);
+      sfx_lay(SFX_RELOAD_AR_TAC, n, (int)(0.880f * t_tac * SFX_HZ
+                                          + 0.007f * SFX_HZ), 0.0f, 0);
+      n = sfx_click(0.0025f, 0.00018f, 2100.0f, 0.48f);
+      sfx_lay(SFX_RELOAD_AR_TAC, n, (int)(0.880f * t_tac * SFX_HZ), 0.0f, 0);
       sfx_verb(SFX_RELOAD_AR_TAC, g_sfx_len[SFX_RELOAD_AR_TAC], 0.006f, 0.028f,
                0.15f, 3000.0f, 0.14f);
       sfx_finish(SFX_RELOAD_AR_TAC, 0.93f, 0.1050f, 0.30f);
@@ -3969,6 +4035,11 @@ static void sfx_build_all(void) {
     // than a STANAG and it lands in a chassis rather than in an alloy lower.
     sfx_mech(SFX_RELOAD_SR, (int)(RELOAD_BEAT[WPN_SR][0] * t_sr * SFX_HZ), 760.0f, 92.0f,
              0.84f, 0.24f);
+    // Sub under the seat, the AR's argument at the SR's own pitch: a ten-round
+    // .308 box is the heavier magazine, so the ring sits at 58 Hz.
+    n = sfx_ring(0.160f, 58.0f, 90.0f, 0.036f, 0.34f);
+    sfx_lay(SFX_RELOAD_SR, n, (int)(RELOAD_BEAT[WPN_SR][0] * t_sr * SFX_HZ
+                                    + 0.007f * SFX_HZ), 0.0f, 0);
     // The hand leaving the grip for the knob, in the window where the animation is
     // travel rather than a struck part — the same hole the AR's sixth event fills, at
     // the same level relative to the seat.
@@ -3986,6 +4057,14 @@ static void sfx_build_all(void) {
              1.78f, 0.15f);
     n = sfx_burst(0.10f, 2300.0f, 1.4f, 0.00004f, 0.013f, 1.4f, 0.62f);
     sfx_lay(SFX_RELOAD_SR, n, (int)(RELOAD_BEAT[WPN_SR][1] * t_sr * SFX_HZ), -0.08f, 2);
+    // Bolt down and LOCKED gets the heaviest chunk in the buffer — camming a
+    // .338 action shut is a bank-vault move, and `eng` lives here anyway.
+    n = sfx_ring(0.145f, 108.0f, 168.0f, 0.032f, 0.44f);
+    sfx_lay(SFX_RELOAD_SR, n, (int)(RELOAD_BEAT[WPN_SR][1] * t_sr * SFX_HZ
+                                    + 0.006f * SFX_HZ), 0.0f, 0);
+    n = sfx_burst(0.065f, 3400.0f, 1.6f, 0.00005f, 0.018f, 1.5f, 0.34f);
+    sfx_lay(SFX_RELOAD_SR, n, (int)(RELOAD_BEAT[WPN_SR][1] * t_sr * SFX_HZ
+                                    + 0.003f * SFX_HZ), -0.06f, 1);
     sfx_verb(SFX_RELOAD_SR, g_sfx_len[SFX_RELOAD_SR], 0.006f, 0.028f, 0.15f,
            3000.0f, 0.14f);
   sfx_finish(SFX_RELOAD_SR, 0.88f, 0.1210f, 0.0f);
@@ -4381,8 +4460,11 @@ static void audio_shot_world(const event_t *e) {
       g_whizz_g = g;
       // A near pass is SHARPER as well as louder: the rate rides the same curve,
       // so the bow wave's whole spectrum shifts up as it gets closer instead of
-      // only its level.
-      audio_play(SFX_WHIZZ, g, rng_rangef(&g_rng_audio, 0.92f, 1.10f)
+      // only its level. And a .338 is not a 5.56: the heavier round plays the
+      // same buffer a fifth lower, which reads as MASS without a second buffer
+      // — the same trick fx_flash uses for the weapon-differentiated star.
+      audio_play(SFX_WHIZZ, g, (e->wpn == WPN_SR ? 0.81f : 1.0f)
+                 * rng_rangef(&g_rng_audio, 0.92f, 1.10f)
                  * (0.90f + 0.22f * k), pan, delay);
     }
   }
@@ -8767,6 +8849,13 @@ typedef struct {
   // The BOLT's own 0..1, and it is a monotone RAMP where `cyc` is a hump.
   float bolt;
   float bhand;  // trigger hand off the grip and onto the bolt knob, 0..1
+  // MICRO-MOTION, viewmodel only. `jolt` is the signed ring-down of a struck
+  // mass — a ~15 Hz decaying oscillation after each beat, zero by the last
+  // tick. `heft` is the mass transfer of the magazine itself: positive while
+  // it rips OUT (the gun pops up, lighter), negative while the fresh one is
+  // driven IN (the gun dips under the hand). Both are pure functions of prog,
+  // so they stay on the sim clock like everything else in here.
+  float jolt, heft;
 } gunanim_t;
 
 static gunanim_t gun_anim(const weapon_t *w, float alpha) {
@@ -8799,7 +8888,12 @@ static gunanim_t gun_anim(const weapon_t *w, float alpha) {
   // only 0.04 of progress left after the beat — 6 ticks on the AR — so that impulse was
   // still at 79% of its peak on the final tick, and one tick later every term became
   // zero at once: 32 mm of translation and 10.5 degrees of roll gone in 8.3 ms.
-  float x1 = (prog - seat) / (tac_ar ? 0.0075f : 0.021f);
+  // THE SEAT HITS HARDER AND RINGS DOWN. tau 0.017 rather than 0.021 — the
+  // impulse peaks 0.6 of a tick sooner and the front of it is what reads as
+  // "slam" — and the amplitude is up a tenth. The tactical seat is the LAST
+  // event of its reload, so it carries the bigger number: nothing after it
+  // gets to say "live weapon" for it.
+  float x1 = (prog - seat) / (tac_ar ? 0.0075f : 0.017f);
   // Guarded because the numerator is DATA: a beat set within one tick of 1.0
   // makes this zero or negative, i.e. a NaN offset on the whole viewmodel — an
   // invisible weapon from a plausible one-character edit.
@@ -8807,29 +8901,58 @@ static gunanim_t gun_anim(const weapon_t *w, float alpha) {
   float x2 = f_clamp((prog - RELOAD_BEAT[cur][1]) / bw, 0.0f, 1.0f);
   // No second beat on the tactical AR: the 1.45-amplitude bolt-release punch fired at
   // prog 0.96 into audio silence, for a bolt event that does not exist on this reload.
-  g.punch = (x1 > 0.0f ? 1.20f * x1 * expf(1.0f - x1) : 0.0f)
-          + (tac_ar ? 0.0f : 1.45f * sinf(x2 * F_PI));
+  // The bolt lobe is SKEWED (pow 0.60): a released bolt is an instant hit with a
+  // decay, not a symmetric swell — the peak lands a third of the way into the
+  // window and the lobe still reaches exactly zero on the last tick, which is
+  // the contract the sin form exists for.
+  g.punch = (x1 > 0.0f ? (tac_ar ? 1.42f : 1.32f) * x1 * expf(1.0f - x1) : 0.0f)
+          + (tac_ar ? 0.0f : 1.52f * sinf(powf(x2, 0.60f) * F_PI));
+  // MICRO-SETTLE: a struck mass rings. ~15 Hz on the empty AR's clock, dead by
+  // js 0.2 of progress, so the tail of the seat can never reach the bolt beat.
+  // The final beat gets a faster shudder that the (1-x2)^2 envelope forces to
+  // exactly zero on the last tick.
+  float js = prog - seat;
+  g.jolt = (js > 0.0f ? sinf(js * 120.0f) * expf(-js * 26.0f) : 0.0f)
+         + (!tac_ar && x2 > 0.0f
+              ? 0.6f * sinf((prog - RELOAD_BEAT[cur][1]) * 260.0f)
+                     * (1.0f - x2) * (1.0f - x2)
+              : 0.0f);
   // THE HAND ARRIVES FIRST, THEN THE MAGAZINE MOVES. They used to start
   // together, so at any mid-travel tick the hand was still a fraction of the way
   // from the fore-end while the magazine had already dropped — 24 mm of daylight
   // between a fist and the thing it is supposed to be holding, which is the
   // whole reason the grip did not read.
-  g.mag = prog < 0.22f ? 0.0f
-        : prog < 0.30f ? smooth01((prog - 0.22f) / 0.08f)
+  // THE MAG-OUT IS A RIP, ON ITS OWN SOUND. The old travel was a smoothstep at
+  // 0.22-0.30 — 60 ms AFTER the "falls free" event at 0.175/0.185 — and a
+  // symmetric ease reads as placing, not stripping. u*u starts the magazine
+  // slow under the hand and has it accelerating as it clears, and the window
+  // sits on the audio event it belongs to.
+  g.mag = prog < 0.18f ? 0.0f
+        : prog < 0.24f ? ((prog - 0.18f) / 0.06f) * ((prog - 0.18f) / 0.06f)
         : prog < 0.40f ? 1.0f
         // The insert is a POWER curve, not a smoothstep: a magazine goes in slowly and
         // then slams the last centimetre, where a symmetric ease spends its speed in
-        // the middle.
+        // the middle. Fourth power now — the last centimetre is faster still.
         : prog < seat
             ? (tac_ar
-                 ? 1.0f - GUN_MAG_U_TAC(prog) * GUN_MAG_U_TAC(prog) * GUN_MAG_U_TAC(prog)
-                 : 1.0f - GUN_MAG_U(prog) * GUN_MAG_U(prog) * GUN_MAG_U(prog))
+                 ? 1.0f - GUN_MAG_U_TAC(prog) * GUN_MAG_U_TAC(prog)
+                        * GUN_MAG_U_TAC(prog) * GUN_MAG_U_TAC(prog)
+                 : 1.0f - GUN_MAG_U(prog) * GUN_MAG_U(prog)
+                        * GUN_MAG_U(prog) * GUN_MAG_U(prog))
             : 0.0f;
-  // The support hand leaves the fore-end at 10%, is on the magazine by 22% —
-  // before the magazine starts moving — and only starts letting go at 72%
-  // (tactical AR: the hand rides the magazine to ITS later seat, then makes a
-  // quick return — the seat is the event that ends this mechanism).
-  g.hand = smooth01(f_clamp((prog - 0.10f) / 0.12f, 0.0f, 1.0f)) *
+  // The magazine's own mass, felt: + while it rips out (the gun pops, lighter),
+  // - while the fresh one is driven home. mag*(1-mag) is zero except in the two
+  // travel windows, and which window it is is a question about prog.
+  {
+    float mb = g.mag * (1.0f - g.mag) * 4.0f;
+    g.heft = prog < 0.34f ? mb : -0.8f * mb;
+  }
+  // The support hand leaves the fore-end at 7%, is on the magazine by 17% —
+  // before the magazine starts moving, and a third faster than it used to be:
+  // a reload is judged by how fast the hand COMMITS. It only starts letting go
+  // at 72% (tactical AR: the hand rides the magazine to ITS later seat, then
+  // makes a quick return — the seat is the event that ends this mechanism).
+  g.hand = smooth01(f_clamp((prog - 0.07f) / 0.10f, 0.0f, 1.0f)) *
            (tac_ar ? smooth01(f_clamp((0.995f - prog) / 0.10f, 0.0f, 1.0f))
                    : smooth01(f_clamp((0.90f - prog) / 0.18f, 0.0f, 1.0f)));
   // The AR racks its charging handle on the same window the sniper works its bolt on,
@@ -20131,7 +20254,7 @@ static void gun_hold(int cur, int which, v3 org, v3 gx, v3 gy, v3 gz,
 
 static float gun_sight_y(int cur) { return cur == WPN_SR ? VM_SIGHT_SR : VM_SIGHT_AR; }
 // ...and WHERE along the bore the shooter's eye is supposed to sit behind.
-#define AR_APERTURE_Z 0.1835f
+#define AR_APERTURE_Z 0.2150f
 static float gun_sight_z(int cur) { return cur == WPN_SR ? SCOPE_OCU_Z : AR_APERTURE_Z; }
 
 // The bolt cycle, as two scalars: how far the handle is LIFTED and how far it is DRAWN.
@@ -20791,102 +20914,61 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
       GN(0, 0.0225f, 0.4902f, 0.0038f, 0.0038f, black),
     });
     mat_lathe(MAT_PARK_R, MAT_PARK_M);
-    // ---- red dot: a thin SQUARE pane, forward over the barrel ----------------
-    // A narrow plate, not a housing with a barrel's worth of depth.
-    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
-    // Every dimension of this three-piece mount is chosen so that NO face of it lands
-    // within a millimetre of a face of its neighbours: widths 0.0136 and 0.0060 against
-    // the rail's 0.0092 and its teeth's 0.0106, and the neck's top deliberately ends
-    // 1.5 mm ABOVE the window's lower edge — in open air inside the frame — rather than
-    // buried 0.8 mm inside a 1.6 mm wall where its top face and the wall's inner face
-    // are closer together than the depth buffer can resolve at 25 m.
-    GBOX(0, 0.0424f, 0.1834f, 0.0136f, 0.0060f, 0.0100f, alloy);  // rail clamp
-    GBOX( 0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, alloy);  // R post
-    GBOX(-0.0148f, 0.04635f, 0.1834f, 0.0028f, 0.00665f, 0.0050f, alloy);  // L post
-    // A SIGHT IS A BODY WITH A WINDOW IN IT, NOT A WINDOW. This was ONE ring — 1.6 mm
-    // of wall, 3.4 mm deep — hung on two posts with open air on both sides of it, so
-    // from every angle it read as a picture frame floating over the barrel, and in ADS,
-    // which is the frame the player looks at all match, it was a rectangular outline
-    // with nothing in it. The window has to stay OPEN (this pass has no alpha, and an
-    // opaque pane where the target goes is the one thing a sight may not be), so
-    // everything that makes it a sight has to live around the aperture rather than
-    // across it: a chassis behind the glass, a hood over it, and the coating at the
-    // rim, which is where a real coating shows anyway.
+    // ---- red dot: a MICRO dot, low over the rail, forward on the barrel ------
+    // REBUILT 2026-08-25 (third pass). The previous body was a holographic-sight
+    // chassis with a 31.6 mm hood standing over the window: at hip range the tallest
+    // thing on the weapon was its own sight hood, and the group read as a lump. A
+    // micro red dot is the opposite statement — a thin square frame riding LOW on a
+    // short clamp, an emitter pod poking into the window's lower edge, and NOTHING
+    // above the glass. The hood, the chassis and the two posts are deleted outright;
+    // what survives of "a sight is a body with a window in it" is the pod and the
+    // clamp, which is exactly the body a micro dot has.
     //
-    // The window is 16:9 and the class follows from that: a rectangular window is a
-    // HOLOGRAPHIC sight, so it gets the body a holographic sight has — a long chassis
-    // carrying the laser and the battery, standing well back from the glass.
-    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
-    // ...AND IT STANDS UNDER THE WINDOW, NOT ACROSS IT. At y 0.0530 the chassis spanned
-    // 45.0-61.0 mm while the aperture's open span is 51.5-72.5: it ate the bottom 9.5 mm
-    // of a 21.0 mm window and the point of aim passed 1 mm over its top edge, so
-    // everything below the reticle was blocked BY THE SIGHT. That is a gameplay
-    // regression, not a look one — the ADS frame is what the player aims through all
-    // match. 32.0-49.0 now, 2.5 mm clear below the glass, merged into the rail clamp
-    // where a red dot's body actually sits.
+    // THE OPEN APERTURE IS GAMEPLAY AND IT DID NOT SHRINK: inner height stays 21.0 mm
+    // (the ADS frame's own window), inner width 36.0 against the old 37.3. What got
+    // thin is the RIM: 1.05 mm walls against 1.6, a 3.0 mm pane against 3.4.
     //
-    // It is also 73 mm long rather than 48. Every real reflex sight is about twice as
-    // long as it is tall; at 0.8 the block reads as a lump on the rail instead of as an
-    // optic, which is the one thing the silhouette has to say from the side.
-    // SLIMMED 2026-08-25 (second pass). It read as bulky, and three numbers carried it:
-    // the hood was 55.6 mm across a 40.5 mm window, the bridge overhung that at 58, and
-    // the body was 52 mm long and 17 tall. It is 51.8 / 49.2 / 42 / 14 now.
-    // The body is also WIDER than the walls it carries, which it has to be: the hood's
-    // inner faces must clear the window frame's outer by more than a millimetre (or
-    // figcheck's near tier takes them, and they crop the sight picture besides), so they
-    // cannot touch the frame — they have to rise off the body. At the old 0.0175 they
-    // touched NOTHING, and 1.5 mm of air on each side is invisible at a millimetre a
-    // pixel, which is how a floating part survives a look pass: figcheck cannot see it
-    // either, because two parts that never meet are a perfectly valid mesh.
-    // ...and its underside clears the RAIL BASE's by 2.4 mm. At 0.0330 the two bottom
-    // faces were 0.8 mm apart and parallel over the whole width of the base — four of
-    // figcheck's near pairs from one number, and the same class as every other one this
-    // pass produced: two parts sized off the same reference.
-    GBOX(0, 0.0392f, 0.1560f, 0.0230f, 0.0078f, 0.0230f, alloy);  // chassis
-    // The hood: two side walls and a bridge, 28 mm deep against the frame's 3.4. This
-    // is what gives the sight a top line and a shadow of its own.
-    // 0.0160 of half-height, not 0.0145: at 0.0145 a wall's top face landed 0.4 mm
-    // over the window frame's own top face — parallel and overlapping in x, i.e. 34 of
-    // figcheck's near pairs from one number. 1.9 mm clear now.
-    // The walls clear the window LATERALLY too: at x 0.0192 their inner faces sat at
-    // 16.4 against the aperture's 17.9 and cropped 1.5 mm off each side. 21.8 now.
-    // They are carried by the chassis rather than by the frame, which is why they can
-    // stand outside the glass at all.
-    GBOX( 0.0237f, 0.0600f, 0.1840f, 0.0022f, 0.0158f, 0.0140f, alloy);  // R wall
-    GBOX(-0.0237f, 0.0600f, 0.1840f, 0.0022f, 0.0158f, 0.0140f, alloy);  // L wall
-    // THE BRIDGE IS INSET FROM THE WALLS ALONG THE BORE. At the walls' own z extents
-    // (centre 0.1840, half 0.0140) its front and rear faces were COPLANAR with theirs
-    // and overlapped them in x and y — figcheck's zfight tier went 0 to 16 on that one
-    // pair. 0.0126 sets both of its z faces 1.4 mm inside the walls'.
-    // ...and the bridge is INSET from the walls rather than overhanging them, dips
-    // 1.1 mm into the frame's top so it is carried by something, and is 1.6 mm proud of
-    // the walls so no two faces of the three are parallel inside a millimetre.
-    GBOX(0, 0.0752f, 0.1840f, 0.0246f, 0.0022f, 0.0126f, alloy);         // hood bridge
-    // The two buttons, ON THE SIDE THE PLAYER CAN SEE. The camera sits on the weapon's
-    // left, so a control group on +x renders exactly 0 px for the whole match.
+    // FORWARD: the aperture moved 0.1835 -> 0.2150 (AR_APERTURE_Z, one copy — figm's
+    // relief reads the real station, so the eye relief grew 311 -> ~343 mm with it).
+    // The clamp is CENTRED ON A RAIL SLOT: its z faces land mid-gap between teeth
+    // r15/r16 and r16/r17, 3.7 mm from every tooth face — a clamp is bolted ACROSS a
+    // slot, and mid-gap is also where the coplanar ladder has the most room.
+    mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    // hx 0.0122 = rail base 0.0102 + 2.0 mm: the next rung of the rail's own width
+    // ladder (teeth 0.0087 / base 0.0102), so no clamp face runs within 1.5 mm of a
+    // rail face it overlaps. y is the OLD clamp's exactly — its bottom face against
+    // the rail base's top is already in the near baseline and stays neutral.
+    GBOX(0, 0.0424f, AR_APERTURE_Z, 0.0122f, 0.0060f, 0.0070f, alloy);  // clamp
+    // THE EMITTER POD CARRIES THE FRAME. The frame's bottom wall passes through the
+    // pod (crossings at 90 degrees, which the cross tier does not score) and the pod
+    // is buried 1.4 mm in the clamp, so nothing here floats — and the pod's top ends
+    // 1.5 mm ABOVE the window's lower edge, in open air inside the frame, the same
+    // idiom the old posts used: a face buried just under a 1 mm wall is a near pair,
+    // a nub standing proud inside the aperture is a real emitter where a real one
+    // sits. 11 mm wide against a 36 mm window; the point of aim passes 9 mm over it.
     mat_set(MAT_POLY_R, 0.0f);
-    if (gun_tier()) {
-      GBOX(-0.0244f, 0.0400f, 0.1440f, 0.0024f, 0.0036f, 0.0036f, black);  // button
-      GBOX(-0.0244f, 0.0400f, 0.1540f, 0.0024f, 0.0036f, 0.0036f, black);  // button
-    }
+    GBOX(0, 0.0500f, AR_APERTURE_Z, 0.0055f, 0.0030f, 0.0050f, black);  // emitter pod
+    // One brightness button on the clamp's LEFT flank — the side the camera sees.
+    // Embedded 1.4 mm (the gas-block lesson: 1 mm is the floor, not the target).
+    if (gun_tier())
+      GBOX(-0.0132f, 0.0424f, AR_APERTURE_Z, 0.0024f, 0.0034f, 0.0030f, black);
+    // The frame: a thin square tube, 1.05 mm of wall, 3.0 mm deep. Steel, not alloy —
+    // the bright machined rim over a black pod is most of the sight's read.
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
-    fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0017f),
-             GUNP(0, sight_y, AR_APERTURE_Z + 0.0017f),
-             0.0121f * gg, 0.02027f * gg, 0.0105f * gg, 0.01867f * gg, 4, steel, gy);
-    // THE COATING, AS AN ANNULUS IN THE FRAME'S OWN WALL. A coated lens reflects almost
-    // nothing on axis — that is what the coating is FOR, and it is why a scope's pupil
-    // is the darkest thing on a rifle — and throws a hard colour at the rim as the
-    // angle opens. So the only part of the glass that can be drawn without a pane is
-    // exactly the part that carries the whole cue. Buried 1.3 mm inside the frame's
-    // wall, which keeps it clear of the house rule's 1 mm minimum at both edges.
+    fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0015f),
+             GUNP(0, sight_y, AR_APERTURE_Z + 0.0015f),
+             0.01155f * gg, 0.01905f * gg, 0.0105f * gg, 0.0180f * gg, 4, steel, gy);
+    // THE COATING, AS AN ANNULUS IN THE FRAME'S OWN WALL — construction unchanged
+    // from the second pass, scaled to the thinner wall: outer edges 0.3 mm inside the
+    // frame's, inner edges 0.5 / 0.8 mm proud into the aperture (which is what makes
+    // the glass, not the steel, the tighter constraint), z faces 1.1 mm inside the
+    // frame's so no pair of the four ring faces is parallel within a millimetre.
     mat_set(MAT_GLASS_R, 0.0f);
-    // ...and 0.0006 of half-depth, not 0.0011: the glass's own z faces sat 0.6 mm
-    // inside the frame's and parallel to them. 1.1 mm at each end now.
-    fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0006f),
-             GUNP(0, sight_y, AR_APERTURE_Z + 0.0006f),
-             0.0118f * gg, 0.0200f * gg, 0.0100f * gg, 0.0179f * gg, 4, lens, gy);
+    fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0004f),
+             GUNP(0, sight_y, AR_APERTURE_Z + 0.0004f),
+             0.01125f * gg, 0.0188f * gg, 0.0100f * gg, 0.0172f * gg, 4, lens, gy);
     g_gun_sight_p = GUNP(0, sight_y, gun_sight_z(cur));   // one copy; see figm weld
-    // ...and the tighter constraint is now the GLASS's inner edge, not the frame's:
+    // ...and the tighter constraint is the GLASS's inner edge, not the frame's:
     // the coating annulus narrows the open aperture from 21.0 to 20.0 mm.
     g_gun_sight_r = 0.0100f;
     mat_set(MAT_POLY_R, 0.0f);
@@ -23490,6 +23572,12 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   gunanim_t ga_ = gun_anim(w, alpha);
   float rl = ga_.arc, rk = ga_.punch, mdrop = ga_.mag, rch = ga_.cyc;
   float trig = ga_.trig, mgv = ga_.hand;
+  // The reload's micro-motion: the ring-down after each beat and the magazine's
+  // own mass in the hands — see gunanim_t. Small numbers on purpose: these are
+  // the difference between a pose that snaps between keyframes and a mechanism
+  // with weight in it, and past ~2x these values they read as the shooter
+  // losing the weapon rather than working it.
+  float jl = ga_.jolt, hf = ga_.heft;
   // Swap: the incoming weapon rises from below, muzzle tilted down.
   float sw = smooth01(w->prev_switch +
                       ((float)w->switch_t / GUN_SWITCH_TICKS - w->prev_switch) * alpha);
@@ -23532,14 +23620,15 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   // keeps the sight welded to the axis.
   float sl = VLERP(slide_s);
   float px = 0.158f * hip + VLERP(bob_x) + VLERP(lag_x) - rl * 0.072f
-           + rk * 0.011f + rch * (srcyc ? -0.062f : 0.026f)
+           + rk * 0.011f + jl * 0.0016f + rch * (srcyc ? -0.062f : 0.026f)
            + (lean_d * 0.16f - lean * 0.028f - sl * 0.048f) * hip;
   // DOWN a little and NOT toward the eye.
   float py = -0.120f * hip - sight_y * ads + VLERP(bob_y) + VLERP(lag_y)
            // sw * 0.125, not 0.22: THE SWAP PUT THE WHOLE WEAPON BELOW THE FRAME, which
            // is the identical failure the reload dip above was already fixed for.
            - dip * 0.5f + rl * 0.084f + rch * (srcyc ? 0.044f : 0.020f)
-           - rk * 0.020f - sw * 0.125f + br_y - sl * 0.020f * hip;
+           - rk * 0.020f + jl * 0.0030f + hf * 0.0045f
+           - sw * 0.125f + br_y - sl * 0.020f * hip;
   // The sniper pulls closer to the eye in ADS so the scope window opens up. TAKE-UP:
   // the weapon comes back into the grip as the finger closes on it.
   float tkick = cur == WPN_SR ? hip : 0.45f + 0.55f * hip;
@@ -23557,10 +23646,11 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   // jump float, the fall lead-down and the crouch settle are all this term.
   rot2(&gz, &gy, -(VLERP(sway_p) + kick * (6.0f + 3.2f * hip)
                  + rl * 0.055f - rch * 0.045f
-                 - rk * 0.075f + sw * 0.42f) + 0.045f * hip
+                 - rk * 0.075f - jl * 0.020f - hf * 0.012f
+                 + sw * 0.42f) + 0.045f * hip
                  + br_p + VLERP(lag_y) * 0.9f * (0.15f + 0.85f * hip)
                  + sl * 0.20f * hip);                                      // pitch
-  rot2(&gx, &gz, VLERP(sway_y) + rl * 0.10f
+  rot2(&gx, &gz, VLERP(sway_y) + rl * 0.10f + jl * 0.016f
                  - rch * (srcyc ? 0.13f : 0.0f)
                  + (-0.075f + lean_d * 0.22f + sl * 0.06f) * hip);        // yaw
   // THE CANT HAS A SIGN, and it decides whether the reload is about the magazine or
@@ -23569,7 +23659,8 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   // apparently pointed into the shooter's own face. 0.55 plus the yaw term
   // above keeps the bolt raceway in view and the glass off-axis.
   float cyroll = cur == WPN_SR ? 0.40f : 0.34f;
-  rot2(&gx, &gy, VLERP(roll) + rl * -0.46f + rch * cyroll - rk * 0.16f +
+  rot2(&gx, &gy, VLERP(roll) + rl * -0.46f + rch * cyroll - rk * 0.16f
+                 - jl * 0.055f - hf * 0.040f +
                  (0.090f - lean * 0.10f + lean_d * 0.30f + sl * 0.10f) * hip
                  - kick * 1.4f);                                           // roll
   v3 org = v3_add(eye, v3_add(v3_scale(rgt, px),
