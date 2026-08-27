@@ -292,7 +292,7 @@ static void netfuzz_proof(void) {
         accepted_tele++;
         // Everything the server then prints must be in bounds: mode and os
         // INDEX string tables, dt is clamped, and the version may carry
-        // neither a space nor an '=' or it injects fields into game.log.
+        // neither a space nor an '=' or it injects fields into server.log.
         if (tf.kind > 1 || tf.mode > 2 || tf.os > 1 ||
             tf.dt > NET_TELE_DT_MAX || tf.ver[12])
           accepted_tele = -1000000;

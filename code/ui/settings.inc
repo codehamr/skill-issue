@@ -801,11 +801,12 @@ static void ui_home(int click, float cx, float cy) {
     int st = g_cl.state;
     int busy = st == NC_CONNECTING || st == NC_JOINING || st == NC_PLAYING;
     const char *ml = busy ? "CONNECTING" : "MULTIPLAYER";
-    const char *ms = st == NC_FAILED
+    const char *ms = busy ? "PLEASE WAIT"
+                   : st == NC_FAILED
                    ? (g_cl.reject == NR_FULL  ? "ALL ARENAS FULL"
                     : g_cl.reject == NR_PROTO ? "UPDATE REQUIRED"
                     : g_cl.reject == NR_WORLD ? "ARENA MISMATCH"
-                                              : "SERVER UNREACHABLE")
+                                              : "SERVER DOWN - TRY LATER")
                    : "QUICK JOIN";
     // ...and online the same slot is the way OUT of the match, which is the one
     // destination a live session has and a boot screen does not.
@@ -818,7 +819,12 @@ static void ui_home(int click, float cx, float cy) {
       }
     } else if (ui_tile(ml, ms, rx, y, rw, sh2, 1.25f, click, cx, cy, 0) && !busy) {
       g_ui_arm = UI_ARM_NONE;
-      if (start_connect(g_cfg.mp_host, g_cfg.mp_port)) ui_close_menu();
+      // THE MENU STAYS OPEN FOR THE WHOLE HANDSHAKE. This tile is the one
+      // place a failed join is reported (the FAILED messages above), so
+      // closing here would hide the verdict — the local bots keep playing and
+      // read as multiplayer. Success closes the menu instead: app_frame does
+      // it the moment the first snapshot flips g_online.
+      start_connect(g_cfg.mp_host, g_cfg.mp_port);
     }
   }
   y += sh2 + gap;

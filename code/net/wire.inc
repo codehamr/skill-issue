@@ -175,8 +175,8 @@ static int net_tele_parse(const unsigned char *b, int n, net_tele_t *t) {
   for (int i = 0; i < 12; i++) {
     int c = np_r8(&r);
     // SPACE and '=' are excluded on purpose, not by accident: this string is printed
-    // into game.log, whose grammar is space-separated key=value and is a CONTRACT with
-    // tools/server-report.awk.
+    // into server.log, whose grammar is space-separated key=value and is a CONTRACT with
+    // docker/report.awk.
     t->ver[i] = (char)((c > 0x20 && c <= 0x7e && c != '=') ? c : (c ? '?' : 0));
   }
   t->ver[12] = 0;

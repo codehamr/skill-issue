@@ -1,0 +1,41 @@
+# The whole server deployment. This file + docker/ live in ~/skill-issue on
+# the server box (make server-up syncs them); `docker compose up -d` there is
+# a running, self-updating public server — no checkout, no compiler, no .env.
+# Every knob below carries its default inline (${VAR:-default}); to override
+# one, put a .env next to this file — needed only for deviations, never for
+# operation. The folder itself is the state: server.log and stats.txt appear
+# next to this file, the binary under data/. Ops targets live in the Makefile.
+services:
+  game:
+    build: ./docker
+    image: skill-issue-server
+    init: true
+    restart: unless-stopped
+    # Runs as the folder's owner so every file stays directly editable on the
+    # box. Default 0/0 = a root login (this VPS); a non-root box sets PUID/PGID
+    # to its `id -u`/`id -g` via .env. Container-root is defanged regardless:
+    # cap_drop ALL + no-new-privileges + read-only rootfs below.
+    user: "${PUID:-0}:${PGID:-0}"
+    ports:
+      - "${GAME_PORT:-31415}:${GAME_PORT:-31415}/udp"
+    environment:
+      PORT:             ${GAME_PORT:-31415}
+      LOBBIES:          ${GAME_LOBBIES:-16}
+      CAP_PUBLIC:       ${GAME_CAP_PUBLIC:-4}
+      CAP_BOTS:         ${GAME_CAP_BOTS:-1}
+      SKILL:            ${GAME_SKILL:-1}
+      FRAGLIMIT:        ${GAME_FRAGLIMIT:-12}
+      UPDATE_URL:       ${UPDATE_URL:-https://github.com/codehamr/skill-issue/releases/latest/download}
+      UPDATE_INTERVAL:  ${UPDATE_INTERVAL:-300}
+      UPDATE_MAX_DEFER: ${UPDATE_MAX_DEFER:-3600}
+    volumes:
+      - .:/srv
+      # Dev override: run a local build instead of the release, updates off.
+      # - ./build/game-x86_64:/local/game:ro
+    read_only: true          # rootfs; /srv is the only writable place
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+# Bridge networking + a published UDP port on purpose: Docker's DNAT preserves
+# client source addresses, which the cookie/per-host-join logic needs.
+# `network_mode: host` is the one-line fallback if conntrack ever misbehaves.

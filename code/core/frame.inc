@@ -434,7 +434,11 @@ static void client_online_tick(player_t *p, const int held[IN_COUNT]) {
 // server happens only when its first snapshot lands.
 static int start_connect(const char *host, int port) {
   uint32_t ip = net_resolve(host);
-  if (!ip) return 0;
+  if (!ip) {           // resolve failure reports like any other failed join:
+    g_cl.reject = 0;   // the menu tile's generic message, never silence
+    g_cl.state = NC_FAILED;
+    return 0;
+  }
   g_net_secret = 0;                          // client uses the server's cookie
   return net_cl_connect(ip, (uint16_t)port, g_cfg.name);
 }
@@ -495,7 +499,13 @@ static int app_frame(app_t *a, player_t *p, double dt, const frame_input_t *in) 
 
   // Drive an in-progress handshake even while still playing locally:
   // the switch to online happens on the first snapshot, inside net_cl_poll.
-  if (!g_online && g_cl.state != NC_OFF && g_cl.state != NC_FAILED) net_cl_poll();
+  if (!g_online && g_cl.state != NC_OFF && g_cl.state != NC_FAILED) {
+    net_cl_poll();
+    // The join landing is the success signal the menu waits on: the
+    // MULTIPLAYER tile keeps the menu open through the handshake so a failure
+    // has a visible place to be seen — success closes it here instead.
+    if (g_online && g_menu_open) ui_close_menu();
+  }
 
   // ONLINE FORK: the local player is predicted and sent, foreign entities come from
   // snapshots, and the AI/present halves of the SP tick do not run.

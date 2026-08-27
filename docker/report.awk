@@ -1,11 +1,14 @@
-# tools/server-report.awk — renders `make server-logs`. Input: optionally one
-# lone byte-count line (the size header the Makefile prepends), then raw
-# game.log lines per the grammar that slog() in code/game.c writes. Unknown lines are ignored by
-# design — stderr noise must never break the report. -v now=<unix time>.
+# docker/report.awk — renders stats.txt inside the server container: the
+# entrypoint pipes a byte-count header + server.log through it every minute,
+# and `make server-stats` (or a plain `cat stats.txt` on the box) reads the
+# result. Input: optionally one lone byte-count line (the size header), then
+# raw server.log lines per the grammar that slog() in code/ writes. Unknown
+# lines are ignored by design — stderr noise must never break the report.
+# -v now=<unix time>.
 #
-# THE REPORT IS PLAYERS AND PLAYTIME. It reads exactly one line shape,
-# `tele id= [mode= dt=]`, and prints four rows. What used to be here and why it
-# went:
+# THE REPORT IS PLAYERS AND PLAYTIME. It reads exactly two line shapes —
+# `tele id= [mode= dt=]` and the 10 s `lobby N digest … humans=…` beat — and
+# prints five rows. What used to be here and why it went:
 #   - "mp connections" / "mp connection time" measured SOCKET time off the
 #     join/leave lines: they counted telemetry opt-outs, counted every
 #     `make server-deploy`'s own loopback probe, and a re-join split one
@@ -37,23 +40,26 @@ BEGIN {
 
 function kv(i,   a) { split($i, a, "="); return a[2] }
 
-# SECONDS ARE PART OF THE READING, not decoration: a fresh server, a single
-# test session or one `netclient` probe all live under a minute, and "0h 00m"
-# is indistinguishable from "nothing was logged at all" — which is the exact
-# question the first row of this report is asked after every deploy.
-function pt(s,   h, m, sec) {
+# MINUTES ARE THE UNIT OF THIS REPORT — tele beats arrive in ~60 s quanta and
+# stats.txt refreshes once a minute, so second digits were noise. What the
+# seconds used to guarantee survives as a floor: a nonzero total under one
+# minute prints "<1m", so a fresh server's first short session stays
+# distinguishable from "nothing was logged at all" — the exact question this
+# row is asked after every deploy.
+function pt(s,   h, m) {
   s = int(s + 0)
   if (!(s >= 0)) s = 0   # negative AND NaN both fail ">=" -> clamp to 0
-  h = int(s / 3600); m = int((s % 3600) / 60); sec = s % 60
-  if (h > 999) { h = 999; m = 59; sec = 59 }  # cap so %3dh can't overflow
-  return sprintf("%3dh %02dm %02ds", h, m, sec)
+  if (s > 0 && s < 60) return "<1m"   # the columns right-align it
+  h = int(s / 3600); m = int((s % 3600) / 60)
+  if (h > 9999) { h = 9999; m = 59 }  # cap so %4dh can't overflow
+  return sprintf("%4dh %02dm", h, m)
 }
 
 # normalize CRLF before anything else looks at $0/$1 — a \r left on the last
 # field would otherwise make "sp\r" a mode this report has never heard of.
 { sub(/\r$/, "") }
 
-# size-header line: the Makefile prepends a lone byte count before the log.
+# size-header line: the entrypoint prepends a lone byte count before the log.
 NR == 1 && NF == 1 && $1 ~ /^[0-9]+$/ { bytes = $1 + 0; hdr = 1; next }
 
 # every real grammar line and every wrapper line starts with a unix
@@ -94,12 +100,28 @@ $2 == "tele" {
   }
 }
 
+# PEAK CONCURRENT PLAYERS, off the 10 s lobby digests: every OCCUPIED arena
+# prints one `lobby N digest … humans=…` line per beat, and all lobbies of one
+# beat share a timestamp — so the concurrent count is the humans= sum within
+# one timestamp. This is server truth (not client-claimed like tele), but it
+# samples every 10 s: a shorter visit between digests is invisible. Good
+# enough for the question it answers — how full does the box get?
+$2 == "lobby" && $4 == "digest" {
+  ph = 0
+  for (i = 5; i <= NF; i++) if ($i ~ /^humans=/) { ph = kv(i) + 0; break }
+  if (!(ph >= 0)) ph = 0
+  if (ts != peak_ts) { peak_ts = ts; peak_sum = 0 }
+  peak_sum += ph
+  if (peak_sum > peak) peak = peak_sum
+  if (day && peak_sum > peak24) peak24 = peak_sum
+}
+
 END {
   # keyed on "the pipe carried no records", not on which counters are
   # nonzero — a log of only digest lines is still a real log. hdr (not bytes)
   # so a 0-byte log still reads as "no log yet".
   if (NR <= hdr) {
-    print "  no game.log on the server yet — run `make server-deploy` first"
+    print "  no log lines yet — the server writes its first tele line when someone plays"
     exit
   }
 
@@ -118,6 +140,7 @@ END {
   printf "  ------------------------------------------------------------\n"
   printf "  %-26s %12s %14s\n", "", "last 24 h", "all time"
   printf "  %-26s %12d %14d\n", "unique players",        nuniq24 + 0, nuniq + 0
+  printf "  %-26s %12d %14d\n", "peak players (same time)", peak24 + 0, peak + 0
   printf "  %-26s %12s %14s\n", "playtime singleplayer", pt(t24["sp"]), pt(t["sp"])
   printf "  %-26s %12s %14s\n", "playtime multiplayer",  pt(t24["mp"]), pt(t["mp"])
   printf "  %-26s %12s %14s\n", "playtime menu/ui",      pt(t24["ui"]), pt(t["ui"])

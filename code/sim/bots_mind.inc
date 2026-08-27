@@ -594,9 +594,10 @@ static void bot_hear_update(bot_t *b, int bi) {
 }
 
 // Server observability: ONE function feeds both the server's 10 s stdout digest (the
-// wrapper redirects stdout into game.log, and `make server-logs` renders it — that file
-// is the whole monitoring story) and the `netstat` proof command — the one-copy rule
-// applied to observability, and the reason a hanging instance is diagnosable at all.
+// container's entrypoint tees stdout into server.log and docker/report.awk renders it
+// into stats.txt — that file is the whole monitoring story) and the `netstat` proof
+// command — the one-copy rule applied to observability, and the reason a hanging
+// instance is diagnosable at all.
 static long g_srv_started;  // unix time at server start, 0 = not a server
 static long g_srv_behind;     // worst tick backlog the pacing loop ever saw
 static int net_srv_client_count(void);  // defined with the connection layer below
@@ -622,7 +623,7 @@ static int g_net_debug;
     if (g_humans_on[h]) nh++;
   long up = g_srv_started ? (long)time(NULL) - g_srv_started : 0;
   // The world hash rides the digest so a client<->server arena divergence
-  // is diagnosable from game.log with grep and nothing else. clients and
+  // is diagnosable from server.log with grep and nothing else. clients and
   // dropped-inputs are the numbers an operator asks for; rtt/qd are the worst
   // smoothed ping and input-queue depth across the conns — the two numbers
   // that say "the connection feel is fine" or name the client it is not.

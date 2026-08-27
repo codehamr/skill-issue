@@ -35,7 +35,7 @@ static int server_main(uint32_t seed) {
   }
   // No humans until a join; there is no "me" on a server. g_headless stays 0:
   // the event contract is a HARNESS contract, not a log format — at 1,
-  // ev_push would write one line per event into game.log forever, and that
+  // ev_push would write one line per event into server.log forever, and that
   // file has no rotation because its volume is bounded by design (decision 9).
   g_local_ent = -1;
   // Match parameters from argv, not from config.
@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
     else if (arg && !strcmp(a, "--skill"))      g_srv.skill = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--fraglimit"))  g_srv.fraglimit = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--ticks"))      g_srv.ticks = atol(argv[++i]);
-    else if (!strcmp(a, "--net-debug"))         g_net_debug = 1;  // game.log: one
+    else if (!strcmp(a, "--net-debug"))         g_net_debug = 1;  // server.log: one
                                                 // line per trim/skip, see decl
     else if (arg && !strcmp(a, "--connect"))    g_connect_host = argv[++i];  // HOST[:PORT]
     else if (arg && !strcmp(a, "--w")) w = atoi(argv[++i]);

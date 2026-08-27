@@ -10,9 +10,13 @@ screenshots/
 post/
 tools/*
 !tools/ci-proofs.sh
-!tools/server-report.awk
 !tools/byte-gate.sh
 !tools/split-check.sh
+# Runtime files the server container writes next to docker-compose.yaml —
+# only relevant when someone runs the compose file inside a checkout.
+/server.log
+/stats.txt
+/data/
 media/.cache/
 CLAUDE.md
 AGENTS.md
