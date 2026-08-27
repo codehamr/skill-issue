@@ -2,10 +2,10 @@
 // ui/menu.inc  —  ui_menu and its page branches, rebind capture, nav_move.
 // Proof: uistat, nav. One TU: included once by game.c, in definition order —
 // moving a definition out is a semantic change.
-// Contract: g_ui_arm is an enum, not a bool, so QUIT/RESTART/the two bind
+// Contract: g_ui_arm is an enum, not a bool, so RESTART and the two bind
 // RESET rows cannot cross-confirm each other; ui_arm_take is the one
-// chokepoint, and nav_move clears it. Leaving a server is NOT one of them:
-// it is one press, and it lands on the entry screen (see leave_match).
+// chokepoint, and nav_move clears it. QUIT and LEAVE MATCH are NOT on that
+// list — both are one press, each argued at its own tile in ui/settings.inc.
 // =============================================================================
 static float ui_page_binds_kb (float px, float pw, float y, int click, float cx, float cy);
 static float ui_page_settings (float px, float pw, float y, int click, float cx, float cy);

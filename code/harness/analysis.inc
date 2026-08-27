@@ -322,7 +322,7 @@ static void usage(void) {
        "  vmcheck            same analysis, both weapons x 11 ADS steps x 7 poses\n"
        "  vmsight            hand/forearm verts inside the eye's sight cone (must be 0)\n"
        "  vmtrig             trigger guard + blade against the HAND'S MESH, per\n"
-       "                     weapon x reload station x press x first/third person\n"
+       "                     weapon x reload station x first/third person\n"
        "  mapcheck N         regenerate N arenas; count coplanar same-facing faces\n"
        "  parity             24 player-vs-bot gameplay rows, ok/MISMATCH each\n"
        "  bothear            authoritative shot/step hearing and investigation proof\n"

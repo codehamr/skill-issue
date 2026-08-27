@@ -1308,11 +1308,6 @@ static void fig_joint(v3 c, v3 da, v3 db, float rs, float rl, float swell,
 // measured from e1, at radius `rad`.
 static v3    g_gun_trig_p;    // world contact point on the blade's rear face
 static v3    g_gun_trig_n;    // unit REARWARD normal there (the pull direction)
-static float g_gun_trig_s;    // ...and the 0..1 press that put them there. The
-                              // hand needs the PRESS and not just the position:
-                              // the digit curls as it closes, and a fig_hand
-                              // argument would be a second copy of a number the
-                              // weapon already knows, at two call sites.
 static v3    g_gun_guard[4];  // the guard bow's polyline, world space
 static float g_gun_guard_r;   // ...and the tube radius round it
 // The cross-section scale the rifle is being drawn at — 1.0 in first person,
@@ -1356,18 +1351,6 @@ static v3 fig_trig_pt(v3 a, v3 c, v3 b, float t) {
 // A pad PRESSES on a trigger, it does not pass through it: the surface stops on the
 // steel and deforms about a millimetre and a half.
 #define TRIG_PAD_SQUASH 0.0015f
-// How far the press slides the index's interior nodes along its own Bezier.
-// 0.35 moves the middle node from 0.500 to 0.588 of the curve — a visible
-// closing of the digit that costs no change in the curve's shape and therefore
-// none in fig_chain's corner budget.
-#define TRIG_CURL 0.35f
-// A TRIGGER PULL IS A HAND CLOSING, NOT ONE FINGER SLIDING. Three more things move with
-// the press: the MCP flexes, which swings the WHOLE finger and is the only part with
-// real screen area; the pad ROLLS on the shoe as the shoe rotates under it; and the
-// other three digits tighten on the grip.
-#define TRIG_MCP  0.150f   // rad of extra knuckle flexion at full press
-#define TRIG_ROLL 0.220f   // rad the pad rolls on the shoe
-#define TRIG_GRIP 0.055f   // rad the other three digits tighten by
 
 // How much air a digit keeps from the guard's wire, before the girth scale. 6.0 mm and
 // not 1.5, because the push moves NODES and the swept surface between two cleared nodes

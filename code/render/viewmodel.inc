@@ -271,7 +271,7 @@ static vm_pose_t vm_stage_pose(const player_t *p, const vm_t *v, const weapon_t 
   // third-person figure (`gun_anim`) — see the note there. `rl` is the body
   // arc, `rk` the two beat impulses, `rch` the charging-handle / bolt lobe,
   // `mdrop` the magazine's own travel and `mgv` the support hand's.
-  gunanim_t ga_ = gun_anim(w, alpha);
+  gunanim_t ga_ = gun_anim(w);
   // Swap: the incoming weapon rises from below, muzzle tilted down.
   float sw = smooth01(w->prev_switch +
                       ((float)w->switch_t / GUN_SWITCH_TICKS - w->prev_switch) * alpha);
@@ -308,7 +308,7 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
   int cur = ps->cur, srcyc = ps->srcyc;
   float sight_y = ps->sight_y, ads = ps->ads, kick = ps->kick, dip = ps->dip;
   float hip = ps->hip, lean = ps->lean, lean_d = ps->lean_d, sw = ps->sw;
-  float rl = ps->ga.arc, rk = ps->ga.punch, rch = ps->ga.cyc, trig = ps->ga.trig;
+  float rl = ps->ga.arc, rk = ps->ga.punch, rch = ps->ga.cyc;
   // The reload's micro-motion: the ring-down after each beat and the magazine's
   // own mass in the hands — see gunanim_t. Small numbers on purpose: these are
   // the difference between a pose that snaps between keyframes and a mechanism
@@ -343,10 +343,8 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
            - dip * 0.5f + rl * 0.084f + rch * (srcyc ? 0.044f : 0.020f)
            - rk * 0.020f + jl * 0.0030f + hf * 0.0045f
            - sw * 0.125f + br_y - sl * 0.020f * hip;
-  // The sniper pulls closer to the eye in ADS so the scope window opens up. TAKE-UP:
-  // the weapon comes back into the grip as the finger closes on it.
-  float tkick = cur == WPN_SR ? hip : 0.45f + 0.55f * hip;
-  float pz = 0.30f - 0.0015f * trig * tkick
+  // The sniper pulls closer to the eye in ADS so the scope window opens up.
+  float pz = 0.30f
            - 0.022f * hip - (cur == WPN_SR ? 0.152f : 0.06f) * ads - kick
            + VLERP(lag_z) - sw * 0.03f - rl * 0.020f
            - rch * (srcyc ? 0.062f : 0.030f) + rk * 0.016f
@@ -608,7 +606,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   int cur = ps.cur;
   float sight_y = ps.sight_y;
   gunanim_t ga_ = ps.ga;
-  float mdrop = ga_.mag, trig = ga_.trig;
+  float mdrop = ga_.mag;
 
   vm_frame_t fr = vm_stage_springs(&ps, v, alpha, eye, rgt, upv, fwd);
   v3 org = fr.org, gx = fr.gx, gy = fr.gy, gz = fr.gz;
@@ -622,7 +620,7 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   g_cham = 0.0007f;
   g_cham_polish = 1;   // ...and this arris was broken by a machine — see cham_arris
   g_gun_hero = 1;      // ...and this is the one view that can resolve a 4.7 mm land
-  g_vm_muzzle = gun_build(cur, org, gx, gy, gz, mdrop, trig, ga_.bolt);
+  g_vm_muzzle = gun_build(cur, org, gx, gy, gz, mdrop, ga_.bolt);
   g_gun_hero = 0;
   g_cham_polish = 0;
   g_cham = 0.0f;

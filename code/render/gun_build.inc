@@ -514,7 +514,7 @@ static void gun_ar_stock(v3 org, v3 gx, v3 gy, v3 gz, float gg,
 
 static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                            v3 body, v3 alloy2, v3 steel, v3 black, v3 mag,
-                           float md01, float trig01) {
+                           float md01) {
     // ---- grip, trigger, magazine ----
     mat_set(MAT_POLY_R, 0.0f);
     // A PISTOL GRIP HAS TO BE AS LONG AS THE HAND ON IT. This was 62 mm from the
@@ -563,24 +563,17 @@ static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       GN(0, -0.0180f, 0.0790f, 0.0034f, 0.0034f, alloy2),  // buried in the magwell
     });
     mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
-    // The blade: a real curved trigger on a pivot inside the receiver, not a
-    // 5 mm box. `trig01` rotates it about that pivot — 7.2 degrees, which is
-    // 4.4 mm of travel at the toe, the distance a finger actually moves.
+    // The blade: a real curved trigger, not a 5 mm box, and a RIGID one — it does not
+    // travel. See gunanim_t for why the press is not modelled.
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     {
-      // 0.0375 and not 0.0330: the blade used to sit hard against the REAR of its own
-      // bow with 2.67 mm of clearance and 30 mm of empty bow in FRONT of it, so once
-      // the toe travels the right way it ends 2.06 mm INSIDE the guard tube — which
-      // figcheck cannot see, because two closed meshes that intersect are nowhere
-      // coplanar.
-      v3 tpv = GUNP(0, -0.0168f, ARTRIG_Z);       // pivot, inside the receiver
-      // POSITIVE. This basis is (right, up, FORWARD), i.e.
-      float ta = trig01 * 0.210f;                 // rad, toward the shooter
-      // Rotating about gx (the weapon's right) takes the toe REARWARD, which is -gz,
-      // and slightly up.
-      #define TRIGP(VY, WZ) v3_add(tpv, v3_add(                                \
-          v3_scale(gy, ((VY) * cosf(ta) - (WZ) * sinf(ta)) * gg),               \
-          v3_scale(gz, ((VY) * sinf(ta) + (WZ) * cosf(ta)) * gg)))
+      // THE BLADE SITS FORWARD IN ITS OWN BOW, not hard against the rear of it, so the
+      // toe keeps air on both sides. figcheck cannot see this one — two closed meshes
+      // that intersect are nowhere coplanar — so the clearance is authored here and
+      // read back by vmtrig's `blade` row.
+      v3 tpv = GUNP(0, -0.0168f, ARTRIG_Z);       // seat, inside the receiver
+      #define TRIGP(VY, WZ) v3_add(tpv, v3_add(v3_scale(gy, (VY) * gg),   \
+                                               v3_scale(gz, (WZ) * gg)))
       // Radii carry the girth scale exactly as the positions do (every other
       // chain routes through GN, which applies it): raw, the third-person
       // blade drew 18% thinner than designed and the published radius below
@@ -922,7 +915,7 @@ static void gun_sr_action(v3 org, v3 gx, v3 gy, v3 gz, float gg,
 
 static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                            v3 body, v3 upper, v3 steel, v3 black, v3 mag,
-                           v3 chas, float md01, float trig01, float bolt01) {
+                           v3 chas, float md01, float bolt01) {
     mat_set(MAT_POLY_R, 0.0f);  // state carried in from gun_sr_action's last call (task-10 split)
     // ---- magwell and a magazine that is its own class's length ----------------
     // 0.0150 and 0.0186, not 0.0166 and 0.0174: at 0.0166 the well's side faces landed
@@ -1038,13 +1031,9 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     });
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     {
-      v3 tpv = GUNP(0, -0.0010f, SRTRIG_Z);
-      float ta = trig01 * 0.150f;    // a match trigger breaks shorter. Sign:
-                                     // see the AR's note — this basis is
-                                     // left-handed and -0.150 ran forward.
-      #define TRIGP(VY, WZ) v3_add(tpv, v3_add(                                \
-          v3_scale(gy, ((VY) * cosf(ta) - (WZ) * sinf(ta)) * gg),               \
-          v3_scale(gz, ((VY) * sinf(ta) + (WZ) * cosf(ta)) * gg)))
+      v3 tpv = GUNP(0, -0.0010f, SRTRIG_Z);     // seat — rigid, see the AR's blade
+      #define TRIGP(VY, WZ) v3_add(tpv, v3_add(v3_scale(gy, (VY) * gg),   \
+                                               v3_scale(gz, (WZ) * gg)))
       // Girth-scaled radii — same fix as the AR's blade above.
       fnode_t tb[3] = {
         {TRIGP(0.0014f, 0.0004f), steel, steel, 0.0028f * gg, 0.0038f * gg, 0, 0.0f},
@@ -1316,7 +1305,7 @@ static void gun_sr_mount(v3 org, v3 gx, v3 gy, v3 gz, float gg,
 }
 
 static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
-                    float trig01, float bolt01) {
+                    float bolt01) {
   float sight_y = gun_sight_y(cur);
   v3 muzzle = org;
   // Shared palette: slim two-tone polymer/graphite with cool steel accents.
@@ -1362,20 +1351,18 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
   v3 glass = {{0.045f, 0.055f, 0.070f}};  // coated lens: dark pupil, bright rim
   v3 lens  = {{0.086f, 0.112f, 0.118f}};  // multi-coated objective: blue-green
   float gg = g_gun_girth;                 // cross-section chunk (1.0 in first person)
-  g_gun_trig_s = trig01;                  // published once, at the top, so a
-                                          // third weapon cannot forget it
   ao_off();                               // a gun at arm's length sees open sky
   mat_lathe(MAT_PARK_R, MAT_PARK_M);
 
   if (cur == WPN_AR) {
     gun_ar_receiver(org, gx, gy, gz, gg, alloy, alloy2, upper, steel, black, bolt01);
     gun_ar_stock(org, gx, gy, gz, gg, body, alloy, black);
-    gun_ar_gripmag(org, gx, gy, gz, gg, body, alloy2, steel, black, mag, md01, trig01);
+    gun_ar_gripmag(org, gx, gy, gz, gg, body, alloy2, steel, black, mag, md01);
     gun_ar_barrel(org, gx, gy, gz, gg, alloy, upper, steel, black);
     gun_ar_sight(cur, org, gx, gy, gz, gg, alloy, steel, black, lens, sight_y);
   } else {
     gun_sr_action(org, gx, gy, gz, gg, alloy, upper, black, chas);
-    gun_sr_magwell(org, gx, gy, gz, gg, body, upper, steel, black, mag, chas, md01, trig01, bolt01);
+    gun_sr_magwell(org, gx, gy, gz, gg, body, upper, steel, black, mag, chas, md01, bolt01);
     gun_sr_stock(org, gx, gy, gz, gg, black, chas);
     gun_sr_foreend(org, gx, gy, gz, gg, black, chas);
     gun_sr_barrel(org, gx, gy, gz, gg, upper, steel, chas);

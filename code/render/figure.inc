@@ -130,8 +130,6 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   // HEEL grip: the fingers hold the FAR FLANK, they do not crest the top.
   if (style == 2) sweep *= 0.66f;
   int aimed = style == 1 && f == 3 && trig_pt != NULL && !slid;
-  // The whole hand squeezes, not just the index.
-  if (style == 1 && !aimed) sweep += TRIG_GRIP * g_gun_trig_s;
   if (style == 1 && f == 3 && !aimed) { sweep = 1.42f; reach = 0.0125f; }
   fnode_t fg[6];   // 5 authored + one DOME ring, below
   // Node 0 sits BEHIND the knuckle row and inside the palm, so the root cap is
@@ -151,9 +149,9 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   // clear of the guard's rear upright.
   v3 tA = {{0, 0, 0}}, tB = tA, tC = tA;
   if (aimed) {
-    // The METACARPAL joint flexes with the press, which swings the whole digit
-    // rather than only its last two nodes.
-    float aph = ph0 + side * (0.30f + TRIG_MCP * g_gun_trig_s);
+    // The METACARPAL joint carries the whole digit onto the blade, so the bearing
+    // is set here rather than at the last two nodes.
+    float aph = ph0 + side * 0.30f;
     float arad = rr + 0.0018f;
     tA = hand_pt(gc, ga, e1, e2, FAX[f] - 0.0050f, aph, arad);
     // The tip's own half-thickness minus the squash: the pad's SURFACE
@@ -189,7 +187,6 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
       // corner it cannot fillet by collapsing the cross-section, so the fingertip
       // pinched and then flared into a trumpet exactly when the trigger was pulled.
       float u = (t - FT[2]) / (1.0f - FT[2]);
-      u += TRIG_CURL * g_gun_trig_s * u * (1.0f - u);
       fg[i].p = fig_trig_pt(tA, tC, tB, u);
     }
     fg[i].col = fg[i].bcol = col;
@@ -206,9 +203,7 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
     // digit resting against the receiver's flank should touch it, which is
     // this file's contact rule, not stand off it.
     if (i) fg[i].p = fig_body_clear(fg[i].p, fmaxf(fg[i].rx, fg[i].rz) * 0.72f);
-    // The pad ROLLS on the shoe as the shoe turns under it. Only the tip:
-    // rolling the whole digit would twist the wrap off the grip.
-    fg[i].roll = aimed && i == 4 ? side * TRIG_ROLL * g_gun_trig_s : 0.0f;
+    fg[i].roll = 0.0f;
     // AO 0.88..0.96, not 0.58..0.66.
     fg[i].ao = 0.88f + 0.020f * (float)i;
   }
@@ -270,8 +265,7 @@ static void fig_hand_thumb(v3 wrist, v3 pk, v3 gc, v3 ga, v3 e1, v3 e2,
   // ...and it TIGHTENS with the press: the thumb is 3627 px of the AR hip frame
   // against the index finger's 12, so a squeeze that does not move it is a squeeze the
   // player cannot see.
-  const float TWRAP = (style == 1 ? 0.68f : 1.0f) *
-                      (1.0f + (style == 1 ? 0.06f * g_gun_trig_s : 0.0f));
+  const float TWRAP = style == 1 ? 0.68f : 1.0f;
   v3 tb2, tb3, tb4;
   if (style == 2) {
     // FORWARD THUMB. The heel grip trades the C's opposition cue for the drive-

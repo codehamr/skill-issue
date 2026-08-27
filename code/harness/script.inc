@@ -929,7 +929,7 @@ static void cmd_figcheck(sim_ctx_t *s) {
     if (g_fchk_v) { g_nprobe = 0; g_probe_on = 1; }
     scene_draw_figure(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw, NULL,
                       1.0f, 0.0f, (v3){{1, 1, 1}}, 0, WPN_AR,
-                      gun_anim(&g_bots[0].wp, 1.0f));
+                      gun_anim(&g_bots[0].wp));
     g_probe_on = 0;
     fchk_res_t r = fchk_scene();
     tris = r.tris;

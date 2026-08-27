@@ -18,7 +18,7 @@ static const bot_t *probe_capture_figure(int wpn) {
   const bot_t *b = &g_bots[0];
   g_cam_eye = b->pos;
   scene_draw_figure(&b->anim, b->pos, b->yaw, NULL, 1.0f, 0.0f,
-                    (v3){{1, 1, 1}}, 0, wpn, gun_anim(&b->wp, 1.0f));
+                    (v3){{1, 1, 1}}, 0, wpn, gun_anim(&b->wp));
   g_probe_on = 0;
   return b;
 }
@@ -390,7 +390,9 @@ static void flinch_proof(sim_ctx_t *s) {
 }
 
 // The trigger guard and the blade against the HAND'S MESH — the pair figcheck
-// and vmtrig's siblings cannot see, per weapon x reload station x press x view.
+// and vmtrig's siblings cannot see, per weapon x reload station x view. There is no
+// PRESS axis any more: the blade is a rigid part and the index rests on it, so a
+// pressed row was byte-identical to its unpressed twin.
 static void vmtrig_proof(sim_ctx_t *s) {
   // TRIGGER PROOF — A TUBE AGAINST A MESH, not a vertex against a tube. The defect it
   // catches is a THIN weapon part swallowed by a FAT finger, and a point-in-solid test
@@ -431,10 +433,9 @@ static void vmtrig_proof(sim_ctx_t *s) {
         // with the trigger hand" — and passing a NULL death_t here would have left
         // exactly that pose untested.
         if (view == 1 && st > 1) continue;
-        for (int pr = 0; pr <= 1; pr++) {
+        {
           tmp.wp.cur = wi;
           tmp.wp.ads_lin = tmp.wp.ads_s = tmp.wp.prev_ads_s = 0.0f;
-          tmp.wp.trig_s = tmp.wp.prev_trig_s = (float)pr;
           tmp.wp.switch_t = 0; tmp.wp.prev_switch = 0.0f;
           tmp.vm.kick = tmp.vm.prev_kick = 0.0f;
           int rt = WPN_DEF[wi].reload_ticks;
@@ -454,7 +455,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
             death_t dth = {1.0f, DEATH_TILT_MAX, 0.0f, {{1.0f, 0, 0}}, 0.6f, 0.0f};
             scene_draw_figure(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw,
                               st ? &dth : NULL, 1.0f, 0.0f, (v3){{1, 1, 1}},
-                              0, wi, gun_anim(&tmp.wp, 1.0f));
+                              0, wi, gun_anim(&tmp.wp));
           }
           g_probe_on = 0;
           // The hand's triangles: every probe range whose name is a hand part.
@@ -509,10 +510,10 @@ static void vmtrig_proof(sim_ctx_t *s) {
           // must not happen is the blade's own axis going deep, which is the shoe being
           // swallowed whole.
           float blade = trig_tube_clear(g_gun_blade, 3, 0.0f, rng, nrng);
-          printf("vmtrig %s %s %s trig=%d pad=%+.1f guard=%+.1f blade=%+.1f "
+          printf("vmtrig %s %s %s pad=%+.1f guard=%+.1f blade=%+.1f "
                  "body=%.1f inwpn=%.1f wrist=%.1f clamp=%d\n",
                  view ? "3p" : "vm", WPN_DEF[wi].prefix,
-                 view ? STN3[st] : STN[st], pr,
+                 view ? STN3[st] : STN[st],
                  (double)(pad * 1000.0f), (double)(guard * 1000.0f),
                  (double)(blade * 1000.0f), (double)(body * 1000.0f),
                  (double)(inwp * 1000.0f), (double)(g_fig_wrist_mm),

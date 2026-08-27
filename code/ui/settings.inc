@@ -45,12 +45,16 @@ static int session_pauses(void) {
 }
 static int   g_ui_rebind = -1;   // action currently being rebound, -1 = none
 static int   g_ui_rebind_pad;    // ...and which bind table that row edits
-static int   g_ui_quit;          // set by the QUIT button
+static int   g_ui_quit;          // set by the QUIT tile
 // TWO-PRESS DESTRUCTIVE ROWS, ONE LATCH, AND IT REMEMBERS WHICH ROW. A control that
-// ends something the player cannot get back — the process, the round, a bind table —
-// asks twice. LEAVING A SERVER IS NOT ON THIS LIST and has no value here: it ends in
-// the rail it was pressed from, one press from rejoining (see the LEAVE MATCH tile).
-typedef enum { UI_ARM_NONE, UI_ARM_QUIT, UI_ARM_RESTART,
+// destroys STATE THE PLAYER CANNOT REBUILD — the round's scoreboard, a bind table —
+// asks twice. TWO ROWS ARE DELIBERATELY NOT ON THIS LIST, for the same reason in two
+// shapes: neither costs the player anything the second press would give back. Leaving
+// a server ends in the rail it was pressed from, one press from rejoining (see the
+// LEAVE MATCH tile); and QUIT asks for what the window manager already grants in one
+// press — the title bar's close and Alt+F4 end this process without a confirm, and
+// write the config on the way out exactly as that tile does.
+typedef enum { UI_ARM_NONE, UI_ARM_RESTART,
                UI_ARM_RSTKB, UI_ARM_RSTPAD } ui_arm_t;
 static ui_arm_t g_ui_arm;
 static int   g_ui_root_focus;  // rail row to return to, THIS menu session only
@@ -816,11 +820,11 @@ static void ui_home(int click, float cx, float cy) {
     // ...and online the same slot is the way OUT of the match, which is the one
     // destination a live session has and a boot screen does not.
     //
-    // ONE PRESS, AND IT IS THE RAIL'S ONE EXCEPTION. Every other armed row here ends
-    // something that does not come back — the process, the round's scoreboard, a bind
-    // table. Leaving a server ends nothing: the destination IS this rail, with the tile
-    // under the cursor already reading QUICK JOIN, so the undo is the same press again.
-    // A confirm on the way out only made a player who wanted OUT press twice.
+    // ONE PRESS, AND THE UNDO IS THE SAME PRESS AGAIN. Leaving a server ends nothing:
+    // the destination IS this rail, with the tile under the cursor already reading
+    // QUICK JOIN. A confirm on the way out only made a player who wanted OUT press
+    // twice — which is the argument the QUIT tile below now makes for itself. What
+    // still arms on this rail is the round's scoreboard and a bind table (g_ui_arm).
     if (g_online) {
       if (ui_tile("LEAVE MATCH", "BACK TO THE ENTRY SCREEN",
                   rx, y, rw, sh2, 1.25f, click, cx, cy, 1)) {
@@ -852,17 +856,21 @@ static void ui_home(int click, float cx, float cy) {
     y += sh2 + gap;
   }
 
-  // AN UPDATE IS A ROW ONLY WHEN THERE IS SOMETHING LEFT TO DO WITH IT: once the boot
-  // screen applies them by itself, the row exists for the verdict that arrived LATE,
-  // after the player left the reel.
-  if (ui_tile(g_ui_arm == UI_ARM_QUIT ? "CONFIRM QUIT" : "QUIT", NULL,
-              rx, y, rw, qh, 1.1f, click, cx, cy, 1)) {
-    if (ui_arm_take(UI_ARM_QUIT)) { config_write(g_cfg_path, &g_cfg); g_ui_quit = 1; }
+  // ONE PRESS, AND THE CONFIG GOES WITH IT. This tile is not the only way out of the
+  // process and never was — the title bar's close and Alt+F4 end it without asking,
+  // and both write the config on the way out (see the native backends' teardown), so a
+  // confirm here only taxed the player who came to the rail to leave.
+  if (ui_tile("QUIT", NULL, rx, y, rw, qh, 1.1f, click, cx, cy, 1)) {
+    config_write(g_cfg_path, &g_cfg);
+    g_ui_quit = 1;
   }
   y += qh + gap;
 
   int ust = atomic_load(&g_upd_state);
   int offer = ust == UPD_UPDATE || ust == UPD_RECUT;
+  // AN UPDATE IS A ROW ONLY WHEN THERE IS SOMETHING LEFT TO DO WITH IT: once the boot
+  // screen applies them by itself, the row exists for the verdict that arrived LATE,
+  // after the player left the reel.
   if (offer || ust == UPD_APPLYING) {
     // The label is the STATE: arming stores UPD_APPLYING and the frame that is
     // already in flight draws it, which is the whole reason the apply is two
@@ -880,10 +888,11 @@ static void ui_home(int click, float cx, float cy) {
 
   // The pad grammar, and only in pad mode: the tiles say what they do, so a
   // permanent "CLICK TO PLAY" would be noise, while a controller has no visible
-  // affordance at all until something names its buttons.
+  // affordance at all until something names its buttons. NO CONFIRM GRAMMAR ON THIS
+  // RAIL: nothing here arms any more, and ui_route clears the latch on the way in, so
+  // the line would be unreachable. The panel pages own it (see ui_menu's footer).
   if (g_ui_pad_mode) {
-    const char *ph = g_nav_kbd ? "ARROWS MOVE   ENTER OK"
-                   : g_ui_arm ? "A CONFIRMS" : "A OK   D-PAD MOVE";
+    const char *ph = g_nav_kbd ? "ARROWS MOVE   ENTER OK" : "A OK   D-PAD MOVE";
     // THE HINT LIVES IN THE GAP, NOT ABOVE IT. A stroke overshoots its box by about a
     // unit, so a line asked for one unit above the tile block's bottom edge draws two
     // units of cap height INSIDE the QUIT tile.

@@ -445,7 +445,7 @@ static void player_present_tick(player_t *p, int ent) {
     if (g_player_corpse_q[h]) {
       g_player_corpse_q[h] = 0;
       corpse_add(&g_player_anim[h], p->pos, p->pos, g_player_rag[h], p->yaw,
-                 0.0f, 0.0f, gun_anim(&p->wp, 1.0f), p->wp.cur, 1, ent);
+                 0.0f, 0.0f, gun_anim(&p->wp), p->wp.cur, 1, ent);
     }
   }
 }

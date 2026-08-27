@@ -334,7 +334,7 @@ static void netfigure_proof(void) {
   // ...and the POSE has to move with it: gun_anim is what the figure's hands read.
   gunanim_t mid = {0};
   for (int i = 0; i < dur; i++) {
-    if (i == dur / 3) mid = gun_anim(W, 1.0f);
+    if (i == dur / 3) mid = gun_anim(W);
     g_tick++; net_cl_present_advance(); client_anim_all();
   }
   int ok_reload = started == dur && W->reload_t == 0 &&

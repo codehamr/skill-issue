@@ -153,8 +153,6 @@ typedef struct {
   // it from exactly these, at its own tick rate, through the same gun_ads and the
   // same ease. See net_ent_from_live.
   unsigned char ads_want, ready_want;
-  // Trigger travel, 0 = at rest against the blade, 1 = broken.
-  float trig_s, prev_trig_s;
 } weapon_t;
 
 // FULL MAGAZINES, EVERY WEAPON. There is no reserve pool, so a spawn (and every

@@ -466,17 +466,6 @@ static void gun_ads(weapon_t *w, int want_ads) {
 
 static void gun_recover(weapon_t *w, int trigger_held) {
   const float *wp = g_sim_wp[w->cur];
-  // TRIGGER TRAVEL, and it belongs here for the same reason `mv_walk` is shared: the
-  // player and every bot pull the same trigger, and a finger that presses only in first
-  // person does not exist on the twenty models the player is shooting at.
-  w->prev_trig_s = w->trig_s;
-  {
-    // The FULL-AUTO subtlety: a held trigger stays back, and a semi-auto's does too
-    // until the shooter lets go — so this follows the button, not the shot.
-    float want = trigger_held && w->reload_t == 0 && w->switch_t == 0 ? 1.0f : 0.0f;
-    float rate = want > w->trig_s ? 36.0f : 60.0f;
-    w->trig_s += (want - w->trig_s) * fminf(1.0f, rate * TICK_DT);
-  }
   // Recovery only once the trigger is off (or the mag ran dry): during a burst
   // the climb is the shooter's to fight, afterwards the view returns.
   if (!trigger_held || w->ammo[w->cur] == 0 || w->switch_t > 0) {
@@ -511,11 +500,18 @@ typedef struct {
   // so they stay on the sim clock like everything else in here.
   float jolt, heft;
 } gunanim_t;
+// EVERY FIELD HERE IS A RELOAD FIELD, and the trigger is deliberately not one of them:
+// the blade is a rigid part and the index rests on it. A press that travels is a
+// millimetre of steel and one knuckle on a model seen across an arena — too small to
+// read, and it cost sim state, a term in the viewmodel's Z and four in the hand solver
+// before anything could draw it.
 
-static gunanim_t gun_anim(const weapon_t *w, float alpha) {
+// NO SUB-TICK ALPHA. Every field below is a pure function of `prog`, i.e. of the
+// reload clock, and the reload clock is a tick counter — the one thing that ever
+// needed interpolating here was the trigger blade's travel, and that is gone.
+static gunanim_t gun_anim(const weapon_t *w) {
   gunanim_t g = {0};
   int cur = w->cur;
-  g.trig = w->prev_trig_s + (w->trig_s - w->prev_trig_s) * alpha;
   if (w->reload_t <= 0) return g;
   // The SAME duration the sim is counting down, or every beat in the animation
   // lands on a different tick from the sound it is supposed to share.

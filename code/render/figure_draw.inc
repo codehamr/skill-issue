@@ -497,7 +497,7 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
 // stand in the frame beside them.
 static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int wpn,
                      gunanim_t gs) {
-  float mag01 = gs.mag, trig01 = gs.trig;
+  float mag01 = gs.mag;
   v3 g_org, g_rt, g_up, g_fw;
   pose_gun_frame(&P, wpn, &g_org, &g_rt, &g_up, &g_fw);
   g_gun_girth = GUN_GIRTH_3P;
@@ -553,7 +553,7 @@ static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int 
   {
     probe("gun");
     int gv0 = g_scene_floats;
-    gun_build(wpn, g_org, g_rt, g_up, g_fw, mag01, trig01, gs.bolt);
+    gun_build(wpn, g_org, g_rt, g_up, g_fw, mag01, gs.bolt);
     // Publish the model's own below-origin depth, once per weapon per session.
     if (g_gun_low[wpn] == 0.0f && mag01 <= 0.001f && g_fig_diss == 0.0f &&
         gs.arc <= 0.001f) {
@@ -674,7 +674,7 @@ static void scene_draw_bot(const bot_t *b, float alpha) {
   // issuing the AR — but any figure drawn through this path holding the SR
   // would render an AR, and the far SR report bake becomes reachable with it.
   scene_draw_figure(&b->anim, pos, yaw, &dth, alpha, flash01, fc, 0, b->wp.cur,
-                    gun_anim(&b->wp, alpha));
+                    gun_anim(&b->wp));
 }
 
 // Perpendicular frame for marks/tracers whose only anchor is one direction.
@@ -966,7 +966,7 @@ static void scene_build(const player_t *p, float alpha, int show_player,
     scene_draw_figure(&g_player_anim[h], v3_lerp(hp->prev_pos, hp->pos, alpha),
                       hp->yaw, NULL, alpha, ent_flash01(hp->flash, hp->flash_head),
                       hp->flash_head ? (v3){{1.0f, 0.22f, 0.14f}} : (v3){{1, 1, 1}},
-                      1, hp->wp.cur, gun_anim(&hp->wp, alpha));
+                      1, hp->wp.cur, gun_anim(&hp->wp));
   }
   for (int i = 0; i < g_match.nbots; i++)
     if (g_bots[i].active) scene_draw_bot(&g_bots[i], alpha);
@@ -1016,7 +1016,7 @@ static void scene_build(const player_t *p, float alpha, int show_player,
                         alpha, ent_flash01(hp->flash, hp->flash_head),
                         hp->flash_head ? (v3){{1.0f, 0.22f, 0.14f}}
                                        : (v3){{1, 1, 1}},
-                        1, hp->wp.cur, gun_anim(&hp->wp, alpha));
+                        1, hp->wp.cur, gun_anim(&hp->wp));
       g_fig_fp = 0;
     }
   }

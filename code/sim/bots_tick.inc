@@ -346,7 +346,7 @@ static void bot_tick(int bi) {
       // The BODY stays behind.
       corpse_add(&b->anim, b->pos, b->prev_pos, b->rag, b->yaw,
                  b->topple, b->prev_topple,
-                 gun_anim(&b->wp, 1.0f), b->wp.cur, 0, bi + 1);
+                 gun_anim(&b->wp), b->wp.cur, 0, bi + 1);
       bot_spawn(bi);
       ev_push((event_t){.type = EV_RESPAWN, .dst = bi + 1});
     }
