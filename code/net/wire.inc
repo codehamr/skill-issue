@@ -1,12 +1,15 @@
 // =============================================================================
 // net/wire.inc  —  packet encode/decode, the np_rd bounds-checked cursor,
 // quantization, net_world_hash.
-// Proof: netpack, netfuzz. One TU: included once by game.c, in definition
-// order — moving a definition out is a semantic change.
+// Proof: netpack, netfuzz, netcarry. One TU: included once by game.c, in
+// definition order — moving a definition out is a semantic change.
 // Contract: every decoder treats input as hostile — np_rd's `bad` latch
 // makes every post-overflow read return 0; hostile src/dst are neutralised
 // to -1 before any array use. NET_PROTO is the wire version; a bump needs
-// server and client redeployed together.
+// server and client redeployed together, so an ADDITIVE change into space an
+// older build reads as zero (the free NEF_ bits) argues its compatibility at
+// its own gate instead. A snapshot carries INPUTS, never solved presentation:
+// see the NEF_ set and net_ent_t.
 // =============================================================================
 // Netcode wire layer — SHARED CORE, above the platform split, exactly the idiom audio
 // uses: encode/decode, validation, the connection automaton and the FNV world hash all
@@ -284,8 +287,33 @@ static void tele_tick(void) {
 // anim_t/pose_t/vm_t are 100% presentation, re-solved by each client and NEVER sent)
 // plus the state the HUD and the weapon model need. spawn_seq tells the client to
 // anim_reset instead of interpolating across a respawn teleport.
+// THE FLAG BYTE IS THE CHEAPEST FIELD ON THE WIRE, and the carriage lives in it for
+// exactly that reason: a client re-solves the POSE, but only from inputs it was given,
+// and three of anim_tick's inputs are booleans the client can never derive on its own
+// (it never sees a foreign player's buttons). One bit each, no field added, no record
+// grown. Named because there are seven of them now and `>> 5 & 1` next to `>> 3 & 1`
+// is the mistake this byte would otherwise be waiting for.
+enum {
+  NEF_ALIVE    = 1 << 0,
+  NEF_GROUNDED = 1 << 1,
+  NEF_CROUCH   = 1 << 2,
+  NEF_SLIDE    = 1 << 3,
+  // The carriage triple — see net_ent_from_live for where each is published and
+  // net_cl_carry_advance for how the client turns the two intents back into blends.
+  NEF_ADS      = 1 << 4,   // aim INTENT, not the blend: the client runs its own ramp
+  NEF_READY    = 1 << 5,   // fighting — stock up, rather than the low/patrol carry
+  NEF_TUCK     = 1 << 6,   // mid-air crouch: the legs are folded into pos.y, and the
+                           // figure must not follow that step (the amount is the one
+                           // stand-to-crouch constant, so the bit IS the value)
+  // bit 7 free.
+};
+// ADDITIVE, AND DELIBERATELY NOT A NET_PROTO BUMP — the same argument NP_TELE makes.
+// No field moved and no byte was added, and bits 4-6 read zero out of every older
+// build: an old client against a new server renders the carriage it always did, a new
+// client against an old server likewise. A bump here would lock out every un-updated
+// client to fix a pose.
 typedef struct {
-  uint8_t  id, flags;      // flags bit0 alive, bit1 grounded, bit2 crouched, bit3 sliding
+  uint8_t  id, flags;      // the NEF_* set above
   uint8_t  hp, weapon;     // weapon: 2 bits used
   uint8_t  spawn_seq;
   uint8_t  mag;            // rounds in the CURRENT weapon's magazine. Without

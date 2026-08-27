@@ -680,19 +680,31 @@ static uint8_t g_spawn_seq_all[SRV_LOBBIES][MAX_ENTS];
 static void net_ent_from_live(net_ent_t *e, int ent) {
   int h = human_of_ent(ent);
   v3 pos, vel; float yaw, pitch, lean; int alive, grounded, crouch, slide, hp, wpn;
+  // THE CARRIAGE TRIPLE, read back off the entity rather than recomputed here. Each is
+  // published at the one place it is DECIDED (gun_ads for the aim intent; each
+  // producer's own anim_tick call for the carry state), so the packet and the server's
+  // own pose are the same value and cannot drift into disagreeing about the same man.
+  int ads, ready, tuck;
   if (h >= 0) {
     const player_t *p = &g_players[h];
     pos = p->pos; vel = p->vel; yaw = p->yaw; pitch = p->pitch; lean = p->lean;
     alive = p->alive; grounded = p->grounded; crouch = p->crouched; slide = p->sliding;
     hp = p->hp; wpn = p->wp.cur;
+    ads = p->wp.ads_want; ready = p->wp.ready_want; tuck = p->tuck_y > 0.0f;
   } else {
     const bot_t *b = &g_bots[ent - 1];
     pos = b->pos; vel = b->vel; yaw = b->yaw; pitch = b->pitch; lean = 0.0f;
     alive = b->alive; grounded = b->grounded; crouch = b->crouch; slide = b->sliding;
     hp = b->hp; wpn = b->wp.cur;
+    // Bots never tuck — bot_tick passes anim_tick a literal 0.0f — so this is 0 by
+    // construction rather than by omission, exactly as their lean is.
+    ads = b->wp.ads_want; ready = b->wp.ready_want; tuck = 0;
   }
   e->id = (uint8_t)ent;
-  e->flags = (alive ? 1 : 0) | (grounded ? 2 : 0) | (crouch ? 4 : 0) | (slide ? 8 : 0);
+  e->flags = (uint8_t)((alive    ? NEF_ALIVE    : 0) | (grounded ? NEF_GROUNDED : 0) |
+                       (crouch   ? NEF_CROUCH   : 0) | (slide    ? NEF_SLIDE    : 0) |
+                       (ads      ? NEF_ADS      : 0) | (ready    ? NEF_READY    : 0) |
+                       (tuck     ? NEF_TUCK     : 0));
   e->hp = (uint8_t)f_clamp((float)hp, 0.0f, 255.0f);
   e->weapon = (uint8_t)(wpn & 3);
   e->spawn_seq = g_spawn_seq[ent];

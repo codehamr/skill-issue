@@ -377,9 +377,15 @@ static void client_anim_all(void) {
     if (!p->alive) { player_present_tick(p, ent); continue; }   // THE one dead
                                                                 // branch: pose freeze +
                                                                 // the corpse handover
+    // THE CARRIAGE, AND WHERE EACH HALF OF IT COMES FROM. A foreign player's two
+    // intents rode in on the snapshot (NEF_ADS/NEF_READY) and net_cl_carry_advance has
+    // already turned the aim one back into a blend; OUR OWN body is predicted, so no
+    // snapshot describes it and the carry predicate runs here exactly as
+    // player_present_tick runs it on the server.
+    if (ent == g_local_ent) p->wp.ready_want = (unsigned char)player_carry_ready(p);
     anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
               p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
-              p->lean, 0, ent_of_human(h));
+              p->lean, p->wp.ready_want, ent_of_human(h));
   }
   for (int b = 0; b < g_match.nbots; b++) {
     bot_t *bt = &g_bots[b];
@@ -408,7 +414,8 @@ static void client_anim_all(void) {
       continue;
     }
     anim_tick(&bt->anim, bt->pos, bt->vel, bt->yaw, bt->pitch, bt->grounded,
-              bt->crouch, 0.0f, bt->sliding, bt->wp.ads_s, 0.0f, 0, b + 1);
+              bt->crouch, 0.0f, bt->sliding, bt->wp.ads_s, 0.0f,
+              bt->wp.ready_want, b + 1);
   }
 }
 

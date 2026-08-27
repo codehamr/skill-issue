@@ -725,9 +725,10 @@ static void bot_tick(int bi) {
   gun_recover(&b->wp, trigger);
   // Bots do not lean yet: the pose supports it (the puppet drives it) but no AI
   // branch asks for it, so this is 0 by construction rather than by omission.
+  b->wp.ready_want = (unsigned char)(b->tgt >= 0 || startled || b->alert_t > 0);
   anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
             b->crouch, 0.0f, b->sliding, b->wp.ads_s, 0.0f,
-            b->tgt >= 0 || startled || b->alert_t > 0, bi + 1);
+            b->wp.ready_want, bi + 1);
   // (`startled` is in there because a bot that turns to a sound with the rifle
   // still slung is the single most "it did not really notice me" frame in the
   // game — the carry state is the only tell the player gets that hearing

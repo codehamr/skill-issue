@@ -447,6 +447,9 @@ static void gun_reload_tick(weapon_t *w) {
 
 // ADS ramps linearly over the weapon's own ADS TIME; presentation reads the smoothstep.
 static void gun_ads(weapon_t *w, int want_ads) {
+  // THE ONE PLACE THE AIM INTENT ENTERS THE SIM — player, bot and puppet all ask
+  // here — so it is also the one place worth publishing it from.
+  w->ads_want = (unsigned char)(want_ads ? 1 : 0);
   w->ads_lin = f_clamp(w->ads_lin + (want_ads ? 1.0f : -1.0f) *
                        TICK_DT * 1000.0f / g_sim_wp[w->cur][WP_ADS_MS],
                        0.0f, 1.0f);
@@ -696,9 +699,10 @@ static void bot_puppet_tick(bot_t *b, int bi) {
   ent_move(&b->pos, &b->vel, &b->grounded,
            b->crouch ? HEIGHT_CROUCH : HEIGHT_STAND);
   arena_clamp(&b->pos);
+  b->wp.ready_want = (unsigned char)(b->pup_ready ? 1 : 0);
   anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
             b->crouch, 0.0f, b->sliding, b->wp.ads_s, b->pup_lean,
-            b->pup_ready, bi + 1);  // REAL entity id: hardwired 1, every
+            b->wp.ready_want, bi + 1);  // REAL entity id: hardwired 1, every
                                     // puppet != bot 0 pushed EV_STEP/EV_LAND
                                     // with .src = 1 and stepped from the wrong
                                     // body — no tuck, see bot_tick

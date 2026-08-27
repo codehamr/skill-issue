@@ -143,6 +143,16 @@ typedef struct {
   // off the spray pattern independently of the pitch. Render-only, like punch.
   float punch_roll, prev_punch_roll, punch_roll_v;
   float ads_lin, ads_s, prev_ads_s;            // raw ramp + smoothstepped
+  // THE TWO CARRIAGE INTENTS, published where each is DECIDED so that one copy serves
+  // both readers — the pose solver and the wire. ads_want is what gun_ads was last
+  // asked for (the button AFTER its busy gate, not the raw press); ready_want is
+  // "this soldier is fighting rather than carrying", written by each producer at its
+  // own anim_tick call from its own predicate.
+  // They are INTENTS, never blends: the eased values (ads_s here, ready_s in anim_t)
+  // are presentation, and presentation does not cross the wire — a client re-solves
+  // it from exactly these, at its own tick rate, through the same gun_ads and the
+  // same ease. See net_ent_from_live.
+  unsigned char ads_want, ready_want;
   // Trigger travel, 0 = at rest against the blade, 1 = broken.
   float trig_s, prev_trig_s;
 } weapon_t;

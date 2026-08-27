@@ -1,9 +1,12 @@
 // =============================================================================
-// harness/proofs_net.inc  —  netclient/netdeath/netfuzz_proof.
+// harness/proofs_net.inc  —  netclient/netcarry/netdeath/netfuzz_proof.
 // Proof: the proofs themselves. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // Contract: these are the multiplayer acceptance gate; a wire change needs
-// NET_PROTO bumped and server + client redeployed together.
+// NET_PROTO bumped and server + client redeployed together — EXCEPT one that
+// is strictly additive into space an older build already reads as zero (the
+// free NEF_ bits, NP_TELE), which degrades to the old behaviour both ways and
+// is argued at its own gate rather than bumped.
 // =============================================================================
 // A headless client against a real --server on localhost: handshake, reconcile
 // and event-channel stats, end to end and without GL.
@@ -121,6 +124,137 @@ static void netclient_proof(void) {
     }
     net_cl_disconnect();
   }
+}
+
+// --- The carriage round trip -------------------------------------------------
+// net_ent_from_live's contract, taken literally: "presentation is deliberately absent
+// — the client re-solves it" holds only while every INPUT that solver needs is on the
+// wire. anim_tick takes thirteen; three of them describe how the weapon is HELD (the
+// aim blend, the carry state, the mid-air leg tuck) and they are the ones a snapshot
+// used to drop on the floor, so every remote figure stood in the low carry forever
+// while its (correctly synced) pitch pointed somewhere else entirely.
+//
+// One entity goes live -> from_live -> encode -> decode -> apply_ent, the carriage is
+// wiped in between the way a client that knows nothing has it, and what comes out the
+// far side has to be what went in. Then the client's own ramp runs the SAME number of
+// ticks the server ran and has to land on the same blend.
+typedef struct { int ads_want, ready_want; float ads_s, tuck; } carry_t;
+
+static carry_t netcarry_read(int ent) {
+  int h = human_of_ent(ent);
+  const weapon_t *w = h >= 0 ? &g_players[h].wp : &g_bots[ent - 1].wp;
+  float tuck = h >= 0 ? g_players[h].tuck_y : 0.0f;
+  return (carry_t){w->ads_want, w->ready_want, w->ads_s, tuck};
+}
+
+// Erase everything the wire is supposed to carry, so a field that survives by
+// ACCIDENT (this is one process — server and client share the globals) cannot pass.
+static void netcarry_wipe(int ent) {
+  int h = human_of_ent(ent);
+  weapon_t *w = h >= 0 ? &g_players[h].wp : &g_bots[ent - 1].wp;
+  w->ads_want = w->ready_want = 0;
+  w->ads_lin = w->ads_s = 0.0f;
+  if (h >= 0) g_players[h].tuck_y = 0.0f;
+}
+
+// Ramp the server side for `ticks`, then round-trip and ramp the client side for the
+// same count. Returns 0 on a mismatch, and prints the row either way.
+static int netcarry_case(const char *label, int ent, int ticks) {
+  carry_t srv = netcarry_read(ent);
+  for (int i = 0; i < ticks; i++) {
+    int h = human_of_ent(ent);
+    gun_ads(h >= 0 ? &g_players[h].wp : &g_bots[ent - 1].wp, srv.ads_want);
+  }
+  srv = netcarry_read(ent);
+  net_ent_t ne;
+  net_ent_from_live(&ne, ent);
+  unsigned char buf[64];
+  np_wr w = {buf, sizeof buf, 0, 0};
+  net_ent_encode(&w, &ne);
+  np_rd r = {buf, w.at, 0, 0};
+  net_ent_t out;
+  int decoded = net_ent_decode(&r, &out);
+  netcarry_wipe(ent);
+  if (decoded) net_cl_apply_ent(&out);
+  // The client re-solves the blend from the intent, at its own tick rate, through the
+  // one gun_ads — so it has to arrive at the server's number, not merely at "nonzero".
+  for (int i = 0; i < ticks; i++) net_cl_carry_advance();
+  carry_t cl = netcarry_read(ent);
+  float dads = fabsf(cl.ads_s - srv.ads_s);
+  // ...AND THE POSE HAS TO READ THEM. Carrying the bits and feeding them to anim_tick
+  // are two different jobs, and this proof passed the first one while client_anim_all
+  // was still handing the solver a literal 0 — so drive the real client tick and take
+  // the carry state off the anim itself.
+  int h2 = human_of_ent(ent);
+  anim_t *an = h2 >= 0 ? &g_player_anim[h2] : &g_bots[ent - 1].anim;
+  an->ready_s = an->ads_s = 0.0f;
+  for (int i = 0; i < 30; i++) { g_tick++; client_anim_all(); }
+  float pose_ready = an->ready_s, pose_ads = an->ads_s;
+  // 30 ticks of ease_k(20) from 0 is ~0.99 up and ease_k(14) puts the blend past
+  // half; lowered, both stay pinned at 0 because nothing ever asked them to rise.
+  int want_up = srv.ready_want || srv.ads_want;
+  int pose_ok = want_up ? (pose_ready > 0.5f && (!srv.ads_want || pose_ads > 0.3f))
+                        : (pose_ready < 0.05f && pose_ads < 0.05f);
+  int ok = decoded && cl.ads_want == srv.ads_want &&
+           cl.ready_want == srv.ready_want &&
+           fabsf(cl.tuck - srv.tuck) < 1e-4f && dads < 0.02f && pose_ok;
+  printf("netcarry %s ent=%d ads_want=%d/%d ready=%d/%d tuck=%.3f/%.3f "
+         "ads_s=%.3f/%.3f d=%.4f pose_ready=%.2f pose_ads=%.2f %s\n",
+         label, ent, srv.ads_want, cl.ads_want, srv.ready_want, cl.ready_want,
+         (double)srv.tuck, (double)cl.tuck, (double)srv.ads_s, (double)cl.ads_s,
+         (double)dads, (double)pose_ready, (double)pose_ads, ok ? "ok" : "FAIL");
+  return ok;
+}
+
+static void netcarry_proof(void) {
+  g_online = 1;
+  g_local_ent = 0;               // human 0 is us; everything below is FOREIGN
+  g_cl.my_ent = 0;
+  g_cl.synced = 1;
+  // A HUMAN WHO IS AIMING, FIGHTING AND TUCKED — the three bits at once, because a
+  // flags byte is exactly where two of them get packed into one shift.
+  int h = 1, ent = ent_of_human(h);
+  g_humans_on[h] = 1;
+  player_t *p = &g_players[h];
+  player_spawn(p);
+  p->pos = p->prev_pos = (v3){{0.0f, 0.0f, 6.0f}};
+  p->alive = 1; p->hp = 100; p->grounded = 0;   // airborne: the tuck is legal
+  p->pitch = 0.42f;
+  p->tuck_y = HEIGHT_STAND - HEIGHT_CROUCH;
+  p->wp.ads_want = 1;
+  p->wp.ready_want = 1;
+  anim_reset(&g_player_anim[h], p->pos, p->yaw);
+  int ok = netcarry_case("human-ads", ent, 12);
+
+  // ...AND THE SAME FOR A BOT, whose carriage rides the identical bits: a client that
+  // only learned to read them for players sees twenty figures still slung.
+  g_match.nbots = 1;
+  bot_t *b = &g_bots[0];
+  memset(b, 0, sizeof *b);
+  b->active = 1; b->alive = 1; b->hp = 100;
+  b->pos = b->prev_pos = (v3){{2.0f, 0.0f, 6.0f}};
+  wpn_fill_mags(&b->wp);
+  b->wp.ads_want = 1;
+  b->wp.ready_want = 1;
+  anim_reset(&b->anim, b->pos, b->yaw);
+  ok &= netcarry_case("bot-ads", 1, 12);
+
+  // HIP FIRE — READY WITHOUT ADS, and it is the case that actually tests the READY
+  // bit. anim_tick raises the carry on `ready || ads > 0.05`, so with the rifle at the
+  // eye the ready argument is redundant and a client that dropped it still looks
+  // right; a man shooting from the hip at four metres is where the dropped bit shows.
+  p->wp.ads_want = 0;
+  p->wp.ready_want = 1;
+  p->tuck_y = 0.0f;
+  ok &= netcarry_case("human-hipfire", ent, 40);
+
+  // THE OTHER EDGE. A rifle that comes DOWN has to come down too: an intent bit that
+  // is only ever read when set is a bit that never clears.
+  p->wp.ready_want = 0;
+  ok &= netcarry_case("human-lowered", ent, 40);
+
+  printf("netcarry %s\n", ok ? "ok" : "FAIL");
+  if (!ok) exit(1);
 }
 
 // An online death all the way through to a corpse, client half.

@@ -404,18 +404,28 @@ static void player_move_tick(player_t *p, int ent, const int held[IN_COUNT],
   for (int i = 0; i < IN_COUNT; i++) p->prev_held[i] = raw_held[i];
 }
 
+// "THIS SOLDIER IS FIGHTING" — the player's carry predicate, and the ONE copy of it.
+// Two callers: the server/offline pose (below) and the online client's own predicted
+// body, which is the one entity no snapshot bit describes (client_anim_all).
+static int player_carry_ready(const player_t *p) {
+  return p->prev_held[IN_FIRE] || p->prev_held[IN_ADS] || p->wp.cool[p->wp.cur] > 0;
+}
+
 // The PRESENT half: anim solve and the corpse handover.
 static void player_present_tick(player_t *p, int ent) {
   int h = human_of_ent(ent);
   // prev_held holds THIS tick's raw input (copied at the end of the move
   // half), and the anim only runs alive, where raw == effective held.
-  if (p->alive)
+  if (p->alive) {
+    // THE PLAYER'S CARRY PREDICATE, AND IT IS READ BACK OFF THE ENTITY. A client
+    // cannot re-derive this one — it never sees a foreign player's buttons — so it
+    // travels as a flag bit, and computing it a second time at the wire is exactly
+    // how the pose and the packet would drift apart.
+    p->wp.ready_want = (unsigned char)player_carry_ready(p);
     anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
               p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
-              p->lean,
-              p->prev_held[IN_FIRE] || p->prev_held[IN_ADS] ||
-                  p->wp.cool[p->wp.cur] > 0,
-              ent);
+              p->lean, p->wp.ready_want, ent);
+  }
   else {
     g_player_anim[h].prev_pose = g_player_anim[h].pose;
     if (g_player_corpse_q[h]) {

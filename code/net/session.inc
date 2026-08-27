@@ -5,7 +5,10 @@
 // moving a definition out is a semantic change.
 // Contract: server-authoritative with client prediction and rollback
 // reconciliation; the event channel is the client's only source of its own
-// gunfire (ev_push suppressed via g_predicting while predicting).
+// gunfire (ev_push suppressed via g_predicting while predicting). Foreign
+// presentation is RE-SOLVED here, never received: net_cl_extrapolate projects
+// the body, net_cl_carry_advance re-runs the weapon's own ramps from the
+// intents the snapshot carried (proof: netcarry).
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Live connection layer — SHARED. The server accepts clients,
@@ -684,9 +687,16 @@ static void net_cl_apply_ent(const net_ent_t *e) {
     p->prev_pos = tele ? pos : p->pos; p->pos = pos; p->vel = vel;
     p->yaw = net_dq_yaw(e->yaw); p->pitch = net_dq_pitch(e->pitch);
     p->lean = net_dq_wish(e->lean);
-    p->alive = e->flags & 1; p->grounded = (e->flags >> 1) & 1;
-    p->crouched = (e->flags >> 2) & 1; p->sliding = (e->flags >> 3) & 1;
+    p->alive = !!(e->flags & NEF_ALIVE); p->grounded = !!(e->flags & NEF_GROUNDED);
+    p->crouched = !!(e->flags & NEF_CROUCH); p->sliding = !!(e->flags & NEF_SLIDE);
     p->hp = e->hp; p->wp.cur = e->weapon;
+    // THE CARRIAGE ARRIVES AS INTENT. ads_want feeds the client's own gun_ads
+    // (net_cl_carry_advance) rather than being a blend to copy; ready_want is the
+    // carry predicate the client cannot run itself; the tuck is one constant or
+    // nothing, which is why one bit carries the whole of it.
+    p->wp.ads_want = !!(e->flags & NEF_ADS);
+    p->wp.ready_want = !!(e->flags & NEF_READY);
+    p->tuck_y = (e->flags & NEF_TUCK) ? HEIGHT_STAND - HEIGHT_CROUCH : 0.0f;
     if (!g_humans_on[h]) { g_humans_on[h] = 1; anim_reset(&g_player_anim[h], pos, p->yaw); }
     else if (tele) anim_reset(&g_player_anim[h], pos, p->yaw);
   } else {
@@ -698,23 +708,53 @@ static void net_cl_apply_ent(const net_ent_t *e) {
     // yanked the body onto the server's solution, the next tick's rag_step pushed it
     // back onto the client's, and prev_pos was left holding whichever the other one
     // wrote.
-    int keep = g_cl_body[e->id] && !b->alive && !(e->flags & 1);
+    int keep = g_cl_body[e->id] && !b->alive && !(e->flags & NEF_ALIVE);
     if (!keep) { b->prev_pos = tele ? pos : b->pos; b->pos = pos; b->vel = vel; }
     // THE HEADING IS A PAIR TOO. scene_draw_bot lerps prev_yaw->yaw by the sub-tick
     // alpha exactly as it lerps the position pair, and offline bot_tick advances it
     // every tick.
     b->prev_yaw = tele ? byaw : b->yaw; b->yaw = byaw;
     b->pitch = net_dq_pitch(e->pitch);
-    b->alive = e->flags & 1; b->grounded = (e->flags >> 1) & 1;
-    b->crouch = (e->flags >> 2) & 1; b->sliding = (e->flags >> 3) & 1;
+    b->alive = !!(e->flags & NEF_ALIVE); b->grounded = !!(e->flags & NEF_GROUNDED);
+    b->crouch = !!(e->flags & NEF_CROUCH); b->sliding = !!(e->flags & NEF_SLIDE);
     b->hp = e->hp; b->wp.cur = e->weapon; b->active = 1;
+    b->wp.ads_want = !!(e->flags & NEF_ADS);      // a bot's carriage is the same
+    b->wp.ready_want = !!(e->flags & NEF_READY);  // two bits (it never tucks)
     if (tele) anim_reset(&b->anim, pos, b->yaw);
     if (e->id > g_match.nbots) g_match.nbots = e->id;   // grow the roster to fit
   }
 }
 
+// One tick of the CARRIAGE, for every foreign entity — the client half of the
+// "presentation is absent, the client re-solves it" contract at net_ent_from_live.
+// The snapshot carries the two INTENTS (NEF_ADS, NEF_READY); the blend is re-solved
+// here, at tick rate, through the one gun_ads the server ran, so a remote figure
+// shoulders its weapon on exactly the weapon's own ADS TIME instead of on the
+// snapshot cadence.
+//
+// This sits BEFORE net_cl_extrapolate's staleness cap on purpose. Projecting a
+// POSITION on stale velocity walks a body through a wall, so that stops; a carriage
+// ramp is clamped and converges on the last known intent, so continuing it costs at
+// worst a few ms of blend and freezing it leaves a half-raised rifle hanging.
+static void net_cl_carry_advance(void) {
+  int me = human_of_ent(g_cl.my_ent);
+  for (int h = 0; h < MAX_HUMANS; h++) {
+    if (!g_humans_on[h] || h == me) continue;
+    player_t *p = &g_players[h];
+    if (!p->alive) continue;
+    gun_ads(&p->wp, p->wp.ads_want);   // idempotent on the intent it re-publishes
+  }
+  for (int i = 0; i < g_match.nbots; i++) {
+    bot_t *b = &g_bots[i];
+    if (!b->active || !b->alive) continue;
+    gun_ads(&b->wp, b->wp.ads_want);
+  }
+}
+
 // One tick of dead reckoning for every FOREIGN entity.
 static void net_cl_extrapolate(void) {
+  net_cl_carry_advance();
+
   // BOUNDED dead reckoning: snapshots correct the projection every two
   // ticks; when they STOP (loss burst, server stall) unbounded projection
   // glides every foreign entity through walls on stale velocity until the 5 s
@@ -835,7 +875,7 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
     player_t *p = &g_players[h];
     v3 auth = {{net_dq_pos(es[i].x), net_dq_pos(es[i].y), net_dq_pos(es[i].z)}};
     v3 avel = {{net_dq_vel(es[i].vx), net_dq_vel(es[i].vy), net_dq_vel(es[i].vz)}};
-    uint8_t alive = es[i].flags & 1;
+    uint8_t alive = !!(es[i].flags & NEF_ALIVE);
     if (!g_humans_on[h]) g_humans_on[h] = 1;
     // The PREDICTION ERROR, and the CORRECTION, both anchor on predpos[li] — our own
     // recorded prediction for the tick the server just acked.
@@ -861,7 +901,7 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
           printf("netdbg corr li=%u seq=%u err=%.0fmm auth=(%.2f %.2f) pred=(%.2f %.2f) vel=(%.2f %.2f) grounded=%d\n",
                  li, g_cl.seq, (double)e_mm, (double)auth.x, (double)auth.z,
                  (double)pp.x, (double)pp.z, (double)avel.x, (double)avel.z,
-                 (es[i].flags >> 1) & 1);
+                 !!(es[i].flags & NEF_GROUNDED));
       }
     }
     // A big gap or a first fix is a SPAWN/desync, not drift: snap hard and re-solve the
@@ -916,8 +956,8 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
       g_cl.synced = 1;
       // The hard branch adopts the server's own derived state wholesale — a
       // spawn or desync means the prediction stream is broken anyway.
-      p->grounded = (es[i].flags >> 1) & 1;
-      p->crouched = (es[i].flags >> 2) & 1; p->sliding = (es[i].flags >> 3) & 1;
+      p->grounded = !!(es[i].flags & NEF_GROUNDED);
+      p->crouched = !!(es[i].flags & NEF_CROUCH); p->sliding = !!(es[i].flags & NEF_SLIDE);
       // A RESPAWN is a fresh weapon, exactly player_spawn's reset — the hard adopt used
       // to carry the dying weapon's cool/reload_t/recoil into the new life, locking
       // predicted fire until NP re-sync.
@@ -946,8 +986,8 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
       // ROLLBACK HEAL: a real divergence (> 5 cm at the acked tick).
       p->prev_pos = p->pos;                  // one honest render lerp
       p->pos = auth; p->vel = avel;
-      p->grounded = (es[i].flags >> 1) & 1;
-      p->crouched = (es[i].flags >> 2) & 1; p->sliding = (es[i].flags >> 3) & 1;
+      p->grounded = !!(es[i].flags & NEF_GROUNDED);
+      p->crouched = !!(es[i].flags & NEF_CROUCH); p->sliding = !!(es[i].flags & NEF_SLIDE);
       net_cl_restore_pred(p, h, li);         // recorded derived state at li…
       p->wp.cur = es[i].weapon;              // …then the server's weapon truth
       p->wp.ammo[p->wp.cur] = es[i].mag;     // replay re-predicts pending shots
