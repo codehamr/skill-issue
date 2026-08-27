@@ -103,11 +103,13 @@ all: build/game.exe build/game build/game-x86_64
 # old binary (the clock-skew trap, one directory deeper).
 INC := $(wildcard code/*/*.inc)
 
-# Application icon (Windows only): windres compiles game.rc (which embeds
-# icon.ico) into an object file linked alongside the single C translation unit.
+# Application icon + VERSIONINFO (Windows only): windres compiles game.rc
+# (which embeds icon.ico) into an object file linked alongside the single C
+# translation unit. VERFLAG is passed so the rc's version strings carry the
+# same BUILD_VERSION the C build gets.
 build/game.res.o: code/game.rc code/icon.ico
 	mkdir -p build
-	$(WIN_RES) $< -o $@
+	$(WIN_RES) --use-temp-file $(VERFLAG) $< -o $@
 
 build/game.exe: code/game.c build/game.res.o $(INC)
 	mkdir -p build

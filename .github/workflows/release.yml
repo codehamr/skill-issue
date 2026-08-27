@@ -7,10 +7,15 @@
 # it; it orders builds by the DATE still written into VERSION and SHA256SUMS'
 # "# version" header. Rollback is therefore client-side only (each client keeps
 # its own exe.old) — no prior release is kept to fall back to. Two
-# assets, deliberately: linux-amd64 (desktop + SteamOS) and windows-amd64 (also
-# covers Windows-on-ARM via its built-in x64 emulation). linux-arm64 was
+# BINARIES, deliberately: linux-amd64 (desktop + SteamOS) and windows-amd64
+# (also covers Windows-on-ARM via its built-in x64 emulation). linux-arm64 was
 # dropped 2026-08-08 — no player target, and the aarch64 devcontainer builds
-# "dev", which never auto-updates anyway.
+# "dev", which never auto-updates anyway. The windows .zip is browser-download
+# packaging ONLY, outside the update_asset_name()/entrypoint.sh asset-name
+# contract: Chrome treats a bare unsigned .exe download most aggressively, so
+# players are pointed at the zip while the updater keeps fetching the bare exe
+# (both SHA256SUMS readers match their own asset name exactly and ignore the
+# extra line).
 name: Release
 on:
   push:
@@ -101,6 +106,9 @@ jobs:
           V=$(cat dist/VERSION)
           # upload-artifact drops the x bit; the updater swaps the file in as-is.
           chmod +x dist/skill-issue-linux-*
+          # The browser-facing Windows download (see the header note). Built
+          # BEFORE SHA256SUMS so the skill-issue-* glob below covers it too.
+          ( cd dist && zip -q -9 skill-issue-windows-amd64.zip skill-issue-windows-amd64.exe )
           # The tag is fixed ("latest"), so the DATE the updater orders by lives
           # ONLY here — the "# version" header plus VERSION's own sum. Without it
           # an "update" could silently be a downgrade.

@@ -1,3 +1,36 @@
 // Application icon resource. Explorer picks the icon with the lowest ID as
 // the file icon; the Windows backend also loads ID 1 for the window class.
 1 ICON "icon.ico"
+
+// VERSIONINFO: publisher/product metadata baked into the .exe. This exists for
+// the antivirus heuristics, not for players — an anonymous unsigned binary
+// (no company, no product, no version) scores as suspicious on SmartScreen and
+// Chrome Safe Browsing; a populated block takes that heuristic away. windres
+// preprocesses this file, so BUILD_VERSION is the same -D string the C build
+// gets ("dev" locally, the release date in CI). The numeric FILEVERSION stays
+// 1,0,0,0 deliberately: the date is the real version and lives in the strings.
+1 VERSIONINFO
+FILEVERSION    1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS         0x40004L  // VOS_NT_WINDOWS32
+FILETYPE       0x1L      // VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"  // en-US, Unicode
+    BEGIN
+      VALUE "CompanyName",      "codehamr"
+      VALUE "FileDescription",  "skill issue - procedural arena FPS"
+      VALUE "FileVersion",      BUILD_VERSION
+      VALUE "InternalName",     "skill-issue"
+      VALUE "OriginalFilename", "skill-issue-windows-amd64.exe"
+      VALUE "ProductName",      "skill issue"
+      VALUE "ProductVersion",   BUILD_VERSION
+      VALUE "LegalCopyright",   "codehamr"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 0x04b0
+  END
+END

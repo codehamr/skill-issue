@@ -8,8 +8,10 @@ Sounds, animation, maps and guns are all generated in code. Nothing on disk exce
 
 ---
 
-**Windows** — grab `skill-issue-windows-amd64.exe`. It is unsigned, so SmartScreen throws up a
-"Windows protected your PC" wall. **More info** → **Run anyway**.
+**Windows** — grab `skill-issue-windows-amd64.zip` and unpack it. The exe inside is unsigned, so
+SmartScreen throws up a "Windows protected your PC" wall. **More info** → **Run anyway**. (The bare
+`.exe` asset is what the auto-updater fetches — downloading it in a browser tends to trip Chrome's
+unknown-file warning, the zip mostly doesn't.)
 
 **Linux** — grab `skill-issue-linux-amd64`. Runs on desktop and on Steam Deck. Your browser strips
 the execute bit on the way down:
