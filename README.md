@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/codehamr/skill-issue/releases/latest/download/skill-issue-windows-amd64.exe"><b>Download for Windows</b></a>
+  <a href="https://github.com/codehamr/skill-issue/releases/latest/download/skill-issue.exe"><b>Download for Windows</b></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/codehamr/skill-issue/releases/latest/download/skill-issue-linux-amd64"><b>Linux / Steam Deck</b></a><br>
+  <a href="https://github.com/codehamr/skill-issue/releases/latest/download/skill-issue-linux"><b>Linux / Steam Deck</b></a><br>
   One file, just over a megabyte. No installer, no launcher, no account.<br>
   <sub>Windows will warn (new, unsigned): More info, then Run anyway. Linux: <code>chmod +x</code> it first.
   Details on the <a href="https://github.com/codehamr/skill-issue/releases/latest">release page</a>.</sub>

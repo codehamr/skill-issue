@@ -37,7 +37,7 @@ typedef enum {
   NP_INPUT,         // client->server: input_tick(s) + event ack
   NP_SNAPSHOT,      // server->client: world state
   NP_LEAVE,         // client->server: I am going. Frees the slot NOW instead
-                    // of at the 10 s idle timeout — without it a quit-and-
+                    // of at the idle timeout — without it a quit-and-
                     // rejoin arrives from a fresh ephemeral port, finds its
                     // old conn still holding a human slot, and can be refused
                     // an arena that is half empty.

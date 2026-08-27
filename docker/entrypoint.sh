@@ -21,7 +21,7 @@ LOG="$SRV/server.log"
 STATS="$SRV/stats.txt"
 DATA="$SRV/data"
 BIN="$DATA/game"
-ASSET=skill-issue-linux-amd64
+ASSET=skill-issue-linux
 
 mkdir -p "$DATA"
 exec > >(tee -a "$LOG") 2>&1

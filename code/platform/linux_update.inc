@@ -249,7 +249,13 @@ static int native_main(int w, int h, uint32_t seed) {
   app_t app = {0};
   double last = nat_now();
 
+  // Installed HERE, after every start step that may legitimately die loudly: from now
+  // on ^C/`kill` must walk the full teardown below, not the default fatal handler.
+  signal(SIGINT, nat_sig);
+  signal(SIGTERM, nat_sig);
+
   while (g_running) {
+    if (g_nat_quit) break;   // signal quit: same exit as WM_DELETE, teardown below
     nat_pump();
     // Pump the pad even unfocused: the kernel's evdev buffer is a ring, and a
     // paused reader overflows it (SYN_DROPPED). State just isn't ACTED on.
@@ -296,6 +302,11 @@ static int native_main(int w, int h, uint32_t seed) {
     }
   }
 
+  // GOODBYE FIRST: every quit path through this teardown (window close, signal, in-game
+  // QUIT) hands a joined slot back to the server now instead of parking it for the idle
+  // timeout. Gated like leave_match's call — at boot g_cl is zeroed and its fd of 0
+  // would otherwise be "closed".
+  if (g_cl.state != NC_OFF) net_cl_disconnect();
   // Same ordering constraint the Windows teardown documents: signal the audio
   // thread first so it winds down while the window comes apart, and give the
   // cursor back before anything else — a crash from here on must not leave the

@@ -193,14 +193,18 @@ static int g_server;
 // Server parameters come from ARGV, not the config: argv is the interface the
 // deploy needs anyway, and it deletes the config-trap quartet (parser switch,
 // emit list, unknown-key deletion, live slider for a bind-time value).
-// 1 <= cap_public <= MAX_HUMANS is CHECKED at startup.
+// 1 <= cap_public <= MAX_HUMANS, 0 <= bot_fill <= cap_public and
+// 1 <= idle_s <= 120 are CHECKED at startup.
 static struct {   // consumed by the Linux server half only
   int port, cap_bots, cap_public, skill, fraglimit, lobbies;
+  int bot_fill;        // bots top a populated arena up to this (net_bot_target)
+  int idle_s;          // drop a silent conn after this many seconds (net_srv_poll)
   long ticks;          // 0 = run forever; N = exit after N ticks (test/RSS runs)
 // DESIGNATED, not positional: a positional list once fell out of step with the field
 // list and the server ran one tick and exited, forever, under the respawn wrapper.
 } g_srv = {.port = NET_PORT_DEF, .cap_bots = 2, .cap_public = 6,
-           .skill = 1, .fraglimit = 12, .lobbies = 1, .ticks = 0};
+           .skill = 1, .fraglimit = 12, .lobbies = 1,
+           .bot_fill = 2, .idle_s = 4, .ticks = 0};
 
 // WHICH entity is "me", the one identity allowed to differ per process: 0 in
 // singleplayer, the own id on a client, -1 on a dedicated server (where no branch gated

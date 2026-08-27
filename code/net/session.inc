@@ -113,12 +113,12 @@ static uint32_t net_srv_new_token(uint32_t ip, uint16_t port) {
   return t ? t : 1;
 }
 
-// The bot target is a pure function of the humans present: bots pad the arena up to
-// cap_public, at most cap_bots of them.
+// The bot target is a pure function of the humans present: bots top a populated arena
+// up to bot_fill, at most cap_bots of them, none when it is empty.
 static void net_srv_rebalance(void) {
   int humans = 0;
   for (int h = 0; h < MAX_HUMANS; h++) if (g_humans_on[h]) humans++;
-  g_cfg.sp_bots = net_bot_target(humans, g_srv.cap_public, g_srv.cap_bots);
+  g_cfg.sp_bots = net_bot_target(humans, g_srv.bot_fill, g_srv.cap_bots);
 }
 
 // Everything that makes a human slot THIS player's: score row, display name, player
@@ -433,8 +433,10 @@ static int net_srv_lobby_pick(void) {
   uint32_t now = net_now_ms();
   for (int l = 0; l < g_srv.lobbies; l++) {
     g_lobby = l;
-    for (int i = 0; i < MAX_HUMANS; i++)       // idle timeout: 10 s
-      if (g_conns[i].used && now - g_conns[i].last_recv_ms > 10000) net_srv_drop(i);
+    for (int i = 0; i < MAX_HUMANS; i++)       // idle timeout: --idle-timeout s
+      if (g_conns[i].used &&
+          now - g_conns[i].last_recv_ms > (uint32_t)(g_srv.idle_s * 1000))
+        net_srv_drop(i);
   }
   g_lobby = 0;
 }
@@ -645,12 +647,15 @@ static void net_cl_disconnect(void) {
   g_sim_wp = g_cfg.wp;
   // SAY GOODBYE. Best effort and unacknowledged — UDP, and a client that has already
   // lost the link cannot be helped — but in the common case (LEAVE MATCH, or quitting)
-  // it hands the slot back at once instead of parking it for the 10 s idle timeout.
+  // it hands the slot back at once instead of parking it for the idle timeout. Sent
+  // x3 against single-datagram loss: 24 bytes total, and the server side is
+  // idempotent (token-validated, `used`-guarded drop).
   if (g_cl.fd >= 0 && (g_cl.state == NC_PLAYING || g_cl.state == NC_JOINING)) {
     unsigned char b[8]; np_wr w = {b, sizeof b, 0, 0};
     np_w16(&w, NET_PROTO); np_w8(&w, NP_LEAVE);
     np_w32(&w, g_cl.token);                   // session token
-    net_udp_send(g_cl.fd, g_cl.ip, g_cl.port, b, (int)w.at);
+    for (int i = 0; i < 3; i++)
+      net_udp_send(g_cl.fd, g_cl.ip, g_cl.port, b, (int)w.at);
   }
   if (g_cl.fd >= 0) net_udp_close(g_cl.fd);
   memset(&g_cl, 0, sizeof g_cl);

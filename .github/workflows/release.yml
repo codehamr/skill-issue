@@ -10,12 +10,12 @@
 # BINARIES, deliberately: linux-amd64 (desktop + SteamOS) and windows-amd64
 # (also covers Windows-on-ARM via its built-in x64 emulation). linux-arm64 was
 # dropped 2026-08-08 — no player target, and the aarch64 devcontainer builds
-# "dev", which never auto-updates anyway. The windows .zip is browser-download
-# packaging ONLY, outside the update_asset_name()/entrypoint.sh asset-name
-# contract: Chrome treats a bare unsigned .exe download most aggressively, so
-# players are pointed at the zip while the updater keeps fetching the bare exe
-# (both SHA256SUMS readers match their own asset name exactly and ignore the
-# extra line).
+# "dev", which never auto-updates anyway. EVERY published binary asset is one
+# the update_asset_name()/entrypoint.sh asset-name contract names — no extra
+# browser-only packaging beside it. That is deliberate: the file a player
+# downloads and the file the updater fetches are then the same bytes under the
+# same name, so they share one SHA256SUMS line and one reputation with the
+# download reputation services instead of splitting it in two.
 name: Release
 on:
   push:
@@ -64,12 +64,13 @@ jobs:
           echo "$V" > VERSION
           make all BUILD_VERSION="$V" BUILD_COMMIT="$C"
           # game-x86_64, NOT game: the two are the same compile on an x86_64
-          # runner, but only the x86_64 target is guaranteed to be one — and
-          # an asset called linux-amd64 that is not amd64 fails on the player's
-          # machine with an exec format error, which is the failure the deploy
-          # guard exists for and which CI has no equivalent of.
-          mv build/game-x86_64 skill-issue-linux-amd64
-          mv build/game.exe    skill-issue-windows-amd64.exe
+          # runner, but only the x86_64 target is guaranteed to be one — and the
+          # asset name no longer says amd64, so nothing downstream would catch a
+          # wrong-arch binary before it fails on the player's machine with an exec
+          # format error. That is the failure the deploy guard exists for and
+          # which CI has no equivalent of.
+          mv build/game-x86_64 skill-issue-linux
+          mv build/game.exe    skill-issue.exe
 
       # Warning gate WITHOUT LTO (-flto swallows -Wformat-truncation),
       # then the self-contained proof gate. The build that ships is proved.
@@ -81,14 +82,17 @@ jobs:
           # compilers" contract, and a shadowed local could ship.
           gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
           x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
-          ./tools/ci-proofs.sh ./skill-issue-linux-amd64
+          ./tools/ci-proofs.sh ./skill-issue-linux
           # Memory-safety gate: the proof battery (incl. netfuzz, the packet
           # fuzzer) under ASan/UBSan. The Makefile target owns the recipe and
           # the reasoning; ~1 min compile + ~10 s run.
           make asan-gate
 
       - uses: actions/upload-artifact@v7
-        with: { name: assets, path: "skill-issue-*\nVERSION", if-no-files-found: error }
+        # "skill-issue*", NOT "skill-issue-*": skill-issue.exe has no dash after
+        # the stem. VERSION rides along as the date handoff only — it is NOT a
+        # release asset (see Publish).
+        with: { name: assets, path: "skill-issue*\nVERSION", if-no-files-found: error }
 
   release:
     needs: build
@@ -105,14 +109,12 @@ jobs:
           # The build job's date, not a fresh one — see the note there.
           V=$(cat dist/VERSION)
           # upload-artifact drops the x bit; the updater swaps the file in as-is.
-          chmod +x dist/skill-issue-linux-*
-          # The browser-facing Windows download (see the header note). Built
-          # BEFORE SHA256SUMS so the skill-issue-* glob below covers it too.
-          ( cd dist && zip -q -9 skill-issue-windows-amd64.zip skill-issue-windows-amd64.exe )
+          chmod +x dist/skill-issue-linux
           # The tag is fixed ("latest"), so the DATE the updater orders by lives
-          # ONLY here — the "# version" header plus VERSION's own sum. Without it
-          # an "update" could silently be a downgrade.
-          ( cd dist && { echo "# version $V"; sha256sum skill-issue-* VERSION; } > SHA256SUMS )
+          # ONLY in this header. Without it an "update" could silently be a
+          # downgrade. Sums cover the PUBLISHED assets and nothing else: a row for
+          # a file that is not on the release is a 404 waiting to be trusted.
+          ( cd dist && { echo "# version $V"; sha256sum skill-issue*; } > SHA256SUMS )
           # Exactly ONE release, always the tag "latest", recreated each push.
           # Delete every existing release+tag first (this also migrates away any
           # old dated releases), drop a dangling "latest" tag so the new tag
@@ -120,5 +122,14 @@ jobs:
           gh release list --limit 1000 --json tagName -q '.[].tagName' \
             | xargs -r -n1 gh release delete --yes --cleanup-tag
           git push origin :refs/tags/latest 2>/dev/null || true
-          gh release create latest dist/* --target "${{ github.sha }}" \
+          # Assets named ONE BY ONE, never dist/*: the release page is the product
+          # page, and it carries exactly the two binaries a player runs plus the
+          # feed that verifies them. VERSION stays behind in dist — nothing
+          # fetches it (the client reads SHA256SUMS' header, the server keeps its
+          # own copy), so publishing it only adds a row nobody clicks. GitHub's own
+          # "Source code (zip/tar.gz)" pair is attached to every tag and cannot be
+          # suppressed; that is the whole reason to keep OUR list this short.
+          gh release create latest \
+            dist/skill-issue.exe dist/skill-issue-linux dist/SHA256SUMS \
+            --target "${{ github.sha }}" \
             --title latest --latest --notes-file .github/release-body.md

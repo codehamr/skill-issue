@@ -103,10 +103,15 @@ static void sha256_hex(sha256_t *s, char out[65]) {
 }
 
 // ONE table, not an #ifdef expression: update_asset_name() picks its own row and
-// updinfo prints the WHOLE table for a manual cross-check.
-static const struct { const char *os, *arch, *suffix; } UPD_ASSETS[] = {
-  {"linux",   "amd64", ""},
-  {"windows", "amd64", ".exe"},
+// updinfo prints the WHOLE table for a manual cross-check. The names are LITERAL
+// and share no pattern on purpose — they are a contract with the release
+// workflow's `mv` lines and docker/entrypoint.sh's ASSET, and a name a reader can
+// only match EXACTLY (upd_compare rule 3) is one a clever format string can never
+// silently shift. A rename is therefore three edits, and the row order is the one
+// upd_own_asset() indexes.
+static const char *const UPD_ASSETS[] = {
+  "skill-issue-linux",   // 0: linux-amd64 — desktop, SteamOS, dedicated server
+  "skill-issue.exe",     // 1: windows-amd64 — also Windows-on-ARM (x64 emulation)
 };
 #define UPD_NASSETS ((int)(sizeof UPD_ASSETS / sizeof UPD_ASSETS[0]))
 static int upd_own_asset(void) {
@@ -119,8 +124,7 @@ static int upd_own_asset(void) {
 #endif
 }
 static void upd_asset_name(char *out, size_t n, int i) {
-  snprintf(out, n, "skill-issue-%s-%s%s",
-           UPD_ASSETS[i].os, UPD_ASSETS[i].arch, UPD_ASSETS[i].suffix);
+  snprintf(out, n, "%s", UPD_ASSETS[i]);
 }
 static int update_asset_name(char *out, size_t n) {
   int i = upd_own_asset();

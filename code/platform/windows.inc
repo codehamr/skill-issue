@@ -1005,6 +1005,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     }
   }
 
+  // GOODBYE FIRST, as in the Linux teardown: WM_CLOSE/Alt+F4 hands a joined slot back
+  // to the server instead of parking it for the idle timeout. Gated like leave_match's
+  // call — at boot g_cl is zeroed and its fd of 0 would otherwise be "closed".
+  if (g_cl.state != NC_OFF) net_cl_disconnect();
   atomic_store(&g_audio_run, 0);  // the audio thread winds down while the window closes
   // The context stops owning a drawable BEFORE the drawable goes: destroying a window
   // under a current context is undefined, and nothing released the context at all.

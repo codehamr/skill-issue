@@ -33,13 +33,24 @@ static int server_main(uint32_t seed) {
     fprintf(stderr, "server: --cap-bots out of range 0..%d\n", MAX_BOTS);
     return 1;
   }
+  if (g_srv.bot_fill < 0 || g_srv.bot_fill > g_srv.cap_public) {
+    fprintf(stderr, "server: need 0 <= --bot-fill (%d) <= --cap-public (%d)\n",
+            g_srv.bot_fill, g_srv.cap_public);
+    return 1;
+  }
+  if (g_srv.idle_s < 1 || g_srv.idle_s > 120) {
+    fprintf(stderr, "server: --idle-timeout out of range 1..120\n");
+    return 1;
+  }
   // No humans until a join; there is no "me" on a server. g_headless stays 0:
   // the event contract is a HARNESS contract, not a log format — at 1,
   // ev_push would write one line per event into server.log forever, and that
   // file has no rotation because its volume is bounded by design (decision 9).
   g_local_ent = -1;
   // Match parameters from argv, not from config.
-  g_cfg.sp_bots = net_bot_target(0, g_srv.cap_public, g_srv.cap_bots);
+  // An empty booting server holds no bots (net_bot_target returns 0 for 0 humans);
+  // the per-tick rebalance takes over on the first join.
+  g_cfg.sp_bots = net_bot_target(0, g_srv.bot_fill, g_srv.cap_bots);
   g_cfg.sp_diff = g_srv.skill < 0 ? 0 : g_srv.skill > 2 ? 2 : g_srv.skill;
   g_cfg.sp_frag = g_srv.fraglimit;
   signal(SIGINT, srv_sig);
@@ -62,9 +73,10 @@ static int server_main(uint32_t seed) {
     fprintf(stderr, "server: cannot bind UDP port %d (in use?)\n", g_srv.port);
     return 1;
   }
-  slog("server port=%d lobbies=%d cap=%d bots=%d skill=%d fraglimit=%d v=%s",
+  slog("server port=%d lobbies=%d cap=%d bots=%d skill=%d fraglimit=%d "
+       "bot_fill=%d idle_s=%d v=%s",
        g_srv.port, g_srv.lobbies, g_srv.cap_public, g_srv.cap_bots,
-       g_cfg.sp_diff, g_cfg.sp_frag, BUILD_VERSION);
+       g_cfg.sp_diff, g_cfg.sp_frag, g_srv.bot_fill, g_srv.idle_s, BUILD_VERSION);
   // Fixed 120 Hz on the absolute clock: sleep-until beats sleep-for (no
   // drift), and the backlog is MEASURED (worst `behind` goes into the
   // digest) instead of silently eaten. ~13 µs of sim per tick, 0.16% of a
@@ -181,6 +193,8 @@ int main(int argc, char **argv) {
     else if (arg && !strcmp(a, "--port"))       g_srv.port = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--cap-bots"))    g_srv.cap_bots = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--cap-public"))  g_srv.cap_public = atoi(argv[++i]);
+    else if (arg && !strcmp(a, "--bot-fill"))    g_srv.bot_fill = atoi(argv[++i]);
+    else if (arg && !strcmp(a, "--idle-timeout")) g_srv.idle_s = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--lobbies"))    g_srv.lobbies = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--skill"))      g_srv.skill = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--fraglimit"))  g_srv.fraglimit = atoi(argv[++i]);

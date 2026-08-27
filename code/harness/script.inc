@@ -1685,30 +1685,33 @@ static void cmd_netanim(sim_ctx_t *s) {
 static void cmd_netfill(sim_ctx_t *s) {
   (void)s;
   // The fill and cap rules over a join/leave timeline: a join never passes cap_public,
-  // bots pad to cap_public and never past cap_bots, and — the half a
-  // fixed-count model cannot express — the bots COME BACK when humans go.
-  int cb = g_srv.cap_bots, cp = g_srv.cap_public;
-  int humans = 0, bots = net_bot_target(0, cp, cb);   // empty server
-  int bots_empty = bots;
+  // bots keep a lonely human company up to bot_fill and never past cap_bots, an empty
+  // arena holds NONE, and — the half a fixed-count model cannot express — the company
+  // bot COMES BACK when the second human goes.
+  int cb = g_srv.cap_bots, cp = g_srv.cap_public, bf = g_srv.bot_fill;
+  int humans = 0, bots = net_bot_target(0, bf, cb);   // empty server
+  int bots_empty = bots;                              // must be 0: nobody to keep company
+  int bots_lonely = -1;                               // bots seen at exactly 1 human
   int max_public = 0, max_arena = bots;
   int over_public = 0, bots_over = 0, arena_over = 0;
   const int seq[] = {0,0,0,0,0,0,0,0,0,0,0, -1,-1,-1,-1,-1,-1,-1};
   for (int i = 0; i < (int)(sizeof seq / sizeof seq[0]); i++) {
     if (seq[i] < 0) { if (humans > 0) humans--; }
     else if (net_join_ok(humans, cp)) humans++;
-    bots = net_bot_target(humans, cp, cb);   // the one rule, every step
+    bots = net_bot_target(humans, bf, cb);   // the one rule, every step
     if (humans > cp) over_public++;
     if (bots > cb || bots < 0) bots_over++;
     if (humans + bots > cp) arena_over++;
+    if (humans == 1) bots_lonely = bots;
     if (humans > max_public) max_public = humans;
     if (humans + bots > max_arena) max_arena = humans + bots;
   }
-  int inv = cp >= 1 && cp <= MAX_HUMANS;
-  printf("netfill cap_bots=%d cap_public=%d inv(1<=cp<=%d)=%s "
+  int inv = cp >= 1 && cp <= MAX_HUMANS && bf >= 0 && bf <= cp;
+  printf("netfill cap_bots=%d cap_public=%d bot_fill=%d inv(caps)=%s "
          "public_max=%d arena_max=%d over_public=%d bots_over=%d "
-         "arena_over=%d bots_empty=%d bots_refill=%d\n",
-         cb, cp, MAX_HUMANS, inv ? "ok" : "FAIL", max_public, max_arena,
-         over_public, bots_over, arena_over, bots_empty, bots);
+         "arena_over=%d bots_empty=%d bots_lonely=%d bots_end=%d\n",
+         cb, cp, bf, inv ? "ok" : "FAIL", max_public, max_arena,
+         over_public, bots_over, arena_over, bots_empty, bots_lonely, bots);
 }
 
 static void cmd_netleave(sim_ctx_t *s) {

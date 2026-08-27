@@ -23,7 +23,7 @@ BEGIN
       VALUE "FileDescription",  "skill issue - procedural arena FPS"
       VALUE "FileVersion",      BUILD_VERSION
       VALUE "InternalName",     "skill-issue"
-      VALUE "OriginalFilename", "skill-issue-windows-amd64.exe"
+      VALUE "OriginalFilename", "skill-issue.exe"
       VALUE "ProductName",      "skill issue"
       VALUE "ProductVersion",   BUILD_VERSION
       VALUE "LegalCopyright",   "codehamr"

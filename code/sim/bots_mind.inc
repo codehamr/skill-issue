@@ -657,12 +657,15 @@ static v3 ent_pos(int e) {
   return h >= 0 ? g_players[h].pos : g_bots[e - 1].pos;
 }
 
-// Fill / cap decisions. cap_bots is how many bots the arena may hold, cap_public how
-// large it may grow through the public door (humans AND bots together).
-static int net_bot_target(int humans, int cap_public, int cap_bots) {
-  int room = cap_public - humans;
-  if (room > cap_bots) room = cap_bots;
-  return room < 0 ? 0 : room;
+// Fill / cap decisions. bot_fill is the company target: bots top a populated arena up
+// to it (at most cap_bots of them) so a lonely human has an opponent, and an EMPTY
+// arena holds none. The old middle parameter was cap_public — bots padded toward the
+// arena cap, which had an idle server simulating one bot for nobody in every lobby.
+static int net_bot_target(int humans, int bot_fill, int cap_bots) {
+  if (humans <= 0) return 0;
+  int want = bot_fill - humans;
+  if (want > cap_bots) want = cap_bots;
+  return want < 0 ? 0 : want;
 }
 static int net_join_ok(int humans, int cap_public) {
   return humans < cap_public;

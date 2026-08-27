@@ -36,6 +36,7 @@
 #include <X11/keysym.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <time.h>
 
 // --- XInput2, hand-declared ------------------------------------------------
@@ -151,6 +152,11 @@ static EGLSurface g_egl_surf = EGL_NO_SURFACE;
 static EGLContext g_egl_ctx = EGL_NO_CONTEXT;
 
 static int   g_running = 1, g_active, g_mapped, g_grabbed, g_fullscreen = 1;
+// ^C / `kill` quit through the SAME teardown as the window close: the frame loop maps
+// this flag onto g_running, so the net goodbye and the config write both still run.
+// The dedicated server's srv_sig/g_srv_stop is a different path — this is play-mode.
+static volatile sig_atomic_t g_nat_quit;
+static void nat_sig(int sig) { (void)sig; g_nat_quit = 1; }
 static float g_mouse_dx, g_mouse_dy;
 static int   g_xerr;                 // X protocol errors seen, for diagnosis
 
