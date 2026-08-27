@@ -410,8 +410,16 @@ static void upd_spawn_failed(void) {   // the thread never started: undo the gat
 // Download the offered asset to MEMORY and verify its SHA-256 there (the TOCTOU rule:
 // the filesystem is touched only after this returns).
 static char *upd_download_verified(size_t *out_len) {
+  // The ONE legal caller state is APPLYING: upd_arm_apply moved the offer
+  // (UPDATE/RECUT) there before upd_auto_tick calls into the apply. Testing
+  // for the offer states here instead was the bug that broke every auto-update
+  // since the arm flow existed — armed meant "not an offer any more", this
+  // returned NULL with no why, and the tick published UPD_FAILED forever.
   int st = atomic_load(&g_upd_state);
-  if (st != UPD_UPDATE && st != UPD_RECUT) return NULL;
+  if (st != UPD_APPLYING) {
+    snprintf(g_upd_why, sizeof g_upd_why, "STATE");
+    return NULL;
+  }
   char own[64], url[128 + 128];
   if (!update_asset_name(own, sizeof own)) return NULL;   // no asset: nothing to install
   snprintf(url, sizeof url, "%s/releases/latest/download/%s", g_cfg.update_url, own);

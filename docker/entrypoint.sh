@@ -34,6 +34,20 @@ say() { echo "$(date +%s) updater $*"; }
 fetch_sums()    { curl -fsSL --max-time 30 "$UPDATE_URL/SHA256SUMS" -o "$DATA/SHA256SUMS.new"; }
 sums_version()  { awk '/^# version /{print $3; exit}' "$DATA/SHA256SUMS.new" 2>/dev/null; }
 local_version() { cat "$DATA/VERSION" 2>/dev/null || true; }
+sums_sha()      { awk -v a="$ASSET" '$2 == a {print $1; exit}' "$1" 2>/dev/null; }
+
+# Newer date wins; a SAME-date feed whose asset row carries a different sha is
+# a RECUT (several pushes on one day re-cut `latest` under the same date — the
+# client updater has a verdict for exactly this) and counts as an update too.
+# Downgrades (older date) stay refused.
+feed_is_newer() {
+  local new cur
+  new=$(sums_version); cur=$(local_version)
+  [ -n "$new" ] || return 1
+  [[ "$new" > "$cur" ]] && return 0                # ISO dates order lexically
+  [ "$new" = "$cur" ] &&
+    [ "$(sums_sha "$DATA/SHA256SUMS.new")" != "$(sums_sha "$DATA/SHA256SUMS")" ]
+}
 
 install_release() {   # $1 = version parsed from the freshly fetched SHA256SUMS
   curl -fsSL --max-time 300 "$UPDATE_URL/$ASSET" -o "$BIN.new" || return 1
@@ -115,9 +129,10 @@ while :; do
   if [ "$pending_since" -eq 0 ] && [ "$now" -ge "$next_check" ]; then
     next_check=$(( now + UPDATE_INTERVAL ))
     if fetch_sums; then
-      new=$(sums_version); cur=$(local_version)
-      if [ -n "$new" ] && [[ "$new" > "$cur" ]]; then   # ISO dates order lexically
-        say "update available: ${cur:-none} -> $new"; pending_since=$now
+      if feed_is_newer; then
+        cur=$(local_version)
+        say "update available: ${cur:-none} -> $(sums_version)"
+        pending_since=$now
       fi
     else
       say "update check failed (fetch)"
