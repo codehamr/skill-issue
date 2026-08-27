@@ -96,21 +96,27 @@ endif
 # the only target that never needs a cross compiler.
 all: build/game.exe build/game build/game-x86_64
 
+# Every module of the ONE translation unit. game.c is the skeleton and the
+# MAP; the .inc files are its body, included in order. Without them here,
+# `make` does not rebuild after a subsystem edit and you photograph the
+# old binary (the clock-skew trap, one directory deeper).
+INC := $(wildcard code/*/*.inc)
+
 # Application icon (Windows only): windres compiles game.rc (which embeds
 # icon.ico) into an object file linked alongside the single C translation unit.
 build/game.res.o: code/game.rc code/icon.ico
 	mkdir -p build
 	$(WIN_RES) $< -o $@
 
-build/game.exe: code/game.c build/game.res.o
+build/game.exe: code/game.c build/game.res.o $(INC)
 	mkdir -p build
 	$(WIN_CC) $(WIN_CFLAGS) $(VERFLAG) code/game.c build/game.res.o -o $@ $(WIN_LIBS)
 
-build/game: code/game.c
+build/game: code/game.c $(INC)
 	mkdir -p build
 	$(LIN_CC) $(LIN_CFLAGS) $(VERFLAG) $< -o $@ $(LIN_LIBS)
 
-build/game-x86_64: code/game.c
+build/game-x86_64: code/game.c $(INC)
 	mkdir -p build
 	$(X86_CC) $(LIN_CFLAGS) $(VERFLAG) $< -o $@ $(LIN_LIBS)
 
@@ -118,7 +124,7 @@ build/game-x86_64: code/game.c
 # float-cast-overflow and float-divide-by-zero are NOT in -fsanitize=undefined
 # and are exactly the classes -ffast-math makes most likely (a NaN reaching an
 # (int) cast, a zero-length normalize), so they are named explicitly.
-build/game-asan: code/game.c
+build/game-asan: code/game.c $(INC)
 	mkdir -p build
 	$(LIN_CC) -std=c23 -O1 -g -fsanitize=address,undefined,float-cast-overflow,float-divide-by-zero -Wall -Wextra $< -o $@ $(LIN_LIBS)
 
@@ -462,6 +468,11 @@ server-logs-reset:
 	  n=$$(wc -c < "$$D/game.log"); : > "$$D/game.log"; \
 	  echo "game.log reset on $(SERVER_HOST) ($$n bytes cleared; all-time stats start over)"'
 
+# Lines of C code: game.c plus the *.inc splits under code/. Only code/ —
+# .superpowers/ holds stale snapshot copies of game.c that must not count.
+loc:
+	@find code -name '*.c' -o -name '*.h' -o -name '*.inc' | sort | xargs wc -l
+
 # build/ carries a Dropbox-ignore NTFS attribute on the folder itself —
 # delete its contents, never the folder, or the attribute is lost.
 clean:
@@ -473,4 +484,4 @@ init:
 	git push --force origin main
 	@echo "Git history reset to single 'init' commit"
 
-.PHONY: all clean deploy init server-deploy server-delete server-logs server-logs-reset asan-gate
+.PHONY: all clean deploy init loc server-deploy server-delete server-logs server-logs-reset asan-gate

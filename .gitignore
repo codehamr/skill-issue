@@ -11,6 +11,8 @@ post/
 tools/*
 !tools/ci-proofs.sh
 !tools/server-report.awk
+!tools/byte-gate.sh
+!tools/split-check.sh
 media/.cache/
 CLAUDE.md
 AGENTS.md

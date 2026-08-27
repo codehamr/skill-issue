@@ -1,0 +1,6 @@
+{
+  // A .inc file is C — a body fragment of the one translation unit in
+  // code/game.c, not a header and not a separate unit. Without this an editor
+  // shows thousands of lines of unhighlighted text and no symbol navigation.
+  "files.associations": { "*.inc": "c" }
+}
