@@ -7,8 +7,9 @@
 // reconciliation; the event channel is the client's only source of its own
 // gunfire (ev_push suppressed via g_predicting while predicting). Foreign
 // presentation is RE-SOLVED here, never received: net_cl_extrapolate projects
-// the body, net_cl_carry_advance re-runs the weapon's own ramps from the
-// intents the snapshot carried (proof: netcarry).
+// the body, net_cl_present_advance re-runs the weapon's own clocks from the intents
+// the snapshot carried and the events it delivered, and ent_on_event (sim/combat.inc)
+// applies the impulses — kick, reload, flinch (proof: netcarry, netfigure).
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Live connection layer — SHARED. The server accepts clients,
@@ -691,7 +692,7 @@ static void net_cl_apply_ent(const net_ent_t *e) {
     p->crouched = !!(e->flags & NEF_CROUCH); p->sliding = !!(e->flags & NEF_SLIDE);
     p->hp = e->hp; p->wp.cur = e->weapon;
     // THE CARRIAGE ARRIVES AS INTENT. ads_want feeds the client's own gun_ads
-    // (net_cl_carry_advance) rather than being a blend to copy; ready_want is the
+    // (net_cl_present_advance) rather than being a blend to copy; ready_want is the
     // carry predicate the client cannot run itself; the tuck is one constant or
     // nothing, which is why one bit carries the whole of it.
     p->wp.ads_want = !!(e->flags & NEF_ADS);
@@ -725,35 +726,46 @@ static void net_cl_apply_ent(const net_ent_t *e) {
   }
 }
 
-// One tick of the CARRIAGE, for every foreign entity — the client half of the
+// One tick of a foreign entity's WEAPON PRESENTATION — the client half of the
 // "presentation is absent, the client re-solves it" contract at net_ent_from_live.
-// The snapshot carries the two INTENTS (NEF_ADS, NEF_READY); the blend is re-solved
-// here, at tick rate, through the one gun_ads the server ran, so a remote figure
-// shoulders its weapon on exactly the weapon's own ADS TIME instead of on the
-// snapshot cadence.
+// Nothing here is on the wire, and nothing here needs to be: each clock is re-solved
+// from something the client was given, through the same one copy the server ran.
+//
+//   the AIM BLEND, from the NEF_ADS intent, through the one gun_ads — so a remote
+//     figure shoulders its weapon on exactly the weapon's own ADS TIME rather than
+//     on the snapshot cadence;
+//   the RELOAD CLOCK, started by EV_RELOAD in ent_on_event and counted down here on
+//     the same gun_reload_tick the shooter ran — without the countdown reload_t would
+//     be stamped once and never move, i.e. a magazine change that begins and never
+//     ends.
+//
+// FOREIGN ONLY, both of them: our own body is predicted, and re-running either clock
+// on top of prediction would double it.
 //
 // This sits BEFORE net_cl_extrapolate's staleness cap on purpose. Projecting a
-// POSITION on stale velocity walks a body through a wall, so that stops; a carriage
-// ramp is clamped and converges on the last known intent, so continuing it costs at
-// worst a few ms of blend and freezing it leaves a half-raised rifle hanging.
-static void net_cl_carry_advance(void) {
+// POSITION on stale velocity walks a body through a wall, so that stops; these
+// converge on the last known intent, so continuing them costs at worst a few ms of
+// blend and freezing them leaves a half-raised rifle hanging.
+static void net_cl_present_advance(void) {
   int me = human_of_ent(g_cl.my_ent);
   for (int h = 0; h < MAX_HUMANS; h++) {
     if (!g_humans_on[h] || h == me) continue;
     player_t *p = &g_players[h];
     if (!p->alive) continue;
     gun_ads(&p->wp, p->wp.ads_want);   // idempotent on the intent it re-publishes
+    gun_reload_tick(&p->wp);
   }
   for (int i = 0; i < g_match.nbots; i++) {
     bot_t *b = &g_bots[i];
     if (!b->active || !b->alive) continue;
     gun_ads(&b->wp, b->wp.ads_want);
+    gun_reload_tick(&b->wp);
   }
 }
 
 // One tick of dead reckoning for every FOREIGN entity.
 static void net_cl_extrapolate(void) {
-  net_cl_carry_advance();
+  net_cl_present_advance();
 
   // BOUNDED dead reckoning: snapshots correct the projection every two
   // ticks; when they STOP (loss burst, server stall) unbounded projection

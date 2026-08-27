@@ -178,7 +178,7 @@ static int netcarry_case(const char *label, int ent, int ticks) {
   if (decoded) net_cl_apply_ent(&out);
   // The client re-solves the blend from the intent, at its own tick rate, through the
   // one gun_ads — so it has to arrive at the server's number, not merely at "nonzero".
-  for (int i = 0; i < ticks; i++) net_cl_carry_advance();
+  for (int i = 0; i < ticks; i++) net_cl_present_advance();
   carry_t cl = netcarry_read(ent);
   float dads = fabsf(cl.ads_s - srv.ads_s);
   // ...AND THE POSE HAS TO READ THEM. Carrying the bits and feeding them to anim_tick
@@ -254,6 +254,143 @@ static void netcarry_proof(void) {
   ok &= netcarry_case("human-lowered", ent, 40);
 
   printf("netcarry %s\n", ok ? "ok" : "FAIL");
+  if (!ok) exit(1);
+}
+
+// --- The foreign figure's IMPULSES -------------------------------------------
+// netcarry proves the LEVELS arrive: the aim intent, the carry state and the tuck ride
+// the flag byte because they are continuous and a client cannot derive them. This
+// proves the EDGES do. A shot's kick, a reload's clock and a round's flinch are the
+// three things that move a body which no snapshot FIELD describes — they were written
+// inside the sim, at the action, and a client never runs the sim for a foreign entity,
+// so on every figure a player actually looks at all three were silently absent:
+// measured before ent_on_event existed, fire_k held 0.000 across a whole burst and
+// reload_t never left zero. They ride the event channel, which already carries all
+// three with the shooter's and the victim's id on them.
+//
+// One entity, driven ONLY the way a client drives one — wire record in, events in,
+// net_cl_present_advance and client_anim_all for the clocks — and the four things a
+// viewer has to be able to see have to come out.
+static float netfigure_bore_off_aim(int ent) {
+  const anim_t *a = ent_anim(ent);
+  int h = human_of_ent(ent);
+  float yaw   = h >= 0 ? g_players[h].yaw   : g_bots[ent - 1].yaw;
+  float pitch = h >= 0 ? g_players[h].pitch : g_bots[ent - 1].pitch;
+  v3 aim = {{sinf(yaw) * cosf(pitch), sinf(pitch), -cosf(yaw) * cosf(pitch)}};
+  v3 gf = v3_norm(a->pose.gun_f);
+  return acosf(f_clamp(v3_dot(gf, aim), -1.0f, 1.0f)) * (180.0f / F_PI);
+}
+
+static void netfigure_proof(void) {
+  g_online = 1;
+  g_local_ent = 0;
+  g_cl.my_ent = 0;
+  g_cl.synced = 1;
+  g_humans_on[0] = 1;
+  player_spawn(&g_players[0]);
+  int h = 1, ent = ent_of_human(h);
+  g_humans_on[h] = 1;
+  player_t *p = &g_players[h];
+  player_spawn(p);
+  p->pos = p->prev_pos = (v3){{0.0f, 0.0f, 6.0f}};
+  p->alive = 1; p->hp = 100; p->grounded = 1;
+  p->yaw = 0.7f; p->pitch = -0.05f;
+  p->wp.cur = WPN_AR;
+  p->wp.ads_want = p->wp.ready_want = 0;   // PATROL: he is holding nothing down
+  anim_reset(&g_player_anim[h], p->yaw ? p->pos : p->pos, p->yaw);
+  anim_t *A = ent_anim(ent);
+  weapon_t *W = ent_weapon(ent);
+  for (int i = 0; i < 40; i++) { g_tick++; net_cl_present_advance(); client_anim_all(); }
+  float slung = netfigure_bore_off_aim(ent);
+
+  // 1. THE SHOT. The round leaves along the aim axis on the tick the trigger breaks, so
+  // the rifle has to be ON that axis on that same tick — not 20 ticks later, which is
+  // what the carry ramp alone delivered (measured: 36.96 deg still off at the shot).
+  v3 aim = {{sinf(p->yaw) * cosf(p->pitch), sinf(p->pitch), -cosf(p->yaw) * cosf(p->pitch)}};
+  v3 muz_slung = pose_muzzle(&A->pose, p->wp.cur);
+  ev_push((event_t){.type = EV_FIRE, .src = ent, .wpn = p->wp.cur,
+                    .a = v3_add(p->pos, v3_scale(aim, 20.0f)), .b = aim});
+  float kick = A->fire_k;
+  // WHERE THE TRACER AND THE FLASH JUST ANCHORED. vfx_ev_fire reads the pose from
+  // inside that push, so this is the muzzle the shot's VFX were pinned to — and it has
+  // to be the RAISED rifle's, not the pose the previous tick left behind. Raising the
+  // carriage without re-solving moved the rifle up and left the flash at the hip,
+  // 0.60 m away: a visibly detached star, which is why the shot re-solves its shooter.
+  v3 muz_shot = pose_muzzle(&A->pose, p->wp.cur);
+  g_tick++; net_cl_present_advance(); client_anim_all();
+  float shot_off = netfigure_bore_off_aim(ent);
+  v3 muz_drawn = pose_muzzle(&A->pose, p->wp.cur);
+  float anchor = v3_len(v3_sub(muz_shot, muz_drawn));   // spawn vs what is drawn
+  float raised = v3_len(v3_sub(muz_slung, muz_drawn));  // how far the rifle travelled
+  int ok_shot = slung > 20.0f && shot_off < 0.5f && kick > 0.9f &&
+                raised > 0.20f && anchor < 0.05f;
+
+  // 2. THE RELOAD, and it has to END. A clock stamped by the event and never counted
+  // down is a magazine change that begins and hangs — which is what a client did with
+  // reload_t before net_cl_present_advance ran gun_reload_tick on foreign weapons.
+  int dur = wpn_reload_ticks(W->cur, 0);
+  ev_push((event_t){.type = EV_RELOAD, .src = ent, .a = p->pos, .wpn = W->cur, .k = 0});
+  int started = W->reload_t;
+  // ...and the POSE has to move with it: gun_anim is what the figure's hands read.
+  gunanim_t mid = {0};
+  for (int i = 0; i < dur; i++) {
+    if (i == dur / 3) mid = gun_anim(W, 1.0f);
+    g_tick++; net_cl_present_advance(); client_anim_all();
+  }
+  int ok_reload = started == dur && W->reload_t == 0 &&
+                  (fabsf(mid.arc) > 0.01f || fabsf(mid.mag) > 0.01f);
+
+  // 3. THE ROUND LANDING: the hit flash and the flinch, both off the same EV_HIT, and
+  // the flash has to EXPIRE — set by an event and counted down by nobody is a figure
+  // that stays lit for the rest of the match.
+  A->hit_k = 0.0f;
+  ev_push((event_t){.type = EV_HIT, .a = v3_add(p->pos, (v3){{0.0f, 1.10f, 0.0f}}),
+                    .b = v3_add(p->pos, (v3){{0.0f, 1.50f, 4.0f}}),
+                    .i = 26, .k = 74, .src = 0, .dst = ent});
+  int lit = p->flash, flinched = A->hit_k > 0.01f;
+  for (int i = 0; i < BOT_FLASH_TICKS + 2; i++) {
+    g_tick++; net_cl_present_advance(); client_anim_all();
+  }
+  int ok_hit = lit == BOT_FLASH_TICKS && flinched && p->flash == 0;
+
+  // 4. OUR OWN BODY IS NOT A FOREIGN ONE. The local player's reload is PREDICTED ticks
+  // before the server's echo of it arrives; re-stamping the clock on that echo would
+  // add a full round trip to every magazine. The running clock is the whole test — no
+  // mode predicate — so a reload already in flight has to survive its own event.
+  player_t *me = &g_players[0];
+  me->wp.cur = WPN_AR;
+  me->wp.reload_t = 5;
+  me->wp.reload_tac = 1;
+  ev_push((event_t){.type = EV_RELOAD, .src = 0, .a = me->pos,
+                    .wpn = me->wp.cur, .k = 0});
+  int ok_mine = me->wp.reload_t == 5 && me->wp.reload_tac == 1;
+
+  // 5. THE CARRY PREDICATE ITSELF — the server-side half, and the one thing on this
+  // list a client cannot re-derive (it never sees a foreign player's buttons), so it
+  // travels as NEF_READY and netcarry proves the transport. What it has to SAY is
+  // here: a man whose weapon is busy in his hands, or who is taking rounds, is
+  // fighting. Without those rows the rifle came up on the trigger and nowhere earlier,
+  // which is a carry that only tells an opponent the truth after the first round.
+  static player_t q;                       // static: player_t is not a stack object
+  q = (player_t){0};
+  q.wp.cur = WPN_AR;
+  int cr_patrol = player_carry_ready(&q);
+  q.wp.reload_t = 40; int cr_reload = player_carry_ready(&q); q.wp.reload_t = 0;
+  q.wp.switch_t = 12; int cr_swap   = player_carry_ready(&q); q.wp.switch_t = 0;
+  q.flash = BOT_FLASH_TICKS; int cr_hit = player_carry_ready(&q); q.flash = 0;
+  q.prev_held[IN_FIRE] = 1; int cr_fire = player_carry_ready(&q);
+  int ok_carry = !cr_patrol && cr_reload && cr_swap && cr_hit && cr_fire;
+
+  int ok = ok_shot && ok_reload && ok_hit && ok_mine && ok_carry;
+  printf("netfigure carry patrol=%d reload=%d swap=%d hit=%d fire=%d | ",
+         cr_patrol, cr_reload, cr_swap, cr_hit, cr_fire);
+  printf("slung=%.2fdeg shot_off=%.2fdeg kick=%.2f raise=%.2fm anchor=%.3fm | "
+         "reload %d/%d end=%d "
+         "arc=%.2f | flash=%d/%d flinch=%d expired=%d | own_reload=%d %s\n",
+         (double)slung, (double)shot_off, (double)kick, (double)raised, (double)anchor,
+         started, dur, W->reload_t,
+         (double)mid.arc, lit, BOT_FLASH_TICKS, flinched, p->flash == 0,
+         me->wp.reload_t, ok ? "ok" : "FAIL");
   if (!ok) exit(1);
 }
 

@@ -1,12 +1,15 @@
 // =============================================================================
 // sim/combat.inc  —  player_respawn, ent_damage, match_on_kill, gun_shoot/
-// gun_anim, mv_locomote (the bot+puppet locomotion dispatch), tactical
-// steering.
-// Proof: parity, botflank, botweapon. One TU: included once by game.c, in
-// definition order — moving a definition out is a semantic change.
+// gun_anim, ent_on_event (the impulse echo), mv_locomote (the bot+puppet
+// locomotion dispatch), tactical steering.
+// Proof: parity, botflank, botweapon, netfigure. One TU: included once by
+// game.c, in definition order — moving a definition out is a semantic change.
 // Contract: gun_shoot/gun_build/gun_anim are each the ONE copy for every
 // view and every shooter; PEN_PATH (1.20 m, core/hitscan.inc) is a path
-// length, not a per-weapon budget.
+// length, not a per-weapon budget. An action's PRESENTATION is not written
+// at the action: the kick, the reload clock and the flinch leave through
+// ev_push and land in ent_on_event, which is the only version of them a
+// viewer of a FOREIGN entity ever runs.
 // =============================================================================
 static void player_respawn(player_t *p, int ent) {
   int h = human_of_ent(ent);
@@ -150,7 +153,7 @@ static void rag_launch(rag_t *r, v3 pos, v3 vel, int grounded, v3 from, v3 at,
 }
 
 // TAKING A ROUND, for whoever took it.
-static void anim_hit(anim_t *a, v3 pos, float yaw, v3 from, v3 at, int hs) {
+static void anim_hit(anim_t *a, v3 pos, v3 from, v3 at, int hs) {
   v3 hd = v3_sub(at, from);
   hd.y = 0.0f;
   if (v3_dot(hd, hd) > 1e-6f) a->hit_d = v3_norm(hd);
@@ -166,8 +169,10 @@ static void anim_hit(anim_t *a, v3 pos, float yaw, v3 from, v3 at, int hs) {
   // Lateral offset in the body's OWN right axis, normalised on a shoulder half-breadth:
   // that is the widest a hitbox admits, so +-1 is a hit on the point of a shoulder and
   // 0 is dead centre line.
+  // The body's OWN right axis is the solved leg yaw, never the entity's aim yaw: a
+  // man shot while looking over his shoulder takes the round in the shoulder he
+  // actually has there.
   v3 rt = {{cosf(a->leg_yaw), 0.0f, sinf(a->leg_yaw)}};
-  (void)yaw;
   v3 rel = v3_sub(at, pos);
   a->hit_x = f_clamp((rel.x * rt.x + rel.z * rt.z) / 0.26f, -1.0f, 1.0f);
   a->hit_w = 0.0f;
@@ -192,10 +197,9 @@ static void ent_damage(int ent, int dmg, int part, int src, v3 from, v3 at) {
     // what the VFX layer needs to put sparks on the wound.
     ev_push((event_t){.type = hs ? EV_HIT_HEAD : EV_HIT, .a = at, .b = from,
                       .i = dmg, .k = pl->hp, .src = src, .dst = ent});
-    // The player's third-person body flinches on the same helper a bot's does.
-    pl->flash = BOT_FLASH_TICKS;
-    pl->flash_head = hs;
-    if (pl->hp > 0) anim_hit(&g_player_anim[vh], pl->pos, pl->yaw, from, at, hs);
+    // The flash and the flinch are NOT set here — they ride the EV_HIT just pushed
+    // (ent_on_event), which is the only version of this round a viewer of a FOREIGN
+    // victim ever gets. The two branches of this function used to hold one copy each.
     if (pl->hp == 0 && pl->alive) {
       pl->alive = 0;
       pl->respawn_t = PLAYER_RESPAWN_TICKS;
@@ -216,15 +220,9 @@ static void ent_damage(int ent, int dmg, int part, int src, v3 from, v3 at) {
   bot_t *b = &g_bots[ent - 1];
   b->hp -= dmg;
   if (b->hp < 0) b->hp = 0;
-  b->flash = BOT_FLASH_TICKS;
-  b->flash_head = hs;
   ev_push((event_t){.type = hs ? EV_HIT_HEAD : EV_HIT, .a = at, .b = from,
                     .i = dmg, .k = b->hp, .src = src, .dst = ent});
   if (b->hp > 0) {
-    // The body flinches AWAY from the shooter, so the round's own direction of travel
-    // is the pose input — available here for free and nowhere downstream, which is why
-    // it is latched rather than derived.
-    anim_hit(&b->anim, b->pos, b->yaw, from, at, hs);
     // Flinch: being shot at throws the aim off and briefly makes the bot want to
     // break the line rather than stand and trade. Suppression is a real tactic
     // against a human and it should be one against a bot.
@@ -280,8 +278,7 @@ static float weapon_spread(const player_t *p) {
 
 // ONE shot, for whoever pulled the trigger.
 static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
-                      float pitch, v3 vel, int grounded, uint64_t *rng,
-                      anim_t *anim) {
+                      float pitch, v3 vel, int grounded, uint64_t *rng) {
   const wpn_def_t *def = &WPN_DEF[w->cur];
   const float *wp = g_sim_wp[w->cur];
   w->ammo[w->cur]--;
@@ -328,7 +325,10 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   if (sh >= 0) g_players[sh].shots++;
   if (ent == g_local_ent && sh >= 0)
     g_players[sh].vm.kick_v += 0.8f + 0.5f * wp[WP_PUNCH];  // gun slams back
-  if (anim) anim->fire_k = 1.0f;                  // third-person body: gun kick
+  // The third-person body's kick is NOT set here: it is the shot's presentation and it
+  // rides EV_FIRE (see ent_on_event), which is the only version of this shot a viewer
+  // of a FOREIGN entity ever receives. Set from inside the sim it reached exactly the
+  // figures nobody was looking at.
 
   // THE ROUND'S FLIGHT, one segment per piece of material it crosses.
   v3 nrm = {{0, 1, 0}};                 // the face the round finally stopped on
@@ -438,6 +438,14 @@ static void gun_cool(weapon_t *w) {
   w->punch_roll += w->punch_roll_v * TICK_DT;
 }
 
+// HOW LONG A RELOAD TAKES, and the one copy of it: the player starts one, a bot starts
+// one, gun_anim divides the animation's progress by it and a viewer re-starts a FOREIGN
+// one off the event. Four readers of one ternary is exactly how a tactical reload came
+// to animate against the full reload's clock.
+static int wpn_reload_ticks(int cur, int tac) {
+  return tac ? WPN_DEF[cur].reload_tac_ticks : WPN_DEF[cur].reload_ticks;
+}
+
 static void gun_reload_tick(weapon_t *w) {
   if (w->reload_t > 0 && --w->reload_t == 0) {
     w->ammo[w->cur] = WPN_DEF[w->cur].mag;
@@ -511,8 +519,7 @@ static gunanim_t gun_anim(const weapon_t *w, float alpha) {
   if (w->reload_t <= 0) return g;
   // The SAME duration the sim is counting down, or every beat in the animation
   // lands on a different tick from the sound it is supposed to share.
-  float ticks = (float)(w->reload_tac ? WPN_DEF[cur].reload_tac_ticks
-                                      : WPN_DEF[cur].reload_ticks);
+  float ticks = (float)wpn_reload_ticks(cur, w->reload_tac);
   float prog = 1.0f - (float)w->reload_t / ticks;
   // The AR's TACTICAL reload is a different mechanism with its own seat fraction (see
   // RELOAD_SEAT_TAC): the seat is the LAST event, the charging handle and the bolt
@@ -617,6 +624,96 @@ static gunanim_t gun_anim(const weapon_t *w, float alpha) {
   return g;
 }
 
+// --- THE BODY ANSWERS ITS OWN EVENT -----------------------------------------------
+// The snapshot's contract is "INPUTS, never solved presentation — the client re-solves
+// the pose", and the carriage triple (NEF_ADS/NEF_READY/NEF_TUCK) is how a LEVEL
+// satisfies it. This is the other half: the IMPULSES. A shot's kick, a reload's clock
+// and a round's flinch are not levels a flag byte can hold — they are edges, and the
+// event channel already carries every one of them to every viewer, with the shooter's
+// and the victim's id on it.
+//
+// They used to be written where the action happened, inside the sim. A client never
+// runs the sim for a foreign entity, so on exactly the twenty-odd figures a player
+// spends the whole match looking at, every one of them was silently missing: no gun
+// kick, no magazine change, no hit flash, no flinch. Measured on a staged foreign
+// player firing: fire_k held 0.000 across the entire burst.
+//
+// The rule for a new impulse is the snapshot's own rule turned around: if a viewer can
+// derive it from an event it is already being sent, it belongs HERE and costs no wire.
+static void ent_on_event(const event_t *e) {
+  switch (e->type) {
+  case EV_FIRE: {
+    if (e->src < 0 || e->src >= MAX_ENTS) return;
+    anim_t *a = ent_anim(e->src);
+    // The gun kick. gun_shoot no longer sets it: this is the one copy, and it runs on
+    // the shooter's own machine and on every machine watching him, off one event.
+    a->fire_k = 1.0f;
+    // ...AND THE POSE THE SHOT LEAVES FROM. The carry floor lands in anim_tick, at the
+    // END of this tick — but the tracer and the muzzle flash are anchored two lines
+    // from here (vfx_ev_fire), off the pose the LAST tick solved, and on the first
+    // shot out of a low carry that pose is a rifle 43 degrees and 39 cm away from the
+    // one the round left. Raising the carriage without re-solving only moved the
+    // mismatch: the rifle came up and the flash stayed at the hip.
+    //
+    // So the shot re-solves its own shooter. skel_solve advances NO clock — it is the
+    // same standalone pose solve the `skel` instrument runs on a copy — and this pose
+    // is never the one drawn: anim_tick overwrites it at the end of the same tick,
+    // from the same ready_s. What it exists for is the muzzle read in between.
+    if (anim_carry_floor(a)) {
+      float yaw, pitch;
+      ent_aim(e->src, &yaw, &pitch);
+      skel_solve(a, ent_pos(e->src), yaw, pitch);
+    }
+    return;
+  }
+  case EV_RELOAD: {
+    if (e->src < 0 || e->src >= MAX_ENTS) return;
+    weapon_t *w = ent_weapon(e->src);
+    // ONLY IF NOBODY HERE IS ALREADY RUNNING IT, and the running clock IS the test —
+    // no mode predicate needed. Offline and on the server the sim set this same value
+    // one line before the push; on a client our OWN reload was started by prediction
+    // ticks ago, and re-stamping it on the server's echo would add a round trip to
+    // every magazine. A foreign entity is the only one whose clock reads zero here.
+    if (w->reload_t <= 0) {
+      w->reload_tac = e->k;
+      w->reload_t = wpn_reload_ticks(w->cur, e->k);
+    }
+    return;
+  }
+  case EV_RELOAD_CANCEL:
+    // The abandoned reload stops for a viewer exactly as it stops for the shooter —
+    // and for our own predicted body this is a no-op, the swap already cancelled it.
+    if (e->src >= 0 && e->src < MAX_ENTS) ent_weapon(e->src)->reload_t = 0;
+    return;
+  case EV_HIT:
+  case EV_HIT_HEAD: {
+    if (e->dst < 0 || e->dst >= MAX_ENTS) return;
+    int hs = e->type == EV_HIT_HEAD;
+    int h = human_of_ent(e->dst);
+    int *flash = h >= 0 ? &g_players[h].flash : &g_bots[e->dst - 1].flash;
+    int *fhead = h >= 0 ? &g_players[h].flash_head : &g_bots[e->dst - 1].flash_head;
+    *flash = BOT_FLASH_TICKS;
+    *fhead = hs;
+    // `k` is the victim's REMAINING hp, which is what says whether there is still a
+    // body to flinch: a corpse ragdolls, it does not absorb a round. The impact point
+    // and the shooter's origin are `a` and `b` — the same two vectors ent_damage had
+    // in hand, which is why the flinch can be re-solved from the event at all.
+    if (e->k > 0) anim_hit(ent_anim(e->dst), ent_pos(e->dst), e->b, e->a, hs);
+    return;
+  }
+  // Listed, not defaulted — the same rule vfx_on_event states: a new event type that
+  // moves a BODY has to be answered here or the build fails.
+  case EV_KILL:
+  case EV_IMPACT:
+  case EV_DRYFIRE:
+  case EV_RESPAWN:
+  case EV_STEP:
+  case EV_LAND:
+  case EV_END:
+    return;
+  }
+}
+
 // A body handed to the presentation layer at the respawn so it can outlive the
 // entity that was it — see the corpse pool with the VFX. Declared here because
 // both death paths call it and the pool is defined a long way below.
@@ -629,8 +726,7 @@ static void bot_fire(int bi) {
   v3 o = {{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}};
   // The player's shot, fired by a bot: same fire rate, spread model, bloom, recoil
   // climb and pattern, damage and hitscan, all off the live config.
-  gun_shoot(bi + 1, &b->wp, o, b->yaw, b->pitch, b->vel, b->grounded,
-            &g_rng_bot, &b->anim);
+  gun_shoot(bi + 1, &b->wp, o, b->yaw, b->pitch, b->vel, b->grounded, &g_rng_bot);
 }
 
 // Harness puppet: drives one bot with player-style movement intents so every locomotion

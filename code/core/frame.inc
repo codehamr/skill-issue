@@ -378,11 +378,15 @@ static void client_anim_all(void) {
                                                                 // branch: pose freeze +
                                                                 // the corpse handover
     // THE CARRIAGE, AND WHERE EACH HALF OF IT COMES FROM. A foreign player's two
-    // intents rode in on the snapshot (NEF_ADS/NEF_READY) and net_cl_carry_advance has
+    // intents rode in on the snapshot (NEF_ADS/NEF_READY) and net_cl_present_advance has
     // already turned the aim one back into a blend; OUR OWN body is predicted, so no
     // snapshot describes it and the carry predicate runs here exactly as
     // player_present_tick runs it on the server.
     if (ent == g_local_ent) p->wp.ready_want = (unsigned char)player_carry_ready(p);
+    // ...AND THE FLASH COUNTS DOWN HERE for the same reason, on the same line
+    // player_present_tick runs: nothing else on a client ticks a body's presentation,
+    // and the dead branch above already took it through player_present_tick.
+    if (p->flash > 0) p->flash--;
     anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
               p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
               p->lean, p->wp.ready_want, ent_of_human(h));
@@ -390,6 +394,7 @@ static void client_anim_all(void) {
   for (int b = 0; b < g_match.nbots; b++) {
     bot_t *bt = &g_bots[b];
     if (!bt->active) continue;
+    if (bt->flash > 0) bt->flash--;   // bot_tick's countdown; it does not run here
     // A RESPAWN HAS TO UNDO THE DEATH, and offline nothing has to say so: a bot
     // respawns through bot_spawn, whose `memset(b, 0, sizeof *b)` clears b->rag and
     // b->topple along with everything else.

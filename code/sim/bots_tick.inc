@@ -505,9 +505,12 @@ static void bot_tick(int bi) {
   // When neither weapon can fire, retain the existing reload/cover behavior.
   if (b->wp.ammo[b->wp.cur] <= 0 && b->wp.reload_t == 0 && b->wp.switch_t == 0) {
     b->wp.reload_tac = 0;    // a bot only ever reloads when the mag is dry
-    b->wp.reload_t = WPN_DEF[b->wp.cur].reload_ticks;
+    b->wp.reload_t = wpn_reload_ticks(b->wp.cur, 0);
+    // .k is the TACTICAL bit, and it is on the push for the same reason the player's
+    // is: a viewer re-starts this reload off the event and animates it against the
+    // duration that bit selects.
     ev_push((event_t){.type = EV_RELOAD, .a = b->pos, .wpn = b->wp.cur,
-                      .src = bi + 1});
+                      .src = bi + 1, .k = 0});
   }
 
   // Decide where to look and where to move.

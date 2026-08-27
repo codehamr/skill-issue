@@ -1770,6 +1770,7 @@ static void netleave_report(const char *via, int want_reject) {
 }
 
 static void cmd_netcarry(sim_ctx_t *s) { (void)s; netcarry_proof(); }
+static void cmd_netfigure(sim_ctx_t *s) { (void)s; netfigure_proof(); }
 
 static void cmd_netleave(sim_ctx_t *s) {
   // THE ONLINE->LOCAL TRANSITION, as a gate — and BOTH ways into it, because they
@@ -2227,7 +2228,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"padscan", cmd_padscan}, {"padlook", cmd_padlook}, {"padstat", cmd_padstat}, {"padcurve", cmd_padcurve},
   {"nav", cmd_nav}, {"netloop", cmd_netloop}, {"netpack", cmd_netpack}, {"netpredict", cmd_netpredict},
   {"netlagcomp", cmd_netlagcomp}, {"netstall", cmd_netstall}, {"netanim", cmd_netanim}, {"netfill", cmd_netfill},
-  {"netcarry", cmd_netcarry}, {"netleave", cmd_netleave}, {"tele", cmd_tele}, {"humans", cmd_humans}, {"localent", cmd_localent},
+  {"netcarry", cmd_netcarry}, {"netfigure", cmd_netfigure}, {"netleave", cmd_netleave}, {"tele", cmd_tele}, {"humans", cmd_humans}, {"localent", cmd_localent},
   {"tacstat", cmd_tacstat}, {"netdebug", cmd_netdebug}, {"dev", cmd_dev}, {"bots", cmd_bots},
   {"skill", cmd_skill}, {"fraglimit", cmd_fraglimit}, {"restart", cmd_restart}, {"sfxlog", cmd_sfxlog},
   {"sfx", cmd_sfx}, {"mixdown", cmd_mixdown}, {"mapcheck", cmd_mapcheck},

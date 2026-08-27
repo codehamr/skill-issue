@@ -1,9 +1,11 @@
 // =============================================================================
-// sim/skeleton.inc  —  anim_tick, skel_solve. Do NOT decompose further: a
-// verbatim block move changes FP rounding under -O3 -ffast-math -flto
-// (measured: one hoist flipped flank_pct by a full tick).
-// Proof: skel, kine, figm. One TU: included once by game.c, in definition
-// order — moving a definition out is a semantic change.
+// sim/skeleton.inc  —  anim_tick, skel_solve, anim_carry_floor. Do NOT
+// decompose anim_tick/skel_solve further: a verbatim block move changes FP
+// rounding under -O3 -ffast-math -flto (measured: one hoist flipped flank_pct
+// by a full tick). skel_solve advances no clock, so it may be RE-RUN on a pose
+// whose blends changed mid-tick — the shot's event does exactly that.
+// Proof: skel, kine, figm, netfigure. One TU: included once by game.c, in
+// definition order — moving a definition out is a semantic change.
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Skeleton locomotion — procedural humanoid animation for every third-person
@@ -976,6 +978,26 @@ static void foot_ride(afoot_t *f, v3 base, v3 tgt, v3 vel, float yaw, float kf) 
   f->yaw += wrap_pi(yaw - f->yaw) * kf;
 }
 
+// A WEAPON THAT JUST FIRED IS UP, and this is the ONE copy of that rule. `fire_k` is
+// the shot's own impulse — 1.0 at the shot, ~60 ms to decay — so it doubles as the
+// floor under the carry blend: the round leaves along the aim axis on the tick the
+// trigger breaks, and a blend still ramping toward the shoulder draws the muzzle
+// somewhere the round did not come from (measured on a foreign player hip-firing: the
+// bore 43 degrees off, the muzzle 39 cm below and 35 cm inboard of the rifle the round
+// actually left). Nothing is pinned — after the last shot fire_k is long gone before
+// the 4.5/s lower even starts.
+//
+// TWO CALLERS, because the pose is read at two different moments in a tick: anim_tick
+// applies it where the blend is solved, and the shot's own event applies it the instant
+// the shot happens, because the tracer and the muzzle flash are anchored from there.
+// Returns 1 when the blend actually moved, which is what tells that caller its pose is
+// now stale.
+static int anim_carry_floor(anim_t *a) {
+  if (a->ready_s >= a->fire_k) return 0;
+  a->ready_s = a->fire_k;
+  return 1;
+}
+
 // Advance the animation one 120 Hz tick from the entity's physics state.
 static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
                       int grounded, int crouch, float tuck, int slide, float ads,
@@ -988,11 +1010,13 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   // A third-person figure that is AIMING has to look like it: the stock comes into the
   // shoulder, the weapon rises onto the eye line and the head drops onto the comb.
   a->ads_s += (ads - a->ads_s) * ease_k(14.0f);
-  // Carry state: the raise snaps (~110 ms — a shot must never leave a lowered
-  // rifle for long), the lower is deliberate (~0.7 s after the fight ends).
+  // Carry state: the raise snaps (~110 ms), the lower is deliberate (~0.7 s after the
+  // fight ends).
   {
     float want = (ready || ads > 0.05f) ? 1.0f : 0.0f;
     a->ready_s += (want - a->ready_s) * ease_k(want > 0.5f ? 20.0f : 4.5f);
+    // A SHOT MUST NEVER LEAVE A LOWERED RIFLE — see anim_carry_floor for the rule.
+    anim_carry_floor(a);
   }
 
   // Smoothed motion signals; the raw-vs-smoothed velocity gap drives lean.

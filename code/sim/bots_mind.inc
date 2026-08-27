@@ -657,6 +657,26 @@ static v3 ent_pos(int e) {
   return h >= 0 ? g_players[h].pos : g_bots[e - 1].pos;
 }
 
+// ...and the same resolution for the two other things an entity is asked for by id.
+// Every caller that wanted a foreign entity's pose or weapon wrote this ternary out
+// again — the shot's VFX, the carriage round trip, the event echo below — and each
+// copy is one `g_bots[e - 1]` away from the out-of-bounds write the three-range rule
+// exists to prevent. The id is the caller's to validate (ENT_FOREACH, a decoder's
+// bounds check); what these own is the human/bot fork.
+static anim_t *ent_anim(int e) {
+  int h = human_of_ent(e);
+  return h >= 0 ? &g_player_anim[h] : &g_bots[e - 1].anim;
+}
+static weapon_t *ent_weapon(int e) {
+  int h = human_of_ent(e);
+  return h >= 0 ? &g_players[h].wp : &g_bots[e - 1].wp;
+}
+static void ent_aim(int e, float *yaw, float *pitch) {
+  int h = human_of_ent(e);
+  *yaw   = h >= 0 ? g_players[h].yaw   : g_bots[e - 1].yaw;
+  *pitch = h >= 0 ? g_players[h].pitch : g_bots[e - 1].pitch;
+}
+
 // Fill / cap decisions. bot_fill is the company target: bots top a populated arena up
 // to it (at most cap_bots of them) so a lonely human has an opponent, and an EMPTY
 // arena holds none. The old middle parameter was cap_public — bots padded toward the

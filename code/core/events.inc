@@ -4,6 +4,9 @@
 // order — moving a definition out is a semantic change.
 // Contract: MAX_EVENTS 128 is a fixed ring; a drop is COUNTED, never silent.
 // Bot-vs-bot fire, footsteps, landings and bot reloads are silent by design.
+// An event is also the one thing a client receives about a FOREIGN entity's
+// actions, so ev_push drives BOTH presentation layers: ent_on_event moves the
+// body (kick, reload clock, flash, flinch) and vfx_on_event then draws it.
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Events — the sim's one-way channel to presentation. player_tick/bot_tick
@@ -76,6 +79,10 @@ static long    g_tick_all[SRV_LOBBIES];  // sim tick, advanced in player_tick
 #define g_tick (g_tick_all[g_lobby])
 static int     g_score_held;  // scoreboard key level state, sim -> HUD
 
+// THE BODY ANSWERS ITS OWN EVENT — defined with the sim's combat module, which owns
+// every action that pushes one. See ent_on_event for why an impulse rides this channel
+// rather than the snapshot.
+static void ent_on_event(const event_t *e);
 static void vfx_on_event(const event_t *e);  // defined with the renderer
 static void vfx_tick(void);                  // ditto — called every sim tick
 static void vfx_match_reset(void);           // clears killfeed etc. on restart
@@ -104,6 +111,9 @@ static void ev_push(event_t e) {
   } else {
     g_ev_drops++;
   }
+  // THE BODY FIRST, THEN WHAT IS DRAWN OF IT: the shot's kick, the reload's clock and
+  // the hit's flinch are state the VFX layer reads back off the entity two lines later.
+  ent_on_event(&e);
   vfx_on_event(&e);
 #ifndef _WIN32
   if (!g_headless) return;

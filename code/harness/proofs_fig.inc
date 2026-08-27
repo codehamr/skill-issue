@@ -330,7 +330,7 @@ static void flinch_proof(sim_ctx_t *s) {
     v3 at = {{b->pos.x + rt.x * CASE[c].dx, b->pos.y + CASE[c].dy,
               b->pos.z + rt.z * CASE[c].dx}};
     v3 from = {{at.x, at.y, at.z + 6.0f}};
-    anim_hit(&b->anim, b->pos, b->yaw, from, at, c == 0);
+    anim_hit(&b->anim, b->pos, from, at, c == 0);
     for (int i = 0; i < 45; i++) {
       sim_advance(s);
       died |= !b->alive;

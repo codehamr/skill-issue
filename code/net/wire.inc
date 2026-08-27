@@ -299,7 +299,7 @@ enum {
   NEF_CROUCH   = 1 << 2,
   NEF_SLIDE    = 1 << 3,
   // The carriage triple — see net_ent_from_live for where each is published and
-  // net_cl_carry_advance for how the client turns the two intents back into blends.
+  // net_cl_present_advance for how the client turns the two intents back into blends.
   NEF_ADS      = 1 << 4,   // aim INTENT, not the blend: the client runs its own ramp
   NEF_READY    = 1 << 5,   // fighting — stock up, rather than the low/patrol carry
   NEF_TUCK     = 1 << 6,   // mid-air crouch: the legs are folded into pos.y, and the

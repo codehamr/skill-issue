@@ -378,6 +378,11 @@ static void usage(void) {
        "                     fill rule, rate cap, and a G-tick far-ahead jump\n"
        "  netanim N [S]      plants at 120 Hz vs from an S-strided snapshot\n"
        "  netfill            fill/cap invariants over a join/leave timeline\n"
+       "  netfigure          a foreign figure's IMPULSES: the shot puts the\n"
+       "                     rifle on the aim axis and kicks it, the reload\n"
+       "                     runs and ends, the round flashes and flinches\n"
+       "                     the body, and our own predicted reload survives\n"
+       "                     the server's echo of it\n"
        "  netcarry           the carriage round trip: aim intent, carry state\n"
        "                     and the mid-air tuck through from_live -> wire ->\n"
        "                     apply -> the client's own ramp -> anim_tick\n"
@@ -731,9 +736,7 @@ static void proof_world_restore(const proof_world_t *w) {
 
 static void bothear_emit_shot(int src, v3 pos) {
   weapon_t w = {.cur = WPN_AR};
-  anim_t anim;
   wpn_fill_mags(&w);
-  anim_reset(&anim, pos, 0.0f);
-  gun_shoot(src, &w, pos, 0.0f, 0.0f, (v3){{0,0,0}}, 1, &g_rng_bot, &anim);
+  gun_shoot(src, &w, pos, 0.0f, 0.0f, (v3){{0,0,0}}, 1, &g_rng_bot);
 }
 

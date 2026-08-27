@@ -19,8 +19,7 @@
 static void weapon_fire(player_t *p, int ent) {
   int h = human_of_ent(ent);
   v3 o = player_eye_pos(p);
-  gun_shoot(ent, &p->wp, o, p->yaw, p->pitch, p->vel, p->grounded,
-            &g_rng_gun[h], &g_player_anim[h]);
+  gun_shoot(ent, &p->wp, o, p->yaw, p->pitch, p->vel, p->grounded, &g_rng_gun[h]);
 }
 
 static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
@@ -67,7 +66,7 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
   if (held[IN_RELOAD] && !p->prev_held[IN_RELOAD] && !busy &&
       w->ammo[w->cur] < def->mag) {
     w->reload_tac = w->ammo[w->cur] > 0;
-    w->reload_t = w->reload_tac ? def->reload_tac_ticks : def->reload_ticks;
+    w->reload_t = wpn_reload_ticks(w->cur, w->reload_tac);
     w->dry_done = 0;         // ...and so does a fresh magazine
     // .src AND .a, mirroring the bot push: with .src set and .a zero the
     // audio router takes the audio_place branch and pans a remote reload to
@@ -233,7 +232,6 @@ static void player_lean_tick(player_t *p, const int held[IN_COUNT]) {
 static void player_move_tick(player_t *p, int ent, const int held[IN_COUNT],
                              float wish_px, float wish_py) {
   const float *mv = g_sim_mv;
-  if (p->flash > 0) p->flash--;      // the same countdown bot_tick runs
   p->prev_pos = p->pos;
   p->prev_eye = p->eye;
   p->prev_fov_kick = p->fov_kick;
@@ -408,12 +406,28 @@ static void player_move_tick(player_t *p, int ent, const int held[IN_COUNT],
 // Two callers: the server/offline pose (below) and the online client's own predicted
 // body, which is the one entity no snapshot bit describes (client_anim_all).
 static int player_carry_ready(const player_t *p) {
-  return p->prev_held[IN_FIRE] || p->prev_held[IN_ADS] || p->wp.cool[p->wp.cur] > 0;
+  return p->prev_held[IN_FIRE] || p->prev_held[IN_ADS] || p->wp.cool[p->wp.cur] > 0 ||
+         // THE WEAPON IS BUSY IN HIS HANDS. Nobody reloads or brings up a fresh rifle
+         // with the last one hanging 34 degrees off the shoulder, and both states last
+         // the better part of a second — long enough for an opponent to read them as
+         // the figure standing there doing nothing.
+         p->wp.reload_t > 0 || p->wp.switch_t > 0 ||
+         // ...AND HE IS BEING SHOT AT. This is the human's half of the bot's
+         // `tgt >= 0`: a bot raises its rifle when it acquires a man, and the one
+         // signal a mouse-aiming player gives that he is in a fight BEFORE his own
+         // trigger says so is that rounds are landing on him. Without it the rifle
+         // came up on the trigger and nowhere earlier, which is a carry state that
+         // only ever tells an opponent the truth after the first round has left.
+         p->flash > 0;
 }
 
 // The PRESENT half: anim solve and the corpse handover.
 static void player_present_tick(player_t *p, int ent) {
   int h = human_of_ent(ent);
+  // THE HIT FLASH COUNTS DOWN HERE, in the half that runs exactly once per tick — the
+  // move half is replayed on every rollback, which burnt a 12-tick flash in four.
+  // client_anim_all runs this same line for the entities it solves instead.
+  if (p->flash > 0) p->flash--;
   // prev_held holds THIS tick's raw input (copied at the end of the move
   // half), and the anim only runs alive, where raw == effective held.
   if (p->alive) {
