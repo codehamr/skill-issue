@@ -5,7 +5,10 @@
 // moving a definition out is a semantic change.
 // Contract: the frame loop belongs to NEITHER backend; app_pump is the
 // shared input+frame glue both native backends run and nothing else does.
-// Aim assist is FRICTION-ONLY and pad-only, inside pad_look.
+// Aim assist is FRICTION-ONLY and pad-only, inside pad_look. leave_match is
+// the ONE online->local teardown and it ends on the ENTRY SCREEN, whether the
+// player pressed LEAVE MATCH or the server stopped answering (proof:
+// netleave / netleave drop).
 // =============================================================================
 // ===========================================================================
 // Frame step — the part of a game loop that is GAME rather than PLATFORM.
@@ -459,6 +462,14 @@ static void boot_connect_kick(void) {
 // mentions, and NOTHING ever switched them back off: net_cl_disconnect wipes the
 // transport, and match_restart deliberately preserves the roster (it must — a server's
 // players have to survive a rematch).
+//
+// ...AND IT ENDS ON THE ENTRY SCREEN, WHICHEVER WAY IT WAS ENTERED. The teardown has
+// exactly two callers — the player pressing LEAVE MATCH and the client noticing the
+// server stopped answering — and neither of them asked for a singleplayer round. It
+// used to hand one over anyway: a fresh local arena, bots already shooting, the HUD
+// live, which reads as "the server is still there" for however long it takes to notice
+// the names are gone. The rail is where a session is chosen, so the rail is where a
+// session ends.
 static void leave_match(void) {
   if (g_cl.state != NC_OFF) net_cl_disconnect();
   g_online = 0;
@@ -488,7 +499,14 @@ static void leave_match(void) {
   memset(g_cl_alive_prev, 0, sizeof g_cl_alive_prev);
   match_scores_clear();
   match_restart();     // fresh local arena; it also runs vfx_match_reset,
-}                      // which clears the corpses of players who are gone
+                       // which clears the corpses of players who are gone
+  // The boot sequence, in the boot order: the rail first (it releases the pointer grab
+  // and re-seeds the software cursor through platform_menu_changed — this can be
+  // reached from a grabbed, menu-less frame), the BOOT SCREEN second, because
+  // ui_open_menu reads g_home to decide whether it is a pause.
+  ui_open_menu();
+  home_enter(local_player());
+}
 
 static int app_frame(app_t *a, player_t *p, double dt, const frame_input_t *in) {
   tele_tick();             // anonymous usage ping; self-gated, never blocks
@@ -511,8 +529,15 @@ static int app_frame(app_t *a, player_t *p, double dt, const frame_input_t *in) 
   // snapshots, and the AI/present halves of the SP tick do not run.
   if (g_online) {
     net_cl_poll();
-    if (g_cl.state == NC_FAILED) {          // server gone: fall back to local
+    if (g_cl.state == NC_FAILED) {          // server gone: back to the rail
       leave_match();                        // the ONE teardown (see there)
+      // AND THE VERDICT OUTLIVES THE TEARDOWN. net_cl_disconnect wipes g_cl, so one
+      // frame after a drop the MULTIPLAYER tile read QUICK JOIN and the arena had
+      // simply evaporated with no account of itself. Re-latching FAILED here is free:
+      // the fd is closed, so net_cl_poll returns at its own guard and the handshake
+      // poll above excludes FAILED by name.
+      g_cl.state = NC_FAILED;
+      g_cl.reject = NR_LOST;
       // fall through to the singleplayer path this frame
     } else {
       p = local_player();

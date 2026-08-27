@@ -2,9 +2,10 @@
 // ui/menu.inc  —  ui_menu and its page branches, rebind capture, nav_move.
 // Proof: uistat, nav. One TU: included once by game.c, in definition order —
 // moving a definition out is a semantic change.
-// Contract: g_ui_arm is an enum, not a bool, so QUIT/LEAVE MATCH/RESTART/the
-// two bind RESET rows cannot cross-confirm each other; ui_arm_take is the
-// one chokepoint, and nav_move clears it.
+// Contract: g_ui_arm is an enum, not a bool, so QUIT/RESTART/the two bind
+// RESET rows cannot cross-confirm each other; ui_arm_take is the one
+// chokepoint, and nav_move clears it. Leaving a server is NOT one of them:
+// it is one press, and it lands on the entry screen (see leave_match).
 // =============================================================================
 static float ui_page_binds_kb (float px, float pw, float y, int click, float cx, float cy);
 static float ui_page_settings (float px, float pw, float y, int click, float cx, float cy);
@@ -520,18 +521,23 @@ static float ui_page_match(float px, float pw, float y, int click, float cx, flo
     // SINGLEPLAYER — the mode's own page, and since the entry screen stopped carrying a
     // PLAY tile this is also where a match is started.
     y += 4;
-    // ONE BUTTON, TWO LABELS: at the boot screen there is no round to lose, in a pause
-    // there is.
-    int one_press = g_home && !g_online;
+    // ONE BUTTON, THREE LABELS, AND ONLY ONE OF THEM ASKS TWICE. Online this page's
+    // subject — the LOCAL match — is not the one being played, so the row is the way
+    // out of the server and it goes where the rail's LEAVE MATCH tile goes: the entry
+    // screen, one press, never into a local round nobody asked to start. At the boot
+    // screen there is no round to lose either. A RESTART is the one that ends one.
     int rarm = g_ui_arm == UI_ARM_RESTART;
-    const char *ml = one_press ? "START MATCH"
-                   : g_online  ? (rarm ? "CONFIRM LEAVE" : "LEAVE SERVER AND START LOCAL")
-                   : rarm      ? "CONFIRM RESTART" : "RESTART MATCH";
-    if (ui_button(ml, px + 16, y, pw - 32, 18, click, cx, cy, !one_press)) {
+    int one_press = g_online || g_home;
+    int threat = g_online || !g_home;   // the two labels that END a session wear it
+    const char *ml = g_online ? "LEAVE MATCH"
+                   : g_home   ? "START MATCH"
+                   : rarm     ? "CONFIRM RESTART" : "RESTART MATCH";
+    if (ui_button(ml, px + 16, y, pw - 32, 18, click, cx, cy, threat)) {
       if (one_press || ui_arm_take(UI_ARM_RESTART)) {
-        if (g_online) leave_match();
-        else g_match.restart_req = 1;   // serviced by the next sim tick
-        ui_close_menu();
+        g_ui_arm = UI_ARM_NONE;
+        if (g_online) leave_match();      // ...which opens the rail itself
+        else { g_match.restart_req = 1;   // serviced by the next sim tick
+               ui_close_menu(); }
       }
     }
     y += 24;

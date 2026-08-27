@@ -9,8 +9,13 @@
 // other.
 // =============================================================================
 // ---------------------------------------------------------------------------
-// HOME — the boot screen, and the only place this game gets to sell itself.
+// HOME — the entry screen, and the only place this game gets to sell itself.
 // It is a DIRECTOR, not a menu with a picture behind it.
+//
+// It is reached at boot AND on the way back from an online match (leave_match
+// re-enters it), so "the boot screen" is where it is first seen, not the only
+// place: home_enter re-stages the player and restarts the reel's clock either
+// way, and nothing here may assume it has run exactly once.
 // ---------------------------------------------------------------------------
 
 // A shot is four numbers eased from A to B, and which four depends on the lens.

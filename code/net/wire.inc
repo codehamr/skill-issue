@@ -58,6 +58,9 @@ typedef enum {
 typedef enum {
   NR_PROTO = 1, NR_FULL = 2,
   NR_WORLD = 5,   // client-side only: the server's arena hash is not ours
+  NR_LOST  = 6,   // client-side only: the link died MID-MATCH. It never rides a
+                  // packet either — the server that would have sent it is the
+                  // thing that stopped answering.
 } np_reject_t;
 
 // Client input for one tick: the wish vector is post-deadzone/curve (the server must
@@ -194,7 +197,10 @@ static long             g_tele_last;    // wall clock of the last accepted beat
 static int              g_tele_dead;    // one failure ends telemetry for the session
 // "A session has begun" — the whole difference between ui and sp time, set ONCE
 // by ui_close_menu (far below, but this is the file's only writer) and never
-// cleared: there is no quit-to-menu, QUIT ends the process. See tele_mode.
+// cleared. Leaving an online match DOES return to the entry screen (leave_match),
+// and this deliberately does not go back with it: the flag says the session has
+// played, not where the player is standing, so the `ui` row keeps meaning "never
+// got started" and does not silently absorb post-match idle time. See tele_mode.
 static int              g_tele_played;
 
 // Runs OFF the frame thread.

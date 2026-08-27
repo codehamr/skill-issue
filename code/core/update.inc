@@ -367,10 +367,13 @@ static void upd_auto_tick(void) {
     if (!upd_apply()) atomic_store(&g_upd_state, UPD_FAILED);
     return;
   }
-  // FOUR GUARDS, each excluding a different way of being mid-session: the boot
+  // FOUR GUARDS, each excluding a different way of being mid-session: the entry
   // screen, the rail actually being up, not online (--connect kicks a join at
   // boot, so g_home alone does not mean "no session"), and the ROOT page — which
   // is one test covering every modal, rebind capture and held slider in the menu.
+  // The entry screen is ALSO where leave_match lands, so a player who walks out of
+  // a server — or is dropped by one — can apply an update that arrived mid-match,
+  // which is the likeliest moment for the server to have moved on without him.
   if (!g_home || !g_menu_open || g_online || !ui_on_entry_screen()) return;
   upd_arm_apply();
 }

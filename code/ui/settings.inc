@@ -47,9 +47,10 @@ static int   g_ui_rebind = -1;   // action currently being rebound, -1 = none
 static int   g_ui_rebind_pad;    // ...and which bind table that row edits
 static int   g_ui_quit;          // set by the QUIT button
 // TWO-PRESS DESTRUCTIVE ROWS, ONE LATCH, AND IT REMEMBERS WHICH ROW. A control that
-// ends something the player cannot get back — the process, the connection, the round —
-// asks twice.
-typedef enum { UI_ARM_NONE, UI_ARM_QUIT, UI_ARM_LEAVE, UI_ARM_RESTART,
+// ends something the player cannot get back — the process, the round, a bind table —
+// asks twice. LEAVING A SERVER IS NOT ON THIS LIST and has no value here: it ends in
+// the rail it was pressed from, one press from rejoining (see the LEAVE MATCH tile).
+typedef enum { UI_ARM_NONE, UI_ARM_QUIT, UI_ARM_RESTART,
                UI_ARM_RSTKB, UI_ARM_RSTPAD } ui_arm_t;
 static ui_arm_t g_ui_arm;
 static int   g_ui_root_focus;  // rail row to return to, THIS menu session only
@@ -806,16 +807,25 @@ static void ui_home(int click, float cx, float cy) {
                    ? (g_cl.reject == NR_FULL  ? "ALL ARENAS FULL"
                     : g_cl.reject == NR_PROTO ? "UPDATE REQUIRED"
                     : g_cl.reject == NR_WORLD ? "ARENA MISMATCH"
+                    // NR_LOST is the only one of these that speaks about a match that
+                    // was actually PLAYED: it is set by app_frame after the teardown,
+                    // and it is why the tile the player lands back on is not silent.
+                    : g_cl.reject == NR_LOST  ? "CONNECTION LOST - REJOIN"
                                               : "SERVER DOWN - TRY LATER")
                    : "QUICK JOIN";
     // ...and online the same slot is the way OUT of the match, which is the one
     // destination a live session has and a boot screen does not.
+    //
+    // ONE PRESS, AND IT IS THE RAIL'S ONE EXCEPTION. Every other armed row here ends
+    // something that does not come back — the process, the round's scoreboard, a bind
+    // table. Leaving a server ends nothing: the destination IS this rail, with the tile
+    // under the cursor already reading QUICK JOIN, so the undo is the same press again.
+    // A confirm on the way out only made a player who wanted OUT press twice.
     if (g_online) {
-      int armed = g_ui_arm == UI_ARM_LEAVE;
-      if (ui_tile(armed ? "CONFIRM LEAVE" : "LEAVE MATCH",
-                  armed ? "THE MATCH ENDS FOR YOU" : "BACK TO SINGLEPLAYER",
+      if (ui_tile("LEAVE MATCH", "BACK TO THE ENTRY SCREEN",
                   rx, y, rw, sh2, 1.25f, click, cx, cy, 1)) {
-        if (ui_arm_take(UI_ARM_LEAVE)) { leave_match(); ui_close_menu(); }
+        g_ui_arm = UI_ARM_NONE;
+        leave_match();   // ...which lands on this rail; nothing closes the menu here
       }
     } else if (ui_tile(ml, ms, rx, y, rw, sh2, 1.25f, click, cx, cy, 0) && !busy) {
       g_ui_arm = UI_ARM_NONE;

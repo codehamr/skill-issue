@@ -1714,9 +1714,9 @@ static void cmd_netfill(sim_ctx_t *s) {
          over_public, bots_over, arena_over, bots_empty, bots_lonely, bots);
 }
 
-static void cmd_netleave(sim_ctx_t *s) {
-  (void)s;
-  // THE ONLINE->LOCAL TRANSITION, as a gate.
+// Stage a server's roster into the local world: three foreign humans with names,
+// bodies, score rows, pings and spawn seqs, and one of them is us.
+static void netleave_stage(void) {
   int me = 2;                       // the slot a server would have given us
   for (int h = 1; h <= 3; h++) {
     g_humans_on[h] = 1;
@@ -1735,7 +1735,12 @@ static void cmd_netleave(sim_ctx_t *s) {
   snprintf(g_human_name[me], sizeof g_human_name[me], "%s", g_cfg.name);
   g_online = 1;
   g_local_ent = ent_of_human(me);
-  leave_match();
+}
+
+// ...and count what survived it. Every number here must be 0, and the DESTINATION is
+// part of the contract: the teardown ends on the entry screen — menu up, boot screen
+// running, ROOT page — never in a local round the player never asked to start.
+static void netleave_report(const char *via, int want_reject) {
   int ghosts = 0, names = 0, rows = 0, pings = 0, seqs = 0, moved = 0;
   for (int h = 1; h < MAX_HUMANS; h++) {
     if (g_humans_on[h]) ghosts++;
@@ -1751,10 +1756,44 @@ static void cmd_netleave(sim_ctx_t *s) {
   // check: it is what makes one shootable, rendered and scored.
   int walked = 0;
   for (int e = ent_next(-1); e >= 0; e = ent_next(e)) if (e > MAX_BOTS) walked++;
-  printf("netleave ghosts=%d walked=%d names=%d rows=%d pings=%d seq=%d "
-         "move_stuck=%d online=%d local_ent=%d self=%d\n",
-         ghosts, walked, names, rows, pings, seqs, moved, g_online,
-         g_local_ent, g_humans_on[0]);
+  int rail = g_menu_open && g_home && g_ui_page == UI_PAGE_ROOT;
+  printf("netleave via=%s ghosts=%d walked=%d names=%d rows=%d pings=%d seq=%d "
+         "move_stuck=%d online=%d local_ent=%d self=%d rail=%d reject=%d\n",
+         via, ghosts, walked, names, rows, pings, seqs, moved, g_online,
+         g_local_ent, g_humans_on[0], rail, g_cl.reject);
+  // THE EXIT CODE IS THE READING. Every count above is a leak of the server's world
+  // into the local one, and `rail` is where the player ended up — a red line that
+  // still exits 0 is a gate that passes a broken teardown.
+  if (ghosts || walked || names || rows || pings || seqs || moved || g_online ||
+      g_local_ent || !g_humans_on[0] || !rail || g_cl.reject != want_reject)
+    exit(1);
+}
+
+static void cmd_netleave(sim_ctx_t *s) {
+  // THE ONLINE->LOCAL TRANSITION, as a gate — and BOTH ways into it, because they
+  // share one teardown and differ only in what the player is told afterwards.
+  //   netleave        the player pressed LEAVE MATCH: a clean exit, nothing to report
+  //   netleave drop   the server went quiet: app_frame's NC_FAILED branch runs the
+  //                   same teardown and re-latches the verdict so the rail's
+  //                   MULTIPLAYER tile can say why the arena vanished
+  char *how = take_tok();
+  int drop = how && !strcmp(how, "drop");
+  if (how && !drop) g_tok_pushback = how;
+  netleave_stage();
+  if (drop) {
+    // The state a 5 s silence leaves behind, minus the socket: net_cl_poll returns at
+    // its own `fd < 0` guard, exactly as it does once the descriptor is gone.
+    g_cl.state = NC_FAILED;
+    g_cl.fd = -1;
+    g_cl.reject = 0;
+    app_t app = {0};
+    frame_input_t in = {0};
+    s->tick += app_frame(&app, s->p, TICK_DT, &in);
+    netleave_report("drop", NR_LOST);
+  } else {
+    leave_match();
+    netleave_report("leave", 0);
+  }
 }
 
 static void cmd_tele(sim_ctx_t *s) {
