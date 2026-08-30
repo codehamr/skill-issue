@@ -46,7 +46,6 @@
 // off the same numbers, and a retune that moved only one copy would silently
 // split the FP man from the 3P one.
 #define ANIM_BLADE       0.38f
-#define ADS_SEAT_BACK_M  0.135f
 #define ANIM_ARM_REACH_K 0.96f
 // Swing fraction of the FULL cycle per foot (stance = 1 - duty).
 #define ANIM_DUTY     0.40f   // walking
@@ -680,16 +679,14 @@ static v3 ik_solve(v3 a, v3 t, float l1, float l2, v3 pole) {
   return v3_add(a, v3_add(v3_scale(d, proj), v3_scale(side, h)));
 }
 
-// Off hand reaching for the ground (slide brace / hard-landing catch): roll the off
-// shoulder down by `roll`, aim the wrist at `want`, and clamp to the arm's REAL length
-// — that clamp is what keeps the elbow bent instead of straightening the arm into a
-// rigid pole.
-static v3 brace_hand(v3 chest, v3 Rc, v3 want, float roll, v3 wri, float k) {
-  v3 sho = v3_add(chest, v3_add(v3_scale(Rc, -ANIM_SHO_HALF * cosf(roll)),
-                                v3_scale((v3){{0, 1, 0}}, -ANIM_SHO_HALF * sinf(roll))));
-  v3 bd = v3_sub(want, sho);
+// Off hand reaching for the ground (slide brace / hard-landing catch). The caller
+// supplies the same solved shoulder the arm renderer consumes; using a second rolled
+// approximation here made the wrist reachable from one shoulder and clamped from a
+// different one.
+static v3 brace_hand(v3 shoulder, v3 want, v3 wri, float k) {
+  v3 bd = v3_sub(want, shoulder);
   float bl = v3_len(bd), reach = (ANIM_UARM + ANIM_FARM) * 0.97f;
-  if (bl > reach) want = v3_add(sho, v3_scale(bd, reach / bl));
+  if (bl > reach) want = v3_add(shoulder, v3_scale(bd, reach / bl));
   return v3_lerp(wri, want, k);
 }
 
@@ -953,17 +950,12 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // 100 mm along that reclined spine are already low and already behind the head, and
   // the weld's 90 mm then has nowhere to go but into the collar.
   weld_dn -= weld_dn * (0.85f * a->slide_s);
+  // Lateral cheek placement is expressed in the chest frame. A former pair of
+  // nominally cancelling fore/aft offsets used the hip direction for one half and the
+  // aim direction for the other; whenever hips and weapon differed, their residue
+  // pushed the eye sideways off the sight line.
   head = v3_add(head, v3_add(v3_scale(U, weld_dn),
-                    v3_add(v3_scale(Rc,   0.068f * a->ads_s),
-                           // Preserve the authored comb position, then move the
-                           // complete ADS complex backward along the real aim vector
-                           // below. The weapon uses the same ADS_SEAT_BACK_M through
-                           // carry_axial, so eye relief and off-axis stay invariant.
-                           v3_scale(F,    ADS_SEAT_BACK_M * a->ads_s))));
-  v3 ads_seat_axis = {{sinf(yaw) * cosf(pitch), sinf(pitch),
-                       -cosf(yaw) * cosf(pitch)}};
-  head = v3_add(head, v3_scale(ads_seat_axis,
-                               -ADS_SEAT_BACK_M * a->ads_s));
+                              v3_scale(Rc, 0.068f * a->ads_s)));
   // Crouching, the head TUCKS onto the shoulders — the cheap half of putting the
   // rendered head back inside the crouched HEAD HITBOX (which tops out at eye + 0.18).
   head = v3_add(head, v3_scale(U, -0.075f * a->crouch_s * (1.0f - 0.80f * a->slide_s)
@@ -1139,6 +1131,26 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // fire. AR uses its standard carriage; the relative idle pose applies only to SR.
   float ready_pose = wpn == WPN_SR && !idle_ok ? 1.0f : a->ready_s;
   float rl = 1.0f - ready_pose;
+  // Solve the shoulder line once. Stock seating, brace reach and arm IK all consume
+  // these exact anchors; three nearby approximations cannot describe one torso.
+  float troll = 0.80f * a->slide_s + 0.24f * a->hdown;
+  float trc = cosf(troll), trs = sinf(troll);
+  float blade = ANIM_BLADE * ready_pose + 0.20f * runT * (1.0f - ready_pose);
+  float blc = cosf(blade), bls = sinf(blade);
+  v3 fwdh = v3_norm((v3){{aimd.x, 0.0f, aimd.z}});
+  v3 sho_pose[2];
+  for (int i = 0; i < 2; i++) {
+    float s = i ? 1.0f : -1.0f;
+    float shoulder_clear = 0.012f *
+                           (1.0f - f_smoothstep(0.20f, 0.85f, ready_pose));
+    sho_pose[i] = v3_add(
+        chest,
+        v3_add(v3_add(v3_scale(Rc, s * (ANIM_SHO_HALF + shoulder_clear) *
+                                           trc * blc),
+                      v3_add(v3_scale(U, s * ANIM_SHO_HALF * trs),
+                             v3_scale(fwdh, -s * ANIM_SHO_HALF * bls))),
+               v3_scale(spine, 0.05f)));
+  }
   if (rl > 0.003f) {
     v3 gr0 = v3_cross(aimd, U);
     gr0 = v3_dot(gr0, gr0) > 1e-6f ? v3_norm(gr0) : Rc;
@@ -1215,6 +1227,24 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
              // hangs into a leg. 22 mm now — a magazine touching a trouser, which is
              // what a carried rifle does.
   gun_o.y += bob_drop * 0.55f;
+  // ADS is seated from the stock, not guessed from the grip. The descriptor's butt pin
+  // is the shared model point; the target is the high firing-shoulder pocket used with
+  // armour, slightly forward on the plate. Move the complete eye/weapon complex by the
+  // same correction so stock contact cannot trade away sight alignment.
+  if (a->ads_s > 0.001f && a->slide_s < 0.999f) {
+    v3 seat_r = v3_cross(gd, U);
+    seat_r = v3_dot(seat_r, seat_r) > 1e-6f ? v3_norm(seat_r) : Rc;
+    v3 seat_u = v3_norm(v3_cross(seat_r, gd));
+    v3 butt = v3_add(gun_o,
+                     gun_pose_offset(seat_r, seat_u, gd, erg->butt_pin,
+                                     pose_scale));
+    v3 pocket = v3_add(v3_lerp(chest, sho_pose[1], 0.60f),
+                       v3_add(v3_scale(spine, 0.090f), v3_scale(gd, 0.055f)));
+    float seat_k = a->ads_s * (1.0f - a->slide_s);
+    v3 seat_delta = v3_scale(v3_sub(pocket, butt), seat_k);
+    gun_o = v3_add(gun_o, seat_delta);
+    head = v3_add(head, seat_delta);
+  }
   // Sliding at a deep sideways recline the push-out ran up the tilted chest axis and
   // parked the rifle beside the helmet.
   if (a->slide_s > 0.05f) {
@@ -1301,47 +1331,27 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   if (a->slide_s > 0.001f) {
     // Off hand braces ON THE GROUND behind the hip — that contact is most of what sells
     // a slide.
-    v3 want = v3_add(base, v3_add(v3_scale(R, -0.34f), v3_scale(F, -0.20f)));
+    v3 want = v3_add(base, v3_add(v3_scale(R, -0.29f), v3_scale(F, -0.13f)));
     // The wrist rides a fist-height over the floor, so the KNUCKLES are the
     // contact — this is the hand the player reads as dragging on the ground
     // (at 0.004 the old flat-palm wrap wound the fingers under the floor).
-    want.y = base.y + 0.072f;  // an override, not an offset: R and F are horizontal
+    want.y = base.y + 0.068f;  // an override, not an offset: R and F are horizontal
     // The hand plants hard while the slide is fast and LIFTS as it bleeds out
     // (first beat of the exit: hand up, then rock over the lead foot, then
     // rise) — a brace held at walking speed reads as glued.
-    float bk2 = a->slide_s * f_clamp(0.42f + 0.75f * a->slide_v, 0.0f, 1.0f);
-    wriL = brace_hand(chest, Rc, want, 0.80f * a->slide_s, wriL, bk2);
+    float plant = f_smoothstep(0.08f, 0.58f, a->slide_s);
+    float bk2 = plant * f_clamp(0.65f + 0.70f * a->slide_v, 0.0f, 1.0f);
+    wriL = brace_hand(sho_pose[0], want, wriL, bk2);
   }
   // Hard landing: a hand goes down. `land` is the impact impulse (1.0 ~ 10 m/s),
   // so this only fires on a real drop, not on every step.
   if (a->hdown > 0.02f && a->slide_s < 0.2f) {
     v3 want = v3_add(base, v3_add(v3_scale(R, -0.30f), v3_scale(F, 0.26f)));
     want.y = base.y + 0.045f;
-    // Note the 0.20 roll here against the 0.24 the shoulder line below uses for
-    // the same hdown — historically two different approximations, and changing
-    // either moves the braced hand, which is the "11 cm off the ground" defect.
-    wriL = brace_hand(chest, Rc, want, 0.20f * a->hdown, wriL, a->hdown);
+    wriL = brace_hand(sho_pose[0], want, wriL, a->hdown);
   }
-  // Torso roll has to move the SHOULDER LINE, not only the spine: `Rc` is built
-  // from a yaw and is therefore always horizontal, so a reclined, rolled torso
-  // still carried perfectly level shoulders — and the bracing arm could never
-  // reach the ground however far the spine tipped.
-  float troll = 0.80f * a->slide_s + 0.24f * a->hdown;
-  float trc = cosf(troll), trs = sinf(troll);
-  // BLADE THE SHOULDERS. This is the one thing the stance was missing and the reason
-  // every other number fought every other number: with the shoulder line held SQUARE to
-  // the target, the butt pad can be in the shoulder pocket or the support hand can be
-  // on the handguard, but never both.
-  float blade = ANIM_BLADE * ready_pose + 0.20f * runT * (1.0f - ready_pose);
-  float blc = cosf(blade), bls = sinf(blade);
-  v3 fwdh = v3_norm((v3){{aimd.x, 0.0f, aimd.z}});
   for (int i = 0; i < 2; i++) {
-    float s = i ? 1.0f : -1.0f;
-    float shoulder_clear = 0.012f * (1.0f - f_smoothstep(0.20f, 0.85f, ready_pose));
-    v3 sho = v3_add(chest, v3_add(v3_add(v3_scale(Rc, s * (ANIM_SHO_HALF + shoulder_clear) * trc * blc),
-                                 v3_add(v3_scale(U, s * ANIM_SHO_HALF * trs),
-                                        v3_scale(fwdh, -s * ANIM_SHO_HALF * bls))),
-                                  v3_scale(spine, 0.05f)));
+    v3 sho = sho_pose[i];
     v3 wri = i ? wriR : wriL;
     // Elbows are driven wide and down: a rifle stance reads as a triangle, and an elbow
     // tucked against the ribs is exactly where an upper arm starts ploughing through

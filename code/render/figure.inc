@@ -1320,7 +1320,7 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   // clamp, not a firing grip: what says "about to shoot" is one finger doing
   // something different from the other three.
   float sweep = FSW[f], reach = 0.0f;
-  if (style == 2) sweep *= f == 3 && g_fig_fp ? 0.42f : 0.58f;
+  if (style == 2) sweep *= f == 3 && g_fig_fp ? 0.42f : 0.52f;
   int aimed = style == 1 && f == 3 && trig_pt != NULL && !slid;
   if (style == 1 && f == 3 && !aimed) { sweep = 1.42f; reach = 0.0300f; }
   fnode_t fg[FIG_NMAX];   // 5 authored + critical stations + one dome
@@ -1561,16 +1561,13 @@ static void fig_hand_thumb(v3 wrist, v3 pk, v3 gc, v3 ga, v3 e1, v3 e2,
   const float TWRAP = style == 1 ? 0.68f : 1.0f;
   v3 tb2, tb3, tb4;
   if (style == 2) {
-    // FORWARD THUMB. The heel grip trades the C's opposition cue for the drive-
-    // forward cue: phalanges at INCREASING axial stations along ga (little-finger ->
-    // index -> muzzle) at a nearly constant bearing on the near-upper flank, radius
-    // easing down so the pad RIDES the handguard surface (same HAND_BITE philosophy
-    // as the wrap).
-    tb2 = hand_pt(gc, ga, e1, e2, 0.0420f, -side * 0.84f, gr + 0.0070f);
-    tb3 = hand_pt(gc, ga, e1, e2, 0.0560f, -side * 0.76f, gr + 0.0052f);
-    // Stop two millimetres before the authored nose section: the final dome still
-    // carries a full cap radius, so a centre on the end plane clipped q26's closure.
-    tb4 = hand_pt(gc, ga, e1, e2, 0.0640f, -side * 0.70f, gr + 0.0033f);
+    // FORWARD THUMB. Keep its three phalanges on the near-upper FLANK. A 72 mm run
+    // that climbed towards the rail crown made the thumb a second handguard laid on
+    // top of the real one; 58 mm root-to-tip matches the hand and preserves a clear
+    // C between the shorter thumb and the fingers below.
+    tb2 = hand_pt(gc, ga, e1, e2, 0.0280f, -side * 1.08f, gr + 0.0070f);
+    tb3 = hand_pt(gc, ga, e1, e2, 0.0380f, -side * 1.02f, gr + 0.0052f);
+    tb4 = hand_pt(gc, ga, e1, e2, 0.0460f, -side * 0.96f, gr + 0.0033f);
   } else if (style == 1) {
     // The firing thumb rests longitudinally on the receiver-side flank. Use weapon
     // right, not wrist bearing, as its lateral surface normal; targets include each
@@ -1632,7 +1629,7 @@ static void fig_hand_thumb(v3 wrist, v3 pk, v3 gc, v3 ga, v3 e1, v3 e2,
     for (int i = 4; i >= 2; i--) th[i + 1] = th[i];
     float pad = sqrtf(0.0128f * 0.0142f);
     th[2] = (fnode_t){
-      hand_pt(gc, ga, e1, e2, 0.0180f, -side * 0.95f,
+      hand_pt(gc, ga, e1, e2, 0.0120f, -side * 1.08f,
               gr + pad - 0.0034f), col, col, pad, pad, 0, 0.94f};
     nth = 6;
     // Circular exposed sections preserve their authored capsule radius while the

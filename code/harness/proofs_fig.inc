@@ -116,6 +116,24 @@ static void figm_proof(void) {
              (double)(v3_dot(lat, up3) * 1000.0f),
              (double)(v3_dot(lat, rt3) * 1000.0f),
              (double)(-along * 1000.0f), (double)(v3_len(lat) * 1000.0f));
+      // Stock contact is a relationship, not a screenshot judgement. The shoulder
+      // pocket lies between the chest and the firing-side joint, slightly forward on
+      // the armour face. Measure the descriptor's shared butt pin against that target
+      // in the weapon frame so pose edits report which component actually moved.
+      const gun_pose_desc_t *erg = gun_pose_desc(wi);
+      v3 butt = v3_add(WP->gun_o,
+                       gun_pose_offset(rt3, up3, fw3, erg->butt_pin,
+                                       GUN_GIRTH_3P));
+      v3 torso_up = v3_norm(v3_sub(WP->chest, WP->pelvis));
+      v3 pocket = v3_add(v3_lerp(WP->chest, WP->sho[1], 0.60f),
+                         v3_add(v3_scale(torso_up, 0.090f),
+                                v3_scale(fw3, 0.055f)));
+      v3 seat = v3_sub(butt, pocket);
+      printf("figm seat %-3s gap=%.0fmm right=%+.0f up=%+.0f forward=%+.0f\n",
+             WPN_DEF[wi].prefix, (double)(v3_len(seat) * 1000.0f),
+             (double)(v3_dot(seat, rt3) * 1000.0f),
+             (double)(v3_dot(seat, up3) * 1000.0f),
+             (double)(v3_dot(seat, fw3) * 1000.0f));
     }
     printf("figm elbow");
     for (int i = 0; i < 2; i++) {

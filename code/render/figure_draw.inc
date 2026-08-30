@@ -281,7 +281,9 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
       {P.knee[i], kt.pants, kt.pants, 0.056f, 0.058f, 0, 0.0f},
       // Calf belly UP (0.076 -> 0.081): a shank with no calf is a pipe.
       {v3_add(P.knee[i], v3_scale(shv, 0.30f)), kt.pants, kt.pants, 0.081f, 0.083f, 0, 0.0f},
-      {P.ankle[i], kt.dust1, kt.dust1, 0.048f, 0.050f, 0, 0.0f},          // ankle
+      // The tucked trouser narrows before entering the boot shaft; the leather can
+      // therefore remain close-laced without being hidden by a full-width cloth tube.
+      {P.ankle[i], kt.dust1, kt.dust1, 0.044f, 0.046f, 0, 0.0f},          // ankle
       // ...and the shin keeps going 3 cm PAST the ankle, into the boot: a cap
       // sitting exactly at the ankle pokes out of the collar the moment the
       // foot pitches, which reads as a boot that came off.
@@ -459,13 +461,13 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
       // a dark shoe.
       v3 sole_c = v3_scale(kt.boot, 0.78f);
       fnode_t so[7] = {
-        SOLEN(SOLE_H, -0.086f, 0.0138f, 0.0390f, sole_c, sole_c),  // heel, squared
-        SOLEN(SOLE_H, -0.050f, 0.0142f, 0.0420f, sole_c, sole_c),  // heel block
-        SOLEN(SOLE_H, -0.026f, 0.0112f, 0.0410f, sole_c, sole_c),  // heel breast
-        SOLEN(SOLE_H,  0.030f, 0.0134f, 0.0448f, sole_c, sole_c),  // waist
-        SOLEN(SOLE_H,  0.090f, 0.0145f, 0.0520f, sole_c, sole_c),  // ball, widest
-        SOLEN(SOLE_H,  0.152f, 0.0132f, 0.0486f, sole_c, sole_c),  // toe box
-        SOLEN(SOLE_H,  0.194f, 0.0116f, 0.0300f, sole_c, sole_c)}; // toe end
+        SOLEN(SOLE_H, -0.086f, 0.0160f, 0.0430f, sole_c, sole_c),  // heel, squared
+        SOLEN(SOLE_H, -0.050f, 0.0170f, 0.0470f, sole_c, sole_c),  // heel block
+        SOLEN(SOLE_H, -0.026f, 0.0140f, 0.0460f, sole_c, sole_c),  // heel breast
+        SOLEN(SOLE_H,  0.030f, 0.0160f, 0.0500f, sole_c, sole_c),  // waist
+        SOLEN(SOLE_H,  0.090f, 0.0175f, 0.0570f, sole_c, sole_c),  // ball, widest
+        SOLEN(SOLE_H,  0.152f, 0.0160f, 0.0540f, sole_c, sole_c),  // toe box
+        SOLEN(SOLE_H,  0.194f, 0.0140f, 0.0340f, sole_c, sole_c)}; // toe end
       probe("outsole");
       // Half jitter.
       g_fig_jit = 0.5f;
@@ -473,48 +475,56 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
       g_fig_jit = 1.0f;
       mat_set(MAT_LEATHER_R, 0.0f);
       // The leather upper, set INTO the slab: narrower than it at every station
-      // (3.3-4.2 mm of clearance per side) and with its floor buried inside it, so no
+      // and with its floor buried inside it, so no
       // edge of the leather is ever the silhouette's bottom and the two surfaces meet
-      // in exactly one place — a buried floor plate.
+      // in exactly one place — a buried floor plate. A high instep and broad protective
+      // toe keep the combat boot from collapsing into a thin dress-shoe silhouette.
       v3 lea_c = v3_scale(kt.boot, 1.40f);
       v3 up_c = v3_lerp(lea_c, g_theme.ground, 0.20f);
       fnode_t bt[7] = {
-        SOLEN(UPPR_H, -0.074f, 0.0240f, 0.0340f, lea_c, lea_c),      // counter
-        SOLEN(UPPR_H, -0.040f, 0.0310f, 0.0385f, lea_c, lea_c),      // counter top
-        SOLEN(UPPR_H,  0.012f, 0.0350f, 0.0390f, up_c,   up_c),       // throat
-        SOLEN(UPPR_H,  0.068f, 0.0320f, 0.0440f, up_c,   up_c),       // instep
-        SOLEN(UPPR_H,  0.124f, 0.0268f, 0.0462f, up_c,   up_c),       // vamp
-        SOLEN(UPPR_H,  0.172f, 0.0206f, 0.0370f, lea_c, lea_c),      // toe cap
-        // Toe tip in to 0.0262: the sole was 1.0 mm wider here, which is
-        // inside the same coin flip the floors were in.
-        SOLEN(UPPR_H,  0.194f, 0.0132f, 0.0262f, lea_c, lea_c)};     // toe tip
+        SOLEN(UPPR_H, -0.074f, 0.0280f, 0.0380f, lea_c, lea_c),     // counter
+        SOLEN(UPPR_H, -0.040f, 0.0360f, 0.0430f, lea_c, lea_c),     // counter top
+        SOLEN(UPPR_H,  0.012f, 0.0410f, 0.0440f, up_c,   up_c),      // throat
+        SOLEN(UPPR_H,  0.068f, 0.0390f, 0.0500f, up_c,   up_c),      // instep
+        SOLEN(UPPR_H,  0.124f, 0.0330f, 0.0520f, up_c,   up_c),      // vamp
+        SOLEN(UPPR_H,  0.172f, 0.0270f, 0.0430f, lea_c, lea_c),     // toe cap
+        SOLEN(UPPR_H,  0.194f, 0.0160f, 0.0300f, lea_c, lea_c)};    // toe tip
       probe("boot");
       fig_chain(bt, 7, 8, 1, 1, foot_up);  // sole down: rx is the boot height
       #undef SOLEN
-      // Cuff: the shaft up the shin, decisively WIDER than the trouser it
-      // swallows — at the BLOUSE. The leather boundary moved UP 48 mm and the
-      // shaft under it slimmed 6 mm a side: a combat boot is ~200 mm of LACED
-      // shaft hugging the ankle with the trouser bloused over its top, and at
-      // the old numbers the leather started at the ankle bone, so the whole
-      // shaft read as baggy trouser and the boot as a shoe.
+      // Cuff: a tall, close-laced leather shaft OUTSIDE a narrow trouser end. The
+      // first ring is cloth disappearing into the padded collar; every exposed ring
+      // below it is leather. This keeps the trouser visibly tucked instead of drawing
+      // a broad blouse that made the boot itself read as a thin low shoe.
       fnode_t cf[6] = {
-        {v3_add(P.ankle[i], v3_scale(sd, -0.168f)), kt.pants, kt.pants, 0.070f, 0.073f, 0, 0.0f},
-        {v3_add(P.ankle[i], v3_scale(sd, -0.138f)), kt.pants, kt.pants, 0.076f, 0.079f, 0, 0.0f},  // blouse crown
-        {v3_add(P.ankle[i], v3_scale(sd, -0.118f)), up_c, up_c, 0.066f, 0.069f, 0, 0.0f},          // shaft top
-        {v3_add(P.ankle[i], v3_scale(sd, -0.062f)), up_c, up_c, 0.056f, 0.059f, 0, 0.0f},          // laced shaft
-        {v3_add(P.ankle[i], v3_scale(sd, -0.030f)), up_c, up_c, 0.0525f, 0.0555f, 0, 0.0f},        // lace pinch
-        {v3_add(P.ankle[i], v3_scale(sd,  0.014f)), up_c, up_c, 0.0500f, 0.0530f, 0, 0.0f}};
+        {v3_add(P.ankle[i], v3_scale(sd, -0.205f)), kt.pants, kt.pants, 0.049f, 0.052f, 0, 0.0f},
+        {v3_add(P.ankle[i], v3_scale(sd, -0.190f)), lea_c, lea_c, 0.069f, 0.072f, 0, 0.0f},          // padded collar
+        {v3_add(P.ankle[i], v3_scale(sd, -0.145f)), lea_c, lea_c, 0.066f, 0.069f, 0, 0.0f},          // shaft top
+        {v3_add(P.ankle[i], v3_scale(sd, -0.090f)), lea_c, lea_c, 0.061f, 0.064f, 0, 0.0f},          // laced shaft
+        {v3_add(P.ankle[i], v3_scale(sd, -0.035f)), lea_c, lea_c, 0.0570f, 0.0600f, 0, 0.0f},        // lace pinch
+        {v3_add(P.ankle[i], v3_scale(sd,  0.014f)), lea_c, lea_c, 0.0500f, 0.0530f, 0, 0.0f}};
       probe("bootcuff");
       // The shaft leather is the UPPER's band, not the toe-cap's.
-      mat_set(MAT_CLOTH_R, 0.0f);
+      mat_set(MAT_LEATHER_R, 0.0f);
       g_fig_jit = 0.40f;
       fig_chain(cf, 6, 8, 1, 1, prt);
       g_fig_jit = 1.0f;
+      // Four low cross-laces are enough to identify a tightly closed tactical shaft
+      // in the near tier. They lie only 2 mm proud of the tongue and therefore add
+      // detail without changing the boot's contact or distance silhouette.
+      if (g_fig_k >= 12) {
+        mat_set(MAT_RUBBER_R, 0.0f);
+        v3 lace_c = v3_scale(kt.boot, 0.68f);
+        const float lace_h[4] = {-0.150f, -0.118f, -0.086f, -0.054f};
+        for (int l = 0; l < 4; l++) {
+          float front = 0.064f - 0.006f * (float)l / 3.0f;
+          v3 lc = v3_add(v3_add(P.ankle[i], v3_scale(sd, lace_h[l])),
+                         v3_scale(fF, front + 0.002f));
+          scene_box(lc, v3_scale(prt, 0.024f), v3_scale(sd, 0.0016f),
+                    v3_scale(fF, 0.0015f), lace_c);
+        }
+      }
       mat_set(MAT_LEATHER_R, 0.0f);
-      // NO LACING. It was a proud 6-gon strip plus four scene_box cross-bars, gated at
-      // 12 m and 6 m — and 3 mm of proudness is 0.48 px even at 6 m, so both were
-      // functioning as painted stripes rather than as geometry, on the one part of the
-      // figure a minimal brief is loudest about.
     }
     mat_set(MAT_CLOTH_R, 0.0f);   // next iteration of the loop starts on trouser
   }

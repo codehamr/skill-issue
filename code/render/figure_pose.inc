@@ -415,8 +415,13 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
   // Damped jitter: full crate-jitter put a 1.35x light hoop mid-garment (adjacent bands
   // of ONE cloth suit), which reads as chain construction, not as designed planes.
   g_fig_jit = 0.40f;
-  fig_chain(t, 8, 8, 1, 1, prt);
+  // First person needs the pelvis and abdomen that join the visible thighs, not a
+  // second chest wrapped around the camera. Capping the shared trunk at the lower
+  // ribcage keeps a closed surface below the near plane; looking down can no longer
+  // expose the inside of the shoulder-yoke cap or the carrier and pack behind it.
+  fig_chain(t, g_fig_fp ? 5 : 8, 8, 1, 1, prt);
   g_fig_jit = 1.0f;
+  if (g_fig_fp) return;
   mat_set(MAT_GEAR_R, 0.0f);
   // Plate carrier: STANDOFF, not paint.
   #define CN(T, F, RX, RZ, TW_, AO_) \

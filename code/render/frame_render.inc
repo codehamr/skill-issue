@@ -527,11 +527,11 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
   glBindTexture(GL_TEXTURE_2D, R.font_tex);   // unit 0 carried the shadow map
   glBindVertexArray(R.vao_hud);
 
-  // ONE expression, TWO readers: the block below and the ui_begin fallback under it.
+  // The optic is part of the weapon, not the gameplay overlay. Harness captures and
+  // players may hide ammo/crosshair furniture while the scope still has to transmit
+  // the render target through its glass.
   int hud_on = g_hud_visible && !g_home;
-  if (hud_on) {
-  // ...and NOT on the boot screen.
-  if (scope > 0.02f) {
+  if (!g_home && scope > 0.02f) {
     ui_begin();
     float cx = g_scope_cx, cy = g_scope_cy;
     float vw_ = g_ui_vw, vh_ = g_ui_vh;
@@ -598,6 +598,7 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
     }
   }
   glBindTexture(GL_TEXTURE_2D, R.font_tex);
+  if (hud_on) {
   ui_begin();
   if (g_cfg.show_fps) {
     char text[16];

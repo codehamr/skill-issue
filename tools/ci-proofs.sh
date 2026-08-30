@@ -150,7 +150,10 @@ say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 #   reviewed contact census to 72/72/73/59. The new closing caps are near-tier
 #   only; full `figv` sweeps retain zero open/flip/dup/zfight/degen and vmtrig's
 #   exact/proxy forbidden crossings remain zero.
-WANT_AR_NEAR="72 72 73 59"
+# - The tucked-trouser combat boot pass broadens the outsole/upper and buries the
+#   shin more decisively inside its shaft: 75/75/75/59. `figv` locates the added
+#   close contacts in shin/boot; every hard topology class remains zero.
+WANT_AR_NEAR="75 75 75 59"
 [ "$AR_NEAR" = "$WANT_AR_NEAR" ] || {
   say "GATE AR near '$AR_NEAR' != reviewed baseline '$WANT_AR_NEAR'"; fail=1;
 }
@@ -204,9 +207,12 @@ WANT_AR_NEAR="72 72 73 59"
 #   geometry is the symmetric ear-cup pair (two 32-triangle chains); `figv`
 #   shows no ear-cup family in the new histogram, while the near quadruple and
 #   every coarse-tier cross count remain unchanged.
+# - The broader protective toe, buried upper and tight shaft move the reviewed
+#   census to 110/110/92/61. `figv` attributes the delta to shin/boot contact;
+#   the laces and the support-thumb shortening introduce no hard mesh defect.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_AR_CROSS="97 97 83 59"
+WANT_AR_CROSS="110 110 92 61"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -224,10 +230,12 @@ WANT_AR_CROSS="97 97 83 59"
 # while vmtrig reports zero forbidden mesh/proxy crossings and figcheck reports
 # zero open/flip/dup/zfight/degen at every tier.
 # Removing the same symmetric ear-cup chains first changed only the close-tier
-# maxima. Rounded fingertip caps and the connected support-thumb sweep then move
-# the reviewed SR census to the values below; all hard topology classes remain 0.
-WANT_SR_NEAR="92 92 56 38"
-WANT_SR_CROSS="166 166 108 93"
+# maxima. Rounded fingertip caps and the connected support-thumb sweep moved that
+# census again. The shared combat-boot pass now gives the values below; its `figv`
+# delta is the same designed shin/boot burial as AR and all hard topology classes
+# remain zero.
+WANT_SR_NEAR="95 95 58 38"
+WANT_SR_CROSS="180 180 118 93"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -241,7 +249,7 @@ WANT_SR_CROSS="166 166 108 93"
 # The exact near/cross witness catches shallow self-intersections between hand
 # parts (including the hero-tier thumb shoulder) that vmtrig intentionally does
 # not classify as forbidden weapon contact.
-gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=199 cross=142 degen=0 recoil_states=20$'
+gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=199 cross=139 degen=0 recoil_states=20$'
 gate_command vmsight "vmsight" '^vmsight total=0 '
 gate_command vmscope "vmscope" '^vmscope scope_tris=[1-9][0-9]* open_at=0[.]55 baseline_err=.* recoil_min_ocular=.* recoil_axis=.* recoil_center=.* recoil_pip=.* recoil_radius_delta=.* ok$'
 gate_command vmframe "vmframe" '^vmframe ok$'
