@@ -330,15 +330,13 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   if (ent == g_local_ent && sh >= 0) {
     recoil_vm_impulse(&g_players[sh].vm, ent, w->idx, w->cur, w->ads_s);
     // Online forward prediction deliberately suppresses ev_push, including the
-    // ent_on_event carry latch which normally raises the shot pose. Reproduce only
+    // ent_on_event carry latch which normally starts the eased raise. Reproduce only
     // that local presentation edge here; the authoritative echo still owns VFX and
-    // the third-person recoil velocity, so neither can be doubled by replay. Re-solve
-    // immediately for the same T0 muzzle contract as the ordinary EV_FIRE path.
+    // the third-person recoil velocity, so neither can be doubled by replay. The T0
+    // shot anchor is event-local; the visible body is deliberately not re-solved.
     if (g_predicting && !g_prediction_replay) {
       anim_t *a = &g_player_anim[sh];
       a->fire_k = 1.0f;
-      if (anim_carry_floor(a))
-        skel_solve(a, ent_pos(ent), yaw, pitch, w->cur, 0, SKEL_POSE_ONLY);
     }
   }
   // The third-person body is NOT set here: that presentation rides EV_FIRE (see
@@ -659,24 +657,12 @@ static void ent_on_event(const event_t *e) {
     // T+0, so the already-solved muzzle/flash pose remains the pose the round left;
     // compression and lift arrive on the following animation ticks.
     recoil_body_impulse(a, e->src, e->i, e->wpn, e->g);
-    // fire_k is solely the immediate carry-floor latch, not recoil distance.
+    // fire_k starts the same eased raise on every viewer; physical recoil remains in
+    // the three velocity springs above.
     a->fire_k = 1.0f;
-    // ...AND THE POSE THE SHOT LEAVES FROM. The carry floor lands in anim_tick, at the
-    // END of this tick — but the tracer and the muzzle flash are anchored two lines
-    // from here (vfx_ev_fire), off the pose the LAST tick solved, and on the first
-    // shot out of a low carry that pose is a rifle 43 degrees and 39 cm away from the
-    // one the round left. Raising the carriage without re-solving only moved the
-    // mismatch: the rifle came up and the flash stayed at the hip.
-    //
-    // So the shot re-solves its own shooter. skel_solve advances NO clock — it is the
-    // same standalone pose solve the `skel` instrument runs on a copy — and this pose
-    // is never the one drawn: anim_tick overwrites it at the end of the same tick,
-    // from the same ready_s. What it exists for is the muzzle read in between.
-    if (anim_carry_floor(a)) {
-      float yaw, pitch;
-      ent_aim(e->src, &yaw, &pitch);
-      skel_solve(a, ent_pos(e->src), yaw, pitch, e->wpn, 0, SKEL_POSE_ONLY);
-    }
+    float yaw, pitch;
+    ent_aim(e->src, &yaw, &pitch);
+    anim_stage_fire_anchor(a, ent_pos(e->src), yaw, pitch, e->wpn, e->src);
     return;
   }
   case EV_RELOAD: {

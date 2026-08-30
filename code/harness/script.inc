@@ -1214,9 +1214,11 @@ static void cmd_kine(sim_ctx_t *s) {
       // scene_draw_figure), so the lowest sole vertex is ON the plane through av at
       // every foot pitch by construction.
       float sole = ank.y - b->pos.y - ANIM_ANKLE_Y;
-      printf(" %c=(%.4f %.4f %.4f)%c kny=%.4f sp=%.2f toe=%.4f heel=%.4f sole=%.4f",
+      printf(" %c=(%.4f %.4f %.4f)%c K=(%.4f %.4f %.4f) "
+             "sp=%.2f toe=%.4f heel=%.4f sole=%.4f",
              i ? 'R' : 'L', (double)ank.x, (double)ank.y, (double)ank.z,
-             A->foot[i].t >= 1.0f ? '*' : '~', (double)P->knee[i].y,
+             A->foot[i].t >= 1.0f ? '*' : '~', (double)P->knee[i].x,
+             (double)P->knee[i].y, (double)P->knee[i].z,
              (double)A->stance[i],
              (double)toe.y, (double)heel.y, (double)sole);
     }

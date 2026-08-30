@@ -9300,9 +9300,9 @@ static void vmtrig_proof(sim_ctx_t *s) {
         a.recoil_lift = rec.lift;
         a.recoil_side = rec.side;
 
-        // Peak samples are still inside the shot's busy interval. Without this real
-        // state gate an SR recoil row would be re-solved in low-ready merely because
-        // its sampled spring position is not itself a weapon-state predicate.
+        // Peak samples are still inside the shot's carry interval. The weapon clock
+        // supplies player_carry_ready below; it must not hard-gate the solved pose,
+        // because that is the hip-fire arm snap covered by fire0/fire1.
         if (cs->recoil != VMTRIG_REC_NONE) tmp.wp.cool[wi] = 1;
         if (cs->stage == VMTRIG_STAGE_SWAP) {
           tmp.wp.switch_t = GUN_SWITCH_TICKS / 2;
@@ -9316,14 +9316,13 @@ static void vmtrig_proof(sim_ctx_t *s) {
           a.slide_ld = 0.5f;
         } else if (cs->stage == VMTRIG_STAGE_FIRE_T0 ||
                    cs->stage == VMTRIG_STAGE_FIRE_T1) {
-          // The production event changes velocity at T+0, raises a carried rifle,
-          // and leaves displacement for the following animation tick.
+          // The production event changes velocity and starts the carry follower at
+          // T+0; displacement and the partial visible raise begin on the next tick.
           const int shot = 7;
           tmp.wp.cool[wi] = 1;
           recoil_vm_impulse(&tmp.vm, 17, shot, wi, cs->ads);
           recoil_body_impulse(&a, 17, shot, wi, cs->ads);
           a.fire_k = 1.0f;
-          (void)anim_carry_floor(&a);
         }
         tmp.wp.ready_want = (unsigned char)player_carry_ready(&tmp);
         int idle_ok = gun_pose_state(&tmp.wp, &a, tmp.vel,
@@ -9361,22 +9360,22 @@ static void vmtrig_proof(sim_ctx_t *s) {
                         v3_dot(a.slide_pd, a.slide_pd) < 0.99f ||
                         (wi == WPN_SR && render_ready != 1.0f);
         if (cs->stage == VMTRIG_STAGE_FIRE_T0) {
-          stage_fail |= idle_ok != GUN_POSE_BLOCKED || a.fire_k != 1.0f ||
+          stage_fail |= idle_ok != GUN_POSE_IDLE || a.fire_k != 1.0f ||
                         tmp.vm.kick_back != 0.0f || a.recoil_back != 0.0f ||
                         tmp.vm.kick_back_v <= 0.0f || a.recoil_back_v <= 0.0f ||
                         tmp.vm.kick_lift_v <= 0.0f || a.recoil_lift_v <= 0.0f ||
                         fabsf(tmp.vm.kick_side_v) <= 1e-8f ||
                         fabsf(a.recoil_side_v) <= 1e-8f ||
-                        (wi == WPN_SR && render_ready != 1.0f);
+                        render_ready != 0.0f;
         }
         if (cs->stage == VMTRIG_STAGE_FIRE_T1) {
-          stage_fail |= idle_ok != GUN_POSE_BLOCKED ||
+          stage_fail |= idle_ok != GUN_POSE_IDLE ||
                         a.fire_k <= 0.01f || a.fire_k >= 1.0f ||
                         tmp.vm.kick_back <= 0.0f || a.recoil_back <= 0.0f ||
                         tmp.vm.prev_kick_back != 0.0f ||
                         tmp.vm.prev_kick_lift != 0.0f ||
                         tmp.vm.prev_kick_side != 0.0f ||
-                        (wi == WPN_SR && render_ready != 1.0f);
+                        render_ready <= 0.10f || render_ready >= 0.30f;
         }
 
         g_nprobe = 0;

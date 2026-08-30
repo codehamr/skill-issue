@@ -18,9 +18,9 @@
 #   budget  : scene/event/world/UI drops = 0 at 20 bots hard (nothing silently
 #             dropped a triangle, event, arena decoration or interface vertex)
 #   vmframe : the solved 3P SR low-ready axis matches its production descriptor,
-#             uses a monotone ready_s raise/lower transition, and ADS/reload/bolt/
-#             swap/slide/fire stay exactly ready through alpha=0, including predicted
-#             T0/T1
+#             uses a monotone ready_s raise/lower transition, keeps spatial action
+#             gates exact, and proves fire T0 uses a separate tracer anchor while the
+#             visible arms raise only partially at T1 (including prediction)
 #   vmtrig  : complete 70-state FP/3P x AR/SR contact matrix, exact child/part
 #             census, no patch/pool/counter overflow, bounded work and scratch,
 #             and at most 13,000,000 bytes of static vmtrig scratch pools
@@ -232,9 +232,17 @@ WANT_AR_NEAR="75 75 75 61"
 #   85 -> 38 at k=16 and 90 -> 49 at k=6. Joint and boot-host contacts rise where the
 #   folded leg is deliberately joined, but per-frame maxima fall to 121/121/111/63.
 #   All five hard topology classes remain zero at all four tiers.
+# - 2026-08-30 lateral-slide A/B, same compiler/seed/fresh config: replacing a
+#   travel-relative ground hand (which crosses the legs on a left skid) with the
+#   anatomical-side/body-back target removes `thigh/grip_digits` 6 -> 0,
+#   `farm/farm` 11 -> 3 and `uarm/elbow` 15 -> 7 from the aggregate SR close sweep.
+#   A 26 cm side offset is the reviewed minimum that keeps the wrist outside the
+#   lead knee; it also keeps the AR/SR close maxima at 119/208. The remaining
+#   coarse-tier redistribution is joint/host contact, with every hard topology
+#   class and vmtrig's forbidden mesh/proxy crossings still zero.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_AR_CROSS="121 121 111 63"
+WANT_AR_CROSS="119 119 113 63"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -259,7 +267,7 @@ WANT_AR_CROSS="121 121 111 63"
 # the SR maxima, and the follow-up segment/slide A/B moves them again with the same
 # anatomy pair-family deltas: close-tier cross stays 208 while the other censuses fall.
 WANT_SR_NEAR="94 94 58 40"
-WANT_SR_CROSS="208 208 133 89"
+WANT_SR_CROSS="208 208 135 92"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -281,7 +289,7 @@ grep -Eq '^vmframe pose_only state=1 pose=1 .* ok$' \
   "$TMPD/vmframe.log" || {
     say "GATE vmframe missing state-pure SKEL_POSE_ONLY witness"; fail=1;
   }
-grep -Eq '^vmframe 3p_axis low=.*deg target=.*deg raise=.*deg target=.*deg ready=0[.][0-9]+ busy=7 max=0[.]000deg ok$' \
+grep -Eq '^vmframe 3p_axis low=.*deg target=.*deg raise=.*deg target=.*deg ready=0[.][0-9]+ busy=5 max=0[.]000deg ok$' \
   "$TMPD/vmframe.log" || {
     say "GATE vmframe missing production-derived 3P low-ready axis/busy witness"; fail=1;
   }
@@ -292,6 +300,14 @@ grep -Eq '^vmframe ready_transition raise=\(0[.]000 0[.][0-9]+ 0[.][0-9]+ 0[.][0
 grep -Eq '^vmframe reset_transition ready=1[.]000 pose=0[.]000mm lower=\(0[.][0-9]+ 0[.][0-9]+ 0[.][0-9]+\) ok$' \
   "$TMPD/vmframe.log" || {
     say "GATE vmframe missing reset-to-idle transition witness"; fail=1;
+  }
+grep -Eq '^vmframe fire sr T0 .*anchor=0[.]000mm visible_hold=[1-9][0-9]*[.][0-9]+mm .* stale=1$' \
+  "$TMPD/vmframe.log" || {
+    say "GATE vmframe missing separate T0 fire-anchor/visible-hold witness"; fail=1;
+  }
+grep -Eq '^vmframe fire sr T1 .*ready=0[.]000/0[.][12][0-9][0-9] .* ok$' \
+  "$TMPD/vmframe.log" || {
+    say "GATE vmframe missing partial T1 fire carry witness"; fail=1;
   }
 gate_command vmtrig "vmtrig" '^vmtrig worst .* ok$'
 

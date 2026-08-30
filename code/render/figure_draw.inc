@@ -1076,7 +1076,6 @@ static void scene_build(const player_t *p, float alpha, int show_player,
       // the authored position; crouch still brings the knees into view.
       float down = f_smoothstep(0.55f, 1.25f, -hp->pitch);
       float bk = 0.21f - 0.04f * g_player_anim[lh].crouch_s + 0.04f * down;
-      g_fig_fp_down = down;
       g_fig_fp_off = (v3){{-sinf(hp->yaw) * bk, -0.08f * down,
                            cosf(hp->yaw) * bk}};
       scene_draw_figure(&g_player_anim[lh],
@@ -1086,7 +1085,6 @@ static void scene_build(const player_t *p, float alpha, int show_player,
                                        : (v3){{1, 1, 1}},
                         hp->wp.cur, gun_anim(&hp->wp));
       g_fig_fp = 0;
-      g_fig_fp_down = 0.0f;
     }
   }
 }

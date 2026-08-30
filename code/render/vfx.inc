@@ -438,8 +438,10 @@ static void vfx_ev_fire(const event_t *e) {
     // the round visibly leaves.
     if (e->src < 0) return;
     int mh = human_of_ent(e->src);
-    const pose_t *P = mh >= 0 ? &g_player_anim[mh].pose
-                              : &g_bots[e->src - 1].anim.pose;
+    const pose_t *P = g_fire_anchor_src == e->src && g_fire_anchor_tick == g_tick
+                        ? &g_fire_anchor_pose
+                        : mh >= 0 ? &g_player_anim[mh].pose
+                                  : &g_bots[e->src - 1].anim.pose;
     v3 muz = pose_muzzle(P, e->wpn);
     // The pool cannot overflow at the default tune (fire cooldown 10 ticks >
     // the 8-tick life caps concurrency at one per shooter), but a DEV rpm

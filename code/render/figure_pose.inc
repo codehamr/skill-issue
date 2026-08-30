@@ -392,6 +392,37 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
   ao_set(g_fig_y, 0.55f, 0.84f);
   mat_set(MAT_CLOTH_R, 0.0f);
 
+  // The first-person body needs the same pelvis and pose, but not the view camera
+  // entering the bent third-person sweep.  In crouch that sweep changes direction
+  // twice below the eye; fig_chain's join bevels then become broad wings across the
+  // screen.  A straight, closed shell preserves a readable waist/chest while keeping
+  // every join perpendicular to one stable body axis.  This is render-only geometry:
+  // animation, collision and the third-person silhouette remain shared.
+  if (g_fig_fp) {
+    v3 fp_up = v3_norm(v3_lerp(spine, (v3){{0, 1, 0}}, 0.76f));
+    v3 fp_fwd = v3_norm(v3_cross(fp_up, Rc));
+    #define FN(T, F, RX, RZ, COL, AO_) \
+      {v3_add(P->pelvis, v3_add(v3_scale(fp_up, (T)), \
+                                v3_scale(fp_fwd, (F)))), \
+       COL, COL, (RX), (RZ), 0.0f, (AO_)}
+    fnode_t fp[9] = {
+      FN(-0.120f, -0.010f, 0.110f, 0.094f, kt->pants,   0.70f),
+      FN(-0.025f, -0.010f, 0.174f, 0.136f, kt->pants,   0.0f),
+      FN( 0.065f, -0.010f, 0.154f, 0.112f, kt->belt,    0.0f),
+      FN( 0.145f, -0.010f, 0.145f, 0.105f, kt->uniform, 0.0f),
+      FN( 0.230f, -0.010f, 0.157f, 0.119f, kt->uniform, 0.0f),
+      FN( 0.320f, -0.010f, 0.172f, 0.131f, kt->uniform, 0.0f),
+      FN( 0.405f, -0.010f, 0.180f, 0.130f, kt->vest,    0.0f),
+      FN( 0.485f, -0.010f, 0.132f, 0.092f, kt->vest,    0.0f),
+      FN( 0.550f, -0.010f, 0.054f, 0.042f, kt->vest,    0.0f)};
+    #undef FN
+    probe("torso");
+    g_fig_jit = 0.40f;
+    fig_chain(fp, 9, 8, 1, 1, prt);
+    g_fig_jit = 1.0f;
+    return;
+  }
+
   // Torso: ONE swept prism from crotch to shoulder yoke.
   float tw = atan2f(v3_dot(v3_cross(prt, Rc), spine), v3_dot(prt, Rc));
   // FACETED, k=8: the redesign's stated art direction is a chunky flat-faceted operator
@@ -411,32 +442,12 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     TN( 0.352f,  0.018f, 0.184f, 0.134f, kt->uniform, 0.94f, 0.0f), // upper chest
     TN( 0.472f,  0.006f, 0.156f, 0.108f, kt->vest,  1.00f, 0.0f)};  // shoulder yoke
   #undef TN
-  if (g_fig_fp && g_fig_fp_down > 0.0f) {
-    // A world torso viewed from its own eye ends in a broad shoulder cap directly
-    // under the camera. Morph the FP-only upper body into a compact waist as pitch
-    // steepens: thighs remain joined, while no artificial chest cross-section can
-    // fill the view. The continuous morph avoids a mesh popping on/off at one angle.
-    float length = 1.0f - 0.72f * g_fig_fp_down;
-    float width = 1.0f - 0.46f * g_fig_fp_down;
-    for (int i = 0; i < 5; i++) {
-      t[i].p = v3_add(P->pelvis,
-                      v3_add(v3_scale(v3_sub(t[i].p, P->pelvis), length),
-                             v3_scale(cfw0, -0.035f * g_fig_fp_down)));
-      t[i].rx *= width;
-      t[i].rz *= width;
-    }
-  }
   probe("torso");
   // Damped jitter: full crate-jitter put a 1.35x light hoop mid-garment (adjacent bands
   // of ONE cloth suit), which reads as chain construction, not as designed planes.
   g_fig_jit = 0.40f;
-  // First person needs the pelvis and abdomen that join the visible thighs, not a
-  // second chest wrapped around the camera. Capping the shared trunk at the lower
-  // ribcage keeps a closed surface below the near plane; looking down can no longer
-  // expose the inside of the shoulder-yoke cap or the carrier and pack behind it.
-  fig_chain(t, g_fig_fp ? 5 : 8, 8, 1, 1, prt);
+  fig_chain(t, 8, 8, 1, 1, prt);
   g_fig_jit = 1.0f;
-  if (g_fig_fp) return;
   mat_set(MAT_GEAR_R, 0.0f);
   // Plate carrier: STANDOFF, not paint.
   #define CN(T, F, RX, RZ, TW_, AO_) \

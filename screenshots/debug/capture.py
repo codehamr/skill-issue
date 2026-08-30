@@ -305,8 +305,16 @@ CAPTURES = (
     exterior(
         "slide",
         "slide_sideways_ext_front3q.png",
-        "Lateral AR slide, front-left three-quarter view",
+        "Rightward lateral AR slide, front-left three-quarter view",
         ("puppet move 1 0", "puppet speed 7", "puppet slide", "wait 8"),
+        0.55,
+        (-1.55, 0.86, -2.15),
+    ),
+    exterior(
+        "slide",
+        "slide_left_ext_front3q.png",
+        "Leftward lateral AR slide, front-left three-quarter view",
+        ("puppet move -1 0", "puppet speed 7", "puppet slide", "wait 8"),
         0.55,
         (-1.55, 0.86, -2.15),
     ),

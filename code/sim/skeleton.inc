@@ -1,5 +1,5 @@
 // =============================================================================
-// sim/skeleton.inc  —  anim_tick, skel_solve, anim_carry_floor. Do NOT
+// sim/skeleton.inc  —  anim_tick, skel_solve, adaptive limb/carry solvers. Do NOT
 // decompose anim_tick/skel_solve further: a verbatim block move changes FP
 // rounding under -O3 -ffast-math -flto (measured: one hoist flipped flank_pct
 // by a full tick). SKEL_POSE_ONLY advances no state, so event/proof restaging may
@@ -425,6 +425,7 @@ typedef struct {
   float   kneel_s, kneel_lin; // idle crouch: firing knee down; fades before gait
   float   slide_t;           // seconds since the slide began (entry envelope)
   float   slide_v;           // eased slide speed factor 0..1.2 (recline depth)
+  float   slide_knee_avoid;  // eased proximity response; prevents solver chatter
   int     was_slide;
   float   land;              // landing dip impulse, decays
   float   hdown;             // hard-landing hand-to-ground reach, decays slower
@@ -433,7 +434,7 @@ typedef struct {
   float   fall;              // most negative vel.y of the current air time
   float   brace;             // 0..1 preparation for a landing that is coming
   float   lean_f, lean_r;    // fwd/right acceleration lean (rad)
-  float   fire_k;            // shot/carry-floor latch, decays; not recoil distance
+  float   fire_k;            // shot-triggered eased carry intent; not recoil distance
   // Third-person shoulder response. prev_pose, rather than duplicate prev scalars,
   // interpolates the solved gun and hands for rendering.
   float   recoil_back, recoil_back_v;  // m toward the shoulder
@@ -507,6 +508,13 @@ static v3    g_lean_step_want_off, g_lean_step_got_off;
 static float g_lean_step_ratio;
 static int   g_lean_step_side = -1;
 
+// A fire event needs the shouldered muzzle for its tracer, but the visible body must
+// retain its eased carry transition. ev_push calls body handling and VFX synchronously,
+// so one event-local pose slot is sufficient and cannot leak into a later shot.
+static pose_t g_fire_anchor_pose;
+static int g_fire_anchor_src = -1;
+static long g_fire_anchor_tick = -1;
+
 static void recoil_body_impulse(anim_t *a, int src, int shot, int wpn, float ads) {
   const recoil_pose_t *rp = recoil_pose(wpn);
   float brace = recoil_brace(rp, ads);
@@ -519,21 +527,22 @@ static void recoil_body_impulse(anim_t *a, int src, int shot, int wpn, float ads
 // A low-ready lobe is allowed only by real state, never by a transient gun-animation
 // curve. The helper is pure so server, prediction, remote presentation and proofs make
 // the same decision. A plain ready intent is deliberately NOT a hard gate: it is the
-// target of ready_s and must remain visible as the fast raise transition. Cooldown
-// includes the SR bolt cycle; fire_k covers the immediate carry floor before that
-// clock can be observed by a viewer.
+// target of ready_s and must remain visible as the fast raise transition. Fire and
+// cooldown are also intents, not hard pose gates: forcing them to ready in one solve
+// made idle hip-fire teleport both arms.
 enum { GUN_POSE_BLOCKED = -1, GUN_POSE_LOCOMOTION, GUN_POSE_IDLE };
 
-// Three states matter here. Idle may lower the SR, ordinary locomotion raises it only
-// through ready_s's follower, and a real action gate must be shouldered immediately so
-// first- and third-person cannot disagree on a shot/reload/ADS frame.
+// Three states matter here. Idle may lower the SR, ordinary locomotion, firing and the
+// weapon cycle raise it through ready_s's follower, and a spatial manipulation gate
+// must be shouldered immediately so first- and third-person cannot disagree on
+// reload/ADS/swap/slide. The cycle clock is intentionally not such a gate: using it
+// here made every hip-fired shot teleport both arms.
 static int gun_pose_state(const weapon_t *w, const anim_t *a, v3 vel,
                           int grounded, int slide) {
-  int cur = w->cur >= 0 && w->cur < WPN_COUNT ? w->cur : WPN_AR;
+  (void)a;  // presentation history never hard-gates a manipulation pose
   float hspd2 = vel.x * vel.x + vel.z * vel.z;
   if (!grounded || slide || w->ads_want || w->ads_s > 0.01f ||
-      w->reload_t != 0 || w->switch_t != 0 || w->cool[cur] != 0 ||
-      a->fire_k > 0.01f)
+      w->reload_t != 0 || w->switch_t != 0)
     return GUN_POSE_BLOCKED;
   return hspd2 <= 0.20f * 0.20f ? GUN_POSE_IDLE : GUN_POSE_LOCOMOTION;
 }
@@ -742,7 +751,11 @@ static v3 arm_elbow_solve(v3 shoulder, v3 wrist, v3 pole, v3 chest,
   v3 body_fwd = {{body_right.z, 0.0f, -body_right.x}};
   float radial = arm_torso_segment_clearance(shoulder, elbow, wrist, chest,
                                               body_right, body_fwd);
-  if (radial >= 1.0f) return elbow;
+  // Start steering before contact and ramp continuously. The old branch jumped from
+  // zero correction to at least 72% on the first crossing tick, which was the reported
+  // elbow slap when a run stopped or an idle rifle came up.
+  float avoid = f_smoothstep(1.18f, 0.72f, radial);
+  if (avoid <= 0.001f) return elbow;
 
   // Shoulder position is the anatomical authority. Rolled/bladed shoulders can make
   // a caller's nominal left/right sign point through the torso for exactly the stop
@@ -756,7 +769,6 @@ static v3 arm_elbow_solve(v3 shoulder, v3 wrist, v3 pole, v3 chest,
                           v3_scale((v3){{0, 1, 0}},
                                    f_clamp(pole.y, -0.65f, 0.35f))));
   safe = v3_norm(safe);
-  float avoid = 0.72f + 0.28f * smooth01(1.0f - radial);
   v3 corrected = v3_norm(v3_lerp(pole, safe, avoid));
   return ik_solve(shoulder, wrist, ANIM_UARM, ANIM_FARM, corrected);
 }
@@ -1221,11 +1233,10 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // alone; the folded ground-knee contact never moves.
   if (a->slide_s > 0.001f) {
     v3 between = v3_sub(P->knee[1], P->knee[0]);
-    float sep = v3_len(between);
     between.y = 0.0f;
     v3 apart = v3_dot(between, between) > 1e-6f
                  ? v3_norm(between) : slide_side_axis(a->slide_pd);
-    float avoid = f_smoothstep(0.18f, 0.12f, sep) * a->slide_s;
+    float avoid = a->slide_knee_avoid * a->slide_s;
     if (avoid > 0.001f) {
       int i = a->slide_ld >= 0.5f ? 1 : 0;  // extended/lead leg only
       float s = i ? 1.0f : -1.0f;
@@ -1244,8 +1255,9 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   v3 carry_pin = {{0, 0, 0}};
   // `ready_s` owns the soft lower/raise transition. The REAL state gate owns
   // whether the SR's idle lobe may exist at all: interpolation cannot resurrect
-  // low-ready for one frame in the middle of ADS, reload, bolt, swap, slide or
-  // fire. AR uses its standard carriage; the relative idle pose applies only to SR.
+  // low-ready for one frame in the middle of ADS, reload, swap or slide. Fire and the
+  // weapon cycle arrive through ready_s, so their first visible frame stays continuous.
+  // AR uses its standard carriage; the relative idle pose applies only to SR.
   // State changes set ready_s's TARGET; they never bypass its follower. runT then
   // carries either weapon continuously from idle sway into its authored run hold.
   float ready_pose = idle_ok < GUN_POSE_LOCOMOTION ? 1.0f : a->ready_s;
@@ -1459,7 +1471,13 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
     // drifts across the torso while leg_yaw catches up with a newly entered slide;
     // shoulder-relative placement remains reachable and slide_pd makes it work for
     // every travel direction.
-    v3 want = v3_add(sho_pose[0], v3_scale(a->slide_pd, 0.10f));
+    // The support hand trails in the BODY frame, on its own anatomical side. Using
+    // negative travel for "behind" is wrong on a lateral skid: in a left slide that
+    // vector points back toward the pelvis and sends the forearm between both knees.
+    // Body-back remains behind the hip in every travel direction, while the wider
+    // side offset keeps the glove beyond the lead thigh.
+    v3 want = v3_add(sho_pose[0],
+                     v3_add(v3_scale(Rc, -0.26f), v3_scale(F, -0.14f)));
     // The wrist rides a fist-height over the floor, so the KNUCKLES are the
     // contact — this is the hand the player reads as dragging on the ground
     // (at 0.004 the old flat-palm wrap wound the fingers under the floor).
@@ -1573,25 +1591,17 @@ static void foot_ride(afoot_t *f, v3 base, v3 tgt, v3 vel, float yaw, float kf) 
   f->yaw += wrap_pi(yaw - f->yaw) * kf;
 }
 
-// A WEAPON THAT JUST FIRED IS UP, and this is the ONE copy of that rule. `fire_k` is
-// a carry latch — 1.0 at the shot, ~60 ms to decay — and solely the floor under the
-// carry blend. Physical recoil lives in the three springs above. The round leaves
-// along the aim axis on the tick the
-// trigger breaks, and a blend still ramping toward the shoulder draws the muzzle
-// somewhere the round did not come from (measured on a foreign player hip-firing: the
-// bore 43 degrees off, the muzzle 39 cm below and 35 cm inboard of the rifle the round
-// actually left). Nothing is pinned — after the last shot fire_k is long gone before
-// the 4.5/s lower even starts.
-//
-// TWO CALLERS, because the pose is read at two different moments in a tick: anim_tick
-// applies it where the blend is solved, and the shot's own event applies it the instant
-// the shot happens, because the tracer and the muzzle flash are anchored from there.
-// Returns 1 when the blend actually moved, which is what tells that caller its pose is
-// now stale.
-static int anim_carry_floor(anim_t *a) {
-  if (a->ready_s >= a->fire_k) return 0;
-  a->ready_s = a->fire_k;
-  return 1;
+// Solve the event-only shouldered muzzle without mutating the eased body pose. VFX reads
+// this slot immediately in the same ev_push call; render interpolation continues from
+// the untouched `a->pose`/`ready_s` pair.
+static void anim_stage_fire_anchor(const anim_t *a, v3 pos, float yaw,
+                                   float pitch, int wpn, int src) {
+  anim_t shot = *a;
+  shot.ready_s = shot.prev_ready_s = 1.0f;
+  skel_solve(&shot, pos, yaw, pitch, wpn, GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
+  g_fire_anchor_pose = shot.pose;
+  g_fire_anchor_src = src;
+  g_fire_anchor_tick = g_tick;
 }
 
 // Advance the animation one 120 Hz tick from the entity's physics state.
@@ -1616,12 +1626,10 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   // Carry state: the raise snaps (~110 ms), the lower is deliberate (~0.7 s after the
   // fight ends).
   {
-    float want = (ready || ads > 0.05f ||
+    float want = (ready || ads > 0.05f || a->fire_k > 0.01f ||
                   (wpn == WPN_SR && idle_ok <= GUN_POSE_LOCOMOTION))
                    ? 1.0f : 0.0f;
     a->ready_s += (want - a->ready_s) * ease_k(want > 0.5f ? 20.0f : 4.5f);
-    // A SHOT MUST NEVER LEAVE A LOWERED RIFLE — see anim_carry_floor for the rule.
-    anim_carry_floor(a);
   }
 
   // Smoothed motion signals; the raw-vs-smoothed velocity gap drives lean.
@@ -1781,14 +1789,28 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     // Knees only bend one way: mirror the travel direction into the front hemisphere
     // for everything the LEGS do.
     float fdot = a->slide_dir.x * fx + a->slide_dir.z * fz;
-    a->slide_bk = f_clamp(-fdot, 0.0f, 1.0f);
-    a->slide_pd = a->slide_dir;
+    float back_want = f_clamp(-fdot, 0.0f, 1.0f);
+    v3 pose_dir = a->slide_dir;
     if (fdot < 0) {
-      a->slide_pd.x -= 2.0f * fdot * fx;
-      a->slide_pd.z -= 2.0f * fdot * fz;
+      pose_dir.x -= 2.0f * fdot * fx;
+      pose_dir.z -= 2.0f * fdot * fz;
+    }
+    pose_dir = v3_norm(pose_dir);
+    if (slide_enter || v3_dot(a->slide_pd, a->slide_pd) < 1e-6f) {
+      a->slide_pd = pose_dir;
+      a->slide_bk = back_want;
+    } else {
+      a->slide_pd = v3_norm(v3_lerp(a->slide_pd, pose_dir, ease_k(11.0f)));
+      a->slide_bk += (back_want - a->slide_bk) * ease_k(11.0f);
     }
   }
   if (v3_dot(a->slide_pd, a->slide_pd) < 1e-6f) a->slide_pd = (v3){{fx, 0, fz}};
+  {
+    float sep = v3_len(v3_sub(a->pose.knee[1], a->pose.knee[0]));
+    float want = slide ? f_smoothstep(0.18f, 0.12f, sep) : 0.0f;
+    float rate = want > a->slide_knee_avoid ? 18.0f : 8.0f;
+    a->slide_knee_avoid += (want - a->slide_knee_avoid) * ease_k(rate);
+  }
   // Latch one lead leg for the WHOLE slide. Straight-ahead used to blend to 0.5, which
   // produced two identical half-extended legs; allowing steering to flip the latch
   // later made both legs pass through each other. A new slide may choose a new side.

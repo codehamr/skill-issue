@@ -881,8 +881,6 @@ static int g_fig_fp;
 // figure's own eye, so drawn in place the near plane lands mid-torso and a
 // look downward photographs the inside of the plate carrier.
 static v3 g_fig_fp_off;
-// Smoothed 0..1 steep-down view factor for the FP proxy's custom torso shape.
-static float g_fig_fp_down;
 
 // ...AND THE TIER ITSELF, because "hero or not" is two states and a weapon needs three.
 // 2 = the first-person view, which can resolve a 3 mm pin. 1 = a third-person figure
