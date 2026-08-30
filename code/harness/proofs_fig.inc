@@ -18,7 +18,7 @@ static void probe_stage_figure(bot_t *staged, int wpn) {
   // measuring a pose no player can actually render.
   *staged = *subject;
   staged->wp.cur = wpn;
-  int idle_ok = gun_pose_idle_ok(&staged->wp, &staged->anim, staged->vel,
+  int idle_ok = gun_pose_state(&staged->wp, &staged->anim, staged->vel,
                                  staged->grounded, staged->sliding);
   skel_solve(&staged->anim, staged->pos, staged->yaw, staged->pitch,
              wpn, idle_ok, SKEL_POSE_ONLY);
@@ -9326,7 +9326,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
           (void)anim_carry_floor(&a);
         }
         tmp.wp.ready_want = (unsigned char)player_carry_ready(&tmp);
-        int idle_ok = gun_pose_idle_ok(&tmp.wp, &a, tmp.vel,
+        int idle_ok = gun_pose_state(&tmp.wp, &a, tmp.vel,
                                        tmp.grounded, tmp.sliding);
         skel_solve(&a, pos, yaw, 0.0f, wi, idle_ok, SKEL_POSE_ONLY);
         if (cs->stage == VMTRIG_STAGE_FIRE_T1) {
@@ -9334,7 +9334,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
           // shot edge: no copied spring recurrence and no extra pose-only solve.
           vm_tick(&tmp);
           g_tick++;
-          idle_ok = gun_pose_idle_ok(&tmp.wp, &a, tmp.vel,
+          idle_ok = gun_pose_state(&tmp.wp, &a, tmp.vel,
                                      tmp.grounded, tmp.sliding);
           anim_tick(&a, pos, tmp.vel, yaw, 0.0f, tmp.grounded,
                     tmp.crouched && !tmp.sliding, tmp.tuck_y, tmp.sliding,
@@ -9342,17 +9342,18 @@ static void vmtrig_proof(sim_ctx_t *s) {
         } else {
           a.prev_pose = a.pose;
         }
-        idle_ok = gun_pose_idle_ok(&tmp.wp, &a, tmp.vel,
+        idle_ok = gun_pose_state(&tmp.wp, &a, tmp.vel,
                                    tmp.grounded, tmp.sliding);
         float render_ready = vm_render_ready(&tmp, &a, 1.0f);
         vm_build_plan_t plan = vm_plan_make(&tmp, 1.0f, eye, rgt, upv, fwd,
                                             render_ready);
         int stage_fail = 0;
         if (cs->stage == VMTRIG_STAGE_SWAP)
-          stage_fail |= idle_ok || fabsf(plan.pose.sw - 0.5f) > 1e-6f ||
+          stage_fail |= idle_ok != GUN_POSE_BLOCKED ||
+                        fabsf(plan.pose.sw - 0.5f) > 1e-6f ||
                         (wi == WPN_SR && render_ready != 1.0f);
         if (cs->stage == VMTRIG_STAGE_SLIDE)
-          stage_fail |= idle_ok || !tmp.sliding ||
+          stage_fail |= idle_ok != GUN_POSE_BLOCKED || !tmp.sliding ||
                         tmp.vm.slide_s != 1.0f || tmp.vm.prev_slide_s != 1.0f ||
                         a.slide_s != 1.0f || a.slide_lin != 1.0f ||
                         a.slide_v != 1.0f ||
@@ -9360,7 +9361,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
                         v3_dot(a.slide_pd, a.slide_pd) < 0.99f ||
                         (wi == WPN_SR && render_ready != 1.0f);
         if (cs->stage == VMTRIG_STAGE_FIRE_T0) {
-          stage_fail |= idle_ok || a.fire_k != 1.0f ||
+          stage_fail |= idle_ok != GUN_POSE_BLOCKED || a.fire_k != 1.0f ||
                         tmp.vm.kick_back != 0.0f || a.recoil_back != 0.0f ||
                         tmp.vm.kick_back_v <= 0.0f || a.recoil_back_v <= 0.0f ||
                         tmp.vm.kick_lift_v <= 0.0f || a.recoil_lift_v <= 0.0f ||
@@ -9369,7 +9370,8 @@ static void vmtrig_proof(sim_ctx_t *s) {
                         (wi == WPN_SR && render_ready != 1.0f);
         }
         if (cs->stage == VMTRIG_STAGE_FIRE_T1) {
-          stage_fail |= idle_ok || a.fire_k <= 0.01f || a.fire_k >= 1.0f ||
+          stage_fail |= idle_ok != GUN_POSE_BLOCKED ||
+                        a.fire_k <= 0.01f || a.fire_k >= 1.0f ||
                         tmp.vm.kick_back <= 0.0f || a.recoil_back <= 0.0f ||
                         tmp.vm.prev_kick_back != 0.0f ||
                         tmp.vm.prev_kick_lift != 0.0f ||

@@ -1127,7 +1127,7 @@ static void cmd_figcheck(sim_ctx_t *s) {
     weapon_t draw_wp = subject->wp;
     anim_t draw_anim = subject->anim;
     draw_wp.cur = wpn;
-    int idle_ok = gun_pose_idle_ok(&draw_wp, &draw_anim, subject->vel,
+    int idle_ok = gun_pose_state(&draw_wp, &draw_anim, subject->vel,
                                    subject->grounded, subject->sliding);
     skel_solve(&draw_anim, subject->pos, subject->yaw, subject->pitch,
                wpn, idle_ok, SKEL_POSE_ONLY);
@@ -1139,7 +1139,7 @@ static void cmd_figcheck(sim_ctx_t *s) {
     weapon_t other_wp = subject->wp;
     anim_t other_anim = subject->anim;
     other_wp.cur = other_wpn;
-    int other_idle_ok = gun_pose_idle_ok(&other_wp, &other_anim, subject->vel,
+    int other_idle_ok = gun_pose_state(&other_wp, &other_anim, subject->vel,
                                          subject->grounded, subject->sliding);
     skel_solve(&other_anim, subject->pos, subject->yaw, subject->pitch,
                other_wpn, other_idle_ok, SKEL_POSE_ONLY);
@@ -1192,10 +1192,12 @@ static void cmd_kine(sim_ctx_t *s) {
     const bot_t *b = &g_bots[0];
     const anim_t *A = &b->anim;
     const pose_t *P = &A->pose;
-    printf("kine t=%ld pos=(%.3f %.3f %.3f) air=%.2f sl=%.2f hd=%.2f ly=%.4f "
+    printf("kine t=%ld pos=(%.3f %.3f %.3f) air=%.2f cr=%.2f kn=%.2f sl=%.2f "
+           "hd=%.2f ly=%.4f "
            "pel=(%.3f %.3f %.3f) head=%.4f",
            s->tick, (double)b->pos.x, (double)b->pos.y, (double)b->pos.z,
-           (double)A->air_s, (double)A->slide_s, (double)A->hdown,
+           (double)A->air_s, (double)A->crouch_s, (double)A->kneel_s,
+           (double)A->slide_s, (double)A->hdown,
            (double)A->leg_yaw, (double)P->pelvis.x, (double)P->pelvis.y,
            (double)P->pelvis.z, (double)P->head.y);
     for (int i = 0; i < 2; i++) {
@@ -1212,14 +1214,30 @@ static void cmd_kine(sim_ctx_t *s) {
       // scene_draw_figure), so the lowest sole vertex is ON the plane through av at
       // every foot pitch by construction.
       float sole = ank.y - b->pos.y - ANIM_ANKLE_Y;
-      printf(" %c=(%.4f %.4f %.4f)%c sp=%.2f toe=%.4f heel=%.4f sole=%.4f",
+      printf(" %c=(%.4f %.4f %.4f)%c kny=%.4f sp=%.2f toe=%.4f heel=%.4f sole=%.4f",
              i ? 'R' : 'L', (double)ank.x, (double)ank.y, (double)ank.z,
-             A->foot[i].t >= 1.0f ? '*' : '~', (double)A->stance[i],
+             A->foot[i].t >= 1.0f ? '*' : '~', (double)P->knee[i].y,
+             (double)A->stance[i],
              (double)toe.y, (double)heel.y, (double)sole);
     }
     for (int i = 0; i < 2; i++)
-      printf(" %cw=(%.4f %.4f %.4f)", i ? 'R' : 'L', (double)P->wri[i].x,
-             (double)P->wri[i].y, (double)P->wri[i].z);
+      printf(" %cs=(%.4f %.4f %.4f) %ce=(%.4f %.4f %.4f) %cw=(%.4f %.4f %.4f)",
+             i ? 'R' : 'L', (double)P->sho[i].x, (double)P->sho[i].y,
+             (double)P->sho[i].z, i ? 'R' : 'L', (double)P->elb[i].x,
+             (double)P->elb[i].y, (double)P->elb[i].z, i ? 'R' : 'L',
+             (double)P->wri[i].x, (double)P->wri[i].y, (double)P->wri[i].z);
+    {
+      v3 body_right = v3_norm(P->right);
+      v3 body_fwd = {{body_right.z, 0.0f, -body_right.x}};
+      printf(" knee_sep=%.3f arm_clear=%.3f/%.3f",
+             (double)v3_len(v3_sub(P->knee[1], P->knee[0])),
+             (double)arm_torso_segment_clearance(P->sho[0], P->elb[0],
+                                                  P->wri[0], P->chest,
+                                                  body_right, body_fwd),
+             (double)arm_torso_segment_clearance(P->sho[1], P->elb[1],
+                                                  P->wri[1], P->chest,
+                                                  body_right, body_fwd));
+    }
     printf("\n");
   }
 }
@@ -1709,20 +1727,23 @@ static void cmd_homeui(sim_ctx_t *s) {
                  homeui_state_same(&before, &after);
   int focus_ok = before.page == UI_PAGE_ROOT && before.menu && before.home &&
                  before.focus == 0 && before.nfocus == 5 && !before.padmode;
-  // Secured 2a6b08c at this same UPPER RECEIVER instant peaks at 1344 vertices.
-  // The shadowed open readout must still beat that state-for-state baseline.
-  int budget_ok = g_ui_peak <= 1344 && g_ui_drops == 0;
+  // The shipped binary is stamped with YYYY-MM-DD plus a seven-character commit. Its
+  // longer footer peaks at 1374 vertices here; `dev/unknown` is only 1332 and must not
+  // define a release gate. The shadowed readout stays within the stamped baseline.
+  const int vertex_budget = 1374;
+  int budget_ok = g_ui_peak <= vertex_budget && g_ui_drops == 0;
   int scratch_ok = harness_scratch_release(HARNESS_SCRATCH_HOMEUI);
   int ok = read_ok && scratch_ok && layout_ok && fit_ok && caption_ok && hover_delta == 0 &&
            click_delta == 0 && state_ok && focus_ok && budget_ok;
 
   printf("homeui res=%dx%d virtual=%.0fx%.0f visible=%d gap=%.1f "
          "fit_over=%.2fpx caption=%d hover_delta=%d click_delta=%d "
-         "state=%s focus=%d/%d ui_peak=%d/1344 ui_drops=%ld %s\n",
+         "state=%s focus=%d/%d ui_peak=%d/%d ui_drops=%ld %s\n",
          R.width, R.height, (double)g_ui_vw, (double)g_ui_vh, visible,
          (double)gap, (double)fmaxf(worst_over, 0.0f), caption_ok,
          hover_delta, click_delta, state_ok ? "stable" : "CHANGED",
-         before.focus, before.nfocus, g_ui_peak, g_ui_drops, ok ? "ok" : "FAIL");
+         before.focus, before.nfocus, g_ui_peak, vertex_budget, g_ui_drops,
+         ok ? "ok" : "FAIL");
 
   g_ui_dt = dt_save;
   if (!ok) exit(1);

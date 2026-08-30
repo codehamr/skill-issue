@@ -13,12 +13,12 @@
 // washes the clothes toward flash_col.
 
 enum {
+  FIG_HEAD_UNDERCHIN,
   FIG_HEAD_CHIN,
   FIG_HEAD_JAW,
   FIG_HEAD_MOUTH,
   FIG_HEAD_CHEEK,
   FIG_HEAD_BROW,
-  FIG_HEAD_CROWN,
   FIG_HEAD_TOP,
   FIG_HEAD_BANDS
 };
@@ -33,20 +33,24 @@ typedef struct {
 // The renderer and harness share this authored Hero/Near profile. `forward +
 // depth` is the visible front plane; `width` is the across-head half-width.
 static const fig_head_band_t FIG_HEAD_PROFILE[FIG_HEAD_BANDS] = {
-  [FIG_HEAD_CHIN]  = {-0.0900f,  0.0395f, 0.0630f, 0.0600f, 0.74f},
-  [FIG_HEAD_JAW]   = {-0.0650f,  0.0135f, 0.0745f, 0.0840f, 0.80f},
-  [FIG_HEAD_MOUTH] = {-0.0400f, -0.0035f, 0.0752f, 0.0930f, 0.88f},
-  [FIG_HEAD_CHEEK] = {-0.0056f, -0.0090f, 0.0790f, 0.0980f, 0.94f},
-  [FIG_HEAD_BROW]  = { 0.0372f, -0.0110f, 0.0780f, 0.0965f, 0.78f},
-  [FIG_HEAD_CROWN] = { 0.0818f, -0.0190f, 0.0692f, 0.0850f, 0.00f},
-  [FIG_HEAD_TOP]   = { 0.1116f, -0.0250f, 0.0480f, 0.0605f, 0.00f},
+  // Profile planes, not a stack of round bands: a recessed underside breaks cleanly
+  // into the chin, the broad mandible pinches at the mouth, cheekbones carry the face
+  // and the brow turns back under the helmet. The front values deliberately avoid the
+  // old 10 mm underbite where the chin projected beyond the mouth.
+  [FIG_HEAD_UNDERCHIN] = {-0.1040f,  0.0060f, 0.0480f, 0.0700f, 0.68f},
+  [FIG_HEAD_CHIN]      = {-0.0840f,  0.0250f, 0.0620f, 0.0680f, 0.76f},
+  [FIG_HEAD_JAW]       = {-0.0600f,  0.0060f, 0.0780f, 0.0870f, 0.82f},
+  [FIG_HEAD_MOUTH]     = {-0.0340f, -0.0020f, 0.0760f, 0.0960f, 0.88f},
+  [FIG_HEAD_CHEEK]     = { 0.0020f, -0.0060f, 0.0810f, 0.1010f, 0.94f},
+  [FIG_HEAD_BROW]      = { 0.0390f, -0.0120f, 0.0790f, 0.0970f, 0.78f},
+  [FIG_HEAD_TOP]       = { 0.1140f, -0.0250f, 0.0480f, 0.0610f, 0.00f},
 };
 
 // At Far and corpse tiers only the selected chin differs from the exact
 // pre-change profile. Keep that one legacy band as the LOD override instead of
 // duplicating the six unchanged authored bands.
 static const fig_head_band_t FIG_HEAD_FAR_CHIN =
-  {-0.0900f, 0.0310f, 0.0585f, 0.0600f, 0.74f};
+  {-0.0840f, 0.0220f, 0.0600f, 0.0680f, 0.76f};
 
 static inline fig_head_metrics_t fig_head_metrics(void) {
   const fig_head_band_t *chin = &FIG_HEAD_PROFILE[FIG_HEAD_CHIN];
@@ -87,10 +91,9 @@ static void sdf_head(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine) {
        v3_scale(kt.bala, 0.82f), 0.058f, 0.061f, 0, 0.62f}};
     probe("neck");
     fig_chain(nk, 5, 12, 1, 1, Rc);
-    // Seven rings up the skull. Hero/Near uses the selected eight-sided
-    // profile: its chin is 10 mm proud of the mouth and 2 mm proud of the jaw,
-    // with a 0.846 jaw-width ratio. Far/corpse keeps the legacy shape and
-    // requested profile so its topology and scene cost remain exact.
+    // Seven authored planes up the skull. The narrow under-chin and broad jaw are what
+    // make the lower face readable; low polygon count comes from decisive silhouette
+    // changes rather than deleting the nose or turning the head into an ellipsoid.
     const int far_head = g_fig_k <= 8;
     fnode_t hd[FIG_HEAD_BANDS];
     for (int i = 0; i < FIG_HEAD_BANDS; i++) {
@@ -101,14 +104,17 @@ static void sdf_head(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine) {
     }
     probe("skull");
     fig_chain(hd, FIG_HEAD_BANDS, far_head ? 16 : 8, 1, 1, hr);
-    // Nose: the one feature that decides whether a head has a FRONT at 10 m. A
-    // wedge, sunk into the face by more than its own depth so no cap shows.
+    // A compact diamond nose restores a readable facial centre plane in profile. Its
+    // root is buried in the cheek/brow surface and its bridge remains under the goggle;
+    // only the tip and underside alter the silhouette.
     {
-      // NO NOSE. A four-node chain modelling a nose under a balaclava, behind a goggle
-      // band that now covers the whole eye line, contributed one soft bump 19 mm across
-      // on a head that is 62 px tall at conversational range — and it was the part that
-      // grazed the skull's own surface hardest, because a small chain following a big
-      // ellipse is grazing it everywhere.
+      fnode_t ns[4] = {
+        {HP(0,  0.018f, 0.072f), kt.bala, kt.bala, 0.017f, 0.018f, 0, 0.0f},
+        {HP(0,  0.014f, 0.096f), kt.bala, kt.bala, 0.016f, 0.017f, 0, 0.0f},
+        {HP(0, -0.004f, 0.113f), kt.bala, kt.bala, 0.013f, 0.014f, 0, 0.0f},
+        {HP(0, -0.021f, 0.094f), kt.bala, kt.bala, 0.010f, 0.012f, 0, 0.0f}};
+      probe("nose");
+      fig_chain(ns, 4, 4, 1, 1, hu);
       for (int e = 0; e < 2; e++) {
         float es = e ? 1.0f : -1.0f;
         fnode_t er[2] = {
@@ -1064,11 +1070,15 @@ static void scene_build(const player_t *p, float alpha, int show_player,
     if (lh >= 0 && lh < MAX_HUMANS && g_humans_on[lh] && g_players[lh].alive) {
       const player_t *hp = &g_players[lh];
       g_fig_fp = 1;
-      // Stance-aware: a crouched trunk already leans 0.46 rad forward, so the
-      // full stand-off pushes the knees out of even a straight-down look —
-      // exactly the frame the crouched body exists for.
-      float bk = 0.21f - 0.04f * g_player_anim[lh].crouch_s;
-      g_fig_fp_off = (v3){{-sinf(hp->yaw) * bk, 0.0f, cosf(hp->yaw) * bk}};
+      // Keep the visual-only proxy behind the near plane when looking down. At steep
+      // pitch the camera otherwise enters the upper torso and exposes a flat clipped
+      // cross-section instead of the player's chest/legs. Normal look angles retain
+      // the authored position; crouch still brings the knees into view.
+      float down = f_smoothstep(0.55f, 1.25f, -hp->pitch);
+      float bk = 0.21f - 0.04f * g_player_anim[lh].crouch_s + 0.04f * down;
+      g_fig_fp_down = down;
+      g_fig_fp_off = (v3){{-sinf(hp->yaw) * bk, -0.08f * down,
+                           cosf(hp->yaw) * bk}};
       scene_draw_figure(&g_player_anim[lh],
                         v3_lerp(hp->prev_pos, hp->pos, alpha), hp->yaw, NULL,
                         alpha, ent_flash01(hp->flash, hp->flash_head),
@@ -1076,6 +1086,7 @@ static void scene_build(const player_t *p, float alpha, int show_player,
                                        : (v3){{1, 1, 1}},
                         hp->wp.cur, gun_anim(&hp->wp));
       g_fig_fp = 0;
+      g_fig_fp_down = 0.0f;
     }
   }
 }

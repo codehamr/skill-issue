@@ -729,7 +729,7 @@ static void bot_tick(int bi) {
   // Bots do not lean yet: the pose supports it (the puppet drives it) but no AI
   // branch asks for it, so this is 0 by construction rather than by omission.
   b->wp.ready_want = (unsigned char)(b->tgt >= 0 || startled || b->alert_t > 0);
-  int idle_ok = gun_pose_idle_ok(&b->wp, &b->anim, b->vel,
+  int idle_ok = gun_pose_state(&b->wp, &b->anim, b->vel,
                                  b->grounded, b->sliding);
   anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
             b->crouch, 0.0f, b->sliding, b->wp.ads_s, 0.0f,

@@ -1100,7 +1100,7 @@ static void vmframe_stage_case(player_t *p, anim_t *a, int which) {
 // leaves the physical player fixed: ready_s is presentation, and its transition must
 // not need a movement tick or a second renderer-side clock.
 static void vmframe_ready_tick(player_t *p, anim_t *a) {
-  int idle_ok = gun_pose_idle_ok(&p->wp, a, p->vel, p->grounded, p->sliding);
+  int idle_ok = gun_pose_state(&p->wp, a, p->vel, p->grounded, p->sliding);
   g_tick++;
   anim_tick(a, p->pos, p->vel, p->yaw, p->pitch, p->grounded,
             p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
@@ -1280,7 +1280,7 @@ static void vmframe_proof(void) {
   player_t low_p, raise_p;
   anim_t low_a, raise_a;
   vmframe_stage_case(&low_p, &low_a, VMF_IDLE);
-  int low_idle = gun_pose_idle_ok(&low_p.wp, &low_a, low_p.vel,
+  int low_idle = gun_pose_state(&low_p.wp, &low_a, low_p.vel,
                                   low_p.grounded, low_p.sliding);
   skel_solve(&low_a, low_p.pos, 0.0f, 0.0f, WPN_SR, low_idle,
              SKEL_POSE_ONLY);
@@ -1288,7 +1288,7 @@ static void vmframe_proof(void) {
 
   vmframe_stage_case(&raise_p, &raise_a, VMF_READY);
   vmframe_ready_tick(&raise_p, &raise_a);
-  int raise_idle = gun_pose_idle_ok(&raise_p.wp, &raise_a, raise_p.vel,
+  int raise_idle = gun_pose_state(&raise_p.wp, &raise_a, raise_p.vel,
                                     raise_p.grounded, raise_p.sliding);
   skel_solve(&raise_a, raise_p.pos, 0.0f, 0.0f, WPN_SR, raise_idle,
              SKEL_POSE_ONLY);
@@ -1313,7 +1313,7 @@ static void vmframe_proof(void) {
     player_t busy_p;
     anim_t busy_a;
     vmframe_stage_case(&busy_p, &busy_a, c);
-    int idle = gun_pose_idle_ok(&busy_p.wp, &busy_a, busy_p.vel,
+    int idle = gun_pose_state(&busy_p.wp, &busy_a, busy_p.vel,
                                 busy_p.grounded, busy_p.sliding);
     skel_solve(&busy_a, busy_p.pos, 0.0f, 0.0f, WPN_SR, idle,
                SKEL_POSE_ONLY);
@@ -1324,7 +1324,7 @@ static void vmframe_proof(void) {
     float chord = v3_len(v3_sub(busy_a.pose.gun_f, raised.pose.gun_f));
     float angle = 2.0f * asinf(f_clamp(chord * 0.5f, 0.0f, 1.0f)) / DEG2RAD;
     busy_max = fmaxf(busy_max, angle);
-    busy_ok &= !idle && angle <= 0.001f;
+    busy_ok &= idle == GUN_POSE_BLOCKED && angle <= 0.001f;
     busy_count++;
   }
   int axis_ok = low_idle && raise_idle && low_axis.finite && raise_axis.finite &&
@@ -1347,7 +1347,7 @@ static void vmframe_proof(void) {
     anim_t a;
     vmframe_stage_case(&p, &a, c);
     if (c == VMF_READY) vmframe_ready_tick(&p, &a);
-    int idle_ok = gun_pose_idle_ok(&p.wp, &a, p.vel, p.grounded, p.sliding);
+    int idle_ok = gun_pose_state(&p.wp, &a, p.vel, p.grounded, p.sliding);
     skel_solve(&a, p.pos, 0.0f, 0.0f, WPN_SR, idle_ok, SKEL_POSE_ONLY);
     anim_t refa = a;
     refa.ready_s = refa.prev_ready_s = 1.0f;
@@ -1379,7 +1379,8 @@ static void vmframe_proof(void) {
       case_ok &= idle_ok && a.ready_s > 0.10f && a.ready_s < 0.30f &&
                  vm_err > 0.005f && body_err > 0.005f;
     else
-      case_ok &= !idle_ok && vm_err < 1e-6f && body_err < 1e-6f;
+      case_ok &= idle_ok == GUN_POSE_BLOCKED &&
+                 vm_err < 1e-6f && body_err < 1e-6f;
     printf("vmframe %-7s ready=%.3f pitch=%+.2f yaw=%+.2f roll=%+.2f "
            "stock_eye=%.1fmm wrist_eye=(%.1f %.1f)mm stock_wrist=%.1fmm "
            "low_delta=(%.3f %.3f)mm mesh/plan=%.3fmm %s\n",
@@ -1405,13 +1406,13 @@ static void vmframe_proof(void) {
   float raise0 = vm_render_ready(&rp, &ra, 1.0f);
   float raise1 = 0.0f, raise4 = 0.0f, raise8 = 0.0f, raise16 = 0.0f;
   float last = raise0;
-  int transition_ok = gun_pose_idle_ok(&rp.wp, &ra, rp.vel,
+  int transition_ok = gun_pose_state(&rp.wp, &ra, rp.vel,
                                         rp.grounded, rp.sliding) && raise0 == 0.0f;
   for (int i = 1; i <= 16; i++) {
     vmframe_ready_tick(&rp, &ra);
     float r = vm_render_ready(&rp, &ra, 1.0f);
     transition_ok &= r > last && r < 1.0f &&
-                     gun_pose_idle_ok(&rp.wp, &ra, rp.vel,
+                     gun_pose_state(&rp.wp, &ra, rp.vel,
                                       rp.grounded, rp.sliding);
     last = r;
     if (i == 1) raise1 = r;
@@ -1426,7 +1427,7 @@ static void vmframe_proof(void) {
     vmframe_ready_tick(&rp, &ra);
     float r = vm_render_ready(&rp, &ra, 1.0f);
     transition_ok &= r < last && r > 0.0f &&
-                     gun_pose_idle_ok(&rp.wp, &ra, rp.vel,
+                     gun_pose_state(&rp.wp, &ra, rp.vel,
                                       rp.grounded, rp.sliding);
     last = r;
     if (i == 1) lower1 = r;
@@ -1461,13 +1462,13 @@ static void vmframe_proof(void) {
   float reset1 = 0.0f, reset30 = 0.0f, reset90 = 0.0f;
   float reset_last = reset0;
   int reset_ok = reset0 == 1.0f && reset_pose_err < 1e-6f &&
-                 gun_pose_idle_ok(&reset_p.wp, &reset_a, reset_p.vel,
+                 gun_pose_state(&reset_p.wp, &reset_a, reset_p.vel,
                                   reset_p.grounded, reset_p.sliding);
   for (int i = 1; i <= 90; i++) {
     vmframe_ready_tick(&reset_p, &reset_a);
     float r = vm_render_ready(&reset_p, &reset_a, 1.0f);
     reset_ok &= r < reset_last && r > 0.0f &&
-                gun_pose_idle_ok(&reset_p.wp, &reset_a, reset_p.vel,
+                gun_pose_state(&reset_p.wp, &reset_a, reset_p.vel,
                                  reset_p.grounded, reset_p.sliding);
     reset_last = r;
     if (i == 1) reset1 = r;

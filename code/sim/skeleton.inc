@@ -422,6 +422,7 @@ typedef struct {
   float   crouch_s, slide_s, air_s;  // eased pose blends 0..1, S-SHAPED
   float   crouch_lin, slide_lin, air_lin;  // ...and the plain first-order eases
                              // driving them; see anim_tick for why both exist
+  float   kneel_s, kneel_lin; // idle crouch: firing knee down; fades before gait
   float   slide_t;           // seconds since the slide began (entry envelope)
   float   slide_v;           // eased slide speed factor 0..1.2 (recline depth)
   int     was_slide;
@@ -455,8 +456,7 @@ typedef struct {
                              // hemisphere — legs always lead where knees bend
   float   slide_bk;          // 0 = forward/lateral slide, 1 = full butt-slide
   float   slide_ld;          // 0 = the LEFT leg leads the skid, 1 = the right.
-                             // A BLEND: a slide aimed dead ahead sits exactly on
-                             // the boundary and a boolean flips there
+                             // Latched once on entry; it cannot swap mid-slide.
   int     was_grounded;
   float   idle_t;            // always-advancing clock for idle breathing
   float   bwd;               // eased 0..1 how much of the travel is backward
@@ -522,14 +522,20 @@ static void recoil_body_impulse(anim_t *a, int src, int shot, int wpn, float ads
 // target of ready_s and must remain visible as the fast raise transition. Cooldown
 // includes the SR bolt cycle; fire_k covers the immediate carry floor before that
 // clock can be observed by a viewer.
-static int gun_pose_idle_ok(const weapon_t *w, const anim_t *a, v3 vel,
-                            int grounded, int slide) {
+enum { GUN_POSE_BLOCKED = -1, GUN_POSE_LOCOMOTION, GUN_POSE_IDLE };
+
+// Three states matter here. Idle may lower the SR, ordinary locomotion raises it only
+// through ready_s's follower, and a real action gate must be shouldered immediately so
+// first- and third-person cannot disagree on a shot/reload/ADS frame.
+static int gun_pose_state(const weapon_t *w, const anim_t *a, v3 vel,
+                          int grounded, int slide) {
   int cur = w->cur >= 0 && w->cur < WPN_COUNT ? w->cur : WPN_AR;
   float hspd2 = vel.x * vel.x + vel.z * vel.z;
-  return grounded && !slide && hspd2 <= 0.20f * 0.20f &&
-         !w->ads_want && w->ads_s <= 0.01f &&
-         w->reload_t == 0 && w->switch_t == 0 && w->cool[cur] == 0 &&
-         a->fire_k <= 0.01f;
+  if (!grounded || slide || w->ads_want || w->ads_s > 0.01f ||
+      w->reload_t != 0 || w->switch_t != 0 || w->cool[cur] != 0 ||
+      a->fire_k > 0.01f)
+    return GUN_POSE_BLOCKED;
+  return hspd2 <= 0.20f * 0.20f ? GUN_POSE_IDLE : GUN_POSE_LOCOMOTION;
 }
 
 
@@ -690,6 +696,71 @@ static v3 brace_hand(v3 shoulder, v3 want, v3 wri, float k) {
   return v3_lerp(wri, want, k);
 }
 
+// Sideways axis for a slide pose. `slide_pd` is already mirrored into the body's front
+// hemisphere, so its perpendicular remains the matching anatomical side while reacting
+// immediately to a fresh lateral skid instead of waiting for the hip heading.
+static v3 slide_side_axis(v3 travel) {
+  return v3_norm((v3){{-travel.z, 0.0f, travel.x}});
+}
+
+// Smallest torso-ellipse clearance along an arm segment. The shoulder itself grows out
+// of the torso, so the upper-arm samples begin beyond that joint; everything below is
+// the actual visible tube that must stay outside the carrier. Points above the shoulder
+// or below the belt are not torso collisions.
+static float arm_torso_segment_clearance(v3 shoulder, v3 elbow, v3 wrist,
+                                         v3 chest, v3 body_right, v3 body_fwd) {
+  const float upper_t[] = {0.30f, 0.48f, 0.66f, 0.84f, 1.0f};
+  const float fore_t[] = {0.12f, 0.28f};
+  float best = 9.0f;
+  for (int seg = 0; seg < 2; seg++) {
+    const float *samples = seg ? fore_t : upper_t;
+    int count = seg ? (int)(sizeof fore_t / sizeof fore_t[0])
+                    : (int)(sizeof upper_t / sizeof upper_t[0]);
+    v3 a = seg ? elbow : shoulder;
+    v3 b = seg ? wrist : elbow;
+    for (int i = 0; i < count; i++) {
+      v3 rel = v3_sub(v3_lerp(a, b, samples[i]), chest);
+      if (rel.y < -0.43f || rel.y > 0.11f) continue;
+      // Expanded by the arm tube's radius: centre-line clearance alone still lets the
+      // rendered upper arm disappear halfway into the vest.
+      float across = fabsf(v3_dot(rel, body_right)) / 0.205f;
+      float forward = fabsf(v3_dot(rel, body_fwd)) / 0.185f;
+      best = fminf(best, sqrtf(across * across + forward * forward));
+    }
+  }
+  return best;
+}
+
+// Solve an elbow, then react when either visible arm segment enters the torso
+// footprint. The fallback bends toward the wrist's side of the body (front for a
+// rifle, rear for a planted slide hand) while retaining the authored up/down
+// preference. This is one collision response shared by every weapon, motion and
+// pitch, not a stop-animation special case.
+static v3 arm_elbow_solve(v3 shoulder, v3 wrist, v3 pole, v3 chest,
+                          v3 body_right, float side) {
+  v3 elbow = ik_solve(shoulder, wrist, ANIM_UARM, ANIM_FARM, pole);
+  v3 body_fwd = {{body_right.z, 0.0f, -body_right.x}};
+  float radial = arm_torso_segment_clearance(shoulder, elbow, wrist, chest,
+                                              body_right, body_fwd);
+  if (radial >= 1.0f) return elbow;
+
+  // Shoulder position is the anatomical authority. Rolled/bladed shoulders can make
+  // a caller's nominal left/right sign point through the torso for exactly the stop
+  // frame this guard handles.
+  float shoulder_side = v3_dot(v3_sub(shoulder, chest), body_right);
+  if (fabsf(shoulder_side) > 0.03f) side = shoulder_side < 0.0f ? -1.0f : 1.0f;
+  float wrist_fwd = v3_dot(v3_sub(wrist, chest), body_fwd);
+  float fore_sign = wrist_fwd < -0.04f ? -1.0f : 1.0f;
+  v3 safe = v3_add(v3_scale(body_right, 1.30f * side),
+                   v3_add(v3_scale(body_fwd, 0.72f * fore_sign),
+                          v3_scale((v3){{0, 1, 0}},
+                                   f_clamp(pole.y, -0.65f, 0.35f))));
+  safe = v3_norm(safe);
+  float avoid = 0.72f + 0.28f * smooth01(1.0f - radial);
+  v3 corrected = v3_norm(v3_lerp(pole, safe, avoid));
+  return ik_solve(shoulder, wrist, ANIM_UARM, ANIM_FARM, corrected);
+}
+
 // Duty = the fraction of the gait cycle a foot spends on the ground; it rises with
 // speed past 0.5, which is where the FLIGHT time of a run comes from.
 static float anim_hz(const anim_t *a) {
@@ -840,6 +911,9 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // Squatting sends the hips BACK, not straight down — that is what keeps a real
   // crouch balanced over the feet instead of tipping forward off them.
   pelvis = v3_add(pelvis, v3_scale(F, -0.105f * a->crouch_s));
+  // In the idle kneel, settle a little weight over the firing-side knee. The offset
+  // disappears before crouch gait takes over, so movement keeps the symmetric stance.
+  pelvis = v3_add(pelvis, v3_scale(R, 0.030f * a->kneel_s));
   // Running, the mass has to lead the contact.
   pelvis = v3_add(pelvis, v3_scale(F, 0.062f * runT * ground * (1.0f - a->bwd)
                                     - 0.038f * a->bwd * movT * ground));
@@ -1036,6 +1110,26 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
                (sld * 0.45f + (1.0f - sld) * trail_u) * a->slide_s;
     v3 pole = v3_norm(v3_add(v3_scale(footF, 1.0f - 0.55f * a->slide_s),
                              v3_scale(U, uw)));
+    // One-knee contacts use a world-space knee target. IK still owns both bone
+    // lengths; this only chooses the valid side of its solution circle.
+    float kneel_trail = i == 1 ? a->kneel_s : 0.0f;
+    float slide_trail = (1.0f - sld) * a->slide_s;
+    if (kneel_trail > 0.001f) {
+      v3 knee_want = v3_add(base,
+          v3_add(v3_scale(F, 0.20f),
+                 v3_add(v3_scale(R, 0.08f), v3_scale(U, 0.066f))));
+      v3 kp = v3_norm(v3_sub(knee_want, hip));
+      pole = v3_norm(v3_lerp(pole, kp, kneel_trail));
+    }
+    if (slide_trail > 0.001f) {
+      v3 slide_right = slide_side_axis(a->slide_pd);
+      v3 knee_want = v3_add(base,
+          v3_add(v3_scale(a->slide_pd, 0.22f),
+                 v3_add(v3_scale(slide_right, s * 0.22f),
+                        v3_scale(U, 0.066f))));
+      v3 kp = v3_norm(v3_sub(knee_want, hip));
+      pole = v3_norm(v3_lerp(pole, kp, slide_trail));
+    }
     // --- ankle pitch -------------------------------------------------------
     // Swinging: toe pointed just after toe-off, toe up for the heel strike.
     float want = 0.0f;  // target ankle pitch in radians, positive = toe UP
@@ -1120,6 +1214,29 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
     P->toe[i] = v3_add(ank, v3_scale(footF, 0.175f));
   }
 
+  // Final slide-knee collision response. Directional targets keep the legs broadly
+  // apart, but an entry pose can still put the two faceted knee volumes through each
+  // other for one frame. Re-solving the lead bend only below their combined clearance
+  // preserves all four bone lengths and leaves valid authored poses byte-for-byte
+  // alone; the folded ground-knee contact never moves.
+  if (a->slide_s > 0.001f) {
+    v3 between = v3_sub(P->knee[1], P->knee[0]);
+    float sep = v3_len(between);
+    between.y = 0.0f;
+    v3 apart = v3_dot(between, between) > 1e-6f
+                 ? v3_norm(between) : slide_side_axis(a->slide_pd);
+    float avoid = f_smoothstep(0.18f, 0.12f, sep) * a->slide_s;
+    if (avoid > 0.001f) {
+      int i = a->slide_ld >= 0.5f ? 1 : 0;  // extended/lead leg only
+      float s = i ? 1.0f : -1.0f;
+      v3 bend = v3_norm(v3_sub(P->knee[i], P->hip[i]));
+      v3 safe = v3_norm(v3_add(bend,
+                               v3_scale(apart, s * 0.26f * avoid)));
+      P->knee[i] = ik_solve(P->hip[i], P->ankle[i], ANIM_THIGH, ANIM_SHIN,
+                            safe);
+    }
+  }
+
   // Arms hold the rifle two-handed on the aim axis; recoil pulls it back.
   v3 aimd = {{sinf(yaw) * cosf(pitch), sinf(pitch), -cosf(yaw) * cosf(pitch)}};
   // CARRY: a soldier who is not aiming does not walk around shouldered.
@@ -1129,7 +1246,9 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // whether the SR's idle lobe may exist at all: interpolation cannot resurrect
   // low-ready for one frame in the middle of ADS, reload, bolt, swap, slide or
   // fire. AR uses its standard carriage; the relative idle pose applies only to SR.
-  float ready_pose = wpn == WPN_SR && !idle_ok ? 1.0f : a->ready_s;
+  // State changes set ready_s's TARGET; they never bypass its follower. runT then
+  // carries either weapon continuously from idle sway into its authored run hold.
+  float ready_pose = idle_ok < GUN_POSE_LOCOMOTION ? 1.0f : a->ready_s;
   float rl = 1.0f - ready_pose;
   // Solve the shoulder line once. Stock seating, brace reach and arm IK all consume
   // these exact anchors; three nearby approximations cannot describe one torso.
@@ -1227,6 +1346,11 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
              // hangs into a leg. 22 mm now — a magazine touching a trouser, which is
              // what a carried rifle does.
   gun_o.y += bob_drop * 0.55f;
+  // Looking steeply down needs working room in front of the carrier. The weapon and
+  // both wrist targets move as one frame; the arm solve below then chooses collision-
+  // free elbows instead of letting a vertical rifle pull them through the sternum.
+  float aim_down = f_smoothstep(0.20f, 0.92f, -aimd.y);
+  gun_o = v3_add(gun_o, v3_scale(F, 0.205f * aim_down * (1.0f - a->slide_s)));
   // ADS is seated from the stock, not guessed from the grip. The descriptor's butt pin
   // is the shared model point; the target is the high firing-shoulder pocket used with
   // armour, slightly forward on the plate. Move the complete eye/weapon complex by the
@@ -1331,7 +1455,11 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   if (a->slide_s > 0.001f) {
     // Off hand braces ON THE GROUND behind the hip — that contact is most of what sells
     // a slide.
-    v3 want = v3_add(base, v3_add(v3_scale(R, -0.29f), v3_scale(F, -0.13f)));
+    // Place the contact behind the moving support shoulder. A base/hip-frame target
+    // drifts across the torso while leg_yaw catches up with a newly entered slide;
+    // shoulder-relative placement remains reachable and slide_pd makes it work for
+    // every travel direction.
+    v3 want = v3_add(sho_pose[0], v3_scale(a->slide_pd, 0.10f));
     // The wrist rides a fist-height over the floor, so the KNUCKLES are the
     // contact — this is the hand the player reads as dragging on the ground
     // (at 0.004 the old flat-palm wrap wound the fingers under the floor).
@@ -1339,8 +1467,8 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
     // The hand plants hard while the slide is fast and LIFTS as it bleeds out
     // (first beat of the exit: hand up, then rock over the lead foot, then
     // rise) — a brace held at walking speed reads as glued.
-    float plant = f_smoothstep(0.08f, 0.58f, a->slide_s);
-    float bk2 = plant * f_clamp(0.65f + 0.70f * a->slide_v, 0.0f, 1.0f);
+    float plant = f_smoothstep(0.04f, 0.45f, a->slide_s);
+    float bk2 = plant * f_clamp(0.90f + 0.40f * a->slide_v, 0.0f, 1.0f);
     wriL = brace_hand(sho_pose[0], want, wriL, bk2);
   }
   // Hard landing: a hand goes down. `land` is the impact impulse (1.0 ~ 10 m/s),
@@ -1351,6 +1479,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
     wriL = brace_hand(sho_pose[0], want, wriL, a->hdown);
   }
   for (int i = 0; i < 2; i++) {
+    float s = i ? 1.0f : -1.0f;
     v3 sho = sho_pose[i];
     v3 wri = i ? wriR : wriL;
     // Elbows are driven wide and down: a rifle stance reads as a triangle, and an elbow
@@ -1382,7 +1511,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
     }
     P->sho[i] = sho;
     P->wri[i] = wri;
-    P->elb[i] = ik_solve(sho, wri, ANIM_UARM, ANIM_FARM, pole);
+    P->elb[i] = arm_elbow_solve(sho, wri, pole, chest, Rc, s);
   }
 
   P->ant_sway = a->ant_p;
@@ -1487,7 +1616,8 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   // Carry state: the raise snaps (~110 ms), the lower is deliberate (~0.7 s after the
   // fight ends).
   {
-    float want = (ready || ads > 0.05f || (wpn == WPN_SR && !idle_ok))
+    float want = (ready || ads > 0.05f ||
+                  (wpn == WPN_SR && idle_ok <= GUN_POSE_LOCOMOTION))
                    ? 1.0f : 0.0f;
     a->ready_s += (want - a->ready_s) * ease_k(want > 0.5f ? 20.0f : 4.5f);
     // A SHOT MUST NEVER LEAVE A LOWERED RIFLE — see anim_carry_floor for the rule.
@@ -1532,6 +1662,14 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   float kb = ease_k(9.0f);
   a->crouch_lin += (((crouch && !slide) ? 1.0f : 0.0f) - a->crouch_lin) * kb;
   a->crouch_s = smooth01(a->crouch_lin);
+  // A stationary crouch settles onto the firing-side knee. Speed fades that contact
+  // before the gait controller starts stepping, so the same input becomes a mobile
+  // two-foot crouch without a mode switch or a teleported joint.
+  float kneel_speed = f_smoothstep(0.18f, 0.90f, a->spd);
+  float kneel_want = crouch && grounded && !slide ? 1.0f - kneel_speed : 0.0f;
+  float kneel_hz = kneel_want > a->kneel_lin ? 6.5f : 16.0f;
+  a->kneel_lin += (kneel_want - a->kneel_lin) * ease_k(kneel_hz);
+  a->kneel_s = smooth01(a->kneel_lin);
   // Slide blend is asymmetric: the drop-in snaps (~60 ms), standing back up
   // out of the skid is deliberately softer.
   float ksl = ease_k(slide ? 17.0f : 8.0f);
@@ -1627,7 +1765,8 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     if (a->spc >  0.030f) { a->spc =  0.030f; if (a->spc_v > 0) a->spc_v = 0; }
   }
 
-  if (slide && !a->was_slide) a->slide_t = 0;  // fresh slide: entry envelope
+  int slide_enter = slide && !a->was_slide;
+  if (slide_enter) a->slide_t = 0;  // fresh slide: entry envelope
   a->was_slide = slide;
   if (slide) {
     a->slide_t += TICK_DT;
@@ -1650,14 +1789,13 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     }
   }
   if (v3_dot(a->slide_pd, a->slide_pd) < 1e-6f) a->slide_pd = (v3){{fx, 0, fz}};
-  // WHICH LEG LEADS IS CONTINUOUS. It is decided by the sign of the skid's LATERAL
-  // component, and a slide aimed straight ahead sits on that sign change, so a player
-  // steering through dead-ahead mid-slide swapped the two legs' targets outright — 0.43
-  // m of `along` and 60 mm of foot height in one step.
-  {
+  // Latch one lead leg for the WHOLE slide. Straight-ahead used to blend to 0.5, which
+  // produced two identical half-extended legs; allowing steering to flip the latch
+  // later made both legs pass through each other. A new slide may choose a new side.
+  if (slide_enter) {
     float lat = a->slide_pd.x * rx + a->slide_pd.z * rz;
-    float w = smooth01(f_clamp(lat * (1.0f / 0.36f) + 0.5f, 0.0f, 1.0f));
-    a->slide_ld += (w - a->slide_ld) * ease_k(12.0f);
+    a->slide_ld = fabsf(lat) > 0.18f ? (lat > 0.0f ? 1.0f : 0.0f)
+                                     : (a->phase >= 0.5f ? 1.0f : 0.0f);
   }
 
   // Landing: remember the fall speed for the dip, plant both feet where the
@@ -1749,24 +1887,43 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
       foot_ride(&a->foot[i], base, tgt, vel, a->leg_yaw, kf);
     }
   } else if (slide) {
-    // Slide: heel-first lead leg extends along the pose direction (further the faster
-    // we go, pulling in as the slide bleeds off), trail leg folds tight under the hips;
-    // both skid with the body — that IS the contact.
+    // Slide: one heel-first leg extends along the mirrored travel direction while the
+    // other foot stays under the hips, letting its knee become the ground contact.
+    // Both feet still skid with the body; only their body-relative targets differ.
     v3 pd = a->slide_pd;
+    // This axis belongs to the slide direction, not the lagging hip heading. On a
+    // newly entered lateral slide that distinction is what keeps the folded knee on
+    // its own side of the body.
+    v3 slide_right = slide_side_axis(pd);
     float kf = ease_k(22.0f);
     float syaw = atan2f(pd.x, -pd.z);
     for (int i = 0; i < 2; i++) {
       float s = i ? 1.0f : -1.0f;
       float ld = i ? a->slide_ld : 1.0f - a->slide_ld;  // how much THIS leg leads
-      float along = ld * (0.44f + 0.22f * a->slide_v) +
-                    (1.0f - ld) * (0.01f + 0.42f * a->slide_bk);
-      float footy = ld * 0.075f +
-                    (1.0f - ld) * (0.135f - 0.060f * a->slide_bk);
-      v3 tgt = {{base.x + pd.x * along + rx * s * 0.17f,
+      float along = ld * (0.48f + 0.20f * a->slide_v) -
+                    (1.0f - ld) * 0.02f;
+      float footy = ANIM_ANKLE_Y;
+      v3 tgt = {{base.x + pd.x * along + slide_right.x * s * 0.17f,
                  base.y + footy,
-                 base.z + pd.z * along + rz * s * 0.17f}};
+                 base.z + pd.z * along + slide_right.z * s * 0.17f}};
       // Skid HORIZONTALLY only.
       foot_ride(&a->foot[i], base, tgt, (v3){{vel.x, 0.0f, vel.z}}, syaw, kf);
+    }
+  } else if (a->kneel_s > 0.001f) {
+    // Idle crouch: support foot forward, firing foot folded behind. The ankle targets
+    // stay on the floor and IK chooses the firing knee's ground-side solution above.
+    // As kneel_s fades these targets converge on the ordinary crouch stance before the
+    // step clock takes ownership.
+    float kf = ease_k(12.0f);
+    for (int i = 0; i < 2; i++) {
+      float s = i ? 1.0f : -1.0f;
+      float authored = i ? -0.205f : 0.240f;
+      float along = authored * a->kneel_s;
+      float half = 0.14f + (i ? -0.020f : 0.0f) * a->kneel_s;
+      v3 tgt = {{base.x + rx * s * half + fx * along,
+                 base.y + ANIM_ANKLE_Y,
+                 base.z + rz * s * half + fz * along}};
+      foot_ride(&a->foot[i], base, tgt, vel, a->leg_yaw, kf);
     }
   } else {
     // Grounded stepping. Swing targets land ahead along the velocity so the

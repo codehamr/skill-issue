@@ -809,7 +809,7 @@ static void bot_puppet_tick(bot_t *b, int bi) {
            b->crouch ? HEIGHT_CROUCH : HEIGHT_STAND);
   arena_clamp(&b->pos);
   b->wp.ready_want = (unsigned char)(b->pup_ready ? 1 : 0);
-  int idle_ok = gun_pose_idle_ok(&b->wp, &b->anim, b->vel,
+  int idle_ok = gun_pose_state(&b->wp, &b->anim, b->vel,
                                  b->grounded, b->sliding);
   anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
             b->crouch, 0.0f, b->sliding, b->wp.ads_s, b->pup_lean,

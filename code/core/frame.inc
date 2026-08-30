@@ -387,7 +387,7 @@ static void client_anim_all(void) {
     // player_present_tick runs: nothing else on a client ticks a body's presentation,
     // and the dead branch above already took it through player_present_tick.
     if (p->flash > 0) p->flash--;
-    int idle_ok = gun_pose_idle_ok(&p->wp, &g_player_anim[h], p->vel,
+    int idle_ok = gun_pose_state(&p->wp, &g_player_anim[h], p->vel,
                                    p->grounded, p->sliding);
     anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
               p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
@@ -420,7 +420,7 @@ static void client_anim_all(void) {
       bt->grounded = bt->rag.grounded;
       continue;
     }
-    int idle_ok = gun_pose_idle_ok(&bt->wp, &bt->anim, bt->vel,
+    int idle_ok = gun_pose_state(&bt->wp, &bt->anim, bt->vel,
                                    bt->grounded, bt->sliding);
     anim_tick(&bt->anim, bt->pos, bt->vel, bt->yaw, bt->pitch, bt->grounded,
               bt->crouch, 0.0f, bt->sliding, bt->wp.ads_s, 0.0f,

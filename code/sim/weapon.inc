@@ -440,7 +440,7 @@ static void player_present_tick(player_t *p, int ent) {
     // travels as a flag bit, and computing it a second time at the wire is exactly
     // how the pose and the packet would drift apart.
     p->wp.ready_want = (unsigned char)player_carry_ready(p);
-    int idle_ok = gun_pose_idle_ok(&p->wp, &g_player_anim[h], p->vel,
+    int idle_ok = gun_pose_state(&p->wp, &g_player_anim[h], p->vel,
                                    p->grounded, p->sliding);
     anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
               p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,

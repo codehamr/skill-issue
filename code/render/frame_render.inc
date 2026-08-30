@@ -374,7 +374,8 @@ static float vm_render_ready(const player_t *p, const anim_t *a, float alpha) {
   // gate. In particular alpha=0 on the shot tick still observes the current cooldown
   // / fire latch and therefore cannot draw the SR's previous low-ready frame.
   if (p->wp.cur == WPN_SR &&
-      !gun_pose_idle_ok(&p->wp, a, p->vel, p->grounded, p->sliding))
+      gun_pose_state(&p->wp, a, p->vel, p->grounded, p->sliding) ==
+        GUN_POSE_BLOCKED)
     ready = 1.0f;
   return f_clamp(ready, 0.0f, 1.0f);
 }

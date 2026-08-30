@@ -1561,13 +1561,11 @@ static void fig_hand_thumb(v3 wrist, v3 pk, v3 gc, v3 ga, v3 e1, v3 e2,
   const float TWRAP = style == 1 ? 0.68f : 1.0f;
   v3 tb2, tb3, tb4;
   if (style == 2) {
-    // FORWARD THUMB. Keep its three phalanges on the near-upper FLANK. A 72 mm run
-    // that climbed towards the rail crown made the thumb a second handguard laid on
-    // top of the real one; 58 mm root-to-tip matches the hand and preserves a clear
-    // C between the shorter thumb and the fingers below.
-    tb2 = hand_pt(gc, ga, e1, e2, 0.0280f, -side * 1.08f, gr + 0.0070f);
-    tb3 = hand_pt(gc, ga, e1, e2, 0.0380f, -side * 1.02f, gr + 0.0052f);
-    tb4 = hand_pt(gc, ga, e1, e2, 0.0460f, -side * 0.96f, gr + 0.0033f);
+    // FORWARD THUMB. Its visible run is only one thumb, not a second handguard:
+    // compact phalanges stay on the near-upper flank and stop before the finger row.
+    tb2 = hand_pt(gc, ga, e1, e2, 0.0180f, -side * 1.14f, gr + 0.0070f);
+    tb3 = hand_pt(gc, ga, e1, e2, 0.0260f, -side * 1.09f, gr + 0.0052f);
+    tb4 = hand_pt(gc, ga, e1, e2, 0.0320f, -side * 1.04f, gr + 0.0033f);
   } else if (style == 1) {
     // The firing thumb rests longitudinally on the receiver-side flank. Use weapon
     // right, not wrist bearing, as its lateral surface normal; targets include each
@@ -1629,7 +1627,7 @@ static void fig_hand_thumb(v3 wrist, v3 pk, v3 gc, v3 ga, v3 e1, v3 e2,
     for (int i = 4; i >= 2; i--) th[i + 1] = th[i];
     float pad = sqrtf(0.0128f * 0.0142f);
     th[2] = (fnode_t){
-      hand_pt(gc, ga, e1, e2, 0.0120f, -side * 1.08f,
+      hand_pt(gc, ga, e1, e2, 0.0060f, -side * 1.14f,
               gr + pad - 0.0034f), col, col, pad, pad, 0, 0.94f};
     nth = 6;
     // Circular exposed sections preserve their authored capsule radius while the

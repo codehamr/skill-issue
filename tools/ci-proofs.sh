@@ -153,7 +153,14 @@ say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 # - The tucked-trouser combat boot pass broadens the outsole/upper and buries the
 #   shin more decisively inside its shaft: 75/75/75/59. `figv` locates the added
 #   close contacts in shin/boot; every hard topology class remains zero.
-WANT_AR_NEAR="75 75 75 59"
+# - 2026-08-30 adaptive pose/face pass, reviewed against an archived HEAD binary:
+#   the new jaw planes and the one-knee/slide contacts move the per-frame maxima to
+#   77/77/78/61. The paired 60-tick histogram review is recorded with the cross
+#   census below; all five hard topology classes remain zero.
+# - The segment-aware arm solve and collision-reactive slide legs move the same
+#   deterministic sweep to 75/75/75/61. This is the exact old/new build comparison
+#   documented with the cross census below, not an unreviewed baseline bump.
+WANT_AR_NEAR="75 75 75 61"
 [ "$AR_NEAR" = "$WANT_AR_NEAR" ] || {
   say "GATE AR near '$AR_NEAR' != reviewed baseline '$WANT_AR_NEAR'"; fail=1;
 }
@@ -210,9 +217,24 @@ WANT_AR_NEAR="75 75 75 59"
 # - The broader protective toe, buried upper and tight shaft move the reviewed
 #   census to 110/110/92/61. `figv` attributes the delta to shin/boot contact;
 #   the laces and the support-thumb shortening introduce no hard mesh defect.
+# - 2026-08-30 adaptive pose/face A/B (`git archive HEAD`, identical seed/config):
+#   torso/uarm drops 54 -> 28, uarm/farm 12 -> 1 and shin/boot 398 -> 322 over
+#   60 close-tier frames — the reported arm/torso and folded-leg penetrations are
+#   reduced. Expected joint continuity moves to elbow/farm and uarm/uarm; the new
+#   skull planes redistribute its designed equipment burial from skull/helm_shell
+#   into skull/goggle, skull/helm_rail and skull/chinstrap. Slide boot contacts move
+#   from outsole/shaft into the folded cuff. Every run keeps open/flip/dup/zfight/
+#   degen at zero, and vmtrig keeps forbidden hand/weapon crossings at zero.
+# - Follow-up A/B (identical O3/fast-math/LTO flags, seed and fresh config): checking
+#   the whole arm segment keeps both stop-transition arms beyond their expanded torso
+#   ellipse. Latching the slide lead and solving in its travel frame removes the four
+#   knee/knee crossings after the final proximity response; aggregate thigh/shin drops
+#   85 -> 38 at k=16 and 90 -> 49 at k=6. Joint and boot-host contacts rise where the
+#   folded leg is deliberately joined, but per-frame maxima fall to 121/121/111/63.
+#   All five hard topology classes remain zero at all four tiers.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_AR_CROSS="110 110 92 61"
+WANT_AR_CROSS="121 121 111 63"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -233,9 +255,11 @@ WANT_AR_CROSS="110 110 92 61"
 # maxima. Rounded fingertip caps and the connected support-thumb sweep moved that
 # census again. The shared combat-boot pass now gives the values below; its `figv`
 # delta is the same designed shin/boot burial as AR and all hard topology classes
-# remain zero.
-WANT_SR_NEAR="95 95 58 38"
-WANT_SR_CROSS="180 180 118 93"
+# remain zero. The reviewed adaptive pose/face pass described in the AR census moves
+# the SR maxima, and the follow-up segment/slide A/B moves them again with the same
+# anatomy pair-family deltas: close-tier cross stays 208 while the other censuses fall.
+WANT_SR_NEAR="94 94 58 40"
+WANT_SR_CROSS="208 208 133 89"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -486,9 +510,14 @@ for size in 1280x720 1280x800 1024x768 640x360; do
   width="${size%x*}"; height="${size#*x}"
   log="$TMPD/homeui-$size.log"
   if run_size "$width" "$height" "homeui" >"$log"; then status=0; else status=$?; fi
-  [ "$status" = 0 ] || { say "GATE homeui res=$size exit=$status"; fail=1; }
+  if [ "$status" != 0 ]; then
+    say "GATE homeui res=$size exit=$status"
+    sed -n '/^homeui /p' "$log"
+    fail=1
+  fi
   grep -Eq "^homeui res=$size .*hover_delta=0 click_delta=0 state=stable focus=0/5 .*ui_drops=0 ok$" "$log" || {
     say "GATE homeui res=$size missing hover/click/layout/budget success contract"
+    [ "$status" != 0 ] || sed -n '/^homeui /p' "$log"
     fail=1
   }
 done

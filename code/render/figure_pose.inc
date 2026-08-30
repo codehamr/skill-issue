@@ -411,6 +411,21 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     TN( 0.352f,  0.018f, 0.184f, 0.134f, kt->uniform, 0.94f, 0.0f), // upper chest
     TN( 0.472f,  0.006f, 0.156f, 0.108f, kt->vest,  1.00f, 0.0f)};  // shoulder yoke
   #undef TN
+  if (g_fig_fp && g_fig_fp_down > 0.0f) {
+    // A world torso viewed from its own eye ends in a broad shoulder cap directly
+    // under the camera. Morph the FP-only upper body into a compact waist as pitch
+    // steepens: thighs remain joined, while no artificial chest cross-section can
+    // fill the view. The continuous morph avoids a mesh popping on/off at one angle.
+    float length = 1.0f - 0.72f * g_fig_fp_down;
+    float width = 1.0f - 0.46f * g_fig_fp_down;
+    for (int i = 0; i < 5; i++) {
+      t[i].p = v3_add(P->pelvis,
+                      v3_add(v3_scale(v3_sub(t[i].p, P->pelvis), length),
+                             v3_scale(cfw0, -0.035f * g_fig_fp_down)));
+      t[i].rx *= width;
+      t[i].rz *= width;
+    }
+  }
   probe("torso");
   // Damped jitter: full crate-jitter put a 1.35x light hoop mid-garment (adjacent bands
   // of ONE cloth suit), which reads as chain construction, not as designed planes.

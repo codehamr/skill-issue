@@ -2367,7 +2367,7 @@ static int leanstep_snapshot(void) {
     client_anim_all();
     if (g_lean_step_scans - ls_s0 > 1) ls_scan = 0;
     long ls_s1 = g_lean_step_scans;
-    int ls_idle_ok = gun_pose_idle_ok(&ls_full_wp, &ls_full,
+    int ls_idle_ok = gun_pose_state(&ls_full_wp, &ls_full,
                                       (v3){{0, 0, 0}}, 1, 0);
     anim_tick(&ls_full, (v3){{0, 0, 0}}, (v3){{0, 0, 0}}, 0.0f, 0.0f,
               1, 0, 0.0f, 0, 0.0f, ls_full_lean, 0, ls_remote_ent,
@@ -2554,18 +2554,18 @@ static void leanstep_proof(void) {
                 ls_case[7].ratio <= ls_case[3].ratio + 1e-4f &&
                 ls_case[8].ratio <= ls_case[2].ratio + 1e-4f &&
                 ls_case[9].ratio <= ls_case[3].ratio + 1e-4f;
-  // A settled crouch is already at a 52-degree included knee angle. Another
-  // 8 degrees needs more than the plan's 30 mm maximum hip drop in this rig.
-  // The crouch contract is therefore a shorter but
-  // still visible step, the authored local weight drop, and never straightening the
-  // active knee; standing retains the hard 8--15 degree incremental target.
+  // The stationary crouch is now an asymmetric firing-side kneel. Lean still gets a
+  // shorter visible step and the authored local weight drop, but its contact contract
+  // is the firing knee (index 1) staying folded under either lean direction while the
+  // support knee remains up. Standing retains the hard 8--15 degree target.
   int ls_crouch = ls_case[10].got_mm < ls_case[2].got_mm &&
                   ls_case[11].got_mm < ls_case[3].got_mm &&
                   ls_case[10].got_mm > ls_case[2].got_mm * 0.5f &&
                   ls_case[11].got_mm > ls_case[3].got_mm * 0.5f &&
                   ls_case[10].flex >= 0.0f && ls_case[10].flex <= 5.0f &&
                   ls_case[11].flex >= 0.0f && ls_case[11].flex <= 5.0f &&
-                  ls_case[10].knee[0] <= 55.0f && ls_case[11].knee[1] <= 55.0f;
+                  ls_case[10].knee[1] <= 60.0f && ls_case[11].knee[1] <= 60.0f &&
+                  ls_case[10].knee[0] >= 60.0f && ls_case[11].knee[0] >= 60.0f;
   int ls_speed = ls_case[12].got_mm > ls_case[14].got_mm &&
                  ls_case[13].got_mm > ls_case[15].got_mm &&
                  ls_case[14].got_mm > ls_case[16].got_mm &&
