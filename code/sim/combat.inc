@@ -307,6 +307,19 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   dir = v3_norm(v3_add(dir, v3_add(v3_scale(right, r * cosf(phi)),
                                    v3_scale(upv, r * sinf(phi)))));
 
+  // The barrel is authoritative. Solve the current carry/slide pose with this shot's
+  // recoil and spread, then start both hitscan and event at the model's published
+  // muzzle along that solved bore. Camera-to-crosshair convergence was a second axis:
+  // it let the impact and tracer fly somewhere the visible rifle never pointed.
+  {
+    float barrel_yaw = atan2f(dir.x, -dir.z);
+    float barrel_pitch = asinf(f_clamp(dir.y, -1.0f, 1.0f));
+    anim_stage_fire_anchor(ent_anim(ent), ent_pos(ent), barrel_yaw, barrel_pitch,
+                           w->cur, ent);
+    o = pose_muzzle(&g_fire_anchor_pose, w->cur);
+    dir = v3_norm(g_fire_anchor_pose.gun_f);
+  }
+
   // The kick lands AFTER the shot left the barrel.
   w->rec_p += wp[WP_KICK_UP] * rng_rangef(rng, 0.9f, 1.1f);
   w->rec_y += wp[WP_KICK_SIDE] *
@@ -660,9 +673,15 @@ static void ent_on_event(const event_t *e) {
     // fire_k starts the same eased raise on every viewer; physical recoil remains in
     // the three velocity springs above.
     a->fire_k = 1.0f;
-    float yaw, pitch;
-    ent_aim(e->src, &yaw, &pitch);
-    anim_stage_fire_anchor(a, ent_pos(e->src), yaw, pitch, e->wpn, e->src);
+    // A locally simulated shot already staged the exact barrel before tracing. A
+    // received remote event carries the authoritative ballistic muzzle in a/b/f; its
+    // current interpolated pose is only the flash model and must not feed the final
+    // bore through carry rotation a second time.
+    if (g_fire_anchor_src != e->src || g_fire_anchor_tick != g_tick) {
+      g_fire_anchor_pose = a->pose;
+      g_fire_anchor_src = e->src;
+      g_fire_anchor_tick = g_tick;
+    }
     return;
   }
   case EV_RELOAD: {

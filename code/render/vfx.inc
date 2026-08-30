@@ -408,7 +408,7 @@ static void vfx_ev_fire(const event_t *e) {
       // crossed with world up, which is where a port faces on a level rifle and
       // is close enough on a pitched one that nobody could name the error.
       v3 md = v3_norm(e->b);
-      v3 mz = v3_sub(e->a, v3_scale(md, e->f > 0.0f ? e->f : 1.0f));
+      v3 mz = v3_sub(e->a, v3_scale(md, e->f));
       v3 rt = v3_cross(md, (v3){{0, 1, 0}});
       float rl = v3_len(rt);
       rt = rl > 1e-4f ? v3_scale(rt, 1.0f / rl) : (v3){{1, 0, 0}};
@@ -418,11 +418,8 @@ static void vfx_ev_fire(const event_t *e) {
           v3 v = v3_add(v3_scale(rt, BRASS_OUT * skid_r(&bh, 0.80f, 1.25f)),
                 v3_add(v3_scale((v3){{0, 1, 0}}, BRASS_UP * skid_r(&bh, 0.75f, 1.30f)),
                        v3_scale(md, BRASS_FWD * skid_r(&bh, -0.4f, 1.0f))));
-          // SPAWNED WHERE THE RECEIVER IS, NOT WHERE THE MUZZLE IS. For the player
-          // those are not the same point: `weapon_fire` fires from `player_eye_pos`, so
-          // the reconstructed muzzle is the CAMERA — and a case ejected sideways from
-          // the camera crosses the frustum in two ticks and is gone before it can be
-          // seen.
+          // Move back from the reconstructed barrel tip to the receiver port. Muzzle,
+          // case and tracer now share the event's one physical barrel frame.
           g_parts[i] = (particle_t){
               .pos = v3_add(mz, v3_add(v3_scale(rt, 0.135f),
                             v3_add(v3_scale(md, BRASS_PORT_F),
@@ -433,16 +430,12 @@ static void vfx_ev_fire(const event_t *e) {
           break;
         }
     }
-    // The streak leaves the BARREL, not a point in front of the camera: the shooter's
-    // pose anchors the same rifle model scene_draw_figure draws, so its muzzle is where
-    // the round visibly leaves.
+    // The streak reuses the ballistic segment exactly. EV_FIRE's `a` is its endpoint,
+    // `b` its unit bore and `f` its travel from the staged model muzzle, so this inverse
+    // is the same barrel tip combat traced from even after a remote pose has advanced.
     if (e->src < 0) return;
-    int mh = human_of_ent(e->src);
-    const pose_t *P = g_fire_anchor_src == e->src && g_fire_anchor_tick == g_tick
-                        ? &g_fire_anchor_pose
-                        : mh >= 0 ? &g_player_anim[mh].pose
-                                  : &g_bots[e->src - 1].anim.pose;
-    v3 muz = pose_muzzle(P, e->wpn);
+    v3 shot_dir = v3_norm(e->b);
+    v3 muz = v3_sub(e->a, v3_scale(shot_dir, e->f));
     // The pool cannot overflow at the default tune (fire cooldown 10 ticks >
     // the 8-tick life caps concurrency at one per shooter), but a DEV rpm
     // near the 1000 cap makes consecutive shots overlap — and the PLAYER's

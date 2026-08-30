@@ -1948,11 +1948,14 @@ void fig_upper_arm(v3 shoulder, v3 elbow, v3 into, v3 hint,
   v3 outboard = v3_scale(v3_norm(into), -1.0f);
   float near_k = k >= 12 ? 1.0f : 0.0f;
   fnode_t ar[6] = {
-    {v3_add(shoulder, v3_scale(into, 0.052f)), c0, c0,
-     0.0540f, 0.0580f, 0, 0.74f},
+    // A broad buried root is the deltoid's attachment under the vest yoke. Keeping
+    // this ring narrower than the moving belly exposed a crescent of background when
+    // locomotion rotated the upper arm away from the shoulder line.
+    {v3_add(shoulder, v3_scale(into, 0.046f)), c0, c0,
+     0.0640f, 0.0670f, 0, 0.74f},
     {v3_add(v3_add(shoulder, v3_scale(ua, 0.020f)),
             v3_scale(outboard, 0.0060f + 0.0035f * near_k)), c1, c1,
-     0.0680f + 0.0015f * near_k, 0.0700f - 0.0010f * near_k, 0, 0.80f},
+     0.0710f + 0.0015f * near_k, 0.0720f - 0.0010f * near_k, 0, 0.80f},
     {v3_add(v3_add(shoulder, v3_scale(ua, 0.240f)),
             v3_scale(outboard, 0.0030f * near_k)), c2, c2,
      0.0650f + 0.0010f * near_k, 0.0675f - 0.0005f * near_k, 0, 0.0f},

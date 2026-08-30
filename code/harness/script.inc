@@ -1231,8 +1231,17 @@ static void cmd_kine(sim_ctx_t *s) {
     {
       v3 body_right = v3_norm(P->right);
       v3 body_fwd = {{body_right.z, 0.0f, -body_right.x}};
-      printf(" knee_sep=%.3f arm_clear=%.3f/%.3f",
+      float leg_clear = slide_leg_clearance(P, P->knee[0], P->knee[1]);
+      float left_step = v3_len(v3_sub(v3_sub(P->elb[0], P->sho[0]),
+                                      v3_sub(A->prev_pose.elb[0],
+                                             A->prev_pose.sho[0])));
+      float right_step = v3_len(v3_sub(v3_sub(P->elb[1], P->sho[1]),
+                                       v3_sub(A->prev_pose.elb[1],
+                                              A->prev_pose.sho[1])));
+      printf(" knee_sep=%.3f leg_clear=%.3f elbow_step=%.4f/%.4f "
+             "arm_clear=%.3f/%.3f",
              (double)v3_len(v3_sub(P->knee[1], P->knee[0])),
+             (double)leg_clear, (double)left_step, (double)right_step,
              (double)arm_torso_segment_clearance(P->sho[0], P->elb[0],
                                                   P->wri[0], P->chest,
                                                   body_right, body_fwd),
@@ -1242,6 +1251,60 @@ static void cmd_kine(sim_ctx_t *s) {
     }
     printf("\n");
   }
+}
+
+static void cmd_slidecheck(sim_ctx_t *s) {
+  (void)s;
+  static const float DIR[8][2] = {
+    {0, -1}, {0.70710678f, -0.70710678f}, {1, 0},
+    {0.70710678f, 0.70710678f}, {0, 1},
+    {-0.70710678f, 0.70710678f}, {-1, 0},
+    {-0.70710678f, -0.70710678f},
+  };
+  float min_clear = 9.0f, min_side = 9.0f, max_step = 0.0f, bone_err = 0.0f;
+  int clear_dir = -1, clear_tick = -1, step_dir = -1, step_tick = -1;
+  int finite = 1;
+  for (int d = 0; d < 8; d++) {
+    anim_t a;
+    v3 pos = {{0.0f, 5.0f, 0.0f}};
+    v3 vel = {{DIR[d][0] * 7.0f, 0.0f, DIR[d][1] * 7.0f}};
+    anim_reset(&a, pos, 0.0f, WPN_AR);
+    for (int tick = 0; tick < 60; tick++) {
+      pos = v3_add(pos, v3_scale(vel, TICK_DT));
+      anim_tick(&a, pos, vel, 0.0f, 0.0f, 1, 1, 0.0f, 1, 0.0f,
+                0.0f, 1, 1, WPN_AR, GUN_POSE_BLOCKED);
+      if (tick < 6) continue;
+      const pose_t *P = &a.pose;
+      float clear = slide_leg_clearance(P, P->knee[0], P->knee[1]);
+      v3 right = {{cosf(a.leg_yaw), 0.0f, sinf(a.leg_yaw)}};
+      float side = v3_dot(v3_sub(P->knee[1], P->knee[0]), right);
+      if (clear < min_clear) { min_clear = clear; clear_dir = d; clear_tick = tick; }
+      min_side = fminf(min_side, side);
+      for (int i = 0; i < 2; i++) {
+        v3 bend = v3_sub(P->knee[i], P->hip[i]);
+        v3 old_bend = v3_sub(a.prev_pose.knee[i], a.prev_pose.hip[i]);
+        float step = v3_len(v3_sub(bend, old_bend));
+        if (step > max_step) { max_step = step; step_dir = d; step_tick = tick; }
+        bone_err = fmaxf(bone_err,
+            fabsf(v3_len(v3_sub(P->knee[i], P->hip[i])) - ANIM_THIGH));
+        bone_err = fmaxf(bone_err,
+            fabsf(v3_len(v3_sub(P->ankle[i], P->knee[i])) - ANIM_SHIN));
+        finite &= !f_is_nonfinite(P->knee[i].x) &&
+                  !f_is_nonfinite(P->knee[i].y) &&
+                  !f_is_nonfinite(P->knee[i].z);
+      }
+    }
+  }
+  int ok = finite && min_clear >= 0.120f && min_side >= 0.090f &&
+           max_step <= 0.080f && bone_err <= 0.007f;
+  printf("slidecheck dirs=8 clear=%.1fmm@%d/%d side=%.1fmm "
+         "step=%.1fmm@%d/%d "
+         "bone=%.3fmm finite=%d %s\n",
+         (double)(min_clear * 1000.0f), clear_dir, clear_tick,
+         (double)(min_side * 1000.0f), (double)(max_step * 1000.0f),
+         step_dir, step_tick, (double)(bone_err * 1000.0f),
+         finite, ok ? "ok" : "FAIL");
+  if (!ok) exit(1);
 }
 
 static void cmd_skel(sim_ctx_t *s) {
@@ -2948,6 +3011,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"vmsight", cmd_vmsight}, {"vmscope", cmd_vmscope}, {"parity", cmd_parity},
   {"rag", cmd_rag}, {"ragsoak", cmd_ragsoak}, {"ragx", cmd_ragx},
   {"figv", cmd_figv}, {"figcheck", cmd_figcheck}, {"kine", cmd_kine},
+  {"slidecheck", cmd_slidecheck},
   {"skel", cmd_skel}, {"vmhand", cmd_vmhand}, {"vmorbit", cmd_vmorbit},
   {"vmbore", cmd_vmbore},
   {"hud", cmd_hud}, {"showfps", cmd_showfps}, {"trace", cmd_trace},

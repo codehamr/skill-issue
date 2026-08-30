@@ -315,6 +315,8 @@ static void usage(void) {
        "                     through each other at a shallow angle (a seam the\n"
        "                     tessellation decides, not the geometry)\n"
        "                     (DIST = camera distance, to sweep the profile tiers)\n"
+       "  slidecheck         eight-direction slide limb-capsule clearance, anatomical\n"
+       "                     side ordering, joint continuity and bone-length residual\n"
        "  figv               toggle printing each figcheck offender's location\n"
        "  leanstep           hard Lean-foot fixtures: open/wall/corner/slot, sign\n"
        "                     flip, gait/wire/event neutrality and snapshot cadence\n"

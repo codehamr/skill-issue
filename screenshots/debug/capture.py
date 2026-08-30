@@ -318,6 +318,22 @@ CAPTURES = (
         0.55,
         (-1.55, 0.86, -2.15),
     ),
+    exterior(
+        "slide",
+        "slide_right_ext_side.png",
+        "Rightward lateral AR slide, anatomical left profile",
+        ("puppet move 1 0", "puppet speed 7", "puppet slide", "wait 8"),
+        0.55,
+        (-2.65, 0.82, 0.00),
+    ),
+    exterior(
+        "slide",
+        "slide_left_ext_side.png",
+        "Leftward lateral AR slide, anatomical left profile",
+        ("puppet move -1 0", "puppet speed 7", "puppet slide", "wait 8"),
+        0.55,
+        (-2.65, 0.82, 0.00),
+    ),
     Capture(
         "slide",
         "slide_fp.png",

@@ -291,11 +291,11 @@ typedef struct {
   float back1, lift1;
 } netfigure_fire_t;
 
-// One foreign shot, from a fully lowered and fully settled body. EV_FIRE owns a
-// shouldered T0 tracer anchor and adds recoil VELOCITY, but does not overwrite the
+// One foreign shot, from a fully lowered and fully settled body. The event's ballistic
+// segment begins on that live barrel, adds recoil VELOCITY, and does not overwrite the
 // visible body. The next client presentation tick begins the eased raise and owns the
 // first spring displacement. Running this once per weapon proves EV_FIRE.wpn reaches
-// both the event-local solve and the authored impulse without reintroducing an arm pop.
+// both the live event anchor and the authored impulse without reintroducing an arm pop.
 static netfigure_fire_t netfigure_fire_case(int ent, int wpn) {
   int h = human_of_ent(ent);
   player_t *p = &g_players[h];
@@ -317,9 +317,8 @@ static netfigure_fire_t netfigure_fire_case(int ent, int wpn) {
 
   float slung = netfigure_bore_off_aim(ent);
   float ready_slung = a->ready_s;
-  v3 aim = {{sinf(p->yaw) * cosf(p->pitch), sinf(p->pitch),
-             -cosf(p->yaw) * cosf(p->pitch)}};
   v3 muz_slung = pose_muzzle(&a->pose, wpn);
+  v3 bore_slung = v3_norm(a->pose.gun_f);
 
   // No old tracer or queued event may satisfy this case accidentally. Clearing VFX
   // also makes the one live tracer below an unambiguous record of the anchor actually
@@ -328,7 +327,8 @@ static netfigure_fire_t netfigure_fire_case(int ent, int wpn) {
   g_num_events = 0;
   int shot = 7 + wpn;
   ev_push((event_t){.type = EV_FIRE, .src = ent, .wpn = wpn, .i = shot,
-                    .a = v3_add(p->pos, v3_scale(aim, 20.0f)), .b = aim,
+                    .a = v3_add(muz_slung, v3_scale(bore_slung, 20.0f)),
+                    .b = bore_slung,
                     .f = 20.0f, .g = p->wp.ads_s});
 
   int ti = -1;
@@ -354,10 +354,10 @@ static netfigure_fire_t netfigure_fire_case(int ent, int wpn) {
   client_anim_all();
   v3 muz1 = pose_muzzle(&a->pose, wpn);
   float axis1 = netfigure_bore_off_aim(ent);
-  float toward1 = v3_len(v3_sub(tracer, muz1));
   float toward0 = v3_len(v3_sub(tracer, muz0));
   float ready1 = a->ready_s;
   float back1 = a->recoil_back, lift1 = a->recoil_lift, side1 = a->recoil_side;
+  float step1 = v3_len(v3_sub(muz1, muz0));
 
   // T0 body values and pose are continuous, while all three velocities and the event
   // anchor already carry the shot. T1 is the first displaced, partially raised pose;
@@ -367,22 +367,23 @@ static netfigure_fire_t netfigure_fire_case(int ent, int wpn) {
   int impulse0 = backv0 > 0.5f && liftv0 > 0.3f && fabsf(sidev0) > 0.02f;
   int moved1 = back1 > 0.004f && lift1 > 0.001f && fabsf(side1) > 0.0001f;
   int ok = ti >= 0 && staged && ready_slung < 0.05f && slung > 20.0f &&
-           raised > 0.20f && visible0 < 0.002f && latch0 > 0.9f &&
-           anchor0 < 0.002f && axis0 < 0.5f && zero0 && impulse0 && moved1 &&
-           ready1 > 0.10f && ready1 < 0.30f && toward1 < toward0 &&
-           toward1 > 0.05f && axis1 > axis0 + 0.05f && axis1 < slung;
+           raised < 0.002f && visible0 < 0.002f && latch0 > 0.9f &&
+           anchor0 < 0.002f && fabsf(axis0 - slung) < 0.25f &&
+           zero0 && impulse0 && moved1 && ready1 > 0.10f && ready1 < 0.30f &&
+           toward0 < 0.002f && step1 > 0.002f && step1 < 0.12f &&
+           axis1 + 0.05f < axis0;
   printf("netfigure fire=%s slung=%.2fdeg raise=%.2fm | "
          "T0 anchor=%.2fmm hold=%.2fmm axis=%.2fdeg "
          "kick=(%.2fmm %.2fdeg %+.2fmm) "
          "vel=(%.2f %.2f %+.2f) latch=%.2f | "
-         "T1 toward=%.2fmm axis=%.2fdeg ready=%.3f "
+         "T1 step=%.2fmm axis=%.2fdeg ready=%.3f "
          "kick=(%.2fmm %.2fdeg %+.2fmm) %s\n",
          wpn == WPN_SR ? "sr" : "ar", (double)slung, (double)raised,
          (double)(anchor0 * 1000.0f), (double)(visible0 * 1000.0f),
          (double)axis0,
          (double)(back0 * 1000.0f), (double)(lift0 / DEG2RAD),
          (double)(side0 * 1000.0f), (double)backv0, (double)liftv0,
-         (double)sidev0, (double)latch0, (double)(toward1 * 1000.0f),
+         (double)sidev0, (double)latch0, (double)(step1 * 1000.0f),
          (double)axis1, (double)ready1, (double)(back1 * 1000.0f),
          (double)(lift1 / DEG2RAD), (double)(side1 * 1000.0f),
          ok ? "ok" : "FAIL");
@@ -1140,7 +1141,7 @@ typedef struct {
   v3 pub_cam0, pub_cam1;
   float remap0, remap1, publish0, publish1;
   float vm_depth0, fx_depth0, vm_depth1, fx_depth1;
-  float latch;
+  float latch, shot_axis, ballistic_anchor;
   long pub_tick0, pub_tick1;
   int fire_events, all_events, map0_ok, map1_ok, stale_rejected;
 } vmframe_fire_t;
@@ -1221,7 +1222,15 @@ static vmframe_fire_t vmframe_fire_case(int predicting) {
   if (!predicting && g_fire_anchor_src == 0 && g_fire_anchor_tick == g_tick)
     out.anchor0 = pose_muzzle(&g_fire_anchor_pose, WPN_SR);
   for (int i = ev0; i < g_num_events; i++)
-    if (g_events[i].type == EV_FIRE && g_events[i].src == 0) out.fire_events++;
+    if (g_events[i].type == EV_FIRE && g_events[i].src == 0) {
+      const event_t *e = &g_events[i];
+      out.fire_events++;
+      v3 event_dir = v3_norm(e->b);
+      out.shot_axis = v3_len(v3_sub(event_dir,
+                                    v3_norm(g_fire_anchor_pose.gun_f))) * 1000.0f;
+      v3 event_muzzle = v3_sub(e->a, v3_scale(event_dir, e->f));
+      out.ballistic_anchor = v3_len(v3_sub(event_muzzle, out.anchor0));
+    }
   out.all_events = g_num_events - ev0;
   for (int i = 0; i < MAX_TRACERS; i++)
     if (g_tracers[i].life > 0 && g_tracers[i].src == 0) {
@@ -1528,8 +1537,8 @@ static void vmframe_proof(void) {
   // Paired production shots: the ordinary EV_FIRE path is the reference, the second
   // suppresses every event as online prediction does. Local FP state and its exact
   // VM-FOV -> world-FOV tracer remap must agree at T0/T1. The event-local shouldered
-  // pose owns the tracer anchor at T0 while the visible body retains its previous
-  // carry pose; at T1 ready_s must have advanced only part way. The 3P poses then MUST
+  // pose owns the tracer anchor at T0 and must coincide with the visible live carry
+  // pose; at T1 ready_s must have advanced only part way. The 3P poses then MUST
   // diverge because recoil_body_impulse belongs to authoritative EV_FIRE and is
   // intentionally absent from forward prediction.
   // Leave the authoritative case live after the pair: its tracer then drives one
@@ -1598,16 +1607,19 @@ static void vmframe_proof(void) {
                 event.pub_tick1 == pred.pub_tick1 &&
                 remap0 <= 0.002f && remap1 <= 0.002f &&
                 pose0 <= 0.002f && pose1 > 0.002f && anchor0 <= 0.002f &&
-                visible_hold0 > 0.02f;
+                visible_hold0 <= 0.002f && event.shot_axis <= 0.001f &&
+                event.ballistic_anchor <= 0.002f;
   printf("vmframe fire sr T0 vm_pair=%.3fmm fx_pair=%.3fmm "
          "publish=%.3fmm pair=%.3fmm remap=%.3fmm "
          "pose_pair=%.3fmm anchor=%.3fmm visible_hold=%.3fmm "
+         "bore=%.4fmrad ballistic=%.3fmm "
          "depth_vm/fx=%.1f/%.1fmm "
          "tick=%ld stale=%d\n",
          (double)(vm0 * 1000.0f), (double)(fx0 * 1000.0f),
          (double)(pub0 * 1000.0f), (double)(pub_pair0 * 1000.0f),
          (double)(remap0 * 1000.0f), (double)(pose0 * 1000.0f),
          (double)(anchor0 * 1000.0f), (double)(visible_hold0 * 1000.0f),
+         (double)event.shot_axis, (double)(event.ballistic_anchor * 1000.0f),
          (double)(event.vm_depth0 * 1000.0f),
          (double)(event.fx_depth0 * 1000.0f), event.pub_tick0,
          event.stale_rejected && pred.stale_rejected);
