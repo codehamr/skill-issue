@@ -1,7 +1,7 @@
 // =============================================================================
 // ui/settings.inc  —  panel widgets (ui_pill/ui_cycle/ui_slider), bind rows,
 // ui_keyboard, session_pauses.
-// Proof: uistat, click-band sweep. One TU: included once by game.c, in
+// Proof: uistat, click-band sweep, homeui. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // Contract: session_pauses() is the one predicate for "does this session
 // freeze?" (windowed SP with the menu open does, networked never). The
@@ -719,40 +719,76 @@ static int ui_tile(const char *label, const char *sub, float x, float y,
   return (click && hot && g_ui_rebind < 0) || ui_nav_take(foc, NAV_OK);
 }
 
-// The card that names what the camera is looking at.
-static void ui_home_cards(float vw, float vh) {
-  const player_t *lp = local_player();
-  int wc = lp ? lp->wp.cur : WPN_AR;
-  // Descriptions, not trademarks. The file's own reference notes name the real
-  // hardware; a shipped screen says what the thing IS.
-  static const char *const WNAME[WPN_COUNT] = {"ASSAULT RIFLE", "SNIPER RIFLE"};
-  static const char *const WSPEC[WPN_COUNT] = {"5.56 x 45   /   FULL AUTO",
-                                               ".338 MAGNUM   /   BOLT ACTION"};
-  // The cards live in the corner the rail does not own, and at 4:3 that corner is 160
-  // units narrower than at 16:9 — enough that a card sized for a widescreen monitor
-  // lands ON the QUIT tile.
-  #define HOME_RAIL_X 34.0f
-  #define HOME_RAIL_W 208.0f
+// The HOME readout's one layout contract, shared by the draw and its headless proof.
+// Keeping the clamp here means the proof cannot bless a rectangle different from the
+// one players see.
+#define HOME_RAIL_X 34.0f
+#define HOME_RAIL_W 208.0f
+typedef struct { float x, y, w, h; } home_readout_box_t;
+
+static int ui_home_readout_box(float vw, float vh, home_readout_box_t *box) {
   float lim = HOME_RAIL_X + HOME_RAIL_W + 20.0f;
   float cw = 208, ch = 44;
   float cxr = vw - 34 - cw;
   if (cxr < lim) { cxr = lim; cw = vw - 34 - lim; }
-  if (cw < 96) return;               // no room at all: the shot speaks for itself
-  float cyr = vh - 40 - ch;
-  ui_panel(cxr, cyr, cw, ch, 0, 0.84f);
-  ui_rect(cxr, cyr, cw, 1.0f, C_BONE, 0.28f);
-  ui_text_fit(WNAME[wc], cxr + 13, cyr + 11, cw - 26, 1.35f, TXT_BOLD, 1.5f,
-              C4(C_BONE, 1));
-  ui_text_fit(WSPEC[wc], cxr + 13, cyr + 27, cw - 26, 0.72f, TXT_REG, 1.3f,
-              C4(C_HAZE, 0.9f));
+  *box = (home_readout_box_t){cxr, vh - 40 - ch, cw, ch};
+  return cw >= 96;                    // no room at all: the shot speaks for itself
+}
+
+static float ui_home_fit_width(const char *text, float maxw,
+                               float *scale, float *track) {
+  for (int i = 0; i < 8 && ui_text_width_tr(text, *scale, *track) > maxw; i++) {
+    *scale *= 0.94f;
+    *track *= 0.94f;
+  }
+  return ui_text_width_tr(text, *scale, *track);
+}
+
+// Descriptions, not trademarks. Compact calibre copy and one shadow per line stay
+// within the HOME readout vertex budget at every required aspect ratio. The proof
+// reads these same strings.
+static const char *const HOME_WNAME[WPN_COUNT] = {
+  "CARBINE", "SNIPER"
+};
+static const char *const HOME_WSPEC[WPN_COUNT] = {
+  "5.56", ".338"
+};
+
+// An editorial lower third: information over the shot, never a destination.
+static void ui_home_readout(float vw, float vh) {
+  const player_t *lp = local_player();
+  int wc = lp ? lp->wp.cur : WPN_AR;
+  home_readout_box_t box;
+  // At 4:3 the right corner is 160 units narrower than at 16:9;
+  // ui_home_readout_box supplies the shared clamp and fallback that keep the block
+  // off the QUIT tile.
+  if (!ui_home_readout_box(vw, vh, &box)) return;
+  float right = box.x + box.w;
+
+  // OPEN, QUIET, RIGHT-ANCHORED. The existing floor vignette is the contrast
+  // treatment and the small ink shadow keeps type readable over bright SAND. A short
+  // rule is punctuation, not a boundary.
+  float rule = fminf(box.w, 58.0f);
+  ui_rect(right - rule, box.y, rule, 0.8f, C_BONE, 0.32f);
+
+  float ns = 1.35f, nt = 1.5f;
+  float nw = ui_home_fit_width(HOME_WNAME[wc], box.w, &ns, &nt);
+  ui_text_sh(HOME_WNAME[wc], right - nw, box.y + 8, ns, TXT_BOLD, nt,
+             C4(C_BONE, 1));
+
+  float ss = 0.72f, st = 1.3f;
+  float sw = ui_home_fit_width(HOME_WSPEC[wc], box.w, &ss, &st);
+  ui_text_sh(HOME_WSPEC[wc], right - sw, box.y + 27, ss, TXT_REG, st,
+             C4(C_HAZE, 0.9f));
 
   float f;
   const char *cap = home_caption(&f);
-  if (!cap) return;
-  float tw = ui_text_width_tr(cap, 0.8f, 2.4f);
-  float bx = cxr + cw - tw - 12, by = cyr - 19;
-  ui_rect(bx - 10, by - 4, tw + 22, 15, 0.02f, 0.03f, 0.04f, 0.66f * f);
-  ui_text_ex(cap, bx, by, 0.8f, TXT_BOLD, 2.4f, C4(C_BONE, 0.92f * f));
+  if (cap) {
+    float cs = 0.8f, ct = 2.4f;
+    float capw = ui_home_fit_width(cap, box.w, &cs, &ct);
+    ui_text_sh(cap, right - capw, box.y - 13, cs, TXT_BOLD, ct,
+               C4(C_BONE, 0.92f * f));
+  }
 }
 
 static void ui_home(int click, float cx, float cy) {
@@ -767,7 +803,7 @@ static void ui_home(int click, float cx, float cy) {
            C4(0.010f, 0.014f, 0.024f, 0.0f));
   ui_vgrad(0, 0, vw, 54, C4(0.010f, 0.014f, 0.024f, 0.60f),
            C4(0.010f, 0.014f, 0.024f, 0.0f));
-  // ...and a floor under the cards, which only exist while the camera does.
+  // ...and a floor under the readout, which only exists while the camera does.
   if (g_home)
     ui_vgrad(0, vh * 0.62f, vw, vh * 0.38f, C4(0.010f, 0.014f, 0.024f, 0.0f),
              C4(0.010f, 0.014f, 0.024f, 0.62f));
@@ -927,7 +963,7 @@ static void ui_home(int click, float cx, float cy) {
       ui_text_ex(back, rx + clw + 24, 69, 0.7f, TXT_REG, 1.0f, C4(C_HAZE, 0.7f));
     }
   }
-  if (g_home) ui_home_cards(vw, vh);
+  if (g_home) ui_home_readout(vw, vh);
 }
 
 // THE ON-SCREEN KEYBOARD, drawn LAST and over a scrim, because it is a modal and the
@@ -1000,4 +1036,3 @@ static void ui_keyboard(int click, float cx, float cy) {
     y += keyh + gap;
   }
 }
-

@@ -313,70 +313,30 @@ FIG_INLINE void fig_death_pose(pose_t *P, const death_t *dth, v3 pos,
 
 // Every band colour the figure builders below draw with, solved once per figure.
 typedef struct {
-  v3 olive, boot, helm, web, rub, gm2;         // base materials
+  v3 uniform, boot, helm, web, rub, gm2;       // base materials
   v3 gear, belt, pad, pants, dust1;            // carrier, webbing, rubber, trouser
   v3 vest, sleeve, glove, bala;                // derived / balaclava
 } kit_t;
 
-static kit_t fig_kit(int palette, float flash01, v3 flash_col) {
-  // Kit palette.
-  v3 olive = {{0.362f, 0.384f, 0.288f}};   // ripstop uniform, olive drab
-  v3 dark  = {{0.288f, 0.299f, 0.246f}};   // trouser, a shade greyer
-  // Desaturated.
-  v3 boot  = {{0.168f, 0.152f, 0.140f}};   // dark brown leather
-  // 0.65x the sleeve.
-  v3 helm  = {{0.428f, 0.452f, 0.348f}};   // ranger green composite shell (value peak)
-  // The carrier is the LIGHT block. It used to sit a value step below the
-  // uniform, which put the biggest mass on the body at the bottom of the value
-  // ramp; the TF2 rule the redesign follows wants the largest value step at
-  // the chest line, which means the carrier goes ABOVE the uniform, not below.
-  // ...and it is a COOL light block now, not an orange one. The value contract
-  // above is about LUMINANCE, and this holds it: 0.429 against the old 0.423,
-  // so the carrier still sits 1.13x over the uniform and the 25 m silhouette
-  // number is untouched. What changed is saturation, 0.39 -> 0.22. At the old
-  // chroma the single biggest mass on the figure was a warm sand slab on a
-  // green man — it read as surplus webbing rather than as a plate carrier, and
-  // it pulled the eye off the head and the weapon, which are the two things a
-  // shooter's silhouette is supposed to be about.
-  v3 nyl   = {{0.452f, 0.430f, 0.352f}};   // wolf-grey nylon: carrier, pouches
-  v3 web   = {{0.238f, 0.214f, 0.176f}};   // webbing / belt
-  // Pads live in the trouser family now (max ~1.5 value steps off the sleeve):
-  // near-black rubber made every joint the darkest accent on the model, and it
-  // landed exactly on the roundest surfaces — action-figure articulation dots.
-  v3 rub   = {{0.212f, 0.214f, 0.206f}};   // worn rubber knee & elbow pads
+static kit_t fig_kit(float flash01, v3 flash_col) {
+  // One Cool-Arid kit for every figure and every camera. Large Stone-Sage
+  // cloth fields sit between a darker Dust-Olive trouser and the lighter
+  // Coyote/Stone carrier and shell; role is never encoded in uniform hue.
+  v3 uniform = {{0.378f, 0.385f, 0.354f}};  // stone-sage ripstop
+  v3 dark    = {{0.296f, 0.300f, 0.273f}};  // dust-olive trouser
+  v3 boot    = {{0.160f, 0.153f, 0.147f}};  // dark brown leather
+  v3 helm    = {{0.442f, 0.449f, 0.406f}};  // sand-sage shell, the value peak
+  // The carrier is the cool LIGHT block at the chest line: about one value
+  // step above the uniform, with low enough chroma to stay quiet in SAND.
+  v3 nyl   = {{0.447f, 0.426f, 0.374f}};   // muted coyote-stone carrier
+  v3 web   = {{0.229f, 0.218f, 0.198f}};   // umber webbing / belt
+  // Pads remain in the trouser family instead of becoming articulation dots.
+  v3 rub   = {{0.205f, 0.210f, 0.204f}};   // worn graphite rubber
   v3 gm2   = {{0.078f, 0.082f, 0.098f}};   // lens glass, dark pupil
-  // Balaclava: the face is COVERED. The bone-white face wedge was the brightest value
-  // on the whole model — a skull mask up close, a headlamp blob at range — and the
-  // value-ramp contract says the face is never the peak.
-  v3 bala  = {{0.318f, 0.309f, 0.282f}};
-  if (palette == 1) {  // the player: the same kit in slate blue — the SAME
-    // value ramp as the olive design (boots darkest, carrier light, helmet
-    // peak), only the hue family changes.
-    //
-    // ...AND 35% LESS CHROMA THAN IT USED TO CARRY, taken out on the LUMINANCE
-    // axis so every value in the ramp is unchanged to four decimals (olive
-    // 0.3926, helm 0.4411, boot 0.1650 — the same numbers the 25 m silhouette
-    // contract was measured on). Saturation goes 0.29 -> 0.21 on the uniform.
-    // The reason is FIRST PERSON: the sleeve is the only part of this palette
-    // the player ever sees up close, it fills the bottom corner of every frame,
-    // and at the old chroma under a hero rig it read as cornflower blue — the
-    // most saturated thing in an arena whose whole light is warm. Hue family is
-    // untouched, so slate-versus-olive still tells a human from a bot at range;
-    // what is gone is a colour that was fighting the setting rather than
-    // sitting in it.
-    olive = (v3){{0.366f, 0.394f, 0.461f}};
-    dark  = (v3){{0.289f, 0.310f, 0.367f}};
-    helm  = (v3){{0.417f, 0.442f, 0.507f}};
-    web   = (v3){{0.210f, 0.226f, 0.266f}};
-    boot  = (v3){{0.160f, 0.164f, 0.185f}};
-    // The three tones the palette used to leave behind, and leaving them behind was not
-    // neutral — it was a different figure.
-    nyl   = (v3){{0.452f, 0.452f, 0.464f}};
-    rub   = (v3){{0.210f, 0.216f, 0.236f}};
-    bala  = (v3){{0.304f, 0.312f, 0.335f}};
-  }
+  // The covered face stays charcoal and never becomes the value peak.
+  v3 bala  = {{0.253f, 0.253f, 0.246f}};
   if (flash01 > 0) {  // hit flash: every surface washes toward the flash color
-    olive = v3_lerp(olive, flash_col, flash01);
+    uniform = v3_lerp(uniform, flash_col, flash01);
     dark  = v3_lerp(dark, flash_col, flash01);
     boot  = v3_lerp(boot, flash_col, flash01);
     helm  = v3_lerp(helm, flash_col, flash01);
@@ -397,15 +357,14 @@ static kit_t fig_kit(int palette, float flash01, v3 flash_col) {
                                                      // the draw site)
   // The yoke band rides ABOVE the uniform value (it sits at the chest line,
   // where the ramp peaks), not below it.
-  v3 vest = v3_scale(olive, 1.04f), sleeve = v3_scale(olive, 0.97f);
-  // Light tan leather, DECOUPLED from the near-black boot: the lit hand must sit
-  // >=1.15x OVER the sleeve (measured 0.82x under it, the x1.13 size buy was invisible
-  // and the hands stayed dark blobs at the grip).
-  v3 glove = palette == 1 ? (v3){{0.118f, 0.112f, 0.108f}}
-                          : (v3){{0.148f, 0.141f, 0.135f}};
+  v3 vest = v3_scale(uniform, 1.04f), sleeve = v3_scale(uniform, 0.97f);
+  // Dark brown leather in the same neutral family as the boot. Its material
+  // highlight and the viewmodel's lighting correction separate it from both
+  // the cloth sleeve and the graphite weapon without creating a role colour.
+  v3 glove = {{0.158f, 0.151f, 0.145f}};
   if (flash01 > 0) glove = v3_lerp(glove, flash_col, flash01);
   kit_t kt;
-  kt.olive = olive;
+  kt.uniform = uniform;
   kt.boot = boot;
   kt.helm = helm;
   kt.web = web;
@@ -446,10 +405,10 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     TN(-0.120f, -0.008f, 0.112f, 0.096f, kt->pants, 0.00f, 0.70f),  // crotch
     TN(-0.026f, -0.020f, 0.180f, 0.142f, kt->pants, 0.10f, 0.0f),   // glutes: mass BACK
     TN( 0.062f, -0.004f, 0.158f, 0.114f, kt->belt,  0.28f, 0.0f),   // belt line
-    TN( 0.128f,  0.004f, 0.146f, 0.106f, kt->olive, 0.45f, 0.0f),   // waist, pulled in
-    TN( 0.205f,  0.010f, 0.158f, 0.122f, kt->olive, 0.66f, 0.0f),   // lower ribcage
-    TN( 0.285f,  0.016f, 0.172f, 0.136f, kt->olive, 0.86f, 0.0f),   // chest, fwd-up
-    TN( 0.352f,  0.018f, 0.184f, 0.134f, kt->olive, 0.94f, 0.0f),   // upper chest
+    TN( 0.128f,  0.004f, 0.146f, 0.106f, kt->uniform, 0.45f, 0.0f), // waist, pulled in
+    TN( 0.205f,  0.010f, 0.158f, 0.122f, kt->uniform, 0.66f, 0.0f), // lower ribcage
+    TN( 0.285f,  0.016f, 0.172f, 0.136f, kt->uniform, 0.86f, 0.0f), // chest, fwd-up
+    TN( 0.352f,  0.018f, 0.184f, 0.134f, kt->uniform, 0.94f, 0.0f), // upper chest
     TN( 0.472f,  0.006f, 0.156f, 0.108f, kt->vest,  1.00f, 0.0f)};  // shoulder yoke
   #undef TN
   probe("torso");
@@ -512,11 +471,11 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     float es = e ? 1.0f : -1.0f;
     fnode_t tp[3] = {
       {v3_add(P->chest, v3_add(v3_scale(spine, 0.085f), v3_scale(Rc, es * 0.040f))),
-       kt->olive, kt->olive, 0.040f, 0.052f, 0, 0.0f},
+       kt->uniform, kt->uniform, 0.040f, 0.052f, 0, 0.0f},
       {v3_add(P->chest, v3_add(v3_scale(spine, 0.058f), v3_scale(Rc, es * 0.115f))),
-       kt->olive, kt->olive, 0.036f, 0.048f, 0, 0.0f},
+       kt->uniform, kt->uniform, 0.036f, 0.048f, 0, 0.0f},
       {v3_add(P->chest, v3_add(v3_scale(spine, 0.042f), v3_scale(Rc, es * 0.172f))),
-       kt->olive, kt->olive, 0.026f, 0.036f, 0, 0.0f}};
+       kt->uniform, kt->uniform, 0.026f, 0.036f, 0, 0.0f}};
     probe("trap");
     fig_chain(tp, 3, 8, 1, 1, spine);
   }
@@ -692,11 +651,12 @@ FIG_INLINE void fig_torso(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
 // Both arms, and the gloves closed round the grip cylinders the rifle publishes.
 FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
                          v3 g_org, v3 g_rt, v3 g_up, v3 g_fw, int wpn,
-                         float brace_k, v3 brace_dir) {
+                         float brace_k, v3 brace_dir, gunanim_t gs, int relaxed) {
   ao_set(g_fig_y, 0.55f, 0.84f);
   mat_set(MAT_CLOTH_R, 0.0f);
   // Arms: the chain reaches into the chest first, so the deltoid bevel closes
   // the shoulder instead of leaving a floating tube end at the seam.
+  fig_hand_diag_reset();
   for (int i = 0; i < 2; i++) {
     float s = i ? 1.0f : -1.0f;
     // Six rings: a cylinder from shoulder to wrist is the single most obvious "this is
@@ -719,21 +679,12 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     // anatomical stations; both a straight cone and a stack of shells read as
     // machine parts.
     v3 inb = v3_norm(v3_sub(P->chest, P->sho[i]));   // into the trunk
-    // The waist stations sit 4-6 mm fatter than the first cut: at 0.053 the
-    // arm pinched visibly at the insertion and read as a doll's — a soldier's
-    // sleeved arm loses maybe a tenth of its girth between deltoid and elbow,
-    // not a quarter.
-    fnode_t ar[6] = {
-      {v3_add(P->sho[i], v3_scale(inb, 0.052f)), kt->sleeve, kt->sleeve, 0.0540f, 0.0580f, 0, 0.74f},
-      {v3_add(P->sho[i], v3_scale(ua, 0.020f)), kt->sleeve, kt->sleeve, 0.0680f, 0.0700f, 0, 0.80f},
-      {v3_add(P->sho[i], v3_scale(ua, 0.240f)), kt->sleeve, kt->sleeve, 0.0650f, 0.0675f, 0, 0.0f},
-      {v3_add(P->sho[i], v3_scale(ua, 0.500f)), kt->sleeve, kt->sleeve, 0.0580f, 0.0605f, 0, 0.0f},
-      {v3_add(P->sho[i], v3_scale(ua, 0.680f)), kt->sleeve, kt->sleeve, 0.0590f, 0.0620f, 0, 0.0f},
-      {P->elb[i], kt->sleeve, kt->sleeve, 0.0425f, 0.0445f, 0, 0.0f}};   // elbow
     // First bone runs chest-outward, so `spine` is the stable roll reference.
     // k=8 faceted: the sleeve family joins the crate language of the torso.
     probe("uarm");
-    fig_chain(ar, 6, 8, 1, 1, spine);
+    fig_upper_arm(P->sho[i], P->elb[i], inb, spine,
+                  kt->sleeve, kt->sleeve, kt->sleeve,
+                  kt->sleeve, kt->sleeve, kt->sleeve, 8);
     // The FOREARM is built after the hand, further down, because it needs the palm's
     // own axis — see fig_forearm.
     {  // The elbow ball survives only as the cap-swallower between the two arm
@@ -757,8 +708,31 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     mat_set(MAT_GLOVE_R, 0.0f);
     probe("hand");
     {
+      v3 pd;
+      if (relaxed) {
+        fig_hand_relaxed(P->wri[i], P->elb[i], s, Rc, kt->glove, &pd);
+      } else {
       v3 hc, ha; float hr;
       gun_hold(wpn, i ? GH_GRIP : GH_FORE3, g_org, g_rt, g_up, g_fw, &hc, &ha, &hr);
+      if (i == 0 && gs.hand > 0.5f) {
+        const gun_pose_desc_t *erg = gun_pose_desc(wpn);
+        v3 rc, ra; float rr;
+        gun_hold(wpn, GH_RELD, g_org, g_rt, g_up, g_fw, &rc, &ra, &rr);
+        rc = v3_add(rc, v3_add(
+            v3_scale(g_up, -gs.mag * GUN_MAG_TRAVEL[wpn][0] * GUN_GIRTH_3P),
+            v3_scale(g_rt, -gs.mag * GUN_MAG_TRAVEL[wpn][1] * GUN_GIRTH_3P)));
+        hc = v3_lerp(hc, rc, gs.hand);
+        ha = v3_norm(v3_lerp(ha, ra, gs.hand));
+        hr += (rr - hr) * gs.hand;
+        hc = v3_add(hc, gun_reload_route_offset(
+            erg, g_rt, g_up, g_fw, gs.hand, GUN_GIRTH_3P));
+      }
+      if (i == 1 && wpn == WPN_SR && gs.bhand > 0.001f) {
+        v3 kc = gun_bolt_knob(gs.bolt, g_org, g_rt, g_up, g_fw, GUN_GIRTH_3P);
+        hc = v3_lerp(hc, kc, gs.bhand);
+        ha = v3_norm(v3_lerp(ha, g_rt, gs.bhand));
+        hr += (BOLT_HAND_R * GUN_GIRTH_3P - hr) * gs.bhand;
+      }
       if (i == 0 && brace_k > 0.5f) {
         // Slide brace: a KNUCKLE-DRAG FIST. The fat-cylinder palm-flat attempt wrapped
         // the fingers ~90 deg around a deeply buried axis — measured, the digits
@@ -772,9 +746,17 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
       // does — the third-person body is the SAME man holding the SAME rifle, and a
       // finger that only finds the trigger in first person is the divergence this whole
       // pass exists to remove.
-      const v3 *tp = i == 1 ? &g_gun_trig_p : NULL;
-      v3 pd;
-      fig_hand(P->wri[i], hc, ha, hr, s, kt->glove, i == 1 ? 1 : 2, tp, &pd);
+      int trigger_contact = gs.arc + gs.cyc + gs.hand + gs.bhand <= 0.001f;
+      int style = i == 1 ? (gs.bhand > 0.35f ? 0 : 1)
+                         : (gs.hand > 0.5f ? 0 : 2);
+      int hand_slot = i == 1 ? FIG_HAND_FIRE : FIG_HAND_SUPPORT;
+      fig_hand_contact_t contact =
+        fig_hand_contact_pose(hand_slot, gs.hand, gs.bhand,
+                              i == 0 && brace_k > 0.5f);
+      const v3 *tp = i == 1 && trigger_contact ? &g_gun_trig_p : NULL;
+      fig_hand(P->wri[i], hc, ha, hr, s, kt->glove, style, tp,
+               hand_slot, brace_k > 0.5f, contact, g_rt, &pd);
+      }
       // ...and the SAME forearm the viewmodel builds, off the same palm axis.
       mat_set(MAT_CLOTH_R, 0.0f);
       probe("farm");
@@ -794,4 +776,3 @@ FIG_INLINE void fig_arms(const pose_t *P, const kit_t *kt, v3 Rc, v3 spine,
     mat_set(MAT_CLOTH_R, 0.0f);
   }
 }
-

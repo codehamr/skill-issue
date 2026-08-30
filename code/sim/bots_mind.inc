@@ -1037,7 +1037,7 @@ static void bot_spawn(int bi) {
   b->burst = 3;
   b->strafe_dir = (rng_next(&g_rng_bot) & 1) ? 1 : -1;
   g_spawn_seq[bi + 1]++;       // snapshot readers see a teleport, not motion
-  anim_reset(&b->anim, b->pos, b->yaw);
+  anim_reset(&b->anim, b->pos, b->yaw, b->wp.cur);
 }
 
 static int bot_investigating(const bot_t *b) {
@@ -1390,4 +1390,3 @@ static int bot_in_arc(const bot_t *b, int e, float cos_lim) {
   if (hl <= 0.01f) return 1;   // on top of it: the arc has no meaning
   return (dx * sinf(b->yaw) + dz * -cosf(b->yaw)) / hl > cos_lim;
 }
-

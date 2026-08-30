@@ -15,8 +15,18 @@
 #             lines below are the single authority — the config is part of the
 #             number, so the script writes fresh defaults itself)
 #   parity  : no MISMATCH in the shared-code rows
-#   budget  : drops = 0 and ev_drops = 0 at 20 bots hard (nothing silently
-#             dropped a triangle or an event)
+#   budget  : scene/event/world/UI drops = 0 at 20 bots hard (nothing silently
+#             dropped a triangle, event, arena decoration or interface vertex)
+#   vmframe : the solved 3P SR low-ready axis matches its production descriptor,
+#             uses a monotone ready_s raise/lower transition, and ADS/reload/bolt/
+#             swap/slide/fire stay exactly ready through alpha=0, including predicted
+#             T0/T1
+#   vmtrig  : complete 70-state FP/3P x AR/SR contact matrix, exact child/part
+#             census, no patch/pool/counter overflow, bounded work and scratch,
+#             and at most 13,000,000 bytes of static vmtrig scratch pools
+#   homeui  : at four required resolutions the open readout fits, has zero
+#             hover/click pixels outside the cursor mask, preserves root/focus/
+#             uistat state, and does not exceed its secured state-matched peak
 # Also prints the glibc floor for the log — a rise excludes whole distros, so
 # it is worth seeing even though it is not gated here.
 set -eu
@@ -25,6 +35,8 @@ BIN="${1:?usage: ci-proofs.sh <binary>}"
 BIN="$(realpath "$BIN")"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CFG="$(mktemp -u)"                       # fresh defaults: part of the near number
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT HUP INT TERM
 RUN=""
 # A foreign ELF (a cross build checked on its own arch's runner is native, but
 # a local x86_64 check on this aarch64 box needs qemu).
@@ -38,21 +50,68 @@ fail=0
 CROSS=""
 say() { printf '%s\n' "$*"; }
 run() { rm -f "$CFG"; ( cd "$ROOT" && $RUN "$BIN" --seed 1337 --config "$CFG" --do "$1" ) 2>&1; }
+run_size() {
+  width="$1"; height="$2"; script="$3"
+  rm -f "$CFG"
+  ( cd "$ROOT" && $RUN "$BIN" --w "$width" --h "$height" \
+      --seed 1337 --config "$CFG" --do "$script" ) 2>&1
+}
 field() { printf '%s' "$1" | sed -n "s/.* $2=\([0-9]*\).*/\1/p" | head -1; }
+gate_command() {
+  name="$1"; script="$2"; pattern="$3"
+  log="$TMPD/$name.log"
+  if run "$script" >"$log"; then status=0; else status=$?; fi
+  [ "$status" = 0 ] || { say "GATE $name exit=$status"; fail=1; }
+  contract_rows="$(grep -Ec "$pattern" "$log" || true)"
+  [ "$contract_rows" = 1 ] || {
+    say "GATE $name success-contract rows=$contract_rows (want 1): '$pattern'"; fail=1;
+  }
+}
 
-# figcheck at the four DIST tiers — invariants AND the near quadruple
-NEAR=""
-for d in 0 3 12 30; do
-  line="$(run "figcheck 60 $d" | grep '^figcheck' | head -1)"
-  for k in open flip dup zfight degen; do
-    v="$(field "$line" "$k")"
-    [ "${v:-x}" = 0 ] || { say "GATE figcheck dist=$d $k=$v (want 0)"; fail=1; }
+# figcheck at the four DIST tiers, for both production weapons. Keep each profile's
+# near/cross family separate: an SR baseline cannot accidentally bless an AR move.
+AR_NEAR=""; AR_CROSS=""; SR_NEAR=""; SR_CROSS=""
+for wpn in ar sr; do
+  NEAR=""; CROSS=""
+  for d in 0 3 12 30; do
+    log="$TMPD/figcheck-$wpn-$d.log"
+    if run "figcheck 60 $d $wpn" >"$log"; then status=0; else status=$?; fi
+    [ "$status" = 0 ] || { say "GATE figcheck wpn=$wpn dist=$d exit=$status"; fail=1; }
+    fig_rows="$(awk '/^figcheck / { n++ } END { print n + 0 }' "$log")"
+    [ "$fig_rows" = 1 ] || {
+      say "GATE figcheck wpn=$wpn dist=$d summary rows=$fig_rows (want exactly 1)"; fail=1;
+    }
+    line="$(sed -n '/^figcheck /p' "$log")"
+    case "$line" in
+      *" wpn=$wpn "*) ;;
+      *) say "GATE figcheck wpn=$wpn dist=$d summary has wrong weapon"; fail=1 ;;
+    esac
+    pw="$(field "$line" pose_wpn)"
+    [ "${pw:-x}" = 1 ] || {
+      say "GATE figcheck wpn=$wpn dist=$d missing/failed pose_wpn solver witness"; fail=1;
+    }
+    pd="$(field "$line" pose_delta)"
+    case "$pd" in
+      ''|*[!0-9]*)
+        say "GATE figcheck wpn=$wpn dist=$d missing numeric pose_delta"; fail=1 ;;
+      *) [ "$pd" -ge 10 ] || {
+        say "GATE figcheck wpn=$wpn dist=$d pose_delta=${pd}mm (want >=10mm)"; fail=1;
+      } ;;
+    esac
+    for k in open flip dup zfight degen; do
+      v="$(field "$line" "$k")"
+      [ "${v:-x}" = 0 ] || { say "GATE figcheck wpn=$wpn dist=$d $k=$v (want 0)"; fail=1; }
+    done
+    n="$(field "$line" near)"
+    NEAR="${NEAR:+$NEAR }$n"
+    c="$(field "$line" cross)"
+    CROSS="${CROSS:+$CROSS }$c"
   done
-  n="$(field "$line" near)"
-  NEAR="${NEAR:+$NEAR }$n"
-  c="$(field "$line" cross)"
-  CROSS="${CROSS:+$CROSS }$c"
+  if [ "$wpn" = ar ]; then AR_NEAR="$NEAR"; AR_CROSS="$CROSS"
+  else SR_NEAR="$NEAR"; SR_CROSS="$CROSS"; fi
 done
+say "info figcheck AR near=$AR_NEAR cross=$AR_CROSS"
+say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 # `near` (two surfaces parallel within 1 mm) is config-conditioned; fresh
 # defaults give the WANT_NEAR quadruple below. Baselined rather than gated at
 # 0 because two curved bodies that touch are tangent somewhere by
@@ -87,8 +146,14 @@ done
 #   frame moved forward onto a slot-centred clamp). figv family diff against a
 #   HEAD build: only gun/gun, gun/hand and gun/farm move, every body family
 #   identical — the retired pairs are the hood/chassis stack's own.
-WANT_NEAR="76 76 75 62"
-[ "$NEAR" = "$WANT_NEAR" ] || { say "GATE near '$NEAR' != baseline '$WANT_NEAR'"; fail=1; }
+# - 2026-08-30 rounded hero fingertips and continuous thumb roots move the
+#   reviewed contact census to 72/72/73/59. The new closing caps are near-tier
+#   only; full `figv` sweeps retain zero open/flip/dup/zfight/degen and vmtrig's
+#   exact/proxy forbidden crossings remain zero.
+WANT_AR_NEAR="72 72 73 59"
+[ "$AR_NEAR" = "$WANT_AR_NEAR" ] || {
+  say "GATE AR near '$AR_NEAR' != reviewed baseline '$WANT_AR_NEAR'"; fail=1;
+}
 
 # `cross` — surfaces passing THROUGH each other at 1.8-15 degrees, the tier
 # the coplanar test is blind to (it measures the far end of a band, so a
@@ -129,13 +194,312 @@ WANT_NEAR="76 76 75 62"
 #   grazed the support forearm against. figv family diff vs HEAD: gun/gun
 #   1440 -> 1260, gun/hand 152 -> 146, gun/farm 38 -> 28 over the 60-tick
 #   aggregate, nothing else on any tier.
+# - The shared anatomy/contact and weapon-aware pose authority settled at
+#   101/101/81/58. Pair-family review separates palm/thumb/digits that used to
+#   be one `hand` range; exact guard/blade/receiver primitive and runtime-proxy
+#   crossings are independently zero in all 70 vmtrig states, including five
+#   reload stations, recoil extrema, fire T0/T1, low/raise/swap/slide/dead and
+#   the SR bolt hold.
+# - 2026-08-30 headset cleanup: 101/101/81/58 -> 97/97/81/58. The only removed
+#   geometry is the symmetric ear-cup pair (two 32-triangle chains); `figv`
+#   shows no ear-cup family in the new histogram, while the near quadruple and
+#   every coarse-tier cross count remain unchanged.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_CROSS="94 94 79 56"
-[ "${CROSS:-}" = "$WANT_CROSS" ] || { say "GATE cross '${CROSS:-}' != baseline '$WANT_CROSS'"; fail=1; }
+WANT_AR_CROSS="97 97 83 59"
+[ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
+  say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
+}
 
-# parity: no MISMATCH in the shared-code rows
-run "parity" | grep -q MISMATCH && { say "GATE parity MISMATCH"; fail=1; } || true
+# SR had no selectable figcheck path at 2a6b08c. For this first authority the
+# secured source was instrumented in /tmp with ONLY the final `ar|sr` selector;
+# its AR output reproduced 76/76/75/62 and 94/94/79/56 exactly before its SR
+# result was admitted. The old SR values were near=99/99/48/31 and
+# cross=161/161/107/87. Full 60-tick pair histograms explain the new values:
+# close near drops 12 as the undivided hand/hand and gun/hand contacts become
+# bounded palm/thumb/digit contacts; the two far near tiers are unchanged.
+# Cross +13/+13/-2/+10 comes from those disjoint hand ranges, the new scope
+# saddle/low-ready hold, and the shared jaw/chinstrap anatomy. gun/gun remains
+# 4800/4800/2640 across the first three aggregate sweeps (2703 -> 2700 at 30 m),
+# while vmtrig reports zero forbidden mesh/proxy crossings and figcheck reports
+# zero open/flip/dup/zfight/degen at every tier.
+# Removing the same symmetric ear-cup chains first changed only the close-tier
+# maxima. Rounded fingertip caps and the connected support-thumb sweep then move
+# the reviewed SR census to the values below; all hard topology classes remain 0.
+WANT_SR_NEAR="92 92 56 38"
+WANT_SR_CROSS="166 166 108 93"
+[ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
+  say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
+}
+[ "$SR_CROSS" = "$WANT_SR_CROSS" ] || {
+  say "GATE SR cross '$SR_CROSS' != reviewed baseline '$WANT_SR_CROSS'"; fail=1;
+}
+
+# Viewmodel, contact, Lean and recoil contracts. Each command gets a fresh config;
+# an exit status alone is not enough because several older proofs publish their hard
+# result in a summary line consumed here.
+# The exact near/cross witness catches shallow self-intersections between hand
+# parts (including the hero-tier thumb shoulder) that vmtrig intentionally does
+# not classify as forbidden weapon contact.
+gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=199 cross=142 degen=0 recoil_states=20$'
+gate_command vmsight "vmsight" '^vmsight total=0 '
+gate_command vmscope "vmscope" '^vmscope scope_tris=[1-9][0-9]* open_at=0[.]55 baseline_err=.* recoil_min_ocular=.* recoil_axis=.* recoil_center=.* recoil_pip=.* recoil_radius_delta=.* ok$'
+gate_command vmframe "vmframe" '^vmframe ok$'
+grep -Eq '^vmframe pose_only state=1 pose=1 .* ok$' \
+  "$TMPD/vmframe.log" || {
+    say "GATE vmframe missing state-pure SKEL_POSE_ONLY witness"; fail=1;
+  }
+grep -Eq '^vmframe 3p_axis low=.*deg target=.*deg raise=.*deg target=.*deg ready=0[.][0-9]+ busy=7 max=0[.]000deg ok$' \
+  "$TMPD/vmframe.log" || {
+    say "GATE vmframe missing production-derived 3P low-ready axis/busy witness"; fail=1;
+  }
+grep -Eq '^vmframe ready_transition raise=\(0[.]000 0[.][0-9]+ 0[.][0-9]+ 0[.][0-9]+ 0[.][0-9]+\) lower=\(0[.][0-9]+ 0[.][0-9]+ 0[.][0-9]+\) ok$' \
+  "$TMPD/vmframe.log" || {
+    say "GATE vmframe missing monotone ready transition witness"; fail=1;
+  }
+grep -Eq '^vmframe reset_transition ready=1[.]000 pose=0[.]000mm lower=\(0[.][0-9]+ 0[.][0-9]+ 0[.][0-9]+\) ok$' \
+  "$TMPD/vmframe.log" || {
+    say "GATE vmframe missing reset-to-idle transition witness"; fail=1;
+  }
+gate_command vmtrig "vmtrig" '^vmtrig worst .* ok$'
+
+# Do not make field order part of the interface: parse the named witnesses from the
+# self-test, every state row, and the final census independently. `bytes` is only the
+# static vmtrig proof scratch reported by the harness (hand/weapon leaf and node
+# pools plus any compact seam sidecars), not the process's complete BSS. The
+# 13,000,000-byte ceiling admits the reviewed compact four-pool layout while,
+# together with the separately measured non-vmtrig delta, keeping total extra BSS
+# below roughly 20 MB. C-side failures still own geometric tolerances; these checks
+# prevent a truncated/reformatted log or a silently dropped pack/pool/counter witness
+# from satisfying CI merely because one final line says `ok`.
+if ! awk '
+  function clear_fields(    k) {
+    for (k in field) delete field[k]
+  }
+  function parse_fields(    i, p, key) {
+    clear_fields()
+    for (i = 1; i <= NF; i++) {
+      p = index($i, "=")
+      if (p > 1) {
+        key = substr($i, 1, p - 1)
+        field[key] = substr($i, p + 1)
+      }
+    }
+  }
+  function need(key, value) {
+    if (!(key in field) || field[key] != value) bad = 1
+  }
+  function is_uint(value) {
+    return value ~ /^[0-9]+$/
+  }
+
+  $1 == "vmtrig" && $2 == "self" {
+    self_rows++
+    parse_fields()
+    need("ambiguity", "0")
+    need("proof", "0/0/0/0/0/0/0/0")
+    if ($NF != "ok") bad = 1
+
+    ncap = split(field["scratch"], cap, "[/:]")
+    if (ncap != 4) bad = 1
+    for (i = 1; i <= ncap; i++)
+      if (!is_uint(cap[i]) || cap[i] + 0 <= 0) bad = 1
+    self_hand_leaf_cap = cap[1] + 0
+    self_hand_node_cap = cap[2] + 0
+    self_weapon_leaf_cap = cap[3] + 0
+    self_weapon_node_cap = cap[4] + 0
+
+    if (!is_uint(field["work"]) || field["work"] + 0 <= 0) bad = 1
+    if (!is_uint(field["bytes"]) || field["bytes"] + 0 <= 0 ||
+        field["bytes"] + 0 > 13000000) bad = 1
+    self_bytes = field["bytes"] + 0
+  }
+
+  $1 == "vmtrig" && ($2 == "fp" || $2 == "3p") {
+    state_rows++
+    parse_fields()
+    need("miss", "0/0")
+    need("ov", "0/0")
+    need("missing", "0")
+    need("overflow", "0")
+    need("unclassified", "0")
+    need("proof", "0/0")
+    need("amb", "0")
+    need("state", "0")
+    need("clamp", "0")
+    if ($NF != "ok") bad = 1
+  }
+
+  $1 == "vmtrig" && $2 == "worst" {
+    summary_rows++
+    parse_fields()
+    need("rows", "70")
+    need("children", "840")
+    need("bucket", "16/18:17/19")
+    need("live", "68/816/816")
+    need("dead", "2/24/0")
+    need("hand", "420/420")
+    need("part", "140/140/48/512")
+    need("state", "0")
+    need("matrix", "0")
+    need("census", "0/0")
+    need("mesh", "1.1mm")
+    need("mx", "100")
+    need("proxy_cross", "0")
+    need("missing", "0")
+    need("overflow", "0")
+    need("unclassified", "0")
+    need("proof", "0/0")
+    need("amb", "0")
+    need("counter_ov", "0")
+    if ($NF != "ok" || !is_uint(field["pairs"]) || field["pairs"] + 0 <= 0)
+      bad = 1
+
+    nwork = split(field["work"], work, "/")
+    if (nwork != 2 || !is_uint(work[1]) || !is_uint(work[2]) ||
+        work[1] + 0 <= 0 || work[2] != "64000000000" ||
+        work[1] + 0 > work[2] + 0) bad = 1
+
+    nscratch = split(field["scratch"], scratch, "[/:]")
+    if (nscratch != 4) bad = 1
+    for (i = 1; i <= nscratch; i++)
+      if (!is_uint(scratch[i]) || scratch[i] + 0 <= 0) bad = 1
+    summary_hand_peak = scratch[1] + 0
+    summary_hand_node_peak = scratch[2] + 0
+    summary_weapon_peak = scratch[3] + 0
+    summary_weapon_node_peak = scratch[4] + 0
+
+    nsummary_cap = split(field["cap"], summary_cap, "[/:]")
+    if (nsummary_cap != 4) bad = 1
+    for (i = 1; i <= nsummary_cap; i++)
+      if (!is_uint(summary_cap[i]) || summary_cap[i] + 0 <= 0) bad = 1
+
+    if (!is_uint(field["bytes"]) || field["bytes"] + 0 <= 0 ||
+        field["bytes"] + 0 > 13000000) bad = 1
+    summary_bytes = field["bytes"] + 0
+  }
+
+  END {
+    if (self_rows != 1 || state_rows != 70 || summary_rows != 1) bad = 1
+    if (self_rows == 1 && summary_rows == 1) {
+      if (self_bytes != summary_bytes) bad = 1
+      if (summary_cap[1] != self_hand_leaf_cap ||
+          summary_cap[2] != self_hand_node_cap ||
+          summary_cap[3] != self_weapon_leaf_cap ||
+          summary_cap[4] != self_weapon_node_cap) bad = 1
+      # Keep at least 20% capacity above every measured leaf/node peak while
+      # the hard per-row pool-overflow witnesses remain zero.
+      if (summary_hand_peak * 6 > self_hand_leaf_cap * 5 ||
+          summary_hand_node_peak * 6 > self_hand_node_cap * 5 ||
+          summary_weapon_peak * 6 > self_weapon_leaf_cap * 5 ||
+          summary_weapon_node_peak * 6 > self_weapon_node_cap * 5) bad = 1
+    }
+    exit bad ? 1 : 0
+  }
+' "$TMPD/vmtrig.log"; then
+  say "GATE vmtrig incomplete 70-state census or work/scratch/BSS/overflow contract"
+  fail=1
+fi
+
+vmhand_log="$TMPD/vmhand.log"
+if run "vmhand" >"$vmhand_log"; then status=0; else status=$?; fi
+[ "$status" = 0 ] || { say "GATE vmhand exit=$status"; fail=1; }
+if ! awk '
+  $1 == "vmhand" && ($2 == "ar" || $2 == "sr") {
+    rows++; by_weapon[$2]++; bend = -999; bore = -999;
+    for (i = 1; i <= NF; i++) {
+      if ($i == "bend=") bend = $(i + 1) + 0;
+      if ($i == "bore=") bore = $(i + 1) + 0;
+    }
+    if ($3 == "hip" || $3 == "ads") base++;
+    else if ($3 ~ /^rl(15|35|55|75|90)$/) reload++;
+    else if ($3 ~ /^(hip|ads)_(back|lift|side[+-]|over)$/) recoil++;
+    else bad = 1;
+    if ($4 == "trigger") { trigger++; if (!(bend >= 0 && bend < 45)) bad = 1; }
+    else if ($4 == "support") { support++; if (!(bore >= 35 && bore <= 65)) bad = 1; }
+    else bad = 1;
+    if ($0 !~ / clamp=0 ok$/) bad = 1;
+  }
+  END {
+    exit !(rows == 68 && by_weapon["ar"] == 34 && by_weapon["sr"] == 34 &&
+           base == 8 && reload == 20 && recoil == 40 &&
+           trigger == 34 && support == 34 && !bad);
+  }
+' "$vmhand_log"; then
+  say "GATE vmhand incomplete live matrix or trigger-bend<45/support-bore=35..65 violation"
+  fail=1
+fi
+
+gate_command recoil "recoil" '^recoil ok$'
+gate_command netrecoil "netrecoil" '^netrecoil cl_pred=.* ok$'
+netrecoil_single_rows="$(grep -Ec '^netrecoil single .* replay_body=1 .* sidefx=1/1 counts=1/1 noise_t=[0-9]+ events=2/0 ok$' \
+  "$TMPD/netrecoil.log" || true)"
+[ "$netrecoil_single_rows" = 1 ] || {
+  say "GATE netrecoil single-shot witness rows=$netrecoil_single_rows (want 1)"; fail=1;
+}
+netrecoil_burst_rows="$(grep -Ec '^netrecoil burst .* replay_body=1 .* sidefx=1/1 counts=3/3 noise_t=[0-9]+ events=2/0 ok$' \
+  "$TMPD/netrecoil.log" || true)"
+[ "$netrecoil_burst_rows" = 1 ] || {
+  say "GATE netrecoil burst witness rows=$netrecoil_burst_rows (want 1)"; fail=1;
+}
+gate_command netdeath "netdeath" '^netdeath death=1 recoil=1 respawn=1 ok$'
+netdeath_dead_rows="$(grep -Ec '^netdeath respawn motion=1 lean=1 life=1 wp=1 vm=1 buttons=1 rng=1 last_eye=[0-9]+[.][0-9]+$' \
+  "$TMPD/netdeath.log" || true)"
+[ "$netdeath_dead_rows" = 1 ] || {
+  say "GATE netdeath dead-life respawn rows=$netdeath_dead_rows (want 1)"; fail=1;
+}
+netdeath_live_rows="$(grep -Ec '^netdeath respawn_live zero_err=1 fresh=1 buttons=1 rng=1 corr=0/0$' \
+  "$TMPD/netdeath.log" || true)"
+[ "$netdeath_live_rows" = 1 ] || {
+  say "GATE netdeath live zero-error spawn rows=$netdeath_live_rows (want 1)"; fail=1;
+}
+gate_command leanstep "leanstep" '^leanstep symmetry=.* ok$'
+gate_command netanim "netanim 600 4" '^netanim .* ok$'
+gate_command netpredict "netpredict 600" '^netpredict .*dedup=stable '
+if ! awk '
+  /^netpredict / {
+    rows++; stable = ($0 ~ / dedup=stable /); worst = 1e9;
+    for (i = 1; i <= NF; i++) if ($i ~ /^worst_pos=/) {
+      v = $i; sub(/^worst_pos=/, "", v); sub(/mm$/, "", v); worst = v + 0;
+    }
+    if (!stable || worst > 10.0) bad = 1;
+  }
+  END { exit !(rows == 1 && !bad); }
+' "$TMPD/netpredict.log"; then
+  say "GATE netpredict snapshot/dedup exceeds 10mm or is unstable"
+  fail=1
+fi
+gate_command netloop "netloop 600" '^netloop n=600 ok hash='
+
+# HOME is a responsive interaction contract, so each required size gets its own
+# process and fresh config. homeui masks only the two software-cursor squares while
+# comparing the framebuffer, then clicks both the body and UPPER RECEIVER caption.
+for size in 1280x720 1280x800 1024x768 640x360; do
+  width="${size%x*}"; height="${size#*x}"
+  log="$TMPD/homeui-$size.log"
+  if run_size "$width" "$height" "homeui" >"$log"; then status=0; else status=$?; fi
+  [ "$status" = 0 ] || { say "GATE homeui res=$size exit=$status"; fail=1; }
+  grep -Eq "^homeui res=$size .*hover_delta=0 click_delta=0 state=stable focus=0/5 .*ui_drops=0 ok$" "$log" || {
+    say "GATE homeui res=$size missing hover/click/layout/budget success contract"
+    fail=1
+  }
+done
+
+# parity: preserve the command's exit status and require its completion census. The
+# old grep pipeline ended in `|| true`, so a crash/exit 1 with no MISMATCH text was
+# silently green, as was truncated output before the summary.
+parity_log="$TMPD/parity.log"
+if run "parity" >"$parity_log"; then status=0; else status=$?; fi
+[ "$status" = 0 ] || { say "GATE parity exit=$status"; fail=1; }
+grep -q 'MISMATCH' "$parity_log" && { say "GATE parity MISMATCH"; fail=1; }
+parity_rows="$(awk '/^parity total / { n++ } END { print n + 0 }' "$parity_log")"
+[ "$parity_rows" = 1 ] || {
+  say "GATE parity summary rows=$parity_rows (want exactly 1)"; fail=1;
+}
+grep -Eq '^parity total rows=24 live=5 mismatches=0$' "$parity_log" || {
+  say "GATE parity missing complete 24-row/5-live zero-mismatch contract"
+  fail=1
+}
 
 # budget at 20 bots hard: nothing dropped. Render a frame first (budget only
 # accumulates during scene build) — into a TEMPORARY path, not screenshots/:
@@ -144,9 +508,17 @@ run "parity" | grep -q MISMATCH && { say "GATE parity MISMATCH"; fail=1; } || tr
 # before write_png, so drops/ev_drops were real — but the shot proved nothing
 # and depended on an untracked directory. mktemp writes anywhere.
 CISHOT="$(mktemp -u)_ci.png"
-bl="$(run "bots 20; skill hard; wait 1200; shot $CISHOT; wait 300; shot $CISHOT; budget" | grep '^budget' | head -1)"
+budget_log="$TMPD/budget.log"
+if run "bots 20; skill hard; wait 1200; shot $CISHOT; wait 300; shot $CISHOT; budget" \
+    >"$budget_log"; then status=0; else status=$?; fi
 rm -f "$CISHOT"
-for k in drops ev_drops; do
+[ "$status" = 0 ] || { say "GATE budget exit=$status"; fail=1; }
+budget_rows="$(awk '/^budget / { n++ } END { print n + 0 }' "$budget_log")"
+[ "$budget_rows" = 1 ] || {
+  say "GATE budget summary rows=$budget_rows (want exactly 1)"; fail=1;
+}
+bl="$(sed -n '/^budget /p' "$budget_log")"
+for k in drops ev_drops world_drops ui_drops; do
   v="$(field "$bl" "$k")"
   [ "${v:-x}" = 0 ] || { say "GATE budget $k=$v (want 0)"; fail=1; }
 done
@@ -157,5 +529,5 @@ if command -v objdump >/dev/null 2>&1; then
   say "info glibc floor: ${floor:-none} (2.38 = Ubuntu 23.10+ / Debian 13+ / SteamOS 3.7+)"
 fi
 
-[ "$fail" = 0 ] && say "ci-proofs: OK ($ELF, near=$NEAR, cross=$CROSS)" || say "ci-proofs: FAIL"
+[ "$fail" = 0 ] && say "ci-proofs: OK ($ELF, AR=$AR_NEAR/$AR_CROSS SR=$SR_NEAR/$SR_CROSS)" || say "ci-proofs: FAIL"
 exit $fail

@@ -1,13 +1,38 @@
 // =============================================================================
 // render/viewmodel.inc  —  fx_build, vm_build, cam_override_t.
-// Proof: vmcheck, vmsight, vmtrig. One TU: included once by game.c, in
+// Proof: vmcheck, vmsight, vmtrig, vmframe. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // Contract: the FP arms are whole arms — shoulder->elbow->wrist via the one
 // ik_solve, the same ANIM_UARM/ANIM_FARM skel_solve reads. vmorbit moves the
 // EYE (since 2026-08-20); any view-dependent shading term through it before
 // that date measured the wrong viewpoint.
 // =============================================================================
+typedef struct {
+  v3 muzzle;
+  long tick, publish_tick;
+  unsigned serial, order;
+  int live;
+} fx_build_witness_t;
+static fx_build_witness_t g_fx_build_witness;
+typedef struct {
+  v3 muzzle, mesh_muzzle;
+  long tick;
+  unsigned serial, order;
+} vm_emit_witness_t;
+static vm_emit_witness_t g_vm_emit_witness;
+static unsigned g_vm_render_order;
+static long g_vm_muz_tick = -1000; // exact publish tick; stale values are rejected
+
 static void fx_build(v3 eye) {
+  // The real consumer-side witness for vmframe.  Recording at fx_build entry—not in
+  // the publisher—means a future pass-order regression cannot keep the proof green by
+  // merely leaving the publish helper correct while moving its call below this one.
+  g_fx_build_witness.muzzle = g_fx_muzzle;
+  g_fx_build_witness.tick = g_tick;
+  g_fx_build_witness.publish_tick = g_vm_muz_tick;
+  g_fx_build_witness.live = g_fx_muz_live;
+  g_fx_build_witness.serial++;
+  g_fx_build_witness.order = ++g_vm_render_order;
   scene_reset();
 
   for (int i = 0; i < MAX_TRACERS; i++)
@@ -222,18 +247,13 @@ static void rot2(v3 *a, v3 *b, float ang) {
 // The viewmodel pass has its own projection, deliberately wider than the world FOV: at
 // 50 degrees a weapon close enough to read is mostly outside the frame.
 #define VM_FOV_DEG 62.0f
-static v3 g_vm_muzzle;  // world-space barrel tip, set by vm_build every frame
+static v3 g_vm_muzzle;  // world-space barrel tip of the most recently emitted mesh
+static v3 g_vm_mesh_muzzle; // gun_build return; vmframe checks it against the plan
 // The weapon's own basis in world space, published by the same vm_build call that
 // builds the mesh.
 static v3 g_vm_mdl_o, g_vm_mdl_x, g_vm_mdl_y, g_vm_mdl_z;
-static v3 g_vm_muz_cam; // the same tip in CAMERA space (right/up/forward) —
-                        // what the tracer re-anchor FOV-remaps, since the
-                        // viewmodel renders at VM_FOV_DEG, not the world FOV
-static long g_vm_muz_tick = -1000; // publish tick: a windowed session renders
-                        // every frame so the tip is at most a frame stale, but
-                        // the HARNESS renders only on `shot` — a 100-tick-old
-                        // hip-pose tip re-anchored under ADS zoom put the
-                        // streak's start in the bottom corner of the frame
+static v3 g_vm_muz_cam; // current pre-glow plan tip in CAMERA space
+                        // (right/up/forward), FOV-remapped for the world tracer
 
 // TURNTABLE for the viewmodel (harness only).
 static struct { int on, which, piv_on;
@@ -248,20 +268,34 @@ static v3 g_vm_hand_p[2];   // trigger wrist, support wrist — published by vm_
 // call and the scope-disc block that follow.
 typedef struct {
   int cur, srcyc;
-  float ads, sight_y, hip, lean, lean_d, sw, kick, dip;
+  float ads, ready, sight_y, hip, lean, lean_d, sw;
+  float kick_back, kick_lift, kick_side, dip;
   gunanim_t ga;
 } vm_pose_t;
 
 // The weapon's own basis for this frame, as computed by vm_stage_springs.
 typedef struct { v3 org, gx, gy, gz; } vm_frame_t;
 
+// A complete, mesh-free viewmodel frame.  The render pipeline needs the current
+// barrel tip before the glow pass (the opaque viewmodel itself is deliberately drawn
+// later), while the harness needs to build the identical pose without publishing it.
+// Keeping pose, basis and muzzle in this value lets both callers use one pure solve;
+// only vm_build_prepared below emits geometry or changes the published diagnostics.
+typedef struct {
+  vm_pose_t pose;
+  vm_frame_t frame;
+  v3 muzzle;
+} vm_build_plan_t;
+
 #define VLERP(f) (v->prev_##f + (v->f - v->prev_##f) * alpha)
 
 static vm_pose_t vm_stage_pose(const player_t *p, const vm_t *v, const weapon_t *w,
-                                float alpha) {
+                               float alpha, float ready) {
   vm_pose_t ps;
   float ads = w->prev_ads_s + (w->ads_s - w->prev_ads_s) * alpha;
-  float kick = VLERP(kick);
+  float kick_back = VLERP(kick_back);
+  float kick_lift = VLERP(kick_lift);
+  float kick_side = VLERP(kick_side);
   float dip = p->prev_land_dip + (p->land_dip - p->prev_land_dip) * alpha;
 
   int cur = w->cur;
@@ -297,7 +331,9 @@ static vm_pose_t vm_stage_pose(const player_t *p, const vm_t *v, const weapon_t 
   // but the top rail off screen for the entire 1.8 s.
   int srcyc = cur == WPN_SR;
 
-  ps.ads = ads; ps.kick = kick; ps.dip = dip; ps.cur = cur; ps.sight_y = sight_y;
+  ps.ads = ads; ps.ready = f_clamp(ready, 0.0f, 1.0f);
+  ps.kick_back = kick_back; ps.kick_lift = kick_lift;
+  ps.kick_side = kick_side; ps.dip = dip; ps.cur = cur; ps.sight_y = sight_y;
   ps.ga = ga_; ps.sw = sw; ps.hip = hip; ps.lean = lean; ps.lean_d = lean_d;
   ps.srcyc = srcyc;
   return ps;
@@ -306,7 +342,10 @@ static vm_pose_t vm_stage_pose(const player_t *p, const vm_t *v, const weapon_t 
 static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alpha,
                                     v3 eye, v3 rgt, v3 upv, v3 fwd) {
   int cur = ps->cur, srcyc = ps->srcyc;
-  float sight_y = ps->sight_y, ads = ps->ads, kick = ps->kick, dip = ps->dip;
+  const gun_pose_desc_t *erg = gun_pose_desc(cur);
+  float sight_y = ps->sight_y, ads = ps->ads, dip = ps->dip;
+  float kick_back = ps->kick_back, kick_lift = ps->kick_lift;
+  float kick_side = ps->kick_side;
   float hip = ps->hip, lean = ps->lean, lean_d = ps->lean_d, sw = ps->sw;
   float rl = ps->ga.arc, rk = ps->ga.punch, rch = ps->ga.cyc;
   // The reload's micro-motion: the ring-down after each beat and the magazine's
@@ -333,22 +372,30 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
   // reading at first-person scale. All of it rides `hip`, so ADS mid-slide
   // keeps the sight welded to the axis.
   float sl = VLERP(slide_s);
+  // The FP view consumes the SAME eased carry state as the body. Only the SR has a
+  // relative low-ready composition; hip keeps it out of ADS and busy states raise the
+  // shared blend before this render. These are small view-relative deltas, never the
+  // 20/15-degree world carry angles.
+  float low = cur == WPN_SR ? (1.0f - ps->ready) * hip : 0.0f;
   float px = 0.158f * hip + VLERP(bob_x) + VLERP(lag_x) - rl * 0.072f
            + rk * 0.011f + jl * 0.0016f + rch * (srcyc ? -0.062f : 0.026f)
-           + (lean_d * 0.16f - lean * 0.028f - sl * 0.048f) * hip;
+           + kick_side
+           + (lean_d * 0.16f - lean * 0.028f - sl * 0.048f) * hip
+           + erg->fp_low_pos.x * low;
   // DOWN a little and NOT toward the eye.
   float py = -0.120f * hip - sight_y * ads + VLERP(bob_y) + VLERP(lag_y)
            // sw * 0.125, not 0.22: THE SWAP PUT THE WHOLE WEAPON BELOW THE FRAME, which
            // is the identical failure the reload dip above was already fixed for.
            - dip * 0.5f + rl * 0.084f + rch * (srcyc ? 0.044f : 0.020f)
            - rk * 0.020f + jl * 0.0030f + hf * 0.0045f
-           - sw * 0.125f + br_y - sl * 0.020f * hip;
+           - sw * 0.125f + br_y - sl * 0.020f * hip
+           + erg->fp_low_pos.y * low;
   // The sniper pulls closer to the eye in ADS so the scope window opens up.
   float pz = 0.30f
-           - 0.022f * hip - (cur == WPN_SR ? 0.152f : 0.06f) * ads - kick
+           - 0.022f * hip - (cur == WPN_SR ? 0.152f : 0.06f) * ads - kick_back
            + VLERP(lag_z) - sw * 0.03f - rl * 0.020f
            - rch * (srcyc ? 0.062f : 0.030f) + rk * 0.016f
-           - sl * 0.040f * hip;
+           - sl * 0.040f * hip + erg->fp_low_pos.z * low;
 
   v3 gx = rgt, gy = upv, gz = fwd;
   // sw * 0.42, not 0.7: 0.7 rad of muzzle-down put the barrel tip a further 0.32 m
@@ -356,15 +403,17 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
   // The vertical-inertia channel also TILTS: a body that rises or drops under
   // the gun leaves the muzzle a beat behind in angle as well as height — the
   // jump float, the fall lead-down and the crouch settle are all this term.
-  rot2(&gz, &gy, -(VLERP(sway_p) + kick * (6.0f + 3.2f * hip)
-                 + rl * 0.055f - rch * 0.045f
+  rot2(&gz, &gy, -(VLERP(sway_p) + rl * 0.055f - rch * 0.045f
                  - rk * 0.075f - jl * 0.020f - hf * 0.012f
                  + sw * 0.42f) + 0.045f * hip
+                 + kick_lift
                  + br_p + VLERP(lag_y) * 0.9f * (0.15f + 0.85f * hip)
-                 + sl * 0.20f * hip);                                      // pitch
+                 + sl * 0.20f * hip
+                 + erg->fp_low_ang.x * low);                               // pitch
   rot2(&gx, &gz, VLERP(sway_y) + rl * 0.10f + jl * 0.016f
                  - rch * (srcyc ? 0.13f : 0.0f)
-                 + (-0.075f + lean_d * 0.22f + sl * 0.06f) * hip);        // yaw
+                 + (-0.075f + lean_d * 0.22f + sl * 0.06f) * hip
+                 + kick_side + erg->fp_low_ang.y * low);                    // yaw
   // THE CANT HAS A SIGN, and it decides whether the reload is about the magazine or
   // about the top rail. The SR's was 0.86, which swept the scope's OCULAR
   // across the camera at the bolt beat — a black disc dead-centre, the rifle
@@ -374,7 +423,7 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
   rot2(&gx, &gy, VLERP(roll) + rl * -0.46f + rch * cyroll - rk * 0.16f
                  - jl * 0.055f - hf * 0.040f +
                  (0.090f - lean * 0.10f + lean_d * 0.30f + sl * 0.10f) * hip
-                 - kick * 1.4f);                                           // roll
+                 - kick_side * 1.4f + erg->fp_low_ang.z * low);             // roll
   v3 org = v3_add(eye, v3_add(v3_scale(rgt, px),
            v3_add(v3_scale(upv, py), v3_scale(fwd, pz))));
 
@@ -384,31 +433,44 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
 }
 #undef VLERP
 
+// The same pure transform gun_build and pose_muzzle consume, applied to the already-
+// solved FP frame at its required unit scale. render_frame may therefore publish it
+// before any mesh is built, with no second gun build or hidden draw.
+static v3 vm_plan_muzzle(const vm_pose_t *ps, const vm_frame_t *fr) {
+  return gun_muzzle_point(ps->cur, fr->org, fr->gx, fr->gy, fr->gz, 1.0f);
+}
+
+static vm_build_plan_t vm_plan_make(const player_t *p, float alpha,
+                                    v3 eye, v3 rgt, v3 upv, v3 fwd,
+                                    float ready) {
+  vm_build_plan_t plan;
+  plan.pose = vm_stage_pose(p, &p->vm, &p->wp, alpha, ready);
+  plan.frame = vm_stage_springs(&plan.pose, &p->vm, alpha, eye, rgt, upv, fwd);
+  plan.muzzle = vm_plan_muzzle(&plan.pose, &plan.frame);
+  return plan;
+}
+
 // Hands and forearms. Without them the first-person view is a rifle floating in space
 // — the one thing the player looks at for a whole match, held by nobody.
 static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
                             v3 eye, v3 rgt, v3 upv, v3 fwd) {
   int cur = ps->cur;
   float ads = ps->ads;
+  const gun_pose_desc_t *erg = gun_pose_desc(cur);
+  const float pose_scale = 1.0f;  // first-person weapon and GH contacts are unit scale
   gunanim_t ga_ = ps->ga;
   float mdrop = ga_.mag, mgv = ga_.hand;
   {
-    // FROM THE FIGURE'S OWN KIT, not restated. These were two hand-tuned
-    // constants that had to be kept in step with fig_kit by hand, and they had
-    // already drifted apart: the third-person player's GLOVE was slate blue
-    // while the first-person one was brown leather, so the same man had
-    // different hands depending on which camera was looking at him — and the
-    // sleeve was 5% off as well.
-    //
-    // The one thing that may legitimately differ is a LIGHTING compensation.
+    // FROM THE FIGURE'S ONE KIT, not restated. The one thing that may
+    // legitimately differ is a LIGHTING compensation.
     // The viewmodel has its own hero rig and its own depth-cleared pass; the
     // world sun and the shadow map do not reach it, and at equal albedo it
     // measures a few percent darker than the same cloth on the body (measured:
-    // rendered mean luminance of the bluish pixels, 95 on the body against 75
+    // rendered mean luminance of the cloth pixels, 95 on the body against 75
     // on the viewmodel before this was compensated at all). That factor lives
     // here, once, instead of in a second set of colours that can drift.
-    kit_t vkt = fig_kit(1, 0.0f, (v3){{1, 1, 1}});
-    v3 sleeve = v3_scale(vkt.sleeve, 1.055f);   // the player's own slate uniform
+    kit_t vkt = fig_kit(0.0f, (v3){{1, 1, 1}});
+    v3 sleeve = v3_scale(vkt.sleeve, 1.055f);   // shared uniform, VM-lit
     v3 glove  = v3_scale(vkt.glove, 1.055f);    // ...and his own gloves
     // The cuff belongs to the GLOVE, not to the sleeve.
     v3 gnt    = v3_scale(glove, 0.88f);
@@ -419,10 +481,11 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
     // THE RELOAD IS THE ONE MOMENT OF A VIEWMODEL THAT IS ALL HAND, and it was the one
     // moment nothing happened: the gun dipped and rolled while both hands stayed welded
     // where they were, so a magazine change read as "the rifle tilts a bit".
+    fig_hand_diag_reset();
     for (int h = 0; h < 2; h++) {
       v3 gc, ga; float gr;
       gun_hold(cur, h == 0 ? GH_GRIP : GH_FORE, org, gx, gy, gz, &gc, &ga, &gr);
-      if (h == 1 && mgv > 0.0f) {
+      if (h == 1 && mgv > 0.5f) {
         v3 rc, ra; float rr;
         gun_hold(cur, GH_RELD, org, gx, gy, gz, &rc, &ra, &rr);
         // The magazine drops away on the same curve the model uses, so the hand has
@@ -434,6 +497,7 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
         gc = v3_lerp(gc, rc, mgv);
         ga = v3_norm(v3_lerp(ga, ra, mgv));
         gr = gr + (rr - gr) * mgv;
+        gc = v3_add(gc, gun_reload_route_offset(erg, gx, gy, gz, mgv, 1.0f));
       }
       // THE RIGHT HAND WORKS THE BOLT. This is the other half of a bolt gun's reload
       // and the half a player recognises instantly — a magazine change alone is an AR
@@ -442,7 +506,7 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
         // A bolt knob is a small ball gripped across, not a cylinder wrapped
         // along: the axis is the weapon's own right, and the radius is the knob's.
         v3 kc = gun_bolt_knob(ga_.bolt, org, gx, gy, gz, 1.0f), ka = gx;
-        float kr = 0.0082f;
+        float kr = BOLT_HAND_R;
         gc = v3_lerp(gc, kc, ga_.bhand);
         ga = v3_norm(v3_lerp(ga, ka, ga_.bhand));
         gr = gr + (kr - gr) * ga_.bhand;
@@ -450,21 +514,24 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
       // Wrist bearing, authored as a raw direction and then projected onto the plane
       // perpendicular to the grip axis, so it stays a legal bearing however the axis is
       // raked.
-      v3 br = h == 0
-        ? v3_add(v3_scale(gx, 0.34f), v3_add(v3_scale(gy, 0.16f), v3_scale(gz, -0.92f)))
-        : v3_add(v3_scale(gx, -0.55f), v3_scale(gy, -0.84f));
+      const gun_hand_pose_t *eh = &erg->fp_hand[h];
+      v3 br_local = v3_lerp(eh->bearing_hip, eh->bearing_ads, ads);
       // On the magazine the arm comes from the left and FORWARD instead of from
       // below, which is what turns the travel into a reach rather than a slide.
-      if (h == 1 && mgv > 0.0f)
-        br = v3_lerp(br, v3_add(v3_scale(gx, -0.82f), v3_scale(gz, 0.57f)), mgv);
+      if (h == 1 && mgv > 0.5f)
+        br_local = v3_lerp(br_local, eh->bearing_reload, mgv);
+      if (h == 0 && ga_.bhand > 0.0f)
+        br_local = v3_lerp(br_local, eh->bearing_bolt, ga_.bhand);
+      v3 br = gun_pose_offset(gx, gy, gz, br_local, pose_scale);
       br = v3_sub(br, v3_scale(ga, v3_dot(br, ga)));
       br = v3_norm(br);
       // How far the wrist stands off the surface, and how far back along the knuckle
       // row it sits.
-      float lift = h == 0 ? 0.0700f : 0.0660f;
+      float lift = (eh->lift_hip + (eh->lift_ads - eh->lift_hip) * ads) * pose_scale;
       // How far DOWN the grip axis the wrist sits.
-      float axo  = h == 0 ? -0.048f : -0.046f;
-      if (h == 1) { lift += 0.004f * mgv; axo += 0.010f * mgv; }
+      float axo = (eh->axial_hip + (eh->axial_ads - eh->axial_hip) * ads) * pose_scale;
+      lift += (eh->reload_lift * mgv + eh->bolt_lift * ga_.bhand) * pose_scale;
+      axo += (eh->reload_axial * mgv + eh->bolt_axial * ga_.bhand) * pose_scale;
       hd[h].gc = gc; hd[h].ga = ga; hd[h].gr = gr;
       hd[h].side = h == 0 ? 1.0f : -1.0f;       // right hand on the grip
       hd[h].wrist = v3_add(gc, v3_add(v3_scale(ga, axo),
@@ -478,14 +545,21 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
       g_vm_hdbg[h].off_mm = (v3_len(r) - hd[h].gr) * 1000.0f;
     }
     for (int h = 0; h < 2; h++) {
+      const gun_hand_pose_t *eh = &erg->fp_hand[h];
       mat_set(MAT_GLOVE_R, 0.0f);
       v3 pd;
       // A hand that has left the grip for the bolt is not on the trigger, and routing
       // its index at a blade 60 mm away would stretch the digit across the receiver.
-      int style = h == 0 ? (ga_.bhand < 0.35f ? 1 : 0) : (mgv > 0.5f ? 0 : 2);
+      int trigger_contact = ga_.arc + ga_.cyc + ga_.hand + ga_.bhand <= 0.001f;
+      int style = h == 0 ? (ga_.bhand > 0.35f ? 0 : 1)
+                         : (mgv > 0.5f ? 0 : 2);
+      int hand_slot = h == 0 ? FIG_HAND_FIRE : FIG_HAND_SUPPORT;
+      fig_hand_contact_t contact =
+        fig_hand_contact_pose(hand_slot, mgv, ga_.bhand, 0);
       fig_hand(hd[h].wrist, hd[h].gc, hd[h].ga, hd[h].gr, hd[h].side, glove,
-               style, style == 1 ? &g_gun_trig_p : NULL, &pd);
-      g_vm_hdbg[h].palm_mm = g_fig_palm_mm;
+               style, h == 0 && trigger_contact ? &g_gun_trig_p : NULL,
+               hand_slot, 0, contact, gx, &pd);
+      g_vm_hdbg[h].palm_mm = g_fig_hand_diag[h].palm_mm;
       mat_set(MAT_CLOTH_R, 0.0f);
       // THE FOREARM'S DIRECTION IS DERIVED FROM THE PALM'S, and that is the whole
       // wrist. Authored independently — an elbow offset in gun-local space chosen so
@@ -507,15 +581,21 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
       v3 bx = v3_sub(hd[h].ga, v3_scale(pd, v3_dot(hd[h].ga, pd)));
       bx = v3_dot(bx, bx) > 1e-8f ? v3_norm(bx) : v3_norm(v3_cross(pd, gx));
       v3 bn = v3_norm(v3_cross(pd, bx));            // out of the palm
-      float ext = (h == 0 ? 18.0f : 10.0f) * DEG2RAD;
-      float dev = (h == 0 ? 15.0f : -6.0f) * DEG2RAD;
+      float ext = eh->ext_hip + (eh->ext_ads - eh->ext_hip) * ads;
+      float dev = eh->dev_hip + (eh->dev_ads - eh->dev_hip) * ads;
       v3 back = v3_rot_axis(v3_scale(pd, -1.0f), bx, hd[h].side * ext);
       back = v3_norm(v3_rot_axis(back, bn, hd[h].side * dev));
       // AND THEN LEAN IT BACK. Getting the wrist angle right left the support forearm
       // hanging plumb under the rifle: measured on the hip frame its screen axis went
       // 19.4 degrees off vertical to 7.4 — twelve degrees the WRONG way, straight back
       // toward the perpendicular approach the wrist work was supposed to cure.
-      back = v3_norm(v3_add(back, v3_scale(gz, h == 0 ? -0.16f : -0.30f)));
+      float bias = eh->bias_hip + (eh->bias_ads - eh->bias_hip) * ads;
+      // A magazine hand moves to a different grip axis but remains a live support
+      // forearm, not the explicit SR-bolt exception. Blend a separate boreward bias
+      // with the production reload lobe so every intermediate station stays inside
+      // the same 35..65-degree ergonomics contract as Hip/ADS.
+      bias += eh->bias_reload * mgv;
+      back = v3_norm(v3_add(back, v3_scale(gz, bias)));
       // THE ARM IS WHOLE NOW. The forearm used to be a 268 mm stub aimed by the
       // authored wrist angles above and cut off by the frame edge; the arm now
       // runs from a real camera-space SHOULDER through a SOLVED ELBOW to the
@@ -532,25 +612,21 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
           v3_scale(rgt, bside * ANIM_SHO_HALF * cosf(ANIM_BLADE)),
           v3_add(v3_scale(fwd, -bside * ANIM_SHO_HALF * sinf(ANIM_BLADE)),
                  v3_scale(upv, -(0.190f - 0.045f * ads)))));
-      // The body yields to the gun, never the gun to the body: past 96 % of
-      // the arm's real length the SHOULDER rolls forward along the arm's own
-      // line, because the wrist is welded to the grip and may not move.
-      v3 aw = v3_sub(hd[h].wrist, sho);
-      float awl = v3_len(aw), amax = (ANIM_UARM + ANIM_FARM) * ANIM_ARM_REACH_K;
-      if (awl > amax) sho = v3_sub(hd[h].wrist, v3_scale(aw, amax / awl));
-      // skel_solve's pole recipes, expressed in the camera's frame, biased by
-      // the authored forearm direction so the elbow lands in the half-space
-      // the wrist work above already chose.
-      v3 pole = h == 0
-        ? v3_add(v3_scale(rgt, 1.30f),
-                 v3_add(v3_scale(upv, -0.60f), v3_scale(fwd, -0.18f)))
-        : v3_add(v3_scale(rgt, -0.60f),
-                 v3_add(v3_scale(upv, -1.15f), v3_scale(fwd, -0.10f)));
-      // On the magazine the elbow swings out and up, not under the receiver.
-      if (h == 1 && mgv > 0.0f)
-        pole = v3_lerp(pole, v3_add(v3_scale(rgt, -1.05f),
-                                    v3_scale(upv, -0.30f)), mgv);
-      pole = v3_add(pole, v3_scale(back, 0.6f));
+      // The wrist is welded to the published hold, so settle the off-screen shoulder
+      // at the nearest point that lets the descriptor's preferred forearm be an exact
+      // two-bone solution. This keeps both anatomical lengths and makes the drawn arm,
+      // not merely a diagnostic vector, obey the authored wrist angles.
+      v3 want_elb = v3_add(hd[h].wrist, v3_scale(back, ANIM_FARM));
+      v3 se = v3_sub(sho, want_elb);
+      se = v3_dot(se, se) > 1e-8f ? v3_norm(se) : v3_scale(back, -1.0f);
+      sho = v3_add(want_elb, v3_scale(se, ANIM_UARM));
+      // Keep the shoulder on the camera-facing side of the weapon. The exact
+      // length solve above can pull it through the torso at ADS, hiding the
+      // upper arm even though the wrist is correctly welded to the gun.
+      sho = v3_add(sho, v3_scale(rgt, bside * 0.018f));
+      // `ik_solve` projects the pole perpendicular to shoulder->wrist; the preferred
+      // elbow's vector from the settled shoulder selects the correct side of its circle.
+      v3 pole = v3_sub(want_elb, sho);
       v3 elb = ik_solve(sho, hd[h].wrist, ANIM_UARM, ANIM_FARM, pole);
       // Upper arm: the deltoid IS the chain's own fat top, exactly as on the
       // figure (fig_arms' stations verbatim) — buried toward the chest so the
@@ -565,14 +641,8 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
       // two different garments stitched at the elbow.
       v3 usl1 = v3_scale(sleeve, 0.80f), usl2 = v3_scale(sleeve, 0.64f);
       v3 usl3 = v3_scale(sleeve, 0.54f);
-      fnode_t ar[6] = {
-        {v3_add(sho, v3_scale(inb, 0.052f)), sleeve, sleeve, 0.0540f, 0.0580f, 0, 0.74f},
-        {v3_add(sho, v3_scale(ua, 0.020f)), sleeve, sleeve, 0.0680f, 0.0700f, 0, 0.80f},
-        {v3_add(sho, v3_scale(ua, 0.240f)), usl1, usl1, 0.0650f, 0.0675f, 0, 0.0f},
-        {v3_add(sho, v3_scale(ua, 0.500f)), usl2, usl2, 0.0580f, 0.0605f, 0, 0.0f},
-        {v3_add(sho, v3_scale(ua, 0.680f)), usl2, usl2, 0.0590f, 0.0620f, 0, 0.0f},
-        {elb, usl3, usl3, 0.0425f, 0.0445f, 0, 0.0f}};
-      fig_chain(ar, 6, 12, 1, 1, upv);
+      fig_upper_arm(sho, elb, inb, upv, sleeve, sleeve, usl1,
+                    usl2, usl2, usl3, 12);
       // The elbow ball survives only as the cap-swallower between the two arm
       // chains, and it wears the VALUE THE TWO CHAINS ARRIVE WITH (0.55), not
       // the shoulder's. 12 % larger than fig_arms' numbers: at first-person
@@ -597,22 +667,23 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
   }
 }
 
-static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 fwd) {
-  const vm_t *v = &p->vm;
-  const weapon_t *w = &p->wp;
+static void vm_build_prepared(v3 eye, v3 rgt, v3 upv, v3 fwd,
+                              const vm_build_plan_t *plan) {
   scene_reset();
 
-  vm_pose_t ps = vm_stage_pose(p, v, w, alpha);
+  vm_pose_t ps = plan->pose;
   int cur = ps.cur;
   float sight_y = ps.sight_y;
   gunanim_t ga_ = ps.ga;
   float mdrop = ga_.mag;
 
-  vm_frame_t fr = vm_stage_springs(&ps, v, alpha, eye, rgt, upv, fwd);
+  vm_frame_t fr = plan->frame;
   v3 org = fr.org, gx = fr.gx, gy = fr.gy, gz = fr.gz;
 
   ao_off();                               // a gun at arm's length sees open sky
   g_fig_k = FIG_KMAX;                     // ...and always at full resolution
+  if (g_fig_kcap && g_fig_k > g_fig_kcap)
+    g_fig_k = g_fig_kcap;
   probe("vm_gun");
   g_vm_mdl_o = org; g_vm_mdl_x = gx; g_vm_mdl_y = gy; g_vm_mdl_z = gz;
   // BROKEN EDGES, FIRST PERSON ONLY, and that is an LOD decision of exactly the same
@@ -620,7 +691,17 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   g_cham = 0.0007f;
   g_cham_polish = 1;   // ...and this arris was broken by a machine — see cham_arris
   g_gun_hero = 1;      // ...and this is the one view that can resolve a 4.7 mm land
-  g_vm_muzzle = gun_build(cur, org, gx, gy, gz, mdrop, ga_.bolt);
+  g_vm_mesh_muzzle = gun_build(cur, org, gx, gy, gz, mdrop, ga_.bolt);
+  // The return is retained as an executable contract with gun_build.  Both values are
+  // derived from the single GUN_MUZ row and therefore agree bit-for-bit today; using
+  // the plan's value here makes the pre-glow publish and the later emitted pass consume
+  // the exact same production result. vmframe gates any future builder drift.
+  g_vm_muzzle = plan->muzzle;
+  g_vm_emit_witness.muzzle = g_vm_muzzle;
+  g_vm_emit_witness.mesh_muzzle = g_vm_mesh_muzzle;
+  g_vm_emit_witness.tick = g_tick;
+  g_vm_emit_witness.serial++;
+  g_vm_emit_witness.order = ++g_vm_render_order;
   g_gun_hero = 0;
   g_cham_polish = 0;
   g_cham = 0.0f;
@@ -628,8 +709,8 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
   // engine of the harness probes (vmcheck/vmsight/vmhand), which build forced
   // poses on a synthetic camera basis — a probe must stay a side-effect-free
   // observer, and publishing from inside it re-anchored the next live tracer
-  // onto a pose the render never draws. render_frame's real first-person
-  // pass, the one caller whose basis IS the camera, owns the publish.
+  // onto a pose the render never draws. render_frame's mesh-free pre-glow
+  // plan, the one caller whose basis IS the camera, owns the publish.
 
   vm_stage_hands(&ps, org, gx, gy, gz, eye, rgt, upv, fwd);
 
@@ -660,6 +741,17 @@ static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 
     }
   }
 }
+
+// Probe-facing compatibility entry point.  It solves once and emits once, but never
+// publishes a live tracer anchor; only frame_render's real camera path owns that side
+// effect.
+#ifndef _WIN32
+static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 fwd,
+                     float ready) {
+  vm_build_plan_t plan = vm_plan_make(p, alpha, eye, rgt, upv, fwd, ready);
+  vm_build_prepared(eye, rgt, upv, fwd, &plan);
+}
+#endif
 
 // ONE upload per rebuild, not one per pass. g_scene is filled by scene_build and then
 // drawn from up to three times — the shadow depth pass, the main view and the scope FBO
@@ -762,4 +854,3 @@ typedef struct {
   float yaw, pitch, blook;
   float orbit_radius, orbit_height, orbit_rate, orbit_look, orbit_phase;
 } cam_override_t;
-

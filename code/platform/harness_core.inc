@@ -174,6 +174,7 @@ static float trig_mesh_sd(v3 p, const int *rng, int nrng) {
   return (cross & 1) ? -dmin : dmin;
 }
 
+
 // The worst clearance between a tube (a sampled centreline plus a radius) and
 // the hand mesh. Negative = the tube is inside the hand.
 static float trig_tube_clear(const v3 *ax, int nax, float r,
@@ -261,7 +262,7 @@ static void harness_draw_corpse(const corpse_t *cp) {
   g_fig_kcap = CORPSE_K;
   death_t dth = rag_death(&cp->rag, cp->slack, cp->slack, 1.0f);
   scene_draw_figure(&cp->anim, cp->pos, cp->yaw, &dth, 1.0f, 0.0f,
-                    (v3){{1, 1, 1}}, cp->pal, cp->wpn, cp->gs);
+                    (v3){{1, 1, 1}}, cp->wpn, cp->gs);
   g_fig_kcap = 0;
 }
 
@@ -646,4 +647,3 @@ static void write_png(const char *path, int w, int h) {
   if (err) fprintf(stderr, "cannot write %s\n", path);
   else     printf("shot %s\n", path);
 }
-

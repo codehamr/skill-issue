@@ -1,6 +1,6 @@
 // =============================================================================
 // render/frame_render.inc  —  render_frame, the pass order of the frame.
-// Proof: shot battery, budget. One TU: included once by game.c, in
+// Proof: shot battery, budget, vmframe. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // Contract: ONE scene buffer, three frusta (shadow, main, scope) plus the
 // glare chain read it. msaa_resolve's per-frame latch and frame_fbo() are
@@ -9,13 +9,11 @@
 
 // The camera pass: everything that turns (player, alpha, override) into one
 // frame's eye/basis/projection. Field list is exactly the locals that cross
-// into a later pass or into render_frame's own inter-pass glue (grep-verified
-// against the pre-split body): `feet` crosses into the HUD's damage-arc calc,
-// `tp_dist` crosses into the scene_build cast-list call right after this pass
-// returns. `fwd`/`rgt`/`upv` do NOT cross — every later reader (the glow pass,
-// the viewmodel pass) already calls cam_basis(yaw, pitch, roll, ...) itself,
-// fresh, so storing them here would be dead struct weight with no data-flow
-// behind it.
+// into a later pass or into render_frame's own inter-pass glue: `feet` crosses into
+// the HUD's damage-arc calc and `tp_dist` into scene_build. The camera basis is solved
+// later by rf_vm_prepare and crosses glow -> viewmodel in rf_vm_frame_t, because both
+// passes must consume one exact T0/T1 plan; it does not belong in this general camera
+// value.
 typedef struct {
   v3 eye, feet;
   float yaw, pitch, roll, fovy, aspect, ads, tp_dist;
@@ -237,15 +235,86 @@ static scope_result_t rf_scope_pass(const player_t *p, const frame_cam_t *c) {
   return (scope_result_t){.scope = scope, .svp = svp, .scope_on = scope_on};
 }
 
+// A viewmodel point is authored and drawn through VM_FOV_DEG, while its tracer is
+// drawn in the world projection. Preserve its camera-space depth and scale only the
+// lateral coordinates by the tangent ratio: both projections then land on exactly the
+// same pixel. Pure and shared with vmframe, so the proof measures the transform the
+// renderer actually consumes rather than a parallel approximation of it.
+static v3 vm_muzzle_world_remap(v3 eye, v3 fwd, v3 rgt, v3 upv,
+                                float world_fovy, v3 vm_cam) {
+  float k = tanf(world_fovy * 0.5f) /
+            tanf(VM_FOV_DEG * DEG2RAD * 0.5f);
+  return v3_add(eye, v3_add(v3_scale(rgt, vm_cam.x * k),
+         v3_add(v3_scale(upv, vm_cam.y * k),
+                v3_scale(fwd, vm_cam.z))));
+}
+
+static float vm_render_ready(const player_t *p, const anim_t *a, float alpha);
+
+// Mesh-free state shared by the glow and opaque-viewmodel passes.  The glow pass is
+// intentionally earlier, so it prepares and publishes this frame once; the later VM
+// pass consumes the same solve when it emits the one mesh and one draw call.
+typedef struct {
+  vm_build_plan_t plan;
+  v3 fwd, rgt, upv;
+  int active;
+} rf_vm_frame_t;
+
+static rf_vm_frame_t rf_vm_prepare(const player_t *p, float alpha,
+                                   const frame_cam_t *c) {
+  rf_vm_frame_t out = {0};
+  out.active = ((!c->cam_free && !c->third && p->alive) || g_vmorb.on);
+  if (!out.active) return out;
+
+  cam_basis(c->yaw, c->pitch, c->roll, &out.fwd, &out.rgt, &out.upv);
+  int lh = human_of_ent(g_local_ent);
+  const anim_t *a = lh >= 0 && lh < MAX_HUMANS ? &g_player_anim[lh] : NULL;
+  float ready = vm_render_ready(p, a, alpha);
+  out.plan = vm_plan_make(p, alpha, c->eye, out.rgt, out.upv, out.fwd, ready);
+
+  // Only the ordinary live first-person camera may publish.  Orbit/probe poses still
+  // build through the plan above, but can never donate their muzzle to a later tracer.
+  if (!c->cam_free && !c->third && p->alive && !g_vmorb.on) {
+    v3 mc = v3_sub(out.plan.muzzle, c->eye);
+    g_vm_muz_cam = (v3){{v3_dot(mc, out.rgt), v3_dot(mc, out.upv),
+                         v3_dot(mc, out.fwd)}};
+    g_vm_muz_tick = g_tick;
+  }
+  return out;
+}
+
+// Accept only the current tick's live first-person publish. Frame preparation precedes
+// the glow read even at T0; a missing or stale publish is an error, never a fallback.
+static int rf_vm_muzzle_anchor(const player_t *p, const frame_cam_t *c,
+                               const rf_vm_frame_t *vmf, v3 *out) {
+  if (c->cam_free || c->third || !p->alive || g_vmorb.on ||
+      g_vm_muz_tick != g_tick || !(g_vm_muz_cam.z > 0.05f))
+    return 0;
+  *out = vm_muzzle_world_remap(c->eye, vmf->fwd, vmf->rgt, vmf->upv,
+                               c->fovy, g_vm_muz_cam);
+  return !f_is_nonfinite(out->x) && !f_is_nonfinite(out->y) &&
+         !f_is_nonfinite(out->z);
+}
+
+// This is the non-GL production sequence vmframe exercises directly: solve/publish
+// first, then consume the published T0/T1 anchor.  rf_glow_pass adds only buffer build
+// and draws around it.
+static int rf_vm_publish_anchor(const player_t *p, float alpha,
+                                const frame_cam_t *c, rf_vm_frame_t *vmf,
+                                v3 *anchor) {
+  *vmf = rf_vm_prepare(p, alpha, c);
+  return rf_vm_muzzle_anchor(p, c, vmf, anchor);
+}
+
 // Re-anchor the player's own streak onto the viewmodel's published muzzle
 // (glow), plus the scope's own stage 2 (the same glow, seen through the
 // glass) when the scope is up. `svp_in` is aliased to a local `svp` copy: the
 // pass only ever READS the matrix (glUniformMatrix4fv, scene_draw_vp(&svp)),
 // so a value copy behaves identically to the original local.
-static void rf_glow_pass(const player_t *p, const frame_cam_t *c,
-                         int scope_on, const mat4 *svp_in) {
+static void rf_glow_pass(const player_t *p, float alpha, const frame_cam_t *c,
+                         int scope_on, const mat4 *svp_in,
+                         rf_vm_frame_t *vmf) {
   v3 eye = c->eye;
-  float yaw = c->yaw, pitch = c->pitch, roll = c->roll, fovy = c->fovy;
   int cam_free = c->cam_free, third = c->third;
   mat4 vp = c->vp;
   mat4 svp = *svp_in;
@@ -258,16 +327,7 @@ static void rf_glow_pass(const player_t *p, const frame_cam_t *c,
   // world-star suppression above — with g_local_ent < 0 (dedicated server) it must be
   // hard 0, or the two halves disagree and a shot draws zero or two stars.
   g_fx_vm_flash = g_local_ent >= 0 && !cam_free && !third && p->alive && !g_vmorb.on;
-  if (!cam_free && !third && p->alive && g_vm_muz_cam.z > 0.05f &&
-      g_tick - g_vm_muz_tick <= 8) {
-    v3 mf, mr, mu;
-    cam_basis(yaw, pitch, roll, &mf, &mr, &mu);
-    float mk = tanf(fovy * 0.5f) / tanf(VM_FOV_DEG * DEG2RAD * 0.5f);
-    g_fx_muzzle = v3_add(eye, v3_add(v3_scale(mr, g_vm_muz_cam.x * mk),
-                  v3_add(v3_scale(mu, g_vm_muz_cam.y * mk),
-                         v3_scale(mf, g_vm_muz_cam.z))));
-    g_fx_muz_live = 1;
-  }
+  g_fx_muz_live = rf_vm_publish_anchor(p, alpha, c, vmf, &g_fx_muzzle);
   fx_build(eye);
   if (g_scene_floats) {
     fx_pass_begin();
@@ -307,15 +367,26 @@ static void rf_dust_pass(const frame_cam_t *c) {
 
 // Viewmodel pass: depth cleared so the gun never clips into walls, own fixed-FOV
 // projection so the world FOV slider never distorts it.
-static void rf_vm_pass(const player_t *p, float alpha, const frame_cam_t *c) {
-  int cam_free = c->cam_free, third = c->third;
+static float vm_render_ready(const player_t *p, const anim_t *a, float alpha) {
+  if (!a) return 1.0f;
+  float ready = a->prev_ready_s + (a->ready_s - a->prev_ready_s) * alpha;
+  // Render interpolation is cosmetic and may never interpolate across a real action
+  // gate. In particular alpha=0 on the shot tick still observes the current cooldown
+  // / fire latch and therefore cannot draw the SR's previous low-ready frame.
+  if (p->wp.cur == WPN_SR &&
+      !gun_pose_idle_ok(&p->wp, a, p->vel, p->grounded, p->sliding))
+    ready = 1.0f;
+  return f_clamp(ready, 0.0f, 1.0f);
+}
+
+static void rf_vm_pass(const player_t *p, const frame_cam_t *c,
+                       const rf_vm_frame_t *vmf) {
   float yaw = c->yaw, pitch = c->pitch, roll = c->roll, aspect = c->aspect;
   float ads = c->ads;
   v3 eye = c->eye;
 
-  if ((!cam_free && !third && p->alive) || g_vmorb.on) {
-    v3 fwd, rgt, upv;
-    cam_basis(yaw, pitch, roll, &fwd, &rgt, &upv);
+  if (vmf->active) {
+    v3 fwd = vmf->fwd, rgt = vmf->rgt, upv = vmf->upv;
     glClear(GL_DEPTH_BUFFER_BIT);
     mat4 vmvp = m4_mul(m4_perspective(VM_FOV_DEG * DEG2RAD, aspect, 0.01f, 5.0f),
                        m4_look(eye, yaw, pitch, roll));
@@ -345,14 +416,7 @@ static void rf_vm_pass(const player_t *p, float alpha, const frame_cam_t *c) {
     } else {
       glUniform3f(R.u_muzc, 0.0f, 0.0f, 0.0f);
     }
-    vm_build(p, alpha, eye, rgt, upv, fwd);
-    if (!g_vmorb.on) {
-      // The tracer re-anchor publish — from the ONE vm_build call whose basis
-      // is the real camera (the harness probes must stay side-effect-free).
-      v3 mc = v3_sub(g_vm_muzzle, eye);
-      g_vm_muz_cam = (v3){{v3_dot(mc, rgt), v3_dot(mc, upv), v3_dot(mc, fwd)}};
-      g_vm_muz_tick = g_tick;
-    }
+    vm_build_prepared(eye, rgt, upv, fwd, &vmf->plan);
     if (g_vmorb.on) {
       // Re-aim the projection at one hand, keeping the pose that was just built.
       v3 of, orr, ou;
@@ -472,13 +536,7 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
     float cx = g_scope_cx, cy = g_scope_cy;
     float vw_ = g_ui_vw, vh_ = g_ui_vh;
     // Radius comes from the geometry (vm_build projected the ocular).
-    float off = sqrtf((cx - vw_ * 0.5f) * (cx - vw_ * 0.5f) +
-                      (cy - vh_ * 0.5f) * (cy - vh_ * 0.5f));
-    float aligned = 1.0f - f_clamp((off - g_scope_r * 0.30f) /
-                                   fmaxf(1.0f, g_scope_r * 0.55f), 0.0f, 1.0f);
-    float rad = g_scope_r *
-                smooth01(f_clamp((scope - SCOPE_ADS_OPEN) / 0.42f, 0.0f, 1.0f)) *
-                aligned;
+    float rad = scope_pip_radius(scope, vw_, vh_);
     if (rad > 0.5f) {
       // Glass TAKES light: coated optics transmit ~90% and tint slightly cool.
       const float glass[4] = {0.86f, 0.89f, 0.93f, 1.0f};
@@ -867,11 +925,12 @@ static void render_frame(const player_t *p, float alpha, int fps,
 
   scope_result_t sr = rf_scope_pass(p, &cam);
 
-  rf_glow_pass(p, &cam, sr.scope_on, &sr.svp);
+  rf_vm_frame_t vmf;
+  rf_glow_pass(p, alpha, &cam, sr.scope_on, &sr.svp, &vmf);
 
   rf_dust_pass(&cam);
 
-  rf_vm_pass(p, alpha, &cam);
+  rf_vm_pass(p, &cam, &vmf);
 
   // The picture is finished here; everything after this line is interface.
   glare_pass(yaw, pitch, roll, fovy, aspect);

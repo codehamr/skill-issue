@@ -387,9 +387,11 @@ static void client_anim_all(void) {
     // player_present_tick runs: nothing else on a client ticks a body's presentation,
     // and the dead branch above already took it through player_present_tick.
     if (p->flash > 0) p->flash--;
+    int idle_ok = gun_pose_idle_ok(&p->wp, &g_player_anim[h], p->vel,
+                                   p->grounded, p->sliding);
     anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
               p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
-              p->lean, p->wp.ready_want, ent_of_human(h));
+              p->lean, p->wp.ready_want, ent_of_human(h), p->wp.cur, idle_ok);
   }
   for (int b = 0; b < g_match.nbots; b++) {
     bot_t *bt = &g_bots[b];
@@ -402,7 +404,7 @@ static void client_anim_all(void) {
       bt->rag = (rag_t){0};
       bt->topple = bt->prev_topple = 0.0f;
       g_cl_body[b + 1] = 0;                  // the body goes back to the server
-      anim_reset(&bt->anim, bt->pos, bt->yaw);
+      anim_reset(&bt->anim, bt->pos, bt->yaw, bt->wp.cur);
     }
     if (!bt->alive && !g_cl_body[b + 1]) {
       client_death_launch(&bt->rag, bt->pos, bt->vel, bt->grounded, b + 1);
@@ -418,9 +420,11 @@ static void client_anim_all(void) {
       bt->grounded = bt->rag.grounded;
       continue;
     }
+    int idle_ok = gun_pose_idle_ok(&bt->wp, &bt->anim, bt->vel,
+                                   bt->grounded, bt->sliding);
     anim_tick(&bt->anim, bt->pos, bt->vel, bt->yaw, bt->pitch, bt->grounded,
               bt->crouch, 0.0f, bt->sliding, bt->wp.ads_s, 0.0f,
-              bt->wp.ready_want, b + 1);
+              bt->wp.ready_want, b + 1, bt->wp.cur, idle_ok);
   }
 }
 
@@ -646,4 +650,3 @@ static void app_sync(app_t *a) {
   }
   a->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 }
-

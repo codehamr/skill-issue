@@ -346,7 +346,7 @@ static void bot_tick(int bi) {
       // The BODY stays behind.
       corpse_add(&b->anim, b->pos, b->prev_pos, b->rag, b->yaw,
                  b->topple, b->prev_topple,
-                 gun_anim(&b->wp), b->wp.cur, 0, bi + 1);
+                 gun_anim(&b->wp), b->wp.cur, bi + 1);
       bot_spawn(bi);
       ev_push((event_t){.type = EV_RESPAWN, .dst = bi + 1});
     }
@@ -729,9 +729,11 @@ static void bot_tick(int bi) {
   // Bots do not lean yet: the pose supports it (the puppet drives it) but no AI
   // branch asks for it, so this is 0 by construction rather than by omission.
   b->wp.ready_want = (unsigned char)(b->tgt >= 0 || startled || b->alert_t > 0);
+  int idle_ok = gun_pose_idle_ok(&b->wp, &b->anim, b->vel,
+                                 b->grounded, b->sliding);
   anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
             b->crouch, 0.0f, b->sliding, b->wp.ads_s, 0.0f,
-            b->wp.ready_want, bi + 1);
+            b->wp.ready_want, bi + 1, b->wp.cur, idle_ok);
   // (`startled` is in there because a bot that turns to a sound with the rifle
   // still slung is the single most "it did not really notice me" frame in the
   // game — the carry state is the only tell the player gets that hearing
@@ -834,6 +836,6 @@ static void match_init(void) {
   for (int i = 0; i < g_match.nbots; i++) bot_spawn(i);
   for (int h = 0; h < MAX_HUMANS; h++)   // every human starts with a
     if (g_humans_on[h])                  // solved skeleton, not garbage
-      anim_reset(&g_player_anim[h], g_players[h].pos, g_players[h].yaw);
+      anim_reset(&g_player_anim[h], g_players[h].pos, g_players[h].yaw,
+                 g_players[h].wp.cur);
 }
-

@@ -1,12 +1,12 @@
 // =============================================================================
 // world/decor.inc  —  scat_emit, mesh_decor, dec_twig/dec_stick, drifts,
-// mesh_cast_extra, and fig_joint (the one joint-mass builder).
+// mesh_cast_extra, and fig_joint (the shared joint-mass builder).
 // Proof: scat, mapcheck, shot battery. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // Contract: decor lives in the world mesh ONLY, never in g_solids — it does
-// not collide, occlude a bot or cost a tick. fig_joint builds every flexing
-// joint's mass from the two bone directions (not a sphere) and is the ONE
-// copy every render figure file calls.
+// not collide, occlude a bot or cost a tick; this fragment owns no held-hand/
+// gun-contact state. fig_joint builds every flexing joint's mass from the two
+// bone directions (not a sphere) and is the ONE copy every figure file calls.
 // =============================================================================
 // ===========================================================================
 // DECOR — the world mesh only. Never a solid, never a tick, never a bullet.
@@ -382,7 +382,7 @@ static void scat_emit_shrub(const scat_t *sc, v3 at, float sg, v3 w2, uint64_t s
 
 static void scat_emit_cactus(const scat_t *sc, v3 at, float sg, uint64_t st) {
         // Sage over the desert floor — desaturated enough to stay out of the
-        // soldier's olive band, audited at both sun extremes.
+        // uniform's cool arid band, audited at both sun extremes.
         v3 sage = v3_scale((v3){{0.34f, 0.38f, 0.27f}},
                            rng_rangef(&st, 0.92f, 1.06f));
         if (sc->var & 1) {
@@ -1298,97 +1298,4 @@ static void fig_joint(v3 c, v3 da, v3 db, float rs, float rl, float swell,
   fig_ball(v3_add(c, v3_scale(out, rs * 0.22f * bend)),
            rs, rl * (1.0f - 0.30f * bend), rs * (1.0f + swell * bend),
            bis, flex, k, col);
-}
-
-// One hand, CLOSED AROUND A CYLINDER. The figure and the viewmodel both call this,
-// because a hand built twice ends up different in the two places the player sees it —
-// and the viewmodel's is the closest geometry to the camera in the game.
-
-// A point on the grip cylinder's frame: `ax` along the axis from `gc`, `ph` around it
-// measured from e1, at radius `rad`.
-static v3    g_gun_trig_p;    // world contact point on the blade's rear face
-static v3    g_gun_trig_n;    // unit REARWARD normal there (the pull direction)
-static v3    g_gun_guard[4];  // the guard bow's polyline, world space
-static float g_gun_guard_r;   // ...and the tube radius round it
-// The cross-section scale the rifle is being drawn at — 1.0 in first person,
-// GUN_GIRTH_3P on a figure.
-static float g_gun_girth;
-static v3    g_gun_blade[3];  // the trigger blade's polyline, world space
-static float g_gun_blade_r;   // ...and its tube radius. Published for the same
-                              // reason the guard is: it is a THIN part in open air, and
-                              // the proof has to be able to ask whether a fat finger
-                              // has swallowed it.
-static v3    g_gun_body_c, g_gun_body_e[3];   // receiver box: centre + 3 half-axes
-
-static float g_fig_palm_mm;   // last hand's wrist-to-knuckle chord, for `vmhand`
-static float g_fig_wrist_mm;  // ...its distance from the grip axis, and whether
-static int   g_fig_clamped;   // the reach clamp had to move the weapon: `vmtrig`
-                              // prints both, because "the third-person hand is
-                              // not on the grip" was an invisible fact for as
-                              // long as nothing printed it.
-static v3 hand_pt(v3 gc, v3 ga, v3 e1, v3 e2, float ax, float ph, float rad) {
-  return v3_add(gc, v3_add(v3_scale(ga, ax),
-         v3_add(v3_scale(e1, cosf(ph) * rad), v3_scale(e2, sinf(ph) * rad))));
-}
-
-// Digit profile: the SMOOTH family in first person, the faceted one everywhere else.
-#define FIG_DIGIT_K (g_fig_k >= FIG_KMAX ? 12 : 8)
-// THE TRIGGER FINGER IS AIMED, NOT AUTHORED. Three hand-tuned numbers cannot be right
-// from two angles at once, and were not: the digit went straight through the guard and
-// the receiver. `g_gun_trig_p` is where the blade is; this routes the index along a
-// quadratic Bezier from the metacarpal head to that point, with the control point
-// pushed out along the grip's own surface so the finger BOWS the way a curled one does.
-static v3 fig_trig_pt(v3 a, v3 c, v3 b, float t) {
-  float u = 1.0f - t;
-  return v3_add(v3_scale(a, u * u), v3_add(v3_scale(c, 2.0f * u * t),
-                                           v3_scale(b, t * t)));
-}
-
-// The aimed tip's own cross-section, NAMED because the pad's stand-off from the blade
-// is derived from it.
-#define FTIP_RX 0.82f
-#define FTIP_RZ 0.78f
-// A pad PRESSES on a trigger, it does not pass through it: the surface stops on the
-// steel and deforms about a millimetre and a half.
-#define TRIG_PAD_SQUASH 0.0015f
-
-// How much air a digit keeps from the guard's wire, before the girth scale. 6.0 mm and
-// not 1.5, because the push moves NODES and the swept surface between two cleared nodes
-// is a chord where the arc is not — a margin sized for the nodes leaves the BAND
-// between them inside the tube.
-#define HAND_GUARD_CLR 0.0090f
-
-// Push a digit node out of the trigger guard's tube.
-static v3 fig_body_clear(v3 p, float r) {
-  v3 rel = v3_sub(p, g_gun_body_c);
-  float best = 1e9f, sgn = 1.0f;
-  int axis = -1;
-  for (int k = 0; k < 3; k++) {
-    float h = v3_len(g_gun_body_e[k]);
-    if (h < 1e-6f) return p;
-    float d = v3_dot(rel, v3_scale(g_gun_body_e[k], 1.0f / h));
-    float out = h + r - fabsf(d);
-    if (out <= 0.0f) return p;              // already clear on this axis
-    if (out < best) { best = out; axis = k; sgn = d < 0.0f ? -1.0f : 1.0f; }
-  }
-  float h = v3_len(g_gun_body_e[axis]);
-  return v3_add(p, v3_scale(g_gun_body_e[axis], sgn * best / h));
-}
-
-static v3 fig_guard_clear(v3 p, float r) {
-  // The margin scales with the weapon's own girth for the same reason the
-  // radii do: the third-person rifle draws at GUN_GIRTH_3P and its digits are
-  // fatter in proportion, so a fixed millimetre margin covers less of the
-  // chord sag between two cleared nodes there than it does in first person.
-  float need = r + g_gun_guard_r + HAND_GUARD_CLR * g_gun_girth;
-  for (int e = 0; e + 1 < 4; e++) {
-    v3 a = g_gun_guard[e], ab = v3_sub(g_gun_guard[e + 1], a);
-    float l2 = v3_dot(ab, ab);
-    float u = l2 > 1e-9f ? f_clamp(v3_dot(v3_sub(p, a), ab) / l2, 0.0f, 1.0f) : 0.0f;
-    v3 c = v3_add(a, v3_scale(ab, u)), d = v3_sub(p, c);
-    float len = v3_len(d);
-    if (len < 1e-5f || len >= need) continue;
-    p = v3_add(c, v3_scale(d, need / len));
-  }
-  return p;
 }

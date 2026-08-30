@@ -170,7 +170,13 @@ typedef struct {
   float prev_lag_x, prev_lag_y, prev_lag_z;
   float bob_x, bob_y, prev_bob_x, prev_bob_y;      // m: walk figure-8
   float bob_phase, bob_amp;
-  float kick, kick_v, prev_kick;                   // m: fire kick spring
+  // A shot is three presentation springs, not one scalar doing three jobs. Back is
+  // metres along the bore toward the shoulder, lift is radians of delayed muzzle
+  // rise, and side is metres of tiny signed lateral travel. Each has a prev twin so
+  // the viewmodel remains sub-tick interpolated.
+  float kick_back, kick_back_v, prev_kick_back;
+  float kick_lift, kick_lift_v, prev_kick_lift;
+  float kick_side, kick_side_v, prev_kick_side;
   float roll, prev_roll;                           // rad: slide/strafe lean
   float lean_lag, prev_lean_lag;                   // trails player_t.lean: the
                                                    // weapon is on an arm, not
@@ -214,4 +220,3 @@ typedef struct {
   weapon_t wp;
   vm_t  vm;
 } player_t;
-

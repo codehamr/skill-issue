@@ -4,12 +4,13 @@
 // Proof: net*-proofs. One TU: included once by game.c, in definition order —
 // moving a definition out is a semantic change.
 // Contract: server-authoritative with client prediction and rollback
-// reconciliation; the event channel is the client's only source of its own
-// gunfire (ev_push suppressed via g_predicting while predicting). Foreign
-// presentation is RE-SOLVED here, never received: net_cl_extrapolate projects
-// the body, net_cl_present_advance re-runs the weapon's own clocks from the intents
-// the snapshot carried and the events it delivered, and ent_on_event (sim/combat.inc)
-// applies the impulses — kick, reload, flinch (proof: netcarry, netfigure).
+// reconciliation. Predicted local fire applies its VM impulse and immediate carry
+// latch in gun_shoot while ev_push is suppressed; the authoritative event echo owns
+// VFX and the 3P body impulse and never adds a second VM impulse. Foreign presentation
+// is RE-SOLVED here, never received: net_cl_extrapolate projects the body,
+// net_cl_present_advance re-runs the weapon's own clocks from snapshot intents, and
+// ent_on_event (sim/combat.inc) applies delivered recoil/reload/flinch impulses
+// (proof: netcarry, netfigure, netrecoil).
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Live connection layer — SHARED. The server accepts clients,
@@ -558,8 +559,15 @@ static float g_cl_worst_err_mm;
 static int g_cl_ev_applied, g_cl_ev_dupes;   // event channel, for the proof
 static void net_cl_send_inputs(void);        // defined below
 
-// Derived predicted state per input tick, the predpos ring's sibling.
-typedef struct { weapon_t wp; uint64_t rng; float yaw; } cl_pred_t;
+// Derived predicted state per input tick, the predpos ring's sibling. vm is local-only
+// presentation, but it is still derived by player_move_tick: restoring it is what makes
+// a shot inside a rollback window produce exactly one viewmodel impulse.
+typedef struct {
+  weapon_t wp;
+  vm_t vm;
+  uint64_t rng;
+  float yaw;
+} cl_pred_t;
 static cl_pred_t g_cl_pred[NET_HIST];
 
 // True when input tick `t` is inside the recorded prediction window — the
@@ -569,13 +577,37 @@ static int net_cl_hist_ok(uint32_t t) {
          (int32_t)(g_cl.seq - t) >= 0 && g_cl.seq - t < NET_HIST;
 }
 
+// Input edges are derived state too. Replaying (li, seq) must begin with the buttons
+// the server had just consumed at li, not with the live endpoint's later buttons.
+static void net_cl_restore_buttons(player_t *p, uint32_t li) {
+  const net_input_t *in = &g_cl.inlog[li % NET_HIST];
+  if (in->tick != li) return;
+  for (int b = 0; b < IN_COUNT; b++) p->prev_held[b] = (in->buttons >> b) & 1;
+}
+
 // Restore the recorded derived state at input `li` before a rollback replay.
 static void net_cl_restore_pred(player_t *p, int h, uint32_t li) {
   if (!net_cl_hist_ok(li)) return;
   const cl_pred_t *ps = &g_cl_pred[li % NET_HIST];
   p->wp = ps->wp;
+  p->vm = ps->vm;
   g_rng_gun[h] = ps->rng;
   p->yaw = ps->yaw;        // the chain value the replay validates against
+  net_cl_restore_buttons(p, li);
+}
+
+// A spawn-sequence edge is the same fresh life player_respawn creates on the server.
+// Preserve only lifetime/accounting state and the acknowledged input edge; every
+// movement, collision and presentation follower is reset by the one player_spawn
+// implementation before authoritative snapshot fields are applied below.
+static void net_cl_reset_life(player_t *p, uint32_t li) {
+  int shots = p->shots;
+  int prev_held[IN_COUNT];
+  memcpy(prev_held, p->prev_held, sizeof prev_held);
+  player_spawn(p);
+  p->shots = shots;
+  memcpy(p->prev_held, prev_held, sizeof prev_held);
+  net_cl_restore_buttons(p, li);
 }
 
 // An adopted position rides the wire's 1 cm grid, and against a wall the server slides
@@ -698,8 +730,12 @@ static void net_cl_apply_ent(const net_ent_t *e) {
     p->wp.ads_want = !!(e->flags & NEF_ADS);
     p->wp.ready_want = !!(e->flags & NEF_READY);
     p->tuck_y = (e->flags & NEF_TUCK) ? HEIGHT_STAND - HEIGHT_CROUCH : 0.0f;
-    if (!g_humans_on[h]) { g_humans_on[h] = 1; anim_reset(&g_player_anim[h], pos, p->yaw); }
-    else if (tele) anim_reset(&g_player_anim[h], pos, p->yaw);
+    if (!g_humans_on[h]) {
+      g_humans_on[h] = 1;
+      anim_reset(&g_player_anim[h], pos, p->yaw, p->wp.cur);
+    } else if (tele) {
+      anim_reset(&g_player_anim[h], pos, p->yaw, p->wp.cur);
+    }
   } else {
     bot_t *b = &g_bots[e->id - 1];
     float byaw = net_dq_yaw(e->yaw);
@@ -721,7 +757,7 @@ static void net_cl_apply_ent(const net_ent_t *e) {
     b->hp = e->hp; b->wp.cur = e->weapon; b->active = 1;
     b->wp.ads_want = !!(e->flags & NEF_ADS);      // a bot's carriage is the same
     b->wp.ready_want = !!(e->flags & NEF_READY);  // two bits (it never tucks)
-    if (tele) anim_reset(&b->anim, pos, b->yaw);
+    if (tele) anim_reset(&b->anim, pos, b->yaw, b->wp.cur);
     if (e->id > g_match.nbots) g_match.nbots = e->id;   // grow the roster to fit
   }
 }
@@ -796,9 +832,12 @@ static void net_cl_extrapolate(void) {
 // state AFTER input `li`; every input in (li, seq) is already on the wire and the
 // server WILL play it — after a respawn the server is already alive and walking one RTT
 // before this client knows.
-static void net_cl_replay(player_t *p, uint32_t li) {
+static void net_cl_replay(player_t *p, int h, uint32_t li) {
   net_cl_depenetrate(p);     // the adopted fix may sit a wire-rounding inside
                              // a wall; replaying from there teleports
+  int predicting_save = g_predicting;
+  int replay_save = g_prediction_replay;
+  g_prediction_replay = 1;
   for (uint32_t rt = li + 1; (int32_t)(g_cl.seq - rt) > 0; rt++) {
     const net_input_t *rin = &g_cl.inlog[rt % NET_HIST];
     if (rin->tick != rt) break;              // ring recycled: stop cleanly
@@ -810,9 +849,16 @@ static void net_cl_replay(player_t *p, uint32_t li) {
     g_predicting = 1;
     player_move_tick(p, g_cl.my_ent, rheld,
                      net_dq_wish(rin->wish_x), net_dq_wish(rin->wish_y));
-    g_predicting = 0;
+    g_predicting = predicting_save;
     g_cl.predpos[rt % NET_HIST] = p->pos;
+    // Replay replaces history, not merely the live endpoint: a later ack may anchor on
+    // any one of these ticks, so every derived field must describe the recomputed run.
+    g_cl_pred[rt % NET_HIST] =
+        (cl_pred_t){.wp = p->wp, .vm = p->vm, .rng = g_rng_gun[h],
+                    .yaw = p->yaw};
   }
+  g_predicting = predicting_save;
+  g_prediction_replay = replay_save;
 }
 
 static void net_cl_snapshot(const unsigned char *b, int n) {
@@ -927,7 +973,7 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
     // packet — invisible on localhost, a violent mouse yank over a real link.
     g_cl.spawn_seq = es[i].spawn_seq;          // respawned: computed above,
     g_cl.have_spawn_seq = 1;                   // before the error metric
-    if (!synced || cur_err > 2.0f || !alive || !p->alive) {
+    if (respawned || !synced || cur_err > 2.0f || !alive || !p->alive) {
       if (!synced) {
         // SPAWN THE LOCAL SLOT BEFORE ADOPTING THE SERVER'S STATE. Until this instant
         // the player was entity 0; g_players[h] for the server's assigned slot is still
@@ -953,11 +999,13 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
         g_online = 1;
         g_cl.sync_seq = g_cl.seq;    // predictions are real from HERE on
       }
+      if (respawned) net_cl_reset_life(p, li);
       p->pos = p->prev_pos = auth; p->vel = avel;
       if (respawned) { p->yaw = net_dq_yaw(es[i].yaw); p->pitch = net_dq_pitch(es[i].pitch); }
       g_cl.prev_yaw = p->yaw;              // the prev chain re-anchors here,
       g_cl.have_prev_yaw = 1;              // exactly as the server's does
-      anim_reset(&g_player_anim[h], auth, p->yaw);
+      p->wp.cur = es[i].weapon;
+      anim_reset(&g_player_anim[h], auth, p->yaw, p->wp.cur);
       // FLOOD THE PREDICTION HISTORY WITH THE ADOPTED FIX. The ring still holds pre-
       // teleport positions for the ~RTT of ticks the server has yet to ack; without
       // this every snapshot of that window re-measured the corpse->spawn distance as
@@ -970,12 +1018,19 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
       // spawn or desync means the prediction stream is broken anyway.
       p->grounded = !!(es[i].flags & NEF_GROUNDED);
       p->crouched = !!(es[i].flags & NEF_CROUCH); p->sliding = !!(es[i].flags & NEF_SLIDE);
-      // A RESPAWN is a fresh weapon, exactly player_spawn's reset — the hard adopt used
-      // to carry the dying weapon's cool/reload_t/recoil into the new life, locking
-      // predicted fire until NP re-sync.
+      // A respawn starts from player_spawn above, then adopts the server's post-input
+      // state. The snapshot carries the effective Lean and tuck intent; the local
+      // command/clearance split is re-anchored to that one observable value.
       if (respawned) {
-        memset(&p->wp, 0, sizeof p->wp);
-        for (int wi = 0; wi < WPN_COUNT; wi++) p->wp.ammo[wi] = WPN_DEF[wi].mag;
+        p->prev_grounded = p->grounded;
+        p->tuck_y = (es[i].flags & NEF_TUCK) ? HEIGHT_STAND - HEIGHT_CROUCH : 0.0f;
+        p->eye = p->prev_eye = EYE_STAND - p->tuck_y;
+        float lean = net_dq_wish(es[i].lean);
+        p->lean_in = p->lean = p->prev_lean = lean;
+        p->lean_clr = 1.0f;
+        p->wp.ads_want = !!(es[i].flags & NEF_ADS);
+        p->wp.ready_want = !!(es[i].flags & NEF_READY);
+        p->vm.last_eye = p->eye;
       } else if (alive) {
         net_cl_restore_pred(p, h, li);
       }
@@ -991,7 +1046,7 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
       p->alive = alive;                      // BEFORE the replay: the move
       p->hp = es[i].hp;                      // tick's dead branch is a no-op
       if (alive) {
-        net_cl_replay(p, li);
+        net_cl_replay(p, h, li);
         g_cl.prev_yaw = p->yaw;                // the prev chain continues from here
       }
     } else if (anchor && sqrtf(err.x * err.x + err.z * err.z) > 0.05f) {
@@ -1004,7 +1059,7 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
       p->wp.cur = es[i].weapon;              // …then the server's weapon truth
       p->wp.ammo[p->wp.cur] = es[i].mag;     // replay re-predicts pending shots
       g_cl.predpos[li % NET_HIST] = auth;
-      net_cl_replay(p, li);
+      net_cl_replay(p, h, li);
       g_cl.prev_yaw = p->yaw;
     } else if (anchor) {
       // Move the RESIDUAL only, a quarter per snapshot, and shift the recorded
@@ -1112,7 +1167,9 @@ static void net_cl_tick(const int held[IN_COUNT], float wx, float wy,
   }
   g_cl.predpos[g_cl.seq % NET_HIST] = p->pos;   // record for the error metric
   g_cl_pred[g_cl.seq % NET_HIST] =              // …and the derived state a
-      (cl_pred_t){p->wp, g_rng_gun[h], p->yaw}; // rollback replay restores
+      (cl_pred_t){.wp = p->wp, .vm = p->vm, .rng = g_rng_gun[h],
+                  .yaw = p->yaw};
+                                                 // rollback replay restores
   net_cl_send_inputs();
   g_cl.seq++;
 }
@@ -1255,4 +1312,3 @@ static int net_cl_poll(void) {
   }
   return g_cl.state != NC_FAILED;
 }
-

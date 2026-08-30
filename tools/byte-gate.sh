@@ -78,7 +78,7 @@ run "figcheck"  1337 "figcheck 120; figcheck 120 6; figcheck 120 12; figcheck 12
 run "figv"      1337 "figv; figcheck 120; figv"
 run "figm"      1337 "figm; puppet on; puppet ads 1; wait 60; figm; puppet crouch 1; wait 60; figm"
 run "figbury"   1337 "figbury; figbury head; lean"
-run "viewmodel" 1337 "vmcheck; vmsight; vmtrig; vmhand"
+run "viewmodel" 1337 "vmcheck; vmsight; vmframe; vmtrig; vmhand"
 
 # --- Welt, Licht, Mood, Scatter, Parity, Budget ---------------------------
 run "map"        1337 "map; sun; mood; scat; mapcheck 2000"
@@ -98,7 +98,7 @@ run "padcurve"         1337 "padcurve; padlook 120"
 run "botmemory-normal" 1337 "skill normal; wait 120; botmemory"
 
 # --- Netz (inkl. netleave: Teardown-Zaehler muessen 0 sein) ---------------
-run "net" 1337 "netpack 2000; netpredict 600; netlagcomp; netstall; netanim 600; netfill; netloop 600; netleave; netfuzz 5000"
+run "net" 1337 "netpack 2000; netpredict 600; netlagcomp; netstall; netanim 600; netfill; netloop 600; netdeath; netleave; netfuzz 5000"
 
 # --- UI und HOME (appframe, nicht wait — wait bewegt g_ui_time nicht) -----
 run "ui-menu" 1337 "menu; uiframe; uistat; nav down; uiframe; nav ok; uiframe; uistat; cfg"

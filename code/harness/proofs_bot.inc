@@ -36,7 +36,8 @@ static int bh_shot, bh_turn, bh_cap, bh_nofire, bh_move, bh_shot_far, bh_step,
                          .active = 1, .grounded = 1, .eye = EYE_STAND,       \
                          .tgt = -1, .wp.cur = WPN_AR};                       \
     wpn_fill_mags(&g_bots[0].wp);                                            \
-    anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw);                \
+    anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw,                 \
+               g_bots[0].wp.cur);                                             \
   } while (0)
 
 // A wall intersects this otherwise open shot. The accepted score is also a
@@ -658,7 +659,8 @@ static void botmem_stage(bot_t seed, v3 hpos) {
   seed.wp.cur = WPN_AR;
   g_bots[0] = seed;
   wpn_fill_mags(&g_bots[0].wp);
-  anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw);
+  anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw,
+             g_bots[0].wp.cur);
   g_players[0] = (player_t){.pos = hpos, .hp = PLAYER_HP,
                             .alive = 1, .grounded = 1, .eye = EYE_STAND};
 }
@@ -836,7 +838,8 @@ static void botmemory_case_incumbent_fov(int *fail) {
                        .tgt = 0, .belief = BOT_BELIEF_VISIBLE, .scan_t = 1,
                        .react_t = 100, .burst = 3, .wp.cur = WPN_AR};
   wpn_fill_mags(&g_bots[0].wp);
-  anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw);
+  anim_reset(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw,
+             g_bots[0].wp.cur);
   g_bots[1] = (bot_t){.pos = {{0,0,-8}}, .prev_pos = {{0,0,-8}},
                        .hp = PLAYER_HP, .alive = 1, .active = 1,
                        .grounded = 1, .eye = EYE_STAND};
@@ -1374,3 +1377,1248 @@ static void padbackend_proof(void) {
   printf("padbackend ok cases=%d\n", cases);
 }
 
+// --- Lean-step presentation contract ---------------------------------------
+// This proof deliberately lives beside proof_world_save/restore.  The step is a
+// presentation solve, but it consults the simulation's solid list; leaving one of
+// these synthetic walls behind would make every proof after it depend on command
+// order.  All dimensions of the step itself come from skeleton.inc.  The numbers
+// below are acceptance tolerances or fixture extents, never a second pose definition.
+#define LS_SYM_M       0.005f
+#define LS_SYM_DEG     2.0f
+#define LS_PEN_M       0.0005f
+#define LS_SINK_M      0.002f
+#define LS_HEAD_GAP_M  0.0015f
+
+enum { LS_OPEN, LS_SIDEWALL, LS_CORNER, LS_SLOT };
+static const char *LS_PART[3] = {"outsole", "boot", "bootcuff"};
+static const float LS_ALPHA[5] = {0.0f, 0.25f, 0.50f, 0.75f, 1.0f};
+
+typedef struct {
+  const char *name;
+  int side, active, gait_same, event_same, scan_ok, renderer_ok, one_side;
+  float lean, want_mm, got_mm, ratio, knee[2], flex, hip_drop_mm;
+  float sink_mm, reach_mm, head_gap_mm, wall_mm;
+  float ctrl_knee;
+  v3 hip, ankle;
+  float aabb_mm[3][5], mesh_mm[3][5];
+  long scans, ticks;
+} leanstep_case_t;
+
+static float leanstep_knee_deg(const pose_t *ls_pose, int ls_side) {
+  v3 ls_u = v3_sub(ls_pose->hip[ls_side], ls_pose->knee[ls_side]);
+  v3 ls_l = v3_sub(ls_pose->ankle[ls_side], ls_pose->knee[ls_side]);
+  float ls_ul = v3_len(ls_u), ls_ll = v3_len(ls_l);
+  if (ls_ul < 1e-6f || ls_ll < 1e-6f) return 0.0f;
+  return acosf(f_clamp(v3_dot(ls_u, ls_l) / (ls_ul * ls_ll), -1.0f, 1.0f)) /
+         DEG2RAD;
+}
+
+static int leanstep_gait_same(const anim_t *ls_a, const anim_t *ls_b) {
+  return !memcmp(ls_a->foot, ls_b->foot, sizeof ls_a->foot) &&
+         !memcmp(ls_a->stance, ls_b->stance, sizeof ls_a->stance) &&
+         !memcmp(&ls_a->phase, &ls_b->phase, sizeof ls_a->phase);
+}
+
+static int leanstep_event_is_step(const event_t *ls_ev, int ls_n) {
+  for (int ls_i = 0; ls_i < ls_n; ls_i++)
+    if (ls_ev[ls_i].type == EV_STEP) return 1;
+  return 0;
+}
+
+static int leanstep_noise_is_step(
+    const bot_noise_t ls_noise[BOT_NOISE_COUNT][MAX_ENTS]) {
+  for (int ls_i = 0; ls_i < MAX_ENTS; ls_i++)
+    if (ls_noise[BOT_NOISE_STEP][ls_i].tick ||
+        ls_noise[BOT_NOISE_STEP][ls_i].radius != 0.0f) return 1;
+  return 0;
+}
+
+static int leanstep_wire(int ls_ent, unsigned char *ls_buf, size_t ls_cap) {
+  net_ent_t ls_ne;
+  net_ent_from_live(&ls_ne, ls_ent);
+  np_wr ls_wr = {ls_buf, ls_cap, 0, 0};
+  net_ent_encode(&ls_wr, &ls_ne);
+  return ls_wr.bad ? -1 : (int)ls_wr.at;
+}
+
+// Signed distance to an AABB: positive outside, negative inside.  The mesh pass
+// uses this for the true rendered vertices; a separate range-AABB pass below catches
+// the rare large triangle whose surface crosses a wall without placing a vertex in it.
+static float leanstep_point_box(v3 ls_p, const solid_t *ls_s) {
+  float ls_d2 = 0.0f;
+  int ls_inside = 1;
+  for (int ls_k = 0; ls_k < 3; ls_k++) {
+    float ls_d = 0.0f;
+    if (ls_p.e[ls_k] < ls_s->min.e[ls_k]) {
+      ls_d = ls_s->min.e[ls_k] - ls_p.e[ls_k];
+      ls_inside = 0;
+    } else if (ls_p.e[ls_k] > ls_s->max.e[ls_k]) {
+      ls_d = ls_p.e[ls_k] - ls_s->max.e[ls_k];
+      ls_inside = 0;
+    }
+    ls_d2 += ls_d * ls_d;
+  }
+  if (!ls_inside) return sqrtf(ls_d2);
+  float ls_in = 1e9f;
+  for (int ls_k = 0; ls_k < 3; ls_k++) {
+    ls_in = fminf(ls_in, ls_p.e[ls_k] - ls_s->min.e[ls_k]);
+    ls_in = fminf(ls_in, ls_s->max.e[ls_k] - ls_p.e[ls_k]);
+  }
+  return -ls_in;
+}
+
+static float leanstep_range_aabb_pen(int ls_v0, int ls_v1,
+                                     const solid_t *ls_s) {
+  v3 ls_lo = {{1e9f, 1e9f, 1e9f}}, ls_hi = {{-1e9f, -1e9f, -1e9f}};
+  for (int ls_f = ls_v0; ls_f + VERT_FLOATS <= ls_v1; ls_f += VERT_FLOATS)
+    for (int ls_k = 0; ls_k < 3; ls_k++) {
+      float ls_x = g_scene[ls_f + ls_k];
+      if (ls_x < ls_lo.e[ls_k]) ls_lo.e[ls_k] = ls_x;
+      if (ls_x > ls_hi.e[ls_k]) ls_hi.e[ls_k] = ls_x;
+    }
+  float ls_pen = 1e9f;
+  for (int ls_k = 0; ls_k < 3; ls_k++) {
+    float ls_ov = fminf(ls_hi.e[ls_k], ls_s->max.e[ls_k]) -
+                  fmaxf(ls_lo.e[ls_k], ls_s->min.e[ls_k]);
+    if (ls_ov <= 0.0f) return 0.0f;
+    if (ls_ov < ls_pen) ls_pen = ls_ov;
+  }
+  return ls_pen;
+}
+
+static void leanstep_stage_solids(int ls_kind, int ls_side, float ls_inner) {
+  g_num_solids = 0;
+  if (ls_kind == LS_OPEN) return;
+  if (ls_kind == LS_SLOT) {
+    g_solids[g_num_solids++] = (solid_t){
+      .min = {{ls_inner, -0.25f, -2.0f}},
+      .max = {{ls_inner + 2.0f, 2.5f, 2.0f}}, .pen = 0};
+    g_solids[g_num_solids++] = (solid_t){
+      .min = {{-ls_inner - 2.0f, -0.25f, -2.0f}},
+      .max = {{-ls_inner, 2.5f, 2.0f}}, .pen = 0};
+  } else if (ls_side) {
+    g_solids[g_num_solids++] = (solid_t){
+      .min = {{ls_inner, -0.25f, -2.0f}},
+      .max = {{ls_inner + 2.0f, 2.5f, 2.0f}}, .pen = 0};
+  } else {
+    g_solids[g_num_solids++] = (solid_t){
+      .min = {{-ls_inner - 2.0f, -0.25f, -2.0f}},
+      .max = {{-ls_inner, 2.5f, 2.0f}}, .pen = 0};
+  }
+  if (ls_kind == LS_CORNER)
+    g_solids[g_num_solids++] = (solid_t){
+      .min = {{-2.0f, -0.25f, -2.0f}},
+      .max = {{2.0f, 2.5f, -0.25f}}, .pen = 0};
+}
+
+static void leanstep_mesh_measure(float ls_aabb[3], float ls_mesh[3],
+                                  int ls_seen[3], float *ls_wall) {
+  for (int ls_part = 0; ls_part < 3; ls_part++) {
+    ls_aabb[ls_part] = 0.0f;
+    ls_mesh[ls_part] = 0.0f;
+    ls_seen[ls_part] = 0;
+  }
+  *ls_wall = g_num_solids ? 1e9f : 0.0f;
+  for (int ls_i = 0; ls_i < g_nprobe; ls_i++) {
+    int ls_part = -1;
+    if (!g_probe[ls_i].name) continue;
+    for (int ls_k = 0; ls_k < 3; ls_k++)
+      if (!strcmp(g_probe[ls_i].name, LS_PART[ls_k])) ls_part = ls_k;
+    if (ls_part < 0) continue;
+    if (g_probe[ls_i].v1 - g_probe[ls_i].v0 < VERT_FLOATS) continue;
+    ls_seen[ls_part]++;
+    for (int ls_s = 0; ls_s < g_num_solids; ls_s++) {
+      float ls_ap = leanstep_range_aabb_pen(g_probe[ls_i].v0,
+                                             g_probe[ls_i].v1,
+                                             &g_solids[ls_s]);
+      if (ls_ap > ls_aabb[ls_part]) ls_aabb[ls_part] = ls_ap;
+      for (int ls_f = g_probe[ls_i].v0;
+           ls_f + VERT_FLOATS <= g_probe[ls_i].v1; ls_f += VERT_FLOATS) {
+        v3 ls_p = {{g_scene[ls_f], g_scene[ls_f + 1], g_scene[ls_f + 2]}};
+        float ls_sd = leanstep_point_box(ls_p, &g_solids[ls_s]);
+        if (ls_sd < *ls_wall) *ls_wall = ls_sd;
+        if (ls_sd < 0.0f && -ls_sd > ls_mesh[ls_part])
+          ls_mesh[ls_part] = -ls_sd;
+      }
+    }
+  }
+  if (*ls_wall > 1e8f) *ls_wall = 0.0f;
+}
+
+static void leanstep_render_sweep(const anim_t *ls_anim, v3 ls_pos,
+                                  float ls_yaw, leanstep_case_t *ls_res) {
+  ls_res->renderer_ok = 1;
+  ls_res->wall_mm = 1e9f;
+  for (int ls_ai = 0; ls_ai < 5; ls_ai++) {
+    scene_reset();
+    g_nprobe = 0;
+    g_probe_on = 1;
+    long ls_scan0 = g_lean_step_scans;
+    scene_draw_figure(ls_anim, ls_pos, ls_yaw, NULL, LS_ALPHA[ls_ai], 0.0f,
+                      (v3){{1, 1, 1}}, WPN_AR, (gunanim_t){0});
+    probe(NULL);
+    g_probe_on = 0;
+    if (g_lean_step_scans != ls_scan0) ls_res->renderer_ok = 0;
+    float ls_wall;
+    float ls_ab[3], ls_me[3];
+    int ls_seen[3];
+    leanstep_mesh_measure(ls_ab, ls_me, ls_seen, &ls_wall);
+    if (ls_wall < ls_res->wall_mm) ls_res->wall_mm = ls_wall;
+    for (int ls_part = 0; ls_part < 3; ls_part++) {
+      if (!ls_seen[ls_part]) ls_res->renderer_ok = 0;
+      ls_res->aabb_mm[ls_part][ls_ai] = ls_ab[ls_part] * 1000.0f;
+      ls_res->mesh_mm[ls_part][ls_ai] = ls_me[ls_part] * 1000.0f;
+    }
+  }
+  if (ls_res->wall_mm > 1e8f) ls_res->wall_mm = 0.0f;
+  else ls_res->wall_mm *= 1000.0f;
+}
+
+// One production tick against an otherwise identical non-leaning control.  For air
+// and slide, ls_clear first creates a real step, then proves that the next tick clears
+// it without scanning.  Crouch is settled before the measured tick so its production
+// blend, rather than a hand-authored factor, drives the result.
+static leanstep_case_t leanstep_case(const char *ls_name, int ls_kind, int ls_side,
+                                     float ls_lean_abs, int ls_crouch,
+                                     v3 ls_vel, int ls_grounded, int ls_slide,
+                                     int ls_clear, float ls_wall_k) {
+  leanstep_case_t ls_res = {.name = ls_name, .side = ls_side,
+                            .lean = ls_side ? ls_lean_abs : -ls_lean_abs};
+  v3 ls_pos = {{0, 0, 0}};
+  anim_t ls_ctrl, ls_step;
+  g_num_solids = 0;
+  anim_reset(&ls_ctrl, ls_pos, 0.0f, WPN_AR);
+  anim_reset(&ls_step, ls_pos, 0.0f, WPN_AR);
+
+  for (int ls_i = 0; ls_i < (ls_crouch ? 80 : 0); ls_i++) {
+    g_tick++;
+    anim_tick(&ls_ctrl, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1,
+              ls_crouch, 0.0f, 0, 0.0f, 0.0f, 0, 0, WPN_AR, 1);
+    anim_tick(&ls_step, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1,
+              ls_crouch, 0.0f, 0, 0.0f, 0.0f, 0, 0, WPN_AR, 1);
+  }
+
+  float ls_home = fabsf(ls_step.foot[ls_side].pos.x - ls_pos.x);
+  float ls_inner = ls_home + LEAN_STEP_MARGIN_M + LEAN_STEP_OUT_M * ls_wall_k;
+  leanstep_stage_solids(ls_kind, ls_side, ls_inner);
+  int ls_pre_gait = 1, ls_pre_scan = 1, ls_pre_quiet = 1;
+  long ls_pre_scans = 0, ls_pre_ticks = 0;
+  int ls_settle = !ls_clear && ls_grounded && !ls_slide &&
+                  v3_dot(ls_vel, ls_vel) < 1e-8f;
+  g_num_events = 0;
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  for (int ls_i = 0; ls_i < (ls_settle ? 160 : 0); ls_i++) {
+    g_tick++;
+    long ls_cs0 = g_lean_step_scans;
+    anim_tick(&ls_ctrl, ls_pos, ls_vel, 0.0f, 0.0f, ls_grounded,
+              ls_crouch, 0.0f, ls_slide, 0.0f, 0.0f, 0, 0, WPN_AR, 1);
+    if (g_lean_step_scans != ls_cs0) ls_pre_scan = 0;
+    long ls_ss0 = g_lean_step_scans;
+    anim_tick(&ls_step, ls_pos, ls_vel, 0.0f, 0.0f, ls_grounded,
+              ls_crouch, 0.0f, ls_slide, 0.0f, ls_res.lean,
+              0, 0, WPN_AR, 1);
+    long ls_ds = g_lean_step_scans - ls_ss0;
+    if (ls_ds > 1) ls_pre_scan = 0;
+    ls_pre_scans += ls_ds;
+    ls_pre_ticks++;
+    if (!leanstep_gait_same(&ls_ctrl, &ls_step)) ls_pre_gait = 0;
+  }
+  if (leanstep_event_is_step(g_events, g_num_events) ||
+      leanstep_noise_is_step(g_match.noise)) ls_pre_quiet = 0;
+  if (ls_clear) {
+    g_tick++;
+    anim_tick(&ls_ctrl, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1,
+              ls_crouch, 0.0f, 0, 0.0f, 0.0f, 0, 0, WPN_AR, 1);
+    anim_tick(&ls_step, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1,
+              ls_crouch, 0.0f, 0, 0.0f, ls_res.lean, 0, 0, WPN_AR, 1);
+  }
+
+  event_t ls_ctrl_ev[MAX_EVENTS];
+  bot_noise_t ls_ctrl_noise[BOT_NOISE_COUNT][MAX_ENTS];
+  g_num_events = 0;
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  long ls_ctrl_scan0 = g_lean_step_scans;
+  anim_tick(&ls_ctrl, ls_pos, ls_vel, 0.0f, 0.0f, ls_grounded,
+            ls_crouch, 0.0f, ls_slide, 0.0f, 0.0f, 0, 0, WPN_AR, 1);
+  long ls_ctrl_scans = g_lean_step_scans - ls_ctrl_scan0;
+  int ls_ctrl_nev = g_num_events;
+  memcpy(ls_ctrl_ev, g_events, sizeof ls_ctrl_ev);
+  memcpy(ls_ctrl_noise, g_match.noise, sizeof ls_ctrl_noise);
+
+  g_num_events = 0;
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  float ls_step_sink0 = ls_step.sink;
+  long ls_step_scan0 = g_lean_step_scans;
+  anim_tick(&ls_step, ls_pos, ls_vel, 0.0f, 0.0f, ls_grounded,
+            ls_crouch, 0.0f, ls_slide, 0.0f, ls_res.lean, 0, 0, WPN_AR, 1);
+  ls_res.scans = g_lean_step_scans - ls_step_scan0;
+  ls_res.scan_ok = ls_pre_scan && ls_ctrl_scans == 0 && ls_res.scans <= 1;
+  ls_res.scans += ls_pre_scans;
+  ls_res.ticks = ls_pre_ticks + 1;
+  ls_res.event_same = ls_ctrl_nev == g_num_events &&
+      !memcmp(ls_ctrl_ev, g_events, (size_t)g_num_events * sizeof *g_events) &&
+      !memcmp(ls_ctrl_noise, g_match.noise, sizeof ls_ctrl_noise) &&
+      !leanstep_event_is_step(g_events, g_num_events) &&
+      !leanstep_noise_is_step(g_match.noise) && ls_pre_quiet;
+  ls_res.gait_same = ls_pre_gait && leanstep_gait_same(&ls_ctrl, &ls_step);
+  // Isolate the leg pose from the already-established torso Lean.  The comparison
+  // carries the identical settled state and removes only the presentation offset/k;
+  // upright-vs-Lean would charge the old torso counterweight to this feature.
+  anim_t ls_same = ls_step;
+  ls_same.lean_step_off = (v3){{0, 0, 0}};
+  ls_same.lean_step_k = 0.0f;
+  ls_same.sink = ls_step_sink0;
+  skel_solve(&ls_same, ls_pos, 0.0f, 0.0f, WPN_AR, 1,
+             SKEL_ADVANCE_STATE);
+  ls_res.sink_mm = fabsf(ls_same.sink - ls_step.sink) * 1000.0f;
+  ls_res.active = g_lean_step_side;
+  ls_res.want_mm = v3_len(g_lean_step_want_off) * 1000.0f;
+  ls_res.got_mm = v3_len(g_lean_step_got_off) * 1000.0f;
+  ls_res.ratio = g_lean_step_ratio;
+  for (int ls_i = 0; ls_i < 2; ls_i++)
+    ls_res.knee[ls_i] = leanstep_knee_deg(&ls_step.pose, ls_i);
+  float ls_ctrl_knee = leanstep_knee_deg(&ls_same.pose, ls_side);
+  ls_res.ctrl_knee = ls_ctrl_knee;
+  ls_res.flex = ls_ctrl_knee - ls_res.knee[ls_side];
+  ls_res.hip_drop_mm = LEAN_STEP_HIP_DROP_M * fabsf(ls_step.lean_step_k) * 1000.0f;
+  ls_res.hip = ls_step.pose.hip[ls_side];
+  ls_res.ankle = ls_step.pose.ankle[ls_side];
+  v3 ls_actual_add = v3_sub(ls_step.pose.ankle[ls_side],
+                             ls_same.pose.ankle[ls_side]);
+  ls_res.reach_mm = v3_len(v3_sub(ls_actual_add,
+                                  ls_step.lean_step_off)) * 1000.0f;
+
+  v3 ls_right = {{1, 0, 0}};
+  float ls_head_lat = v3_dot(v3_sub(ls_step.pose.head, ls_ctrl.pose.head), ls_right);
+  ls_res.head_gap_mm = fabsf(fabsf(ls_head_lat) -
+                                  fabsf(lean_eye_off(ls_res.lean))) * 1000.0f;
+  int ls_actual = ls_step.lean_step_k > 1e-4f ? 1
+                : ls_step.lean_step_k < -1e-4f ? 0 : -1;
+  // lean_step_k is intentionally the single owner of the active leg.  Comparing
+  // ankles against an upright control is not a two-leg test: the ordinary pelvis
+  // lean can make the other leg hit its existing reach clamp.  Instead prove that
+  // the one signed state, its cached offset and the diagnostic all name one side;
+  // the transition proof below separately requires a neutral tick before reversal.
+  float ls_off_len = v3_len(ls_step.lean_step_off);
+  ls_res.one_side = ls_actual == g_lean_step_side &&
+                    (ls_actual < 0 ? ls_off_len < 0.0005f
+                                   : ls_off_len > 0.0001f) &&
+                    (ls_actual < 0 || ls_actual == ls_side);
+
+  leanstep_render_sweep(&ls_step, ls_pos, 0.0f, &ls_res);
+  return ls_res;
+}
+
+static void leanstep_print_case(const leanstep_case_t *ls_res) {
+  printf("leanstep %-13s lean=%+.2f want=%.1fmm got=%.1fmm ratio=%.3f "
+         "side=%c knees=%.2f/%.2fdeg flex=%.2fdeg hip=%.1fmm sink=%.2fmm "
+         "reach=%.2fmm "
+         "headgap=%.2fmm wall=%.2fmm scans=%ld/%ld\n",
+         ls_res->name, (double)ls_res->lean, (double)ls_res->want_mm,
+         (double)ls_res->got_mm, (double)ls_res->ratio,
+         ls_res->active < 0 ? '-' : ls_res->active ? 'R' : 'L',
+         (double)ls_res->knee[0], (double)ls_res->knee[1],
+         (double)ls_res->flex, (double)ls_res->hip_drop_mm,
+         (double)ls_res->sink_mm, (double)ls_res->reach_mm,
+         (double)ls_res->head_gap_mm,
+         (double)ls_res->wall_mm, ls_res->scans, ls_res->ticks);
+  for (int ls_part = 0; ls_part < 3; ls_part++) {
+    printf("leanstep   %-8s aabb/mesh(mm)", LS_PART[ls_part]);
+    for (int ls_ai = 0; ls_ai < 5; ls_ai++)
+      printf(" a%.2f=%.2f/%.2f", (double)LS_ALPHA[ls_ai],
+             (double)ls_res->aabb_mm[ls_part][ls_ai],
+             (double)ls_res->mesh_mm[ls_part][ls_ai]);
+    printf("\n");
+  }
+}
+
+static float leanstep_span_knee(v3 ls_hip, v3 ls_ankle) {
+  float ls_span = v3_len(v3_sub(ls_ankle, ls_hip));
+  float ls_max = ANIM_LEG * ANIM_REACH_K;
+  if (ls_span > ls_max) ls_span = ls_max;
+  float ls_c = (ANIM_THIGH * ANIM_THIGH + ANIM_SHIN * ANIM_SHIN -
+                ls_span * ls_span) / (2.0f * ANIM_THIGH * ANIM_SHIN);
+  return acosf(f_clamp(ls_c, -1.0f, 1.0f)) / DEG2RAD;
+}
+
+// Diagnostic only: solve the two local authoring knobs against the same ankle and
+// pelvis frame the production pose produced.  This does not feed a second pose into
+// the gate; it tells the integrator whether the 8-degree floor is reachable by the
+// plan's 15--30 mm drop band, or how many millimetres of hip travel toward the active
+// foot would be needed at the authored 20 mm drop.
+static void leanstep_flex_diagnostic(const leanstep_case_t *ls_res) {
+  v3 ls_base_hip = ls_res->hip;
+  ls_base_hip.y += ls_res->hip_drop_mm * 0.001f;
+  float ls_drop_only = -1.0f, ls_out_only = -1.0f;
+  float ls_combo_drop = -1.0f, ls_combo_out = -1.0f;
+  for (int ls_di = 60; ls_di <= 120; ls_di++) {
+    float ls_drop = (float)ls_di * 0.00025f;
+    v3 ls_hip = ls_base_hip;
+    ls_hip.y -= ls_drop;
+    float ls_flex = ls_res->ctrl_knee - leanstep_span_knee(ls_hip, ls_res->ankle);
+    if (ls_drop_only < 0.0f && ls_flex >= 8.0f && ls_flex <= 15.0f)
+      ls_drop_only = ls_drop;
+    for (int ls_oi = 0; ls_oi <= 120; ls_oi++) {
+      float ls_out = (float)ls_oi * 0.00025f;
+      v3 ls_h2 = ls_hip;
+      ls_h2.x += (ls_res->side ? 1.0f : -1.0f) * ls_out;
+      float ls_f2 = ls_res->ctrl_knee - leanstep_span_knee(ls_h2, ls_res->ankle);
+      if (ls_f2 >= 8.0f && ls_f2 <= 15.0f &&
+          (ls_combo_out < 0.0f || ls_out < ls_combo_out)) {
+        ls_combo_drop = ls_drop;
+        ls_combo_out = ls_out;
+      }
+      if (fabsf(ls_drop - LEAN_STEP_HIP_DROP_M) < 0.00013f &&
+          ls_out_only < 0.0f && ls_f2 >= 8.0f && ls_f2 <= 15.0f)
+        ls_out_only = ls_out;
+    }
+  }
+  printf("leanstep flexdiag %-13s actual=%.2fdeg drop-only=",
+         ls_res->name, (double)ls_res->flex);
+  if (ls_drop_only >= 0.0f) printf("%.2fmm", (double)(ls_drop_only * 1000.0f));
+  else printf(">30mm");
+  printf(" outward@%.0fmm=", (double)(LEAN_STEP_HIP_DROP_M * 1000.0f));
+  if (ls_out_only >= 0.0f) printf("%.2fmm", (double)(ls_out_only * 1000.0f));
+  else printf(">30mm");
+  printf(" best-combo=");
+  if (ls_combo_out >= 0.0f)
+    printf("drop %.2fmm + outward %.2fmm\n",
+           (double)(ls_combo_drop * 1000.0f), (double)(ls_combo_out * 1000.0f));
+  else
+    printf("none-in-band\n");
+}
+
+static int leanstep_case_ok(const leanstep_case_t *ls_res, int ls_expect_active) {
+  int ls_ok = ls_res->gait_same && ls_res->event_same && ls_res->scan_ok &&
+              ls_res->renderer_ok && ls_res->one_side &&
+              ls_res->sink_mm <= LS_SINK_M * 1000.0f;
+  if (ls_res->want_mm > 0.1f) {
+    float ls_expect_ratio = f_clamp(ls_res->got_mm / ls_res->want_mm,
+                                    0.0f, 1.0f);
+    ls_ok &= fabsf(ls_res->ratio - ls_expect_ratio) <= 0.02f;
+  }
+  if (ls_expect_active)
+    ls_ok &= ls_res->active == ls_res->side && ls_res->got_mm > 0.5f &&
+             ls_res->reach_mm <= LS_PEN_M * 1000.0f &&
+             ls_res->scans > 0 && ls_res->scans <= ls_res->ticks;
+  else
+    ls_ok &= ls_res->active < 0 && ls_res->got_mm < 0.1f &&
+             ls_res->scans <= ls_res->ticks;
+  for (int ls_part = 0; ls_part < 3; ls_part++)
+    for (int ls_ai = 0; ls_ai < 5; ls_ai++)
+      if (ls_res->aabb_mm[ls_part][ls_ai] > LS_PEN_M * 1000.0f ||
+          ls_res->mesh_mm[ls_part][ls_ai] > LS_PEN_M * 1000.0f) ls_ok = 0;
+  return ls_ok;
+}
+
+static float leanstep_wall_ratio(int ls_side, float ls_wall_k,
+                                 float *ls_got_mm, int *ls_scan_ok,
+                                 long *ls_scans) {
+  v3 ls_pos = {{0, 0, 0}};
+  anim_t ls_anim;
+  g_num_solids = 0;
+  anim_reset(&ls_anim, ls_pos, 0.0f, WPN_AR);
+  float ls_home = fabsf(ls_anim.foot[ls_side].pos.x - ls_pos.x);
+  float ls_inner = ls_home + LEAN_STEP_MARGIN_M + LEAN_STEP_OUT_M * ls_wall_k;
+  leanstep_stage_solids(LS_SIDEWALL, ls_side, ls_inner);
+  *ls_scan_ok = 1;
+  *ls_scans = 0;
+  for (int ls_i = 0; ls_i < 160; ls_i++) {
+    long ls_scan0 = g_lean_step_scans;
+    anim_tick(&ls_anim, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1, 0,
+              0.0f, 0, 0.0f, ls_side ? 1.0f : -1.0f,
+              0, 0, WPN_AR, 1);
+    long ls_tick_scans = g_lean_step_scans - ls_scan0;
+    if (ls_tick_scans > 1) *ls_scan_ok = 0;
+    *ls_scans += ls_tick_scans;
+  }
+  *ls_got_mm = v3_len(g_lean_step_got_off) * 1000.0f;
+  if (*ls_scans == 0) *ls_scan_ok = 0;
+  return g_lean_step_ratio;
+}
+
+static int leanstep_wall_sweep(void) {
+  const float ls_k[6] = {1.25f, 1.00f, 0.75f, 0.50f, 0.25f, 0.10f};
+  float ls_ratio[2][6], ls_got[2][6];
+  int ls_ok = 1;
+  for (int ls_side = 0; ls_side < 2; ls_side++) {
+    printf("leanstep wall-%c", ls_side ? 'R' : 'L');
+    for (int ls_i = 0; ls_i < 6; ls_i++) {
+      int ls_scan_ok;
+      long ls_scans;
+      ls_ratio[ls_side][ls_i] = leanstep_wall_ratio(
+          ls_side, ls_k[ls_i], &ls_got[ls_side][ls_i], &ls_scan_ok,
+          &ls_scans);
+      if (!ls_scan_ok || (ls_i && ls_ratio[ls_side][ls_i] >
+                                    ls_ratio[ls_side][ls_i - 1] + 1e-4f)) ls_ok = 0;
+      printf(" k%.2f=%.3f/%.1fmm/s%ld", (double)ls_k[ls_i],
+             (double)ls_ratio[ls_side][ls_i], (double)ls_got[ls_side][ls_i],
+             ls_scans);
+    }
+    printf("\n");
+  }
+  for (int ls_i = 0; ls_i < 6; ls_i++)
+    if (fabsf(ls_got[0][ls_i] - ls_got[1][ls_i]) > LS_SYM_M * 1000.0f ||
+        fabsf(ls_ratio[0][ls_i] - ls_ratio[1][ls_i]) > 0.02f) ls_ok = 0;
+  return ls_ok;
+}
+
+// A static wall fixture does not catch a stale follower: the foot can first reach the
+// open-space endpoint, then remain beyond a newly shortened request while it eases back.
+// Grow the real production state in open space, introduce a wall around that endpoint,
+// and request a genuine 10% Lean on the next tick. The old endpoint is inside the new
+// wall while the shortened endpoint is safely inboard. A radial body->target query misses
+// that wall; only the production previous-ankle->candidate sweep can escape it now.
+static int leanstep_contraction(void) {
+  v3 ls_pos = {{0, 0, 0}};
+  int ls_ok = 1;
+  for (int ls_side = 0; ls_side < 2; ls_side++) {
+    anim_t ls_anim;
+    g_num_solids = 0;
+    anim_reset(&ls_anim, ls_pos, 0.0f, WPN_AR);
+    for (int ls_i = 0; ls_i < 160; ls_i++) {
+      g_tick++;
+      anim_tick(&ls_anim, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1, 0,
+                0.0f, 0, 0.0f, ls_side ? 1.0f : -1.0f,
+                0, 0, WPN_AR, 1);
+    }
+    float ls_open = v3_len(ls_anim.lean_step_off);
+    float ls_home = fabsf(ls_anim.foot[ls_side].pos.x - ls_pos.x);
+    float ls_inner = ls_home + LEAN_STEP_MARGIN_M + LEAN_STEP_OUT_M * 0.16f;
+    leanstep_stage_solids(LS_SIDEWALL, ls_side, ls_inner);
+
+    float ls_sink0 = ls_anim.sink;
+    long ls_s0 = g_lean_step_scans;
+    g_tick++;
+    anim_tick(&ls_anim, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1, 0,
+              0.0f, 0, 0.0f, ls_side ? 0.10f : -0.10f,
+              0, 0, WPN_AR, 1);
+    long ls_scans = g_lean_step_scans - ls_s0;
+
+    float ls_want = v3_len(g_lean_step_want_off);
+    float ls_got = v3_len(ls_anim.lean_step_off);
+    anim_t ls_same = ls_anim;
+    ls_same.lean_step_off = (v3){{0, 0, 0}};
+    ls_same.lean_step_k = 0.0f;
+    ls_same.sink = ls_sink0;
+    skel_solve(&ls_same, ls_pos, 0.0f, 0.0f, WPN_AR, 1,
+               SKEL_ADVANCE_STATE);
+    v3 ls_actual_add = v3_sub(ls_anim.pose.ankle[ls_side],
+                               ls_same.pose.ankle[ls_side]);
+    float ls_reach = v3_len(v3_sub(ls_actual_add,
+                                    ls_anim.lean_step_off));
+
+    // The fixture deliberately introduces a wall between ticks, so alpha=0 still is
+    // the legitimately open previous frame. Freeze only this discontinuous-world mesh
+    // check on the newly solved current pose; the shrink assertion above catches the
+    // stale follower. The continuous-yaw proof below keeps the real pose history.
+    anim_t ls_current = ls_anim;
+    ls_current.prev_pose = ls_current.pose;
+    leanstep_case_t ls_render = {0};
+    leanstep_render_sweep(&ls_current, ls_pos, 0.0f, &ls_render);
+    float ls_pen = 0.0f;
+    for (int ls_part = 0; ls_part < 3; ls_part++)
+      for (int ls_ai = 0; ls_ai < 5; ls_ai++)
+        ls_pen = fmaxf(ls_pen, fmaxf(ls_render.aabb_mm[ls_part][ls_ai],
+                                    ls_render.mesh_mm[ls_part][ls_ai]));
+    float ls_expect_ratio = ls_want > 1e-6f
+                              ? f_clamp(ls_got / ls_want, 0.0f, 1.0f) : 0.0f;
+    int ls_one = ls_scans == 1 && ls_render.renderer_ok &&
+                 ls_open > ls_want + 0.050f &&
+                 ls_open > ls_got + 0.040f && ls_got < 0.025f &&
+                 fabsf(g_lean_step_ratio - ls_expect_ratio) <= 0.02f &&
+                 ls_reach <= LS_PEN_M &&
+                 ls_pen <= LS_PEN_M * 1000.0f &&
+                 ls_render.wall_mm >= -LS_PEN_M * 1000.0f;
+    printf("leanstep contract-%c open=%.1fmm want=%.1fmm got=%.1fmm "
+           "ratio=%.3f reach=%.2fmm pen=%.2fmm wall=%.2fmm scans=%ld %s\n",
+           ls_side ? 'R' : 'L', (double)(ls_open * 1000.0f),
+           (double)(ls_want * 1000.0f), (double)(ls_got * 1000.0f),
+           (double)g_lean_step_ratio, (double)(ls_reach * 1000.0f),
+           (double)ls_pen, (double)ls_render.wall_mm, ls_scans,
+           ls_one ? "ok" : "FAIL");
+    if (!ls_one) ls_ok = 0;
+  }
+  return ls_ok;
+}
+
+// Direction changes are the case a radial base->candidate ray cannot certify.  The
+// old and new endpoints both clear this tiny convex wall by more than the published
+// boot margin, while their chord crosses its centre.  The renderer is then exercised
+// on the untouched prev_pose->pose history at all five production alphas.
+static int leanstep_yaw_chord(void) {
+  v3 ls_pos = {{0, 0, 0}};
+  const v3 ls_vel = {{0.0f, 0.0f, 0.0f}};
+  const float ls_half = 0.0015f;
+  int ls_ok = 1;
+  for (int ls_side = 0; ls_side < 2; ls_side++) {
+    float ls_out_yaw = (ls_side ? 1.0f : -1.0f) *
+                       atan2f(LEAN_STEP_FWD_M, LEAN_STEP_OUT_M);
+    float ls_old_yaw = wrap_pi(ls_out_yaw + F_PI);
+    float ls_new_yaw = ls_out_yaw;
+    anim_t ls_anim;
+    g_num_solids = 0;
+    // Keep a wide but reachable plant in the zero-yaw leg frame. These two aim angles
+    // make the authored old/new deltas point exactly inward/outward across the boot's
+    // narrow axis, so both endpoints clear while their 168 mm chord crosses the box.
+    anim_reset(&ls_anim, ls_pos, 0.0f, WPN_AR);
+    float ls_sign = ls_side ? 1.0f : -1.0f;
+    v3 ls_plant = {{ls_sign * 0.20f, ANIM_ANKLE_Y, 0.0f}};
+    ls_anim.foot[ls_side].pos = ls_plant;
+    ls_anim.foot[ls_side].from = ls_plant;
+    ls_anim.foot[ls_side].to = ls_plant;
+    ls_anim.spd = 0.0f;
+    ls_anim.vel_s = ls_vel;
+    ls_anim.yaw_prev = ls_old_yaw;
+    g_tick++;
+    anim_tick(&ls_anim, ls_pos, ls_vel, ls_old_yaw, 0.0f,
+              1, 0, 0.0f, 0, 0.0f, ls_side ? 1.0f : -1.0f,
+              0, 0, WPN_AR, 1);
+    // Stage the exact old production candidate as the incoming endpoint. The next
+    // anim_tick itself copies this pose into prev_pose; no history is frozen after the
+    // measured solve.
+    ls_anim.lean_step_off = g_lean_step_want_off;
+    ls_anim.lean_step_k = ls_side ? 1.0f : -1.0f;
+    // Re-establish the planted zero-yaw gait frame after the endpoint query. The
+    // measured anim_tick is still free to advance it normally; only fixture staging is
+    // pinned, never prev_pose or the rendered interpolation.
+    ls_anim.leg_yaw = 0.0f;
+    ls_anim.foot[ls_side].yaw = 0.0f;
+    // Keep this geometry fixture comfortably inside the ordinary leg budget. Reach
+    // edge/inversion behavior is covered separately below; here only the swept chord
+    // is under test.
+    ls_anim.sink = 0.130f;
+    skel_solve(&ls_anim, ls_pos, ls_old_yaw, 0.0f, WPN_AR, 1,
+               SKEL_POSE_ONLY);
+    v3 ls_from = ls_anim.pose.ankle[ls_side];
+
+    // Ask production, on a copy and in open space, for this tick's exact candidate.
+    // This avoids a copied yaw/sign/reach implementation in the proof.  Restore the
+    // diagnostic counter and clock before the measured tick.
+    anim_t ls_open = ls_anim;
+    long ls_scan_save = g_lean_step_scans;
+    long ls_tick_save = g_tick;
+    g_tick++;
+    anim_tick(&ls_open, ls_pos, ls_vel, ls_new_yaw, 0.0f,
+              1, 0, 0.0f, 0, 0.0f, ls_side ? 1.0f : -1.0f,
+              0, 0, WPN_AR, 1);
+    v3 ls_candidate = v3_add(ls_open.foot[ls_side].pos,
+                              g_lean_step_want_off);
+    g_lean_step_scans = ls_scan_save;
+    g_tick = ls_tick_save;
+
+    v3 ls_chord = v3_sub(ls_candidate, ls_from);
+    float ls_chord2 = v3_dot(ls_chord, ls_chord);
+    v3 ls_mid = v3_lerp(ls_from, ls_candidate, 0.5f);
+    float ls_from_clear = fmaxf(fabsf(ls_from.x - ls_mid.x),
+                                 fabsf(ls_from.z - ls_mid.z)) - ls_half;
+    float ls_to_clear = fmaxf(fabsf(ls_candidate.x - ls_mid.x),
+                               fabsf(ls_candidate.z - ls_mid.z)) - ls_half;
+    g_num_solids = 1;
+    g_solids[0] = (solid_t){
+      .min = {{ls_mid.x - ls_half, -0.25f, ls_mid.z - ls_half}},
+      .max = {{ls_mid.x + ls_half, 2.5f, ls_mid.z + ls_half}}, .pen = 0};
+
+    float ls_sink0 = ls_anim.sink;
+    long ls_s0 = g_lean_step_scans;
+    g_tick++;
+    anim_tick(&ls_anim, ls_pos, ls_vel, ls_new_yaw, 0.0f,
+              1, 0, 0.0f, 0, 0.0f, ls_side ? 1.0f : -1.0f,
+              0, 0, WPN_AR, 1);
+    long ls_scans = g_lean_step_scans - ls_s0;
+
+    anim_t ls_same = ls_anim;
+    ls_same.lean_step_off = (v3){{0, 0, 0}};
+    ls_same.lean_step_k = 0.0f;
+    ls_same.sink = ls_sink0;
+    skel_solve(&ls_same, ls_pos, ls_new_yaw, 0.0f, WPN_AR, 1,
+               SKEL_ADVANCE_STATE);
+    v3 ls_actual_add = v3_sub(ls_anim.pose.ankle[ls_side],
+                               ls_same.pose.ankle[ls_side]);
+    float ls_reach = v3_len(v3_sub(ls_actual_add,
+                                    ls_anim.lean_step_off));
+    v3 ls_actual_chord = v3_sub(ls_anim.pose.ankle[ls_side], ls_from);
+    float ls_t = ls_chord2 > 1e-9f
+                   ? v3_dot(ls_actual_chord, ls_chord) / ls_chord2 : -1.0f;
+    v3 ls_on_line = v3_add(ls_from, v3_scale(ls_chord, ls_t));
+    float ls_line = v3_len(v3_sub(ls_anim.pose.ankle[ls_side], ls_on_line));
+    float ls_effect = v3_len(v3_sub(ls_anim.pose.ankle[ls_side],
+                                     ls_open.pose.ankle[ls_side]));
+
+    leanstep_case_t ls_render = {0};
+    leanstep_render_sweep(&ls_anim, ls_pos, ls_new_yaw, &ls_render);
+    float ls_pen = 0.0f;
+    for (int ls_part = 0; ls_part < 3; ls_part++)
+      for (int ls_ai = 0; ls_ai < 5; ls_ai++)
+        ls_pen = fmaxf(ls_pen, fmaxf(ls_render.aabb_mm[ls_part][ls_ai],
+                                    ls_render.mesh_mm[ls_part][ls_ai]));
+    int ls_one = ls_scans == 1 && ls_render.renderer_ok &&
+                 ls_chord2 > 0.020f * 0.020f &&
+                 ls_from_clear >= LEAN_STEP_MARGIN_M &&
+                 ls_to_clear >= LEAN_STEP_MARGIN_M &&
+                 ls_t >= -0.001f && ls_t < 0.5f &&
+                 ls_line <= LS_PEN_M && ls_effect > 0.0001f &&
+                 ls_reach <= LS_PEN_M &&
+                 ls_pen <= LS_PEN_M * 1000.0f &&
+                 ls_render.wall_mm >= -LS_PEN_M * 1000.0f;
+    printf("leanstep yaw-%c chord=%.1fmm ends=%.1f/%.1fmm t=%.3f "
+           "line=%.2fmm effect=%.2fmm reach=%.2fmm pen=%.2fmm "
+           "wall=%.2fmm scans=%ld %s\n", ls_side ? 'R' : 'L',
+           (double)(sqrtf(ls_chord2) * 1000.0f),
+           (double)(ls_from_clear * 1000.0f),
+           (double)(ls_to_clear * 1000.0f), (double)ls_t,
+           (double)(ls_line * 1000.0f), (double)(ls_effect * 1000.0f),
+           (double)(ls_reach * 1000.0f), (double)ls_pen,
+           (double)ls_render.wall_mm, ls_scans, ls_one ? "ok" : "FAIL");
+    if (!ls_one) ls_ok = 0;
+  }
+  return ls_ok;
+}
+
+// Exercise the intersection of the leg reach disk and side slab. The ordinary fixture
+// gates solved-delta identity; the second starts beyond the disk and
+// would turn the reach correction into an inward Lean step without the signed-delta
+// gate.  The valid case also proves that the solved-ankle delta equals the stored
+// presentation offset; the rejected case must publish no offset and perform no scan.
+static int leanstep_reach(void) {
+  v3 ls_pos = {{0, 0, 0}};
+  int ls_ok = 1;
+  for (int ls_side = 0; ls_side < 2; ls_side++) {
+    for (int ls_far = 0; ls_far < 2; ls_far++) {
+      anim_t ls_anim;
+      g_num_solids = 0;
+      anim_reset(&ls_anim, ls_pos, 0.0f, WPN_AR);
+      float ls_sign = ls_side ? 1.0f : -1.0f;
+      v3 ls_authored = {{ls_sign * LEAN_STEP_OUT_M, 0.0f,
+                         -LEAN_STEP_FWD_M}};
+      v3 ls_dir = v3_norm(ls_authored);
+      float ls_hmax = anim_hmax(&ls_anim) * 0.97f;
+      float ls_radius = ls_hmax * 1.04f;
+      if (ls_far) {
+        v3 ls_plant = v3_add(ls_pos, v3_scale(ls_dir, ls_radius));
+        ls_plant.y = ANIM_ANKLE_Y;
+        ls_anim.foot[ls_side].pos = ls_plant;
+        ls_anim.foot[ls_side].from = ls_plant;
+        ls_anim.foot[ls_side].to = ls_plant;
+        ls_anim.foot[ls_side].t = 1.0f;
+        skel_solve(&ls_anim, ls_pos, 0.0f, 0.0f, WPN_AR, 1,
+                   SKEL_POSE_ONLY);
+        ls_anim.prev_pose = ls_anim.pose;
+      }
+
+      float ls_sink0 = ls_anim.sink;
+      long ls_s0 = g_lean_step_scans;
+      g_tick++;
+      anim_tick(&ls_anim, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f,
+                1, 0, 0.0f, 0, 0.0f, ls_side ? 1.0f : -1.0f,
+                0, 0, WPN_AR, 1);
+      long ls_scans = g_lean_step_scans - ls_s0;
+      v3 ls_candidate = v3_add(ls_anim.foot[ls_side].pos,
+                                g_lean_step_want_off);
+      float ls_radial = sqrtf(ls_candidate.x * ls_candidate.x +
+                               ls_candidate.z * ls_candidate.z);
+      float ls_forward = v3_dot(g_lean_step_want_off, ls_dir);
+
+      anim_t ls_same = ls_anim;
+      ls_same.lean_step_off = (v3){{0, 0, 0}};
+      ls_same.lean_step_k = 0.0f;
+      ls_same.sink = ls_sink0;
+      skel_solve(&ls_same, ls_pos, 0.0f, 0.0f, WPN_AR, 1,
+                 SKEL_ADVANCE_STATE);
+      v3 ls_actual_add = v3_sub(ls_anim.pose.ankle[ls_side],
+                                 ls_same.pose.ankle[ls_side]);
+      float ls_reach = v3_len(v3_sub(ls_actual_add,
+                                      ls_anim.lean_step_off));
+      int ls_one = 1;
+      if (ls_far)
+        ls_one &= ls_scans == 0 && g_lean_step_side < 0 &&
+                  v3_len(g_lean_step_want_off) < 1e-6f &&
+                  v3_len(ls_anim.lean_step_off) < 1e-6f &&
+                  ls_forward >= -1e-6f;
+      else
+        ls_one &= ls_reach <= LS_PEN_M && ls_scans == 1 &&
+                  g_lean_step_side == ls_side &&
+                  ls_forward > 1e-5f && ls_radial <= ls_hmax + 1e-5f;
+      printf("leanstep reach-%c-%s hmax=%.1fmm radial=%.1fmm "
+             "forward=%.2fmm delta=%.2fmm scans=%ld %s\n",
+             ls_side ? 'R' : 'L', ls_far ? "invert" : "normal",
+             (double)(ls_hmax * 1000.0f), (double)(ls_radial * 1000.0f),
+             (double)(ls_forward * 1000.0f), (double)(ls_reach * 1000.0f),
+             ls_scans, ls_one ? "ok" : "FAIL");
+      if (!ls_one) ls_ok = 0;
+    }
+  }
+  return ls_ok;
+}
+
+static int leanstep_signflip(void) {
+  v3 ls_pos = {{0, 0, 0}};
+  anim_t ls_ctrl, ls_anim;
+  g_num_solids = 0;
+  g_num_events = 0;
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  anim_reset(&ls_ctrl, ls_pos, 0.0f, WPN_AR);
+  anim_reset(&ls_anim, ls_pos, 0.0f, WPN_AR);
+  anim_tick(&ls_ctrl, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1, 0, 0.0f,
+            0, 0.0f, 0.0f, 0, 0, WPN_AR, 1);
+  anim_tick(&ls_anim, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1, 0, 0.0f,
+            0, 0.0f, 1.0f, 0, 0, WPN_AR, 1);
+  int ls_saw_r = ls_anim.lean_step_k > 0.0f;
+  int ls_saw_zero = 0, ls_saw_l = 0, ls_dual = 0, ls_gait = 1, ls_scan = 1;
+  long ls_scans = 0;
+  float ls_source_lean = 1.0f;
+  int ls_prev_side = 1;
+  float ls_prev_off = v3_len(ls_anim.lean_step_off);
+  for (int ls_i = 0; ls_i < 260; ls_i++) {
+    float ls_rate = fabsf(-1.0f) > fabsf(ls_source_lean)
+                      ? LEAN_IN_RATE : LEAN_OUT_RATE;
+    ls_source_lean += (-1.0f - ls_source_lean) * ease_k(ls_rate);
+    g_tick++;
+    anim_tick(&ls_ctrl, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1, 0, 0.0f,
+              0, 0.0f, 0.0f, 0, 0, WPN_AR, 1);
+    long ls_s0 = g_lean_step_scans;
+    anim_tick(&ls_anim, ls_pos, (v3){{0, 0, 0}}, 0.0f, 0.0f, 1, 0, 0.0f,
+              0, 0.0f, ls_source_lean, 0, 0, WPN_AR, 1);
+    long ls_ds = g_lean_step_scans - ls_s0;
+    ls_scans += ls_ds;
+    if (ls_ds > 1) ls_scan = 0;
+    if (!leanstep_gait_same(&ls_ctrl, &ls_anim)) ls_gait = 0;
+    int ls_state_side = ls_anim.lean_step_k > 1e-4f ? 1
+                      : ls_anim.lean_step_k < -1e-4f ? 0 : -1;
+    float ls_off = v3_len(ls_anim.lean_step_off);
+    if (ls_state_side != g_lean_step_side ||
+        (ls_state_side < 0 && v3_len(ls_anim.lean_step_off) >= 0.0005f) ||
+        (ls_prev_side >= 0 && ls_state_side >= 0 &&
+         ls_prev_side != ls_state_side &&
+         fminf(ls_prev_off, ls_off) >= LS_SYM_M)) ls_dual = 1;
+    if (ls_off < LS_SYM_M) ls_saw_zero = 1;
+    if (ls_state_side == 0) ls_saw_l = 1;
+    ls_prev_side = ls_state_side;
+    ls_prev_off = ls_off;
+  }
+  int ls_quiet = !leanstep_event_is_step(g_events, g_num_events) &&
+                 !leanstep_noise_is_step(g_match.noise);
+  printf("leanstep signflip R=%d zero=%d L=%d dual=%d gait=%d quiet=%d "
+         "scans=%ld final=%+.3f\n", ls_saw_r, ls_saw_zero, ls_saw_l,
+         ls_dual, ls_gait, ls_quiet, ls_scans, (double)ls_anim.lean_step_k);
+  return ls_saw_r && ls_saw_zero && ls_saw_l && !ls_dual && ls_gait &&
+         ls_quiet && ls_scan;
+}
+
+static int leanstep_origin_wire(void) {
+  int ls_h = 0, ls_ent = ent_of_human(ls_h);
+  player_t *ls_pl = &g_players[ls_h];
+  player_spawn(ls_pl);
+  ls_pl->pos = ls_pl->prev_pos = (v3){{0, 0, 0}};
+  ls_pl->vel = (v3){{0.12f, 0.0f, -0.08f}};
+  ls_pl->yaw = 0.37f;
+  ls_pl->lean = 1.0f;
+  anim_reset(&g_player_anim[ls_h], ls_pl->pos, ls_pl->yaw, ls_pl->wp.cur);
+  unsigned char ls_before[64], ls_after[64];
+  int ls_nb = leanstep_wire(ls_ent, ls_before, sizeof ls_before);
+  v3 ls_pos0 = ls_pl->pos, ls_vel0 = ls_pl->vel;
+  v3 ls_shot0 = player_eye_pos(ls_pl);
+  v3 ls_ray_o = {{0, EYE_STAND, 2.0f}}, ls_ray_d = {{0, 0, -1}};
+  int ls_part0 = 0, ls_part1 = 0;
+  float ls_hit0 = ent_trace_box(ls_pl->pos, ls_pl->eye, ls_pl->yaw,
+                                ls_pl->lean, ls_ray_o, ls_ray_d, &ls_part0);
+  anim_tick(&g_player_anim[ls_h], ls_pl->pos, ls_pl->vel, ls_pl->yaw,
+            ls_pl->pitch, ls_pl->grounded, ls_pl->crouched, ls_pl->tuck_y,
+            ls_pl->sliding, ls_pl->wp.ads_s, ls_pl->lean,
+            ls_pl->wp.ready_want, ls_ent, ls_pl->wp.cur, 1);
+  int ls_na = leanstep_wire(ls_ent, ls_after, sizeof ls_after);
+  v3 ls_shot1 = player_eye_pos(ls_pl);
+  float ls_hit1 = ent_trace_box(ls_pl->pos, ls_pl->eye, ls_pl->yaw,
+                                ls_pl->lean, ls_ray_o, ls_ray_d, &ls_part1);
+  int ls_ok = !memcmp(&ls_pos0, &ls_pl->pos, sizeof ls_pos0) &&
+              !memcmp(&ls_vel0, &ls_pl->vel, sizeof ls_vel0) &&
+              !memcmp(&ls_shot0, &ls_shot1, sizeof ls_shot0) &&
+              !memcmp(&ls_hit0, &ls_hit1, sizeof ls_hit0) &&
+              ls_part0 == ls_part1 && ls_nb > 0 && ls_na == ls_nb &&
+              !memcmp(ls_before, ls_after, (size_t)ls_nb);
+  printf("leanstep neutral origin=%d velocity=%d shot=%d hitbox=%d wire=%d "
+         "bytes=%d\n",
+         !memcmp(&ls_pos0, &ls_pl->pos, sizeof ls_pos0),
+         !memcmp(&ls_vel0, &ls_pl->vel, sizeof ls_vel0),
+         !memcmp(&ls_shot0, &ls_shot1, sizeof ls_shot0),
+         !memcmp(&ls_hit0, &ls_hit1, sizeof ls_hit0) && ls_part0 == ls_part1,
+         ls_nb > 0 && ls_na == ls_nb && !memcmp(ls_before, ls_after, (size_t)ls_nb),
+         ls_nb);
+  return ls_ok;
+}
+
+typedef struct {
+  bot_t bot;
+  event_t events[MAX_EVENTS];
+  bot_noise_t noise[BOT_NOISE_COUNT][MAX_ENTS];
+  unsigned char wire[64];
+  int nevents, nwire, scan_ok;
+} leanstep_puppet_t;
+
+static void leanstep_puppet_run(float ls_target, leanstep_puppet_t *ls_out) {
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  g_num_solids = 0;
+  g_num_events = 0;
+  g_match.nbots = 1;
+  g_tick = 700;
+  g_rng_bot = 0x9e3779b97f4a7c15ull;
+  bot_t *ls_bot = &g_bots[0];
+  *ls_bot = (bot_t){.pos = {{0, 0, 0}}, .prev_pos = {{0, 0, 0}},
+                    .hp = PLAYER_HP, .alive = 1, .active = 1, .grounded = 1,
+                    .eye = EYE_STAND, .puppet = 1, .pup_lean_t = ls_target,
+                    .pup_speed = 0.0f, .wp.cur = WPN_AR};
+  wpn_fill_mags(&ls_bot->wp);
+  anim_reset(&ls_bot->anim, ls_bot->pos, ls_bot->yaw, ls_bot->wp.cur);
+  ls_out->scan_ok = 1;
+  for (int ls_i = 0; ls_i < 80; ls_i++) {
+    g_tick++;
+    long ls_s0 = g_lean_step_scans;
+    bot_puppet_tick(ls_bot, 0);
+    long ls_ds = g_lean_step_scans - ls_s0;
+    if (ls_ds > 1 || (ls_target == 0.0f && ls_ds != 0)) ls_out->scan_ok = 0;
+  }
+  ls_out->bot = *ls_bot;
+  ls_out->nevents = g_num_events;
+  memcpy(ls_out->events, g_events, sizeof ls_out->events);
+  memcpy(ls_out->noise, g_match.noise, sizeof ls_out->noise);
+  ls_out->nwire = leanstep_wire(1, ls_out->wire, sizeof ls_out->wire);
+}
+
+static int leanstep_puppet(void) {
+  leanstep_puppet_t ls_ctrl, ls_step;
+  leanstep_puppet_run(0.0f, &ls_ctrl);
+  leanstep_puppet_run(1.0f, &ls_step);
+  int ls_origin = !memcmp(&ls_ctrl.bot.pos, &ls_step.bot.pos,
+                          sizeof ls_ctrl.bot.pos);
+  int ls_velocity = !memcmp(&ls_ctrl.bot.vel, &ls_step.bot.vel,
+                            sizeof ls_ctrl.bot.vel);
+  int ls_gait = leanstep_gait_same(&ls_ctrl.bot.anim, &ls_step.bot.anim);
+  int ls_events = ls_ctrl.nevents == ls_step.nevents &&
+      !memcmp(ls_ctrl.events, ls_step.events,
+              (size_t)ls_step.nevents * sizeof *ls_step.events) &&
+      !memcmp(ls_ctrl.noise, ls_step.noise, sizeof ls_step.noise) &&
+      !leanstep_event_is_step(ls_step.events, ls_step.nevents) &&
+      !leanstep_noise_is_step(ls_step.noise);
+  int ls_wire = ls_ctrl.nwire > 0 && ls_step.nwire == ls_ctrl.nwire &&
+                !memcmp(ls_ctrl.wire, ls_step.wire, (size_t)ls_ctrl.nwire);
+  int ls_pose = ls_step.bot.pup_lean > 0.95f &&
+                ls_step.bot.anim.lean_step_k > 0.5f;
+  int ls_ok = ls_origin && ls_velocity && ls_gait && ls_events && ls_wire &&
+              ls_pose && ls_ctrl.scan_ok && ls_step.scan_ok;
+  printf("leanstep puppet lean=%.3f step=%+.3f origin=%d velocity=%d gait=%d "
+         "events=%d wire=%d scan=%d\n", (double)ls_step.bot.pup_lean,
+         (double)ls_step.bot.anim.lean_step_k, ls_origin, ls_velocity, ls_gait,
+         ls_events, ls_wire, ls_ctrl.scan_ok && ls_step.scan_ok);
+  return ls_ok;
+}
+
+static int leanstep_snapshot(void) {
+  const int ls_src_h = 1, ls_remote_h = 2;
+  const int ls_src_ent = ent_of_human(ls_src_h);
+  const int ls_remote_ent = ent_of_human(ls_remote_h);
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  memset(g_match.noise, 0, sizeof g_match.noise);
+  memset(g_cl_alive_prev, 0, sizeof g_cl_alive_prev);
+  memset(g_cl_body, 0, sizeof g_cl_body);
+  g_num_solids = 0;
+  g_num_events = 0;
+  g_online = 1;
+  g_local_ent = 0;
+  g_cl.ent_ss_seen[ls_remote_ent] = 0;
+  player_t *ls_src = &g_players[ls_src_h];
+  player_spawn(ls_src);
+  ls_src->pos = ls_src->prev_pos = (v3){{0, 0, 0}};
+  ls_src->wp.cur = WPN_AR;
+  ls_src->yaw = 0.0f;
+
+  anim_t ls_full;
+  weapon_t ls_full_wp = ls_src->wp;
+  anim_reset(&ls_full, ls_src->pos, ls_src->yaw, ls_full_wp.cur);
+  float ls_source_lean = 0.0f, ls_max_ankle = 0.0f, ls_max_total = 0.0f;
+  int ls_decoded = 1, ls_side_same = 1, ls_gait = 1, ls_scan = 1;
+  int ls_wire_neutral = 1, ls_saw_r = 0, ls_saw_l = 0;
+  for (int ls_i = 0; ls_i < 540; ls_i++) {
+    float ls_target = ls_i < 120 ? 1.0f : ls_i < 360 ? -1.0f : 0.0f;
+    float ls_rate = fabsf(ls_target) > fabsf(ls_source_lean)
+                      ? LEAN_IN_RATE : LEAN_OUT_RATE;
+    ls_source_lean += (ls_target - ls_source_lean) * ease_k(ls_rate);
+    ls_src->lean = ls_source_lean;
+    net_ent_t ls_ne;
+    net_ent_from_live(&ls_ne, ls_src_ent);
+    ls_ne.id = (uint8_t)ls_remote_ent;
+    unsigned char ls_packet[64];
+    np_wr ls_wr = {ls_packet, sizeof ls_packet, 0, 0};
+    net_ent_encode(&ls_wr, &ls_ne);
+    np_rd ls_rd = {ls_packet, ls_wr.at, 0, 0};
+    net_ent_t ls_out;
+    int ls_one_decoded = !ls_wr.bad && net_ent_decode(&ls_rd, &ls_out) &&
+                         !ls_rd.bad && ls_out.id == ls_remote_ent;
+    if (!ls_one_decoded) { ls_decoded = 0; break; }
+    float ls_full_lean = net_dq_wish(ls_out.lean);
+    if ((ls_i & 1) == 0) net_cl_apply_ent(&ls_out);
+    player_t *ls_remote = &g_players[ls_remote_h];
+    unsigned char ls_before[64], ls_after[64];
+    int ls_nb = leanstep_wire(ls_remote_ent, ls_before, sizeof ls_before);
+    g_tick++;
+    long ls_s0 = g_lean_step_scans;
+    client_anim_all();
+    if (g_lean_step_scans - ls_s0 > 1) ls_scan = 0;
+    long ls_s1 = g_lean_step_scans;
+    int ls_idle_ok = gun_pose_idle_ok(&ls_full_wp, &ls_full,
+                                      (v3){{0, 0, 0}}, 1, 0);
+    anim_tick(&ls_full, (v3){{0, 0, 0}}, (v3){{0, 0, 0}}, 0.0f, 0.0f,
+              1, 0, 0.0f, 0, 0.0f, ls_full_lean, 0, ls_remote_ent,
+              WPN_AR, ls_idle_ok);
+    if (g_lean_step_scans - ls_s1 > 1) ls_scan = 0;
+    int ls_na = leanstep_wire(ls_remote_ent, ls_after, sizeof ls_after);
+    if (ls_nb <= 0 || ls_na != ls_nb ||
+        memcmp(ls_before, ls_after, (size_t)ls_nb)) ls_wire_neutral = 0;
+    if (!leanstep_gait_same(&ls_full, &g_player_anim[ls_remote_h])) ls_gait = 0;
+    // Diagnose the presentation-step contribution separately, but keep the plan's
+    // 5 mm contract on the complete solved ankle below. Both controls use the actual
+    // post-wire states and remove only lean_step_off/k before the same production
+    // solver runs again.
+    anim_t ls_full_zero = ls_full;
+    anim_t ls_remote_zero = g_player_anim[ls_remote_h];
+    ls_full_zero.lean_step_off = ls_remote_zero.lean_step_off =
+        (v3){{0, 0, 0}};
+    ls_full_zero.lean_step_k = ls_remote_zero.lean_step_k = 0.0f;
+    skel_solve(&ls_full_zero, (v3){{0, 0, 0}}, 0.0f, 0.0f,
+               WPN_AR, 1, SKEL_POSE_ONLY);
+    skel_solve(&ls_remote_zero, ls_remote->pos, ls_remote->yaw,
+               ls_remote->pitch, ls_remote->wp.cur, 1, SKEL_POSE_ONLY);
+    float ls_tick_max = 0.0f;
+    for (int ls_side = 0; ls_side < 2; ls_side++) {
+      float ls_total = v3_len(v3_sub(
+          ls_full.pose.ankle[ls_side],
+          g_player_anim[ls_remote_h].pose.ankle[ls_side]));
+      if (ls_total > ls_max_total) ls_max_total = ls_total;
+      v3 ls_full_add = v3_sub(ls_full.pose.ankle[ls_side],
+                              ls_full_zero.pose.ankle[ls_side]);
+      v3 ls_remote_add = v3_sub(g_player_anim[ls_remote_h].pose.ankle[ls_side],
+                                ls_remote_zero.pose.ankle[ls_side]);
+      float ls_d = v3_len(v3_sub(ls_full_add, ls_remote_add));
+      if (ls_d > ls_tick_max) ls_tick_max = ls_d;
+    }
+    if (ls_tick_max > ls_max_ankle) ls_max_ankle = ls_tick_max;
+    int ls_fs = ls_full.lean_step_k > 1e-4f ? 1
+              : ls_full.lean_step_k < -1e-4f ? 0 : -1;
+    int ls_ds = g_player_anim[ls_remote_h].lean_step_k > 1e-4f ? 1
+              : g_player_anim[ls_remote_h].lean_step_k < -1e-4f ? 0 : -1;
+    if (ls_fs != ls_ds && fminf(v3_len(ls_full.lean_step_off),
+                                v3_len(g_player_anim[ls_remote_h].lean_step_off)) >=
+                           LS_SYM_M) ls_side_same = 0;
+    if (ls_ds == 1) ls_saw_r = 1;
+    if (ls_ds == 0) ls_saw_l = 1;
+  }
+  int ls_quiet = !leanstep_event_is_step(g_events, g_num_events) &&
+                 !leanstep_noise_is_step(g_match.noise);
+  int ls_ok = ls_decoded && ls_side_same && ls_gait && ls_scan &&
+              ls_wire_neutral && ls_saw_r && ls_saw_l && ls_quiet &&
+              ls_max_ankle <= LS_SYM_M && ls_max_total <= LS_SYM_M;
+  printf("leanstep snapshot stride=2 ankle_add=%.2fmm ankle_total=%.2fmm "
+         "side=%d gait=%d decode=%d "
+         "wire=%d events=%d scan=%d ramp=%d/%d\n", (double)(ls_max_ankle * 1000.0f),
+         (double)(ls_max_total * 1000.0f), ls_side_same, ls_gait, ls_decoded,
+         ls_wire_neutral, ls_quiet, ls_scan, ls_saw_r, ls_saw_l);
+  return ls_ok;
+}
+
+static void leanstep_proof(void) {
+  proof_world_t ls_world;
+  proof_world_save(&ls_world);
+  anim_t ls_player_anim_save[MAX_HUMANS];
+  memcpy(ls_player_anim_save, g_player_anim, sizeof ls_player_anim_save);
+  net_client_t ls_cl_save = g_cl;
+  unsigned char ls_body_save[MAX_ENTS], ls_alive_save[MAX_ENTS];
+  memcpy(ls_body_save, g_cl_body, sizeof ls_body_save);
+  memcpy(ls_alive_save, g_cl_alive_prev, sizeof ls_alive_save);
+  int ls_online_save = g_online, ls_local_save = g_local_ent;
+  const float *ls_sim_mv_save = g_sim_mv;
+  const float (*ls_sim_wp_save)[WP_COUNT] = g_sim_wp;
+  v3 ls_cam_save = g_cam_eye;
+  int ls_cull_save = g_cam_cull, ls_kcap_save = g_fig_kcap;
+  int ls_fp_save = g_fig_fp, ls_probe_save = g_probe_on;
+  float ls_diss_save = g_fig_diss;
+  long ls_scan_save = g_lean_step_scans;
+  v3 ls_want_save = g_lean_step_want_off, ls_got_save = g_lean_step_got_off;
+  float ls_ratio_save = g_lean_step_ratio;
+  int ls_side_save = g_lean_step_side;
+
+  g_sim_mv = g_cfg.mv;
+  g_sim_wp = g_cfg.wp;
+  g_predicting = 0;
+  g_cam_eye = (v3){{0, 0.9f, 0}};
+  g_cam_cull = 0;
+  g_fig_kcap = 0;
+  g_fig_fp = 0;
+  g_fig_diss = 0.0f;
+  // All direct cases are authoritative/offline. The snapshot case below opts into
+  // online mode explicitly and the caller's mode/local identity are restored below.
+  g_online = 0;
+  g_local_ent = 0;
+  g_lean_step_scans = 0;
+
+  leanstep_case_t ls_case[22];
+  int ls_n = 0;
+  ls_case[ls_n++] = leanstep_case("open-L-half", LS_OPEN, 0, 0.5f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("open-R-half", LS_OPEN, 1, 0.5f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("open-L-full", LS_OPEN, 0, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("open-R-full", LS_OPEN, 1, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("wall-L", LS_SIDEWALL, 0, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 0.45f);
+  ls_case[ls_n++] = leanstep_case("wall-R", LS_SIDEWALL, 1, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 0.45f);
+  ls_case[ls_n++] = leanstep_case("corner-L", LS_CORNER, 0, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 0.45f);
+  ls_case[ls_n++] = leanstep_case("corner-R", LS_CORNER, 1, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 0.45f);
+  ls_case[ls_n++] = leanstep_case("slot-L", LS_SLOT, 0, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 0.45f);
+  ls_case[ls_n++] = leanstep_case("slot-R", LS_SLOT, 1, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 0.45f);
+  ls_case[ls_n++] = leanstep_case("crouch-L", LS_OPEN, 0, 1.0f, 1,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("crouch-R", LS_OPEN, 1, 1.0f, 1,
+                                  (v3){{0, 0, 0}}, 1, 0, 0, 1.25f);
+  float ls_run = g_sim_mv[MV_RUN];
+  float ls_slow = ls_run * LEAN_SPD_LO * 0.75f;
+  float ls_mid = ls_run * (LEAN_SPD_LO + LEAN_SPD_HI) * 0.5f;
+  float ls_fast = ls_run * LEAN_SPD_HI;
+  ls_case[ls_n++] = leanstep_case("slow-L", LS_OPEN, 0, 1.0f, 0,
+                                  (v3){{ls_slow, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("slow-R", LS_OPEN, 1, 1.0f, 0,
+                                  (v3){{ls_slow, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("fade-L", LS_OPEN, 0, 1.0f, 0,
+                                  (v3){{ls_mid, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("fade-R", LS_OPEN, 1, 1.0f, 0,
+                                  (v3){{ls_mid, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("fast-L", LS_OPEN, 0, 1.0f, 0,
+                                  (v3){{ls_fast, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("fast-R", LS_OPEN, 1, 1.0f, 0,
+                                  (v3){{ls_fast, 0, 0}}, 1, 0, 0, 1.25f);
+  ls_case[ls_n++] = leanstep_case("air-L", LS_OPEN, 0, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 0, 0, 1, 1.25f);
+  ls_case[ls_n++] = leanstep_case("air-R", LS_OPEN, 1, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 0, 0, 1, 1.25f);
+  ls_case[ls_n++] = leanstep_case("slide-L", LS_OPEN, 0, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 1, 1, 1.25f);
+  ls_case[ls_n++] = leanstep_case("slide-R", LS_OPEN, 1, 1.0f, 0,
+                                  (v3){{0, 0, 0}}, 1, 1, 1, 1.25f);
+
+  int ls_ok = ls_n == (int)(sizeof ls_case / sizeof ls_case[0]);
+  for (int ls_i = 0; ls_i < ls_n; ls_i++) {
+    leanstep_print_case(&ls_case[ls_i]);
+    int ls_expect_active = ls_i < 16 || (ls_i >= 12 && ls_i < 16);
+    if (ls_i >= 16) ls_expect_active = 0;
+    if (!leanstep_case_ok(&ls_case[ls_i], ls_expect_active)) ls_ok = 0;
+  }
+  leanstep_flex_diagnostic(&ls_case[2]);
+  leanstep_flex_diagnostic(&ls_case[3]);
+  leanstep_flex_diagnostic(&ls_case[10]);
+  leanstep_flex_diagnostic(&ls_case[11]);
+
+  // Open-space mirror: ankle travel and the two mapped knee angles are the actual
+  // solved quantities, not an assumption about which key means which leg.
+  int ls_sym = 1;
+  const int ls_pair[2][2] = {{0, 1}, {2, 3}};
+  for (int ls_i = 0; ls_i < 2; ls_i++) {
+    const leanstep_case_t *ls_l = &ls_case[ls_pair[ls_i][0]];
+    const leanstep_case_t *ls_r = &ls_case[ls_pair[ls_i][1]];
+    if (fabsf(ls_l->got_mm - ls_r->got_mm) > LS_SYM_M * 1000.0f ||
+        fabsf(ls_l->knee[0] - ls_r->knee[1]) > LS_SYM_DEG ||
+        fabsf(ls_l->knee[1] - ls_r->knee[0]) > LS_SYM_DEG ||
+        fabsf(ls_l->hip_drop_mm - ls_r->hip_drop_mm) > LS_SYM_M * 1000.0f)
+      ls_sym = 0;
+  }
+  float ls_full_want = sqrtf(LEAN_STEP_OUT_M * LEAN_STEP_OUT_M +
+                                  LEAN_STEP_FWD_M * LEAN_STEP_FWD_M) * 1000.0f;
+  int ls_shape = fabsf(ls_case[2].want_mm - ls_full_want) <= 5.0f &&
+                 fabsf(ls_case[3].want_mm - ls_full_want) <= 5.0f &&
+                 ls_case[0].got_mm < ls_case[2].got_mm &&
+                 ls_case[1].got_mm < ls_case[3].got_mm &&
+                 ls_case[2].flex >= 8.0f && ls_case[2].flex <= 15.0f &&
+                 ls_case[3].flex >= 8.0f && ls_case[3].flex <= 15.0f &&
+                 ls_case[2].head_gap_mm <= LS_HEAD_GAP_M * 1000.0f &&
+                 ls_case[3].head_gap_mm <= LS_HEAD_GAP_M * 1000.0f;
+  int ls_wall = ls_case[4].ratio <= ls_case[2].ratio + 1e-4f &&
+                ls_case[5].ratio <= ls_case[3].ratio + 1e-4f &&
+                ls_case[6].ratio <= ls_case[2].ratio + 1e-4f &&
+                ls_case[7].ratio <= ls_case[3].ratio + 1e-4f &&
+                ls_case[8].ratio <= ls_case[2].ratio + 1e-4f &&
+                ls_case[9].ratio <= ls_case[3].ratio + 1e-4f;
+  // A settled crouch is already at a 52-degree included knee angle. Another
+  // 8 degrees needs more than the plan's 30 mm maximum hip drop in this rig.
+  // The crouch contract is therefore a shorter but
+  // still visible step, the authored local weight drop, and never straightening the
+  // active knee; standing retains the hard 8--15 degree incremental target.
+  int ls_crouch = ls_case[10].got_mm < ls_case[2].got_mm &&
+                  ls_case[11].got_mm < ls_case[3].got_mm &&
+                  ls_case[10].got_mm > ls_case[2].got_mm * 0.5f &&
+                  ls_case[11].got_mm > ls_case[3].got_mm * 0.5f &&
+                  ls_case[10].flex >= 0.0f && ls_case[10].flex <= 5.0f &&
+                  ls_case[11].flex >= 0.0f && ls_case[11].flex <= 5.0f &&
+                  ls_case[10].knee[0] <= 55.0f && ls_case[11].knee[1] <= 55.0f;
+  int ls_speed = ls_case[12].got_mm > ls_case[14].got_mm &&
+                 ls_case[13].got_mm > ls_case[15].got_mm &&
+                 ls_case[14].got_mm > ls_case[16].got_mm &&
+                 ls_case[15].got_mm > ls_case[17].got_mm &&
+                 ls_case[16].got_mm < 0.1f && ls_case[17].got_mm < 0.1f;
+  int ls_clear = ls_case[18].got_mm < 0.1f && ls_case[19].got_mm < 0.1f &&
+                 ls_case[20].got_mm < 0.1f && ls_case[21].got_mm < 0.1f;
+  int ls_monotone = leanstep_wall_sweep();
+  int ls_contract = leanstep_contraction();
+  int ls_yaw = leanstep_yaw_chord();
+  int ls_reach = leanstep_reach();
+  int ls_flip = leanstep_signflip();
+  int ls_neutral = leanstep_origin_wire();
+  int ls_puppet = leanstep_puppet();
+  int ls_snapshot = leanstep_snapshot();
+  ls_ok &= ls_sym && ls_shape && ls_wall && ls_crouch && ls_speed &&
+           ls_clear && ls_monotone && ls_contract && ls_yaw && ls_reach &&
+           ls_flip && ls_neutral && ls_puppet && ls_snapshot;
+
+  proof_world_restore(&ls_world);
+  memcpy(g_player_anim, ls_player_anim_save, sizeof ls_player_anim_save);
+  g_cl = ls_cl_save;
+  memcpy(g_cl_body, ls_body_save, sizeof ls_body_save);
+  memcpy(g_cl_alive_prev, ls_alive_save, sizeof ls_alive_save);
+  g_online = ls_online_save;
+  g_local_ent = ls_local_save;
+  g_sim_mv = ls_sim_mv_save;
+  g_sim_wp = ls_sim_wp_save;
+  g_cam_eye = ls_cam_save;
+  g_cam_cull = ls_cull_save;
+  g_fig_kcap = ls_kcap_save;
+  g_fig_fp = ls_fp_save;
+  g_fig_diss = ls_diss_save;
+  g_probe_on = ls_probe_save;
+  g_nprobe = 0;
+  scene_reset();
+  g_lean_step_scans = ls_scan_save;
+  g_lean_step_want_off = ls_want_save;
+  g_lean_step_got_off = ls_got_save;
+  g_lean_step_ratio = ls_ratio_save;
+  g_lean_step_side = ls_side_save;
+
+  printf("leanstep symmetry=%d shape=%d wall=%d crouch=%d speed=%d clear=%d "
+         "monotone=%d contract=%d yaw=%d reach=%d flip=%d neutral=%d "
+         "puppet=%d snapshot=%d %s\n",
+         ls_sym, ls_shape, ls_wall, ls_crouch, ls_speed, ls_clear,
+         ls_monotone, ls_contract, ls_yaw, ls_reach, ls_flip, ls_neutral,
+         ls_puppet, ls_snapshot, ls_ok ? "ok" : "FAIL");
+  if (!ls_ok) exit(1);
+}
+
+#undef LS_SYM_M
+#undef LS_SYM_DEG
+#undef LS_PEN_M
+#undef LS_SINK_M
+#undef LS_HEAD_GAP_M

@@ -5,8 +5,10 @@
 // Contract: MAX_EVENTS 128 is a fixed ring; a drop is COUNTED, never silent.
 // Bot-vs-bot fire, footsteps, landings and bot reloads are silent by design.
 // An event is also the one thing a client receives about a FOREIGN entity's
-// actions, so ev_push drives BOTH presentation layers: ent_on_event moves the
-// body (kick, reload clock, flash, flinch) and vfx_on_event then draws it.
+// actions, so it drives that body's presentation and VFX: ent_on_event applies
+// recoil/reload/flash/flinch and vfx_on_event draws it. Predicted local fire is the
+// deliberate split: gun_shoot starts its VM response and carry latch immediately;
+// the later authoritative echo supplies VFX/3P recoil without duplicating the VM.
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Events — the sim's one-way channel to presentation. player_tick/bot_tick
@@ -100,8 +102,11 @@ static int  g_ev_peak_all[SRV_LOBBIES];
 #define g_ev_peak (g_ev_peak_all[g_lobby])
 
 // While the client PREDICTS/REPLAYS its own motion, events, VFX, audio and damage must
-// not fire — they belong to the authoritative server pass.
+// not fire — they belong to the authoritative server pass. Rollback is distinguished
+// from the first forward prediction because only the latter may create a new local
+// presentation edge; replay recomputes derived weapon/VM state from recorded inputs.
 static int g_predicting;
+static int g_prediction_replay;
 
 static void ev_push(event_t e) {
   if (g_predicting) return;   // a replayed shot must not re-spawn its VFX/audio
@@ -169,4 +174,3 @@ static void ev_push(event_t e) {
   }
 #endif
 }
-

@@ -68,6 +68,11 @@ static const param_def_t MV_DEF[MV_COUNT] = {
 // "<prefix>_<key>" (ar_rpm, sr_rpm, ...). Structural identity is WPN_DEF below.
 typedef enum { WPN_AR, WPN_SR, WPN_COUNT } wpn_id_t;
 
+// Third-person weapon cross-section scale. The pose solver needs this before
+// render/gun_build.inc is included, and both the solver and renderer must read
+// one value rather than silently maintaining parallel grip scales.
+#define GUN_GIRTH_3P 1.05f
+
 typedef enum {
   WP_RPM, WP_KICK_UP, WP_KICK_SIDE, WP_RECOVER_MS, WP_HIP_SPREAD, WP_SPREAD,
   WP_BLOOM, WP_ADS_MS, WP_ADS_ZOOM, WP_PUNCH, WP_SWAY, WP_COUNT
@@ -245,4 +250,3 @@ static int ent_next(int e) {
 // makes the opening match a duel; the difficulty default carries the challenge.
 static const param_def_t SP_BOTS_DEF = {"sp_bots",      "BOTS",        1, 1, MAX_BOTS, 1};
 static const param_def_t SP_FRAG_DEF = {"sp_fraglimit", "FRAG LIMIT", 10, 1, 1000,     1};
-

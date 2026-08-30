@@ -268,8 +268,9 @@ static void usage(void) {
        "  hud on|off         show/hide gameplay HUD (menus remain visible)\n"
        "  showfps on|off     show/hide the FPS counter idempotently\n"
        "  puppet on|off      drive bot 0 by script instead of AI (anim testbed)\n"
+       "  puppet pitch DEG   set the puppet's vertical aim for deterministic filming\n"
        "  puppet move DX DZ | speed S | face DEG | crouch 0|1 | lean -1..1 |\n"
-       "                     ads 0|1 | jump | slide | warp X Z\n"
+       "                     ads 0|1 | ready 0|1 | jump | slide | warp X Z\n"
        "  skel N             advance N ticks printing bot 0 skeleton state\n"
        "  kine N             advance N ticks printing solved foot/hand kinematics\n"
        "  bots N             set bot count %d-%d (applies next tick)\n"
@@ -300,7 +301,8 @@ static void usage(void) {
        "  cambot DX DY DZ    camera at bot+offset looking at the bot (cambot off)\n"
        "  camorbit R H D L   orbit bot 0: radius, height, deg/s, look height\n"
        "                     (camorbit off returns to the previous player camera)\n"
-       "  vmhand             wrist bend / forearm-to-bore / palm length, per hand\n"
+       "  vmhand             FP Hip/ADS/reload/recoil wrist/bore/palm matrix; hard\n"
+       "                     firing bend <45, support bore 35..65 deg, live clamp=0\n"
        "  vmorbit YAW PIT D W  viewmodel turntable, deg+m, W=0 trigger wrist\n"
        "                     1 support wrist  2 both  3 the trigger blade\n"
        "  vmbore YAW PIT D BORE RISE FOV  the same turntable pivoted ON THE\n"
@@ -308,21 +310,38 @@ static void usage(void) {
        "                     real lens: the macro instrument for weapon detail\n"
        "  camaim Y           height on the bot that cambot looks at (default 0.9)\n"
        "machine-checked proofs (each must read 0 / ok):\n"
-       "  figcheck N [DIST]  bot 0 figure over N ticks: open/flip/dup/zfight/\n"
+       "  figcheck N [DIST] [ar|sr]  bot 0 figure over N ticks: open/flip/dup/zfight/\n"
        "                     near/cross/degen. cross = two surfaces passing\n"
        "                     through each other at a shallow angle (a seam the\n"
        "                     tessellation decides, not the geometry)\n"
        "                     (DIST = camera distance, to sweep the profile tiers)\n"
        "  figv               toggle printing each figcheck offender's location\n"
+       "  leanstep           hard Lean-foot fixtures: open/wall/corner/slot, sign\n"
+       "                     flip, gait/wire/event neutrality and snapshot cadence\n"
        "  figm               every figure part's measured extent in mm + bone lengths\n"
        "  figbury [head]     third-person weapon vs the BODY: deepest vertex\n"
        "                     inside the trunk, %% of the weapon hidden in it,\n"
        "                     and how far the BUTT PAD is buried. `head` asks\n"
        "                     the same of the SKULL against the trunk instead\n"
-       "  vmcheck            same analysis, both weapons x 11 ADS steps x 7 poses\n"
+       "  vmcheck            both weapons x 11 ADS steps x 6 base poses, plus real\n"
+       "                     Hip/ADS back/lift/side+/-/overshoot recoil frames\n"
        "  vmsight            hand/forearm verts inside the eye's sight cone (must be 0)\n"
-       "  vmtrig             trigger guard + blade against the HAND'S MESH, per\n"
-       "                     weapon x reload station x first/third person\n"
+       "  vmscope            SR ocular/axis/PiP against secured 2a6b08c over ADS;\n"
+       "                     aligned ocular/PiP limits through real recoil (hard gate)\n"
+       "  vmframe            signed FP pitch/yaw/roll plus stock/wrist distances;\n"
+       "                     SR idle/action gate; Fire T0/T1 proves the exact VM-to-\n"
+       "                     world FOV remap, prediction pair and pose/EV T0 anchor;\n"
+       "                     pose-only re-solves must preserve all anim state\n"
+       "  recoil             AR/SR hip+ADS, single+burst: T0/1/2/4/8/16/settle,\n"
+       "                     muzzle axis, camera punch, shot direction, deterministic\n"
+       "                     curve and gameplay/RNG isolation (hard gate)\n"
+       "  vmtrig             hard hand contract over FP/3P Hip/ADS, reload\n"
+       "                     15/35/55/75/90, SR bolt, recoil peaks, Low-Ready\n"
+       "                     and death: guard/blade, actual allowed bite and\n"
+       "                     bidirectional exact/proxy forbidden crossings. Gates:\n"
+       "                     guard >=0, blade >=-4.5 mm, forbidden <=0.5 mm,\n"
+       "                     proxy/actual bite 2..4 mm, allowed wall <=4.5 mm,\n"
+       "                     live clamp=0 (death is reported separately)\n"
        "  mapcheck N         regenerate N arenas; count coplanar same-facing faces\n"
        "  parity             24 player-vs-bot gameplay rows, ok/MISMATCH each\n"
        "  bothear            authoritative shot/step hearing and investigation proof\n"
@@ -365,6 +384,8 @@ static void usage(void) {
        "  appframe N         N frames through the real frame step (app_frame);\n"
        "                     with the menu open this runs 0 ticks — the pause\n"
        "                     proof. Schedules audio voices; avoid in mixdown\n"
+       "  homeui             current --w/--h HOME gate: masked hover/click pixel\n"
+       "                     diff, root/focus/uistat stability, fit and ui_peak\n"
        "  cfg                print live config values\n"
        "  netpack N          encode/decode round-trip over N random states;\n"
        "                     prints the worst quantization error per field\n"
@@ -376,13 +397,17 @@ static void usage(void) {
        "                     compensation, miss without, residual in mm\n"
        "  netstall [G]       the live input queue: dup-free redundancy, gap\n"
        "                     fill rule, rate cap, and a G-tick far-ahead jump\n"
-       "  netanim N [S]      plants at 120 Hz vs from an S-strided snapshot\n"
+       "  netanim N [S]      plants plus a quantized full-rate/S-strided Lean ramp:\n"
+       "                     ankle, active-side, afoot/phase and event hard gates\n"
        "  netfill            fill/cap invariants over a join/leave timeline\n"
        "  netfigure          a foreign figure's IMPULSES: the shot puts the\n"
        "                     rifle on the aim axis and kicks it, the reload\n"
        "                     runs and ends, the round flashes and flinches\n"
        "                     the body, and our own predicted reload survives\n"
        "                     the server's echo of it\n"
+       "  netrecoil          >5 cm rollback with AR single+burst shots in replay:\n"
+       "                     VM history/end-state, weapon/RNG, no replayed body-carry\n"
+       "                     latch, local echo-once and foreign EV_FIRE response\n"
        "  netcarry           the carriage round trip: aim intent, carry state\n"
        "                     and the mid-air tuck through from_live -> wire ->\n"
        "                     apply -> the client's own ramp -> anim_tick\n"
@@ -396,7 +421,8 @@ static void usage(void) {
        "                     (localhost end-to-end, no GL). `fire` in ACTS must\n"
        "                     move ev_applied: that is the server's shot coming\n"
        "                     back as an event\n"
-       "  netdeath           online death -> ragdoll -> corpse (client half)\n"
+       "  netdeath           online death -> recoil pose -> ragdoll -> corpse, plus\n"
+       "                     respawn VM reset (client half)\n"
        "  netleave [drop]    online->local teardown: every count must be 0 and\n"
        "                     the session must land on the entry screen. `drop`\n"
        "                     runs the same teardown from a dead server instead\n"
@@ -695,7 +721,7 @@ typedef struct {
   solid_t       solids[MAX_SOLIDS];
   event_t       events[MAX_EVENTS];
   unsigned char humans_on[MAX_HUMANS];
-  int      num_solids, num_events, frozen, predicting, ev_peak;
+  int      num_solids, num_events, frozen, predicting, prediction_replay, ev_peak;
   long     ev_drops, tick;
   uint64_t rng_bot;
 } proof_world_t;
@@ -711,6 +737,7 @@ static void proof_world_save(proof_world_t *w) {
   w->num_events = g_num_events;
   w->frozen     = g_bots_frozen;
   w->predicting = g_predicting;
+  w->prediction_replay = g_prediction_replay;
   w->ev_peak    = g_ev_peak;
   w->ev_drops   = g_ev_drops;
   w->tick       = g_tick;
@@ -728,6 +755,7 @@ static void proof_world_restore(const proof_world_t *w) {
   g_num_events  = w->num_events;
   g_bots_frozen = w->frozen;
   g_predicting  = w->predicting;
+  g_prediction_replay = w->prediction_replay;
   g_ev_peak     = w->ev_peak;
   g_ev_drops    = w->ev_drops;
   g_tick        = w->tick;
@@ -739,4 +767,3 @@ static void bothear_emit_shot(int src, v3 pos) {
   wpn_fill_mags(&w);
   gun_shoot(src, &w, pos, 0.0f, 0.0f, (v3){{0,0,0}}, 1, &g_rng_bot);
 }
-

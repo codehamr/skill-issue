@@ -888,9 +888,18 @@ def main():
         if len(args) < 2:
             die("probe needs a shot key")
         t = shots.SHOTS[args[1]]()
-        want = [int(x) for x in args[2:]] or 8
-        if isinstance(want, list) and len(want) == 1:
-            want = want[0]
+        raw = [int(x) for x in args[2:]]
+        if len(raw) <= 1:
+            count = raw[0] if raw else 8
+            if count < 1:
+                die("probe frame count must be positive")
+            if count == 1:
+                want = [max(0, t.f - 1) // 2]
+            else:
+                want = [round(i * max(0, t.f - 1) / (count - 1))
+                        for i in range(count)]
+        else:
+            want = raw
         return probe(t, want)
     if verb == "render":
         sanity()

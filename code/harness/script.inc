@@ -23,15 +23,34 @@ static void cmd_botweapon(sim_ctx_t *s)        { (void)s; botweapon_proof(); }
 static void cmd_botflank(sim_ctx_t *s)         { (void)s; botflank_proof(); }
 static void cmd_botmemory(sim_ctx_t *s)        { (void)s; botmemory_proof(); }
 static void cmd_botmemoryobserve(sim_ctx_t *s) { (void)s; botmemoryobserve_proof(); }
+static void cmd_leanstep(sim_ctx_t *s)         { (void)s; leanstep_proof(); }
 static void cmd_padbackend(sim_ctx_t *s)       { (void)s; padbackend_proof(); }
 static void cmd_padsync(sim_ctx_t *s)          { (void)s; pad_sync(TICK_DT); }
 static void cmd_netfuzz(sim_ctx_t *s)          { (void)s; netfuzz_proof(); }
 static void cmd_netdeath(sim_ctx_t *s)         { (void)s; netdeath_proof(); }
 static void cmd_netclient(sim_ctx_t *s)        { (void)s; netclient_proof(); }
+static void cmd_recoil(sim_ctx_t *s)           { (void)s; recoil_proof(); }
+static void cmd_netrecoil(sim_ctx_t *s)        { (void)s; netrecoil_proof(); }
+static void cmd_vmframe(sim_ctx_t *s)           { (void)s; vmframe_proof(); }
 static void cmd_figbury(sim_ctx_t *s)          { (void)s; figbury_proof(); }
 static void cmd_figm(sim_ctx_t *s)             { (void)s; figm_proof(); }
 static void cmd_pos(sim_ctx_t *s)              { sim_print(s); }
 static void cmd_vmtrig(sim_ctx_t *s)           { vmtrig_proof(s); }
+static void cmd_vmtrigfacet(sim_ctx_t *s) {
+  (void)s;
+  int fail = vmtrig_exact_cert_selftest();
+  printf("vmtrigfacet proof=%d %s\n", fail, fail ? "FAIL" : "ok");
+  if (fail) exit(1);
+}
+static void cmd_vmfiref1c(sim_ctx_t *s) {
+  (void)s;
+  int cases = 0, passed = 0;
+  const char *first = NULL;
+  int fail = vmtrig_fire_f1c_selftest(&cases, &passed, &first);
+  printf("vmfiref1c cases=%d pass=%d first=%s proof=%d %s\n",
+         cases, passed, first ? first : "none", fail, fail ? "FAIL" : "ok");
+  if (fail) exit(1);
+}
 static void cmd_flinch(sim_ctx_t *s)           { flinch_proof(s); }
 
 static void cmd_wait(sim_ctx_t *s) {
@@ -104,7 +123,7 @@ static void cmd_warp(sim_ctx_t *s) {
   s->p->grounded = 1;
   s->p->tuck_y = 0.0f;   // a teleport is a clean slate; anim_reset zeroes
                          // the figure's half of this on the next line
-  anim_reset(&g_player_anim[0], s->p->pos, s->p->yaw);
+  anim_reset(&g_player_anim[0], s->p->pos, s->p->yaw, s->p->wp.cur);
 }
 
 static void cmd_aimbot(sim_ctx_t *s) {
@@ -144,6 +163,7 @@ static void cmd_puppet(sim_ctx_t *s) {
     b->puppet = 1;
     b->pup_speed = 5.0f;
     b->pup_face = b->yaw;
+    b->pitch = 0.0f;
     b->pup_mx = b->pup_mz = 0;
     b->pup_crouch = 0;
     b->pup_ready = 1;
@@ -157,6 +177,8 @@ static void cmd_puppet(sim_ctx_t *s) {
     b->pup_speed = next_f();
   } else if (!strcmp(sub, "face")) {
     b->pup_face = next_f() * DEG2RAD;
+  } else if (!strcmp(sub, "pitch")) {
+    b->pitch = next_f() * DEG2RAD;
   } else if (!strcmp(sub, "warp")) {  // teleport for camera framing
     b->pos.x = next_f();
     b->pos.z = next_f();
@@ -166,7 +188,7 @@ static void cmd_puppet(sim_ctx_t *s) {
       b->pos.y += 0.05f;
     b->prev_pos = b->pos;
     b->vel = (v3){{0, 0, 0}};
-    anim_reset(&b->anim, b->pos, b->yaw);
+    anim_reset(&b->anim, b->pos, b->yaw, b->wp.cur);
   } else if (!strcmp(sub, "crouch")) {
     b->pup_crouch = (int)next_n();
   } else if (!strcmp(sub, "ready")) {
@@ -319,7 +341,8 @@ static void cmd_lean(sim_ctx_t *s) {
   anim_t tmp = g_player_anim[0];
   v3 hl = tmp.pose.head;              // head as solved WITH the lean
   tmp.lean_s = 0.0f;
-  skel_solve(&tmp, pl->pos, pl->yaw, pl->pitch);
+  skel_solve(&tmp, pl->pos, pl->yaw, pl->pitch, pl->wp.cur, 0,
+             SKEL_POSE_ONLY);
   v3 h0 = tmp.pose.head;              // ...and the same pose standing up
   v3 Ra = {{cosf(pl->yaw), 0, sinf(pl->yaw)}};
   float head_lat = (hl.x - h0.x) * Ra.x + (hl.z - h0.z) * Ra.z;
@@ -350,13 +373,14 @@ static void cmd_wpn(sim_ctx_t *s) {
   const vm_t *v = &s->p->vm;
   printf("wpn t=%ld cur=%s ammo=%d spread=%.3f rec=(%.3f %.3f) bloom=%.3f ads=%.3f "
          "reload=%d switch=%d punch=%.3f vm sway=(%.4f %.4f) lag=(%.4f %.4f %.4f) "
-         "kick=%.4f roll=%.4f scope=(%.1f %.1f %.1f)\n",
+         "kick=(%.4f %.3fdeg %.4f) roll=%.4f scope=(%.1f %.1f %.1f)\n",
          s->tick, WPN_DEF[w->cur].prefix, w->ammo[w->cur], (double)weapon_spread(s->p),
          (double)w->rec_p, (double)w->rec_y, (double)w->bloom,
          (double)w->ads_s, w->reload_t, w->switch_t, (double)w->punch,
          (double)v->sway_p, (double)v->sway_y,
          (double)v->lag_x, (double)v->lag_y, (double)v->lag_z,
-         (double)v->kick, (double)v->roll,
+         (double)v->kick_back, (double)(v->kick_lift / DEG2RAD),
+         (double)v->kick_side, (double)v->roll,
          (double)g_scope_cx, (double)g_scope_cy, (double)g_scope_r);
 }
 
@@ -555,6 +579,9 @@ static void cmd_scat(sim_ctx_t *s) {
 static void cmd_vmsight(sim_ctx_t *s) {
   // SIGHT-CLEARANCE PROOF. No part of the shooter's own hands or forearms may enter
   // the cone the eye looks through.
+  static const char *const PART[] = {
+    "vm_hands", "palm", "thumb", "trigger_digit", "grip_digits"
+  };
   player_t tmp = *s->p;
   v3 eye = {{0, 0, 0}}, rgt = {{1, 0, 0}}, upv = {{0, 1, 0}}, fwd = {{0, 0, -1}};
   int total_bad = 0;
@@ -569,22 +596,33 @@ static void cmd_vmsight(sim_ctx_t *s) {
     }
     tmp.wp.cur = wi;
     int wbad = 0;
+    int part_bad[5] = {0};
+    float part_margin[5] = {1e9f, 1e9f, 1e9f, 1e9f, 1e9f};
+    int range_bad[PROBE_MAX] = {0};
+    float range_margin[PROBE_MAX];
+    for (int i = 0; i < PROBE_MAX; i++) range_margin[i] = 1e9f;
     float wmargin = 1e9f;
     float wads = 0.0f;
     for (int a2 = 4; a2 <= 10; a2++) {   // only aimed states have a sight picture
       tmp.wp.ads_lin = (float)a2 / 10.0f;
       tmp.wp.ads_s = tmp.wp.prev_ads_s = smooth01(tmp.wp.ads_lin);
       tmp.wp.reload_t = 0; tmp.wp.switch_t = 0; tmp.wp.prev_switch = 0.0f;
-      tmp.vm.kick = tmp.vm.prev_kick = 0.0f;
+      tmp.vm.kick_back = tmp.vm.prev_kick_back = 0.0f;
+      tmp.vm.kick_lift = tmp.vm.prev_kick_lift = 0.0f;
+      tmp.vm.kick_side = tmp.vm.prev_kick_side = 0.0f;
       g_nprobe = 0; g_probe_on = 1;
-      vm_build(&tmp, 1.0f, eye, rgt, upv, fwd);
+      vm_build(&tmp, 1.0f, eye, rgt, upv, fwd, 1.0f);
       g_probe_on = 0;
       v3 ap = v3_sub(g_gun_sight_p, eye);
       float apd = v3_dot(ap, fwd);
       if (apd < 0.01f) continue;
       float tan_ap = g_gun_sight_r / apd;   // the aperture's angular radius
       for (int i = 0; i < g_nprobe; i++) {
-        if (!g_probe[i].name || strcmp(g_probe[i].name, "vm_hands")) continue;
+        int part = -1;
+        if (g_probe[i].name)
+          for (int k = 0; k < 5; k++)
+            if (!strcmp(g_probe[i].name, PART[k])) { part = k; break; }
+        if (part < 0) continue;
         for (int f = g_probe[i].v0; f < g_probe[i].v1; f += VERT_FLOATS) {
           v3 d = {{g_scene[f] - eye.x, g_scene[f + 1] - eye.y,
                    g_scene[f + 2] - eye.z}};
@@ -595,16 +633,166 @@ static void cmd_vmsight(sim_ctx_t *s) {
           // Positive margin = outside the cone. Reported in milliradians so
           // the number means something at any screen size.
           float m = (tan_v - tan_ap) * 1000.0f;
-          if (m < 0.0f) wbad++;
+          if (m < 0.0f) { wbad++; part_bad[part]++; range_bad[i]++; }
+          if (m < part_margin[part]) part_margin[part] = m;
+          if (m < range_margin[i]) range_margin[i] = m;
           if (m < wmargin) { wmargin = m; wads = tmp.wp.ads_lin; }
         }
       }
     }
     printf("vmsight %s occluding_verts=%d worst_margin=%.1f mrad at ads=%.1f\n",
            WPN_DEF[wi].prefix, wbad, (double)wmargin, (double)wads);
+    if (wbad) {
+      printf("vmsight %s parts", WPN_DEF[wi].prefix);
+      for (int k = 0; k < 5; k++)
+        if (part_bad[k]) printf(" %s=%d/%.1f", PART[k], part_bad[k],
+                                (double)part_margin[k]);
+      printf("\n");
+      printf("vmsight %s ranges", WPN_DEF[wi].prefix);
+      for (int i = 0; i < g_nprobe; i++)
+        if (range_bad[i]) printf(" %d:%s=%d/%.1f", i, g_probe[i].name,
+                                 range_bad[i], (double)range_margin[i]);
+      printf("\n");
+    }
     total_bad += wbad;
   }
   printf("vmsight total=%d (must be 0)\n", total_bad);
+  if (total_bad) exit(1);
+}
+
+static void cmd_vmscope(sim_ctx_t *s) {
+  // THE SR'S OPTICAL CONTRACT. Unlike vmsight, this measures the projected ocular
+  // and the PiP aperture that is composited after geometry. The renderer's own
+  // scope_pip_radius() supplies the threshold/alignment result. These eleven rows
+  // were measured from secured 2a6b08c with a temporary observer that called its
+  // production five-argument vm_build; values are in metres / 640x360 virtual pixels.
+  // Keeping the reference here makes the plan's "compare with the before binary"
+  // requirement a hard gate instead of a one-time transcript.
+  typedef struct { float ocular, axis, cx, cy, radius, pip; } scope_before_t;
+  static const scope_before_t BEFORE[11] = {
+    {0.222957f, 0.138023f, 516.820923f, 230.674255f, 25.394438f,  0.000000f},
+    {0.219381f, 0.134357f, 514.426331f, 230.044708f, 25.808449f,  0.000000f},
+    {0.209679f, 0.124349f, 507.510193f, 228.229950f, 27.002558f,  0.000000f},
+    {0.195399f, 0.109447f, 496.053955f, 225.234070f, 28.975935f,  0.000000f},
+    {0.178086f, 0.091106f, 479.652740f, 220.963928f, 31.792862f,  0.000000f},
+    {0.159280f, 0.070840f, 457.728638f, 215.283447f, 35.546787f,  0.000000f},
+    {0.140508f, 0.050253f, 429.911743f, 208.110443f, 40.295887f,  0.000000f},
+    {0.123288f, 0.031052f, 396.864471f, 199.624878f, 45.923969f,  0.000000f},
+    {0.109129f, 0.015036f, 361.810181f, 190.654678f, 51.882401f,  1.591349f},
+    {0.099532f, 0.004063f, 332.341888f, 183.131760f, 56.884842f, 56.884842f},
+    {0.095999f, 0.000004f, 320.000000f, 179.984848f, 58.978577f, 58.978577f},
+  };
+  player_t tmp = *s->p;
+  v3 eye = {{0, 0, 0}}, rgt = {{1, 0, 0}}, upv = {{0, 1, 0}}, fwd = {{0, 0, -1}};
+  tmp.wp.cur = WPN_SR;
+  tmp.wp.reload_t = tmp.wp.switch_t = 0;
+  tmp.wp.prev_switch = 0.0f;
+  memset(&tmp.vm, 0, sizeof tmp.vm);
+  float sc = ui_scale();
+  float vw = (float)R.width / sc, vh = (float)R.height / sc;
+  int bad = 0, scope_tris = 0;
+  float max_base_m = 0.0f, max_base_px = 0.0f;
+  for (int a = 0; a <= 10; a++) {
+    tmp.wp.ads_lin = (float)a / 10.0f;
+    tmp.wp.ads_s = tmp.wp.prev_ads_s = smooth01(tmp.wp.ads_lin);
+    vm_build(&tmp, 1.0f, eye, rgt, upv, fwd, 1.0f);
+    v3 rel = v3_sub(g_gun_sight_p, eye);
+    float ocular = v3_dot(rel, fwd);
+    v3 axis = v3_norm(g_vm_mdl_z);
+    float along = v3_dot(rel, axis);
+    float axis_off = v3_len(v3_sub(rel, v3_scale(axis, along)));
+    float center_off = sqrtf((g_scope_cx - vw * 0.5f) * (g_scope_cx - vw * 0.5f) +
+                             (g_scope_cy - vh * 0.5f) * (g_scope_cy - vh * 0.5f));
+    float pip = scope_pip_radius(tmp.wp.ads_s, vw, vh);
+    if (g_gun_sr_scope_v0 >= 0 && g_gun_sr_scope_v1 > g_gun_sr_scope_v0)
+      scope_tris = (g_gun_sr_scope_v1 - g_gun_sr_scope_v0) /
+                   (3 * VERT_FLOATS);
+    float values[] = {ocular, axis_off, center_off, g_scope_cx, g_scope_cy,
+                      g_scope_r, g_gun_sight_r, pip};
+    for (unsigned i = 0; i < sizeof values / sizeof values[0]; i++)
+      if (f_is_nonfinite(values[i])) bad++;
+    if (fabsf(g_gun_sight_r - SCOPE_OCU_R) > 1e-6f || !(g_scope_r > 0.0f)) bad++;
+    if (tmp.wp.ads_s <= SCOPE_ADS_OPEN && pip > 0.001f) bad++;
+    // The old values were captured at virtual 640x360. Projection offsets and radii
+    // scale with virtual height, while the viewport centre itself follows vw/vh.
+    float vk = vh / 360.0f;
+    const scope_before_t *b = &BEFORE[a];
+    float want_cx = vw * 0.5f + (b->cx - 320.0f) * vk;
+    float want_cy = vh * 0.5f + (b->cy - 180.0f) * vk;
+    float em = fmaxf(fabsf(ocular - b->ocular), fabsf(axis_off - b->axis));
+    float ep = fabsf(g_scope_cx - want_cx);
+    ep = fmaxf(ep, fabsf(g_scope_cy - want_cy));
+    ep = fmaxf(ep, fabsf(g_scope_r - b->radius * vk));
+    ep = fmaxf(ep, fabsf(pip - b->pip * vk));
+    if (em > max_base_m) max_base_m = em;
+    if (ep > max_base_px) max_base_px = ep;
+    int base_ok = em <= 0.00020f && ep <= 0.08f * vk;
+    if (!base_ok) bad++;
+    printf("vmscope ads=%.1f eased=%.3f ocular=%.1fmm axis=%.2fmm "
+           "center=(%.1f %.1f) off=%.2f radius=%.2f pip=%.2f base=%s\n",
+           (double)tmp.wp.ads_lin, (double)tmp.wp.ads_s,
+           (double)(ocular * 1000.0f), (double)(axis_off * 1000.0f),
+           (double)g_scope_cx, (double)g_scope_cy, (double)center_off,
+           (double)g_scope_r, (double)pip, base_ok ? "ok" : "FAIL");
+  }
+
+  // The same full-ADS ocular across the real SR recoil springs. Radius may breathe
+  // slightly as the rifle compresses, but the eye must stay behind the glass.
+  tmp.wp.ads_lin = tmp.wp.ads_s = tmp.wp.prev_ads_s = 1.0f;
+  memset(&tmp.vm, 0, sizeof tmp.vm);
+  vm_build(&tmp, 1.0f, eye, rgt, upv, fwd, 1.0f);
+  float calm_r = g_scope_r, min_ocular = 1e9f, max_rdelta = 0.0f;
+  float max_axis = 0.0f, max_center_ratio = 0.0f, min_pip_ratio = 1e9f;
+  recoil_vm_impulse(&tmp.vm, 0, 0, WPN_SR, 1.0f);
+  for (int t = 0; t <= 24; t++) {
+    tmp.vm.prev_kick_back = tmp.vm.kick_back;
+    tmp.vm.prev_kick_lift = tmp.vm.kick_lift;
+    tmp.vm.prev_kick_side = tmp.vm.kick_side;
+    vm_build(&tmp, 1.0f, eye, rgt, upv, fwd, 1.0f);
+    v3 rel = v3_sub(g_gun_sight_p, eye);
+    float ocular = v3_dot(rel, fwd);
+    v3 axis = v3_norm(g_vm_mdl_z);
+    float along = v3_dot(rel, axis);
+    float axis_off = v3_len(v3_sub(rel, v3_scale(axis, along)));
+    float center_off = sqrtf((g_scope_cx - vw * 0.5f) * (g_scope_cx - vw * 0.5f) +
+                             (g_scope_cy - vh * 0.5f) * (g_scope_cy - vh * 0.5f));
+    float pip = scope_pip_radius(1.0f, vw, vh);
+    float rd = calm_r > 0.0f ? fabsf(g_scope_r - calm_r) / calm_r : 1.0f;
+    float cr = g_scope_r > 0.0f ? center_off / g_scope_r : 1e9f;
+    float pr = g_scope_r > 0.0f ? pip / g_scope_r : 0.0f;
+    if (ocular < min_ocular) min_ocular = ocular;
+    if (rd > max_rdelta) max_rdelta = rd;
+    if (axis_off > max_axis) max_axis = axis_off;
+    if (cr > max_center_ratio) max_center_ratio = cr;
+    if (pr < min_pip_ratio) min_pip_ratio = pr;
+    float rvalues[] = {ocular, axis_off, center_off, g_scope_cx, g_scope_cy,
+                       g_scope_r, pip, rd, cr, pr};
+    for (unsigned i = 0; i < sizeof rvalues / sizeof rvalues[0]; i++)
+      if (f_is_nonfinite(rvalues[i])) bad++;
+    recoil_spring(&tmp.vm.kick_back, &tmp.vm.kick_back_v,
+                  RECOIL_BACK_K, RECOIL_BACK_C);
+    recoil_spring(&tmp.vm.kick_lift, &tmp.vm.kick_lift_v,
+                  RECOIL_LIFT_K, RECOIL_LIFT_C);
+    recoil_spring(&tmp.vm.kick_side, &tmp.vm.kick_side_v,
+                  RECOIL_SIDE_K, RECOIL_SIDE_C);
+  }
+  // Recoil is intentionally new, so its motion cannot equal the old one. Its limits
+  // come from the approved plan: >=78 mm ocular and <=20% radius breathing. The two
+  // alignment limits are renderer contracts: the eye remains inside the ocular and
+  // the PiP stays in scope_pip_radius's full-alignment plateau (off <= 0.30 radius).
+  if (scope_tris <= 0 || fabsf(SCOPE_ADS_OPEN - 0.55f) > 1e-6f ||
+      min_ocular < 0.078f || max_rdelta > 0.2005f ||
+      max_axis > SCOPE_OCU_R + 1e-5f || max_center_ratio > 0.302f ||
+      min_pip_ratio < 0.998f) bad++;
+  printf("vmscope scope_tris=%d open_at=%.2f baseline_err=%.3fmm/%.3fpx "
+         "recoil_min_ocular=%.1fmm recoil_axis=%.2fmm "
+         "recoil_center=%.3fr recoil_pip=%.3fr recoil_radius_delta=%.1f%% %s\n",
+         scope_tris, (double)SCOPE_ADS_OPEN, (double)(max_base_m * 1000.0f),
+         (double)max_base_px, (double)(min_ocular * 1000.0f),
+         (double)(max_axis * 1000.0f), (double)max_center_ratio,
+         (double)min_pip_ratio, (double)(max_rdelta * 100.0f),
+         bad ? "FAIL" : "ok");
+  if (bad) exit(1);
 }
 
 static void cmd_parity(sim_ctx_t *s) {
@@ -670,6 +858,7 @@ static void cmd_parity(sim_ctx_t *s) {
   }
   printf("parity total rows=%u live=%d mismatches=%d\n",
          (unsigned)(sizeof row / sizeof *row), live, bad);
+  if (bad) exit(1);
 }
 
 static void cmd_rag(sim_ctx_t *s) {
@@ -911,36 +1100,85 @@ static void cmd_figcheck(sim_ctx_t *s) {
   // shape that covers everything past 6 m, i.e. most of a 48 m arena — had
   // no gate at all. 0 keeps the old behaviour exactly.
   float fdist = (float)opt_n(0);
+  int wpn = WPN_AR;
+  {
+    char *wtok = take_tok();
+    if (wtok && !strcmp(wtok, "ar")) wpn = WPN_AR;
+    else if (wtok && !strcmp(wtok, "sr")) wpn = WPN_SR;
+    else if (wtok) g_tok_pushback = wtok;
+  }
 
   fchk_res_t worst = {0};
   long wt = s->tick, tris = 0;
-  int bad = 0, wcross = 0;   // cross has its own worst; see vmcheck's note
+  int bad = 0, wcross = 0, pose_wpn = 1, structural_bad = 0;
+  // cross has its own worst; see vmcheck's note. Near/cross are intentional contact
+  // census values and are baselined by ci-proofs; the five topology classes are hard.
+  float pose_delta_min = 1e9f;
   // The whole figure is now body surface: the ground blob disk it used to emit
   // first (an open fan, which had to be skipped) is gone, replaced by a real cast
   // shadow that lives in the shadow map and not in this buffer.
   for (long i = 0; i < (n > 0 ? n : 1); i++) {
     if (n > 0) sim_advance(s);
+    const bot_t *subject = &g_bots[0];
+    // Stage both sides of the selector locally. Merely asking the renderer for an
+    // SR mesh around the bot's live AR-authored wrists is a plausible-looking but
+    // false SR proof; mutating the live bot here would make this diagnostic alter
+    // the simulation it is measuring.
+    weapon_t draw_wp = subject->wp;
+    anim_t draw_anim = subject->anim;
+    draw_wp.cur = wpn;
+    int idle_ok = gun_pose_idle_ok(&draw_wp, &draw_anim, subject->vel,
+                                   subject->grounded, subject->sliding);
+    skel_solve(&draw_anim, subject->pos, subject->yaw, subject->pitch,
+               wpn, idle_ok, SKEL_POSE_ONLY);
+    // A selector echo is not a pose witness. Solve the same immutable animation
+    // state with the other production weapon and require the actually drawn gun,
+    // wrists and weapon frame to differ. This counterfactual fails if `wpn` stops
+    // reaching skel_solve even though the renderer still receives the right enum.
+    int other_wpn = wpn == WPN_AR ? WPN_SR : WPN_AR;
+    weapon_t other_wp = subject->wp;
+    anim_t other_anim = subject->anim;
+    other_wp.cur = other_wpn;
+    int other_idle_ok = gun_pose_idle_ok(&other_wp, &other_anim, subject->vel,
+                                         subject->grounded, subject->sliding);
+    skel_solve(&other_anim, subject->pos, subject->yaw, subject->pitch,
+               other_wpn, other_idle_ok, SKEL_POSE_ONLY);
+    const pose_t *pa = &draw_anim.pose, *pb = &other_anim.pose;
+    float pose_delta = v3_len(v3_sub(pa->gun_o, pb->gun_o))
+                     + v3_len(v3_sub(pa->wri[0], pb->wri[0]))
+                     + v3_len(v3_sub(pa->wri[1], pb->wri[1]))
+                     + 0.25f * v3_len(v3_sub(pa->gun_f, pb->gun_f))
+                     + 0.25f * v3_len(v3_sub(pa->gun_u, pb->gun_u));
+    if (pose_delta < pose_delta_min) pose_delta_min = pose_delta;
+    if (draw_wp.cur != wpn || other_wp.cur != other_wpn ||
+        f_is_nonfinite(pose_delta) || pose_delta < 0.010f)
+      pose_wpn = 0;
     scene_reset();
     // Check the mesh the player sees up close: scene_draw_figure picks its
     // profile resolution from the camera distance, and the invariants have to
     // hold on the most detailed variant.
-    g_cam_eye = g_bots[0].pos;
+    g_cam_eye = subject->pos;
     if (fdist > 0.0f) g_cam_eye.z += fdist;
     if (g_fchk_v) { g_nprobe = 0; g_probe_on = 1; }
-    scene_draw_figure(&g_bots[0].anim, g_bots[0].pos, g_bots[0].yaw, NULL,
-                      1.0f, 0.0f, (v3){{1, 1, 1}}, 0, WPN_AR,
-                      gun_anim(&g_bots[0].wp));
+    scene_draw_figure(&draw_anim, subject->pos, subject->yaw, NULL,
+                      1.0f, 0.0f, (v3){{1, 1, 1}}, wpn,
+                      gun_anim(&draw_wp));
     g_probe_on = 0;
     fchk_res_t r = fchk_scene();
     tris = r.tris;
+    structural_bad |= r.open || r.flip || r.dup || r.zfight || r.degen;
     int sc = 100 * (r.open + r.flip + r.dup + r.degen) + 10 * r.zfight + r.near;
     if (r.cross > wcross) wcross = r.cross;   // its own worst; see vmcheck
     if (sc > bad) { bad = sc; worst = r; wt = s->tick; }
   }
-  printf("figcheck ticks=%ld dist=%.0f k=%d tris=%d worst_t=%ld open=%d "
-         "flip=%d dup=%d zfight=%d near=%d cross=%d degen=%d\n", n,
-         (double)fdist, g_fig_k, (int)tris, wt, worst.open, worst.flip,
-         worst.dup, worst.zfight, worst.near, wcross, worst.degen);
+  printf("figcheck ticks=%ld dist=%.0f wpn=%s pose_wpn=%d pose_delta=%.1fmm "
+         "k=%d tris=%d "
+         "worst_t=%ld open=%d flip=%d dup=%d zfight=%d near=%d cross=%d degen=%d\n", n,
+         (double)fdist, WPN_DEF[wpn].prefix, pose_wpn,
+         (double)(pose_delta_min * 1000.0f), g_fig_k, (int)tris, wt,
+         worst.open, worst.flip, worst.dup, worst.zfight, worst.near, wcross,
+         worst.degen);
+  if (!pose_wpn || structural_bad) exit(1);
 }
 
 static void cmd_kine(sim_ctx_t *s) {
@@ -1020,31 +1258,84 @@ static void cmd_vmhand(sim_ctx_t *s) {
   player_t tmp = *s->p;
   v3 eye = {{0, 0, 0}}, rgt = {{1, 0, 0}}, upv = {{0, 1, 0}}, fwd = {{0, 0, -1}};
   static const float RSTATION[5] = {0.15f, 0.35f, 0.55f, 0.75f, 0.90f};
+  static const int RWHICH[5] = {
+    VMTRIG_REC_BACK, VMTRIG_REC_LIFT, VMTRIG_REC_SIDE_POS,
+    VMTRIG_REC_SIDE_NEG, VMTRIG_REC_OVERSHOOT,
+  };
+  static const char *const RNAME[5] = {
+    "back", "lift", "side+", "side-", "over",
+  };
+  float max_fire_bend = 0.0f, min_support_bore = 1e9f, max_support_bore = 0.0f;
+  int rows = 0, live_rows = 0, clamp_rows = 0, fail = 0;
   for (int wi = 0; wi < WPN_COUNT; wi++) {
     tmp.wp.cur = wi;
-    for (int a = 0; a <= 6; a++) {
-      char tag[12];
-      tmp.wp.ads_lin = a == 1 ? 1.0f : 0.0f;
+    // Hip/ADS, five reload stations, then the five real recoil landmarks at both
+    // Hip and ADS. Recoil amplitudes come from the same production sampler vmtrig
+    // uses; this matrix contains no kick literals.
+    for (int a = 0; a < 17; a++) {
+      char tag[20];
+      int recoil = a >= 7;
+      int recoil_ads = a >= 12;
+      // Every row in this matrix is a live held pose. Reload deliberately moves the
+      // support hand, but it is not the SR bolt exception from the descriptor contract;
+      // both wrist/bore limits therefore remain hard throughout the five stations.
+      tmp.wp.ads_lin = (a == 1 || recoil_ads) ? 1.0f : 0.0f;
       tmp.wp.ads_s = tmp.wp.prev_ads_s = tmp.wp.ads_lin;
       tmp.wp.switch_t = 0; tmp.wp.prev_switch = 0.0f;
-      tmp.vm.kick = tmp.vm.prev_kick = 0.0f;
+      tmp.vm.kick_back = tmp.vm.prev_kick_back = 0.0f;
+      tmp.vm.kick_lift = tmp.vm.prev_kick_lift = 0.0f;
+      tmp.vm.kick_side = tmp.vm.prev_kick_side = 0.0f;
       if (a < 2) {
         tmp.wp.reload_t = 0;
         snprintf(tag, sizeof tag, "%s", a ? "ads" : "hip");
-      } else {
+      } else if (!recoil) {
         float pr = RSTATION[a - 2];
         tmp.wp.reload_t = (int)((1.0f - pr) * WPN_DEF[wi].reload_ticks + 0.5f);
         snprintf(tag, sizeof tag, "rl%02d", (int)(pr * 100.0f));
+      } else {
+        int ri = (a - 7) % 5;
+        tmp.wp.reload_t = 0;
+        vmtrig_recoil_state_t rs = vmtrig_recoil_sample(
+            0, wi, tmp.wp.ads_s, RWHICH[ri]);
+        tmp.vm.kick_back = tmp.vm.prev_kick_back = rs.back;
+        tmp.vm.kick_lift = tmp.vm.prev_kick_lift = rs.lift;
+        tmp.vm.kick_side = tmp.vm.prev_kick_side = rs.side;
+        snprintf(tag, sizeof tag, "%s_%s", recoil_ads ? "ads" : "hip", RNAME[ri]);
       }
-      vm_build(&tmp, 1.0f, eye, rgt, upv, fwd);
-      for (int h = 0; h < 2; h++)
+      vm_build(&tmp, 1.0f, eye, rgt, upv, fwd, 1.0f);
+      unsigned clamp = g_fig_clamped;
+      if (clamp) clamp_rows += 2;
+      for (int h = 0; h < 2; h++) {
+        float bend = g_vm_hdbg[h].bend_deg, bore = g_vm_hdbg[h].bore_deg;
+        int finite = !f_is_nonfinite(bend) && !f_is_nonfinite(bore) &&
+                     !f_is_nonfinite(g_vm_hdbg[h].palm_mm) &&
+                     !f_is_nonfinite(g_vm_hdbg[h].off_mm);
+        int row_fail = !finite || clamp != 0;
+        if (!h) {
+          row_fail |= !(bend >= 0.0f && bend < 45.0f);
+          if (bend > max_fire_bend) max_fire_bend = bend;
+        }
+        if (h) {
+          row_fail |= !(bore >= 35.0f && bore <= 65.0f);
+          if (bore < min_support_bore) min_support_bore = bore;
+          if (bore > max_support_bore) max_support_bore = bore;
+        }
         printf("vmhand %s %-4s %-7s bend=%5.1f deg  bore=%5.1f deg  "
-               "palm=%5.1f mm  off=%5.1f mm\n", WPN_DEF[wi].prefix,
+               "palm=%5.1f mm  off=%5.1f mm clamp=%u %s\n", WPN_DEF[wi].prefix,
                tag, h ? "support" : "trigger",
-               (double)g_vm_hdbg[h].bend_deg, (double)g_vm_hdbg[h].bore_deg,
-               (double)g_vm_hdbg[h].palm_mm, (double)g_vm_hdbg[h].off_mm);
+               (double)bend, (double)bore, (double)g_vm_hdbg[h].palm_mm,
+               (double)g_vm_hdbg[h].off_mm, clamp, row_fail ? "FAIL" : "ok");
+        fail |= row_fail;
+        rows++;
+        live_rows++;
+      }
     }
   }
+  printf("vmhand summary rows=%d live=%d firing_bend_max=%.1fdeg "
+         "support_bore=%.1f..%.1fdeg clamp_rows=%d %s\n",
+         rows, live_rows, (double)max_fire_bend, (double)min_support_bore,
+         (double)max_support_bore, clamp_rows, fail ? "FAIL" : "ok");
+  if (fail) exit(1);
 }
 
 static void cmd_vmorbit(sim_ctx_t *s) {
@@ -1163,6 +1454,280 @@ static void cmd_camorbit(sim_ctx_t *s) {
   s->cam.orbit_phase = 0.0f;
 }
 
+typedef struct {
+  int menu, home, tab, page, control, padsub, devsub, wpn;
+  int focus, nfocus, padmode, rebind, rebindpad, arm, nedit;
+  int kb, kb_r, kb_c, dev, curve, assist, inv, connected;
+  int quit, online, client, root_focus, nav_n, nav_act;
+  float dz_l, dz_r, sens, ads_sens;
+  char name[sizeof g_cfg.name];
+} homeui_state_t;
+
+// Large script-proof buffers are mutually exclusive: the dispatcher finishes one
+// command before entering the next. Keep that lifetime contract explicit instead of
+// giving every proof a permanent BSS allocation. HOMEUI currently sets the arena's
+// size: one retained 1280x800 RGB frame plus one scanline. The next framebuffer is
+// compared a row at a time and retained only when it becomes the next baseline.
+#define HOMEUI_SCRATCH_W 1280
+#define HOMEUI_SCRATCH_H 800
+#define HOMEUI_FRAME_BYTES ((size_t)HOMEUI_SCRATCH_W * HOMEUI_SCRATCH_H * 3u)
+#define HOMEUI_ROW_BYTES ((size_t)HOMEUI_SCRATCH_W * 3u)
+#define HARNESS_SCRATCH_BYTES (HOMEUI_FRAME_BYTES + HOMEUI_ROW_BYTES)
+typedef union {
+  uint8_t bytes[HARNESS_SCRATCH_BYTES];
+  long double align_ld;
+  void *align_ptr;
+  uint64_t align_u64;
+} harness_scratch_t;
+enum { HARNESS_SCRATCH_NONE, HARNESS_SCRATCH_HOMEUI };
+static harness_scratch_t g_harness_scratch;
+static int g_harness_scratch_owner;
+
+_Static_assert(sizeof g_harness_scratch == HARNESS_SCRATCH_BYTES,
+               "harness scratch gained hidden padding");
+_Static_assert(HARNESS_SCRATCH_BYTES <= 13000000u,
+               "harness scratch exceeds the 13 MB hard budget");
+
+static int harness_scratch_acquire(int owner) {
+  if (owner <= HARNESS_SCRATCH_NONE || g_harness_scratch_owner) return 0;
+  g_harness_scratch_owner = owner;
+  return 1;
+}
+
+static uint8_t *harness_scratch_bytes(int owner) {
+  return g_harness_scratch_owner == owner ? g_harness_scratch.bytes : NULL;
+}
+
+static int harness_scratch_release(int owner) {
+  if (owner <= HARNESS_SCRATCH_NONE || g_harness_scratch_owner != owner)
+    return 0;
+  g_harness_scratch_owner = HARNESS_SCRATCH_NONE;
+  return 1;
+}
+
+// One UI-only frame step, shared by the public `uiframe` command and HOME's pixel/
+// interaction proof. Keeping the operation here makes the proof exercise the exact
+// command path required by the HOME acceptance recipe.
+static void harness_uiframe(sim_ctx_t *s) {
+  render_frame(s->p, 1.0f, 120, &s->cam);
+}
+
+static homeui_state_t homeui_state(void) {
+  homeui_state_t q = {0};
+  q.menu = g_menu_open; q.home = g_home;
+  q.tab = g_ui_tab; q.page = g_ui_page; q.control = g_ui_control;
+  q.padsub = g_ui_pad_sub; q.devsub = g_ui_dev_sub; q.wpn = g_ui_wpn;
+  q.focus = g_ui_focus; q.nfocus = g_ui_nfocus_last;
+  q.padmode = g_ui_pad_mode; q.rebind = g_ui_rebind;
+  q.rebindpad = g_ui_rebind_pad; q.arm = g_ui_arm;
+  q.nedit = g_ui_name_edit; q.kb = g_ui_kb;
+  q.kb_r = g_ui_kb_r; q.kb_c = g_ui_kb_c;
+  q.dev = DEV_MENU && g_cfg.devmode; q.curve = g_cfg.pad_curve;
+  q.dz_l = g_cfg.pad[PAD_DZ_L]; q.dz_r = g_cfg.pad[PAD_DZ_R];
+  q.sens = g_cfg.pad[PAD_SENS]; q.ads_sens = g_cfg.pad[PAD_ADS_SENS];
+  q.assist = g_cfg.pad_assist; q.inv = g_cfg.pad_inv_y;
+  q.connected = g_pad.connected;
+  q.quit = g_ui_quit; q.online = g_online; q.client = g_cl.state;
+  q.root_focus = g_ui_root_focus; q.nav_n = g_nav_n; q.nav_act = g_nav_act;
+  memcpy(q.name, g_cfg.name, sizeof q.name);
+  return q;
+}
+
+static int homeui_state_same(const homeui_state_t *a, const homeui_state_t *b) {
+  return a->menu == b->menu && a->home == b->home &&
+         a->tab == b->tab && a->page == b->page &&
+         a->control == b->control && a->padsub == b->padsub &&
+         a->devsub == b->devsub && a->wpn == b->wpn &&
+         a->focus == b->focus && a->nfocus == b->nfocus &&
+         a->padmode == b->padmode && a->rebind == b->rebind &&
+         a->rebindpad == b->rebindpad && a->arm == b->arm &&
+         a->nedit == b->nedit && a->kb == b->kb &&
+         a->kb_r == b->kb_r && a->kb_c == b->kb_c &&
+         a->dev == b->dev && a->curve == b->curve &&
+         a->dz_l == b->dz_l && a->dz_r == b->dz_r &&
+         a->sens == b->sens && a->ads_sens == b->ads_sens &&
+         a->assist == b->assist && a->inv == b->inv &&
+         a->connected == b->connected && a->quit == b->quit &&
+         a->online == b->online && a->client == b->client &&
+         a->root_focus == b->root_focus && a->nav_n == b->nav_n &&
+         a->nav_act == b->nav_act &&
+         !memcmp(a->name, b->name, sizeof a->name);
+}
+
+static int homeui_capture_pixels(void) {
+  uint8_t *frame = harness_scratch_bytes(HARNESS_SCRATCH_HOMEUI);
+  size_t bytes = (size_t)R.width * (size_t)R.height * 3;
+  if (!frame || R.width <= 0 || R.height <= 0 ||
+      R.width > HOMEUI_SCRATCH_W || R.height > HOMEUI_SCRATCH_H ||
+      bytes > HOMEUI_FRAME_BYTES)
+    return 0;
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  while (glGetError() != GL_NO_ERROR) {}
+  glReadPixels(0, 0, R.width, R.height, GL_RGB, GL_UNSIGNED_BYTE,
+               frame);
+  return glGetError() == GL_NO_ERROR;
+}
+
+static int homeui_pixel_delta_current(float ax, float ay, float bx, float by,
+                                      int *changed) {
+  const uint8_t *frame = harness_scratch_bytes(HARNESS_SCRATCH_HOMEUI);
+  uint8_t *row = harness_scratch_bytes(HARNESS_SCRATCH_HOMEUI);
+  if (!frame || !row || !changed || R.width <= 0 || R.height <= 0 ||
+      R.width > HOMEUI_SCRATCH_W || R.height > HOMEUI_SCRATCH_H)
+    return 0;
+  row += HOMEUI_FRAME_BYTES;
+  // ui_menu's graticule reaches 7.1 virtual units from its centre. Mask its old
+  // and new bounding squares only; any readout-wide hover wash remains measurable.
+  int rad = (int)ceilf(8.0f * g_uis) + 1;
+  *changed = 0;
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  while (glGetError() != GL_NO_ERROR) {}
+  for (int gl_y = 0; gl_y < R.height; gl_y++) {
+    glReadPixels(0, gl_y, R.width, 1, GL_RGB, GL_UNSIGNED_BYTE, row);
+    if (glGetError() != GL_NO_ERROR) return 0;
+    int y = R.height - 1 - gl_y;
+    for (int x = 0; x < R.width; x++) {
+      int cursor_a = abs(x - (int)ax) <= rad && abs(y - (int)ay) <= rad;
+      int cursor_b = abs(x - (int)bx) <= rad && abs(y - (int)by) <= rad;
+      if (cursor_a || cursor_b) continue;
+      size_t at = ((size_t)gl_y * (size_t)R.width + (size_t)x) * 3u;
+      size_t rt = (size_t)x * 3u;
+      if (frame[at] != row[rt] || frame[at + 1] != row[rt + 1] ||
+          frame[at + 2] != row[rt + 2])
+        (*changed)++;
+    }
+  }
+  return 1;
+}
+
+static void cmd_homeui(sim_ctx_t *s) {
+  // One current-resolution HOME acceptance run. CI launches four fresh processes at
+  // the required sizes; this command owns the fixed time, cursor mask and state diff.
+  if (!harness_scratch_acquire(HARNESS_SCRATCH_HOMEUI)) {
+    printf("homeui scratch=%zu busy=%d FAIL\n", HARNESS_SCRATCH_BYTES,
+           g_harness_scratch_owner);
+    exit(1);
+  }
+  const float proof_time = 36.0f;     // loop 0, middle of UPPER RECEIVER
+  float dt_save = g_ui_dt;
+  g_ui_dt = 0.0f;                    // pixel pairs must photograph one director instant
+  g_ui_mdown = 0;
+  if (!g_menu_open) ui_open_menu();
+  ui_route(UI_PAGE_ROOT);
+  home_enter(s->p);
+  g_home_t0 = g_ui_time - proof_time;
+  home_stage(s->p);
+
+  // Warm lazy render state and establish the root focus census before sampling.
+  g_ui_cx = g_ui_cy = -40.0f;
+  harness_uiframe(s);
+
+  home_readout_box_t box;
+  int visible = ui_home_readout_box(g_ui_vw, g_ui_vh, &box);
+  float rail_right = HOME_RAIL_X + HOME_RAIL_W;
+  float gap = box.x - rail_right;
+  int layout_ok = visible && gap >= 20.0f - 0.01f &&
+                  box.x + box.w <= g_ui_vw - 34.0f + 0.01f &&
+                  box.y - 13.0f >= 0.0f && box.y + box.h <= g_ui_vh;
+
+  // Exercise the exact fit helper on both weapon strings and every authored caption,
+  // including the long UPPER RECEIVER and the sniper-only substitute shot.
+  float worst_over = 0.0f;
+  for (int wi = 0; wi < WPN_COUNT; wi++) {
+    float ns = 1.35f, nt = 1.5f;
+    float over = ui_home_fit_width(HOME_WNAME[wi], box.w, &ns, &nt) - box.w;
+    if (over > worst_over) worst_over = over;
+    float ss = 0.72f, st = 1.3f;
+    over = ui_home_fit_width(HOME_WSPEC[wi], box.w, &ss, &st) - box.w;
+    if (over > worst_over) worst_over = over;
+  }
+  for (int i = 0; i <= HOME_NSHOT; i++) if (HOME_SHOT[i].cap) {
+    float cs = 0.8f, ct = 2.4f;
+    float over = ui_home_fit_width(HOME_SHOT[i].cap, box.w, &cs, &ct) - box.w;
+    if (over > worst_over) worst_over = over;
+  }
+  int fit_ok = worst_over <= 0.01f;
+
+  float fade = 0.0f;
+  const char *cap = home_caption(&fade);
+  int caption_ok = cap && !strcmp(cap, "UPPER RECEIVER") && fade > 0.99f;
+  float cs = 0.8f, ct = 2.4f;
+  float capw = cap ? ui_home_fit_width(cap, box.w, &cs, &ct) : 0.0f;
+
+  float out_x = (rail_right + box.x) * 0.5f * g_uis;
+  float main_x = (box.x + box.w * 0.5f) * g_uis;
+  float main_y = (box.y + box.h * 0.5f) * g_uis;
+  float cap_x = (box.x + box.w - capw * 0.5f) * g_uis;
+  float cap_y = (box.y - 9.5f) * g_uis;
+
+  // Outside readout -> inside readout: only the two graticule squares may move.
+  g_ui_cx = out_x; g_ui_cy = main_y;
+  harness_uiframe(s);
+  int read_ok = homeui_capture_pixels();
+  homeui_state_t before = homeui_state();
+  g_ui_cx = main_x; g_ui_cy = main_y;
+  harness_uiframe(s);
+  homeui_state_t hover = homeui_state();
+  int hover_delta = 0;
+  read_ok &= homeui_pixel_delta_current(out_x, main_y, main_x, main_y,
+                                         &hover_delta);
+  // The hovered frame is the baseline for the following press.
+  read_ok &= homeui_capture_pixels();
+
+  // Press/release in the body, then repeat on the caption. Both pixels and every field
+  // printed by uistat must remain unchanged; page/root/menu extras are included too.
+  g_ui_mdown = 1;
+  harness_uiframe(s);
+  homeui_state_t main_down = homeui_state();
+  int click_delta = 0;
+  read_ok &= homeui_pixel_delta_current(main_x, main_y, main_x, main_y,
+                                         &click_delta);
+  g_ui_mdown = 0;
+  harness_uiframe(s);
+  homeui_state_t main_up = homeui_state();
+
+  g_ui_cx = cap_x; g_ui_cy = cap_y;
+  harness_uiframe(s);
+  read_ok &= homeui_capture_pixels();
+  homeui_state_t cap_hover = homeui_state();
+  g_ui_mdown = 1;
+  harness_uiframe(s);
+  homeui_state_t cap_down = homeui_state();
+  int cap_delta = 0;
+  read_ok &= homeui_pixel_delta_current(cap_x, cap_y, cap_x, cap_y,
+                                         &cap_delta);
+  click_delta += cap_delta;
+  g_ui_mdown = 0;
+  harness_uiframe(s);
+  homeui_state_t after = homeui_state();
+
+  int state_ok = homeui_state_same(&before, &hover) &&
+                 homeui_state_same(&before, &main_down) &&
+                 homeui_state_same(&before, &main_up) &&
+                 homeui_state_same(&before, &cap_hover) &&
+                 homeui_state_same(&before, &cap_down) &&
+                 homeui_state_same(&before, &after);
+  int focus_ok = before.page == UI_PAGE_ROOT && before.menu && before.home &&
+                 before.focus == 0 && before.nfocus == 5 && !before.padmode;
+  // Secured 2a6b08c at this same UPPER RECEIVER instant peaks at 1344 vertices.
+  // The shadowed open readout must still beat that state-for-state baseline.
+  int budget_ok = g_ui_peak <= 1344 && g_ui_drops == 0;
+  int scratch_ok = harness_scratch_release(HARNESS_SCRATCH_HOMEUI);
+  int ok = read_ok && scratch_ok && layout_ok && fit_ok && caption_ok && hover_delta == 0 &&
+           click_delta == 0 && state_ok && focus_ok && budget_ok;
+
+  printf("homeui res=%dx%d virtual=%.0fx%.0f visible=%d gap=%.1f "
+         "fit_over=%.2fpx caption=%d hover_delta=%d click_delta=%d "
+         "state=%s focus=%d/%d ui_peak=%d/1344 ui_drops=%ld %s\n",
+         R.width, R.height, (double)g_ui_vw, (double)g_ui_vh, visible,
+         (double)gap, (double)fmaxf(worst_over, 0.0f), caption_ok,
+         hover_delta, click_delta, state_ok ? "stable" : "CHANGED",
+         before.focus, before.nfocus, g_ui_peak, g_ui_drops, ok ? "ok" : "FAIL");
+
+  g_ui_dt = dt_save;
+  if (!ok) exit(1);
+}
+
 static void cmd_home(sim_ctx_t *s) {
   // The BOOT SCREEN, on demand.
   char *ha = next_tok();
@@ -1209,7 +1774,7 @@ static void cmd_mup(sim_ctx_t *s) {
 }
 
 static void cmd_uiframe(sim_ctx_t *s) {
-  render_frame(s->p, 1.0f, 120, &s->cam);
+  harness_uiframe(s);
   if (g_ui_quit) puts("ui: quit");
 }
 
@@ -1655,7 +2220,7 @@ static void cmd_netanim(sim_ctx_t *s) {
   // reference: the puppet already running (bot 0), count its EV_STEP via a
   // plant-edge detector on foot t crossing.
   int plants_full = 0, plants_dec = 0;
-  anim_t ra; anim_reset(&ra, g_bots[0].pos, g_bots[0].yaw);
+  anim_t ra; anim_reset(&ra, g_bots[0].pos, g_bots[0].yaw, g_bots[0].wp.cur);
   v3 pprev = g_bots[0].pos;   // yaw comes live from the puppet, not sampled
   int last_stance = -1, last_stance_d = -1;
   for (long i = 0; i < n; i++) {
@@ -1670,16 +2235,156 @@ static void cmd_netanim(sim_ctx_t *s) {
       v3 pos = g_bots[0].pos;
       v3 vel = v3_scale(v3_sub(pos, pprev), (float)TICK_HZ / stride);
       anim_tick(&ra, pos, vel, g_bots[0].yaw, g_bots[0].pitch,
-                g_bots[0].grounded, 0, 0.0f, 0, 0.0f, 0.0f, 0, 1);
+                g_bots[0].grounded, 0, 0.0f, 0, 0.0f, 0.0f, 0, 1,
+                g_bots[0].wp.cur, 0);
       int sd = ra.foot[0].t < ra.foot[1].t ? 0 : 1;
       if (last_stance_d >= 0 && sd != last_stance_d) plants_dec++;
       last_stance_d = sd;
       pprev = pos;
     }
   }
+
+  // A snapshot does not carry the presentation-only lean foot. Re-solve that
+  // absolute target from the existing quantized lean level, once with a full-rate
+  // stream and once with a level held for `stride` ticks. This is the production
+  // LEAN_IN/OUT ramp including a direct sign change; slowing it down or inserting a
+  // neutral dwell would hide the exact transition a remote figure has to survive.
+  const int lean_n = 540;
+  anim_t af, ad;
+  anim_reset(&af, SPAWN_POS, 0.0f, WPN_AR);
+  anim_reset(&ad, SPAWN_POS, 0.0f, WPN_AR);
+  afoot_t foot_f[2], foot_d[2];
+  memcpy(foot_f, af.foot, sizeof foot_f);
+  memcpy(foot_d, ad.foot, sizeof foot_d);
+  float phase_f = af.phase, phase_d = ad.phase;
+  float source_lean = 0.0f, dec_lean = 0.0f, max_ankle = 0.0f;
+  float max_total_ankle = 0.0f;
+  float max_full_lean = 0.0f, max_dec_lean = 0.0f;
+  float max_full_step = 0.0f, max_dec_step = 0.0f;
+  int max_tick = -1, max_total_tick = -1, max_side = -1;
+  int max_active_full = -1, max_active_dec = -1;
+  int side_mismatch = 0, plant_flicker = 0, seen_f = 0, seen_d = 0;
+  int lean_scan_ok = 1;
+
+  event_t ev_save[MAX_EVENTS];
+  memcpy(ev_save, g_events, sizeof ev_save);
+  int nev_save = g_num_events, peak_save = g_ev_peak, predicting_save = g_predicting;
+  int replay_save = g_prediction_replay;
+  int online_save = g_online, local_save = g_local_ent;
+  long tick_save = g_tick, drops_save = g_ev_drops;
+  bot_noise_t noise_save[BOT_NOISE_COUNT][MAX_ENTS];
+  memcpy(noise_save, g_match.noise, sizeof noise_save);
+  long scans_save = g_lean_step_scans;
+  v3 want_save = g_lean_step_want_off, got_save = g_lean_step_got_off;
+  float ratio_save = g_lean_step_ratio;
+  int diag_side_save = g_lean_step_side;
+  g_num_events = 0;
+  g_ev_drops = 0;
+  g_predicting = 0;
+  g_prediction_replay = 0;
+  // Both solvers model foreign figures. The production path applies its short
+  // snapshot-hold presentation follower only to this online/non-local case.
+  g_online = 1;
+  g_local_ent = -1;
+
+  for (int i = 0; i < lean_n; i++) {
+    float target = i < 120 ? 1.0f : i < 360 ? -1.0f : 0.0f;
+    float rate = fabsf(target) > fabsf(source_lean) ? LEAN_IN_RATE : LEAN_OUT_RATE;
+    source_lean += (target - source_lean) * ease_k(rate);
+    float lean = net_dq_wish(net_q_wish(source_lean));
+    // The decimated side sees exactly what the live wire publishes: signed 16-bit
+    // wish quantization followed by a held level between snapshots.
+    if (i % stride == 0) dec_lean = net_dq_wish(net_q_wish(lean));
+    g_tick++;
+    long scan_f0 = g_lean_step_scans;
+    anim_tick(&af, SPAWN_POS, (v3){{0, 0, 0}}, 0.0f, 0.0f,
+              1, 0, 0.0f, 0, 0.0f, lean, 0, 0, WPN_AR, 1);
+    if (g_lean_step_scans - scan_f0 > 1) lean_scan_ok = 0;
+    long scan_d0 = g_lean_step_scans;
+    anim_tick(&ad, SPAWN_POS, (v3){{0, 0, 0}}, 0.0f, 0.0f,
+              1, 0, 0.0f, 0, 0.0f, dec_lean, 0, 1, WPN_AR, 1);
+    if (g_lean_step_scans - scan_d0 > 1) lean_scan_ok = 0;
+    int sf = af.lean_step_k > 1e-4f ? 1 : af.lean_step_k < -1e-4f ? -1 : 0;
+    int sd = ad.lean_step_k > 1e-4f ? 1 : ad.lean_step_k < -1e-4f ? -1 : 0;
+    // Control solve: remove only the new presentation step from otherwise identical
+    // states. The isolated delta identifies this feature's share, while the plan's
+    // 5 mm contract remains hard on the complete solved ankle as well.
+    anim_t zf = af, zd = ad;
+    zf.lean_step_off = zd.lean_step_off = (v3){{0, 0, 0}};
+    zf.lean_step_k = zd.lean_step_k = 0.0f;
+    skel_solve(&zf, SPAWN_POS, 0.0f, 0.0f, WPN_AR, 1, SKEL_POSE_ONLY);
+    skel_solve(&zd, SPAWN_POS, 0.0f, 0.0f, WPN_AR, 1, SKEL_POSE_ONLY);
+    for (int side = 0; side < 2; side++) {
+      float total = v3_len(v3_sub(af.pose.ankle[side], ad.pose.ankle[side]));
+      if (total > max_total_ankle) {
+        max_total_ankle = total;
+        max_total_tick = i;
+      }
+      v3 add_f = v3_sub(af.pose.ankle[side], zf.pose.ankle[side]);
+      v3 add_d = v3_sub(ad.pose.ankle[side], zd.pose.ankle[side]);
+      float added = v3_len(v3_sub(add_f, add_d));
+      if (added > max_ankle) {
+        max_ankle = added;
+        max_tick = i;
+        max_side = side;
+        max_active_full = sf;
+        max_active_dec = sd;
+        max_full_lean = lean;
+        max_dec_lean = dec_lean;
+        max_full_step = af.lean_step_k;
+        max_dec_step = ad.lean_step_k;
+      }
+    }
+    if (sf > 0) seen_f |= 1; else if (sf < 0) seen_f |= 2;
+    if (sd > 0) seen_d |= 1; else if (sd < 0) seen_d |= 2;
+    if (sf && sd && sf != sd &&
+        fminf(v3_len(af.lean_step_off), v3_len(ad.lean_step_off)) >= 0.005f)
+      side_mismatch++;
+    if (memcmp(af.foot, foot_f, sizeof foot_f) || af.phase != phase_f ||
+        memcmp(ad.foot, foot_d, sizeof foot_d) || ad.phase != phase_d)
+      plant_flicker++;
+  }
+  int extra_events = g_num_events;
+  int step_events = 0;
+  for (int i = 0; i < g_num_events; i++)
+    if (g_events[i].type == EV_STEP) step_events++;
+  int lean_ok = max_ankle <= 0.005f && max_total_ankle <= 0.005f &&
+                side_mismatch == 0 &&
+                seen_f == 3 && seen_d == 3 && plant_flicker == 0 &&
+                extra_events == 0 && step_events == 0 && g_ev_drops == 0 &&
+                lean_scan_ok;
+
+  memcpy(g_events, ev_save, sizeof ev_save);
+  g_num_events = nev_save;
+  g_ev_peak = peak_save;
+  g_ev_drops = drops_save;
+  g_predicting = predicting_save;
+  g_prediction_replay = replay_save;
+  g_online = online_save;
+  g_local_ent = local_save;
+  memcpy(g_match.noise, noise_save, sizeof noise_save);
+  g_tick = tick_save;
+  g_lean_step_scans = scans_save;
+  g_lean_step_want_off = want_save;
+  g_lean_step_got_off = got_save;
+  g_lean_step_ratio = ratio_save;
+  g_lean_step_side = diag_side_save;
+
   printf("netanim n=%ld stride=%d plants_full=%d plants_decimated=%d "
-         "(counting plants, not frames)\n",
-         n, stride, plants_full, plants_dec);
+         "lean_ticks=%d ankle_add=%.2fmm@T%d/%s active_at_worst=%d/%d "
+         "ankle_total=%.2fmm@T%d lean=%.3f/%.3f step=%+.3f/%+.3f "
+         "active=%d/%d side_mismatch=%d "
+         "plant_flicker=%d events=%d steps=%d scan=%d %s\n",
+         n, stride, plants_full, plants_dec, lean_n,
+         (double)(max_ankle * 1000.0f), max_tick, max_side == 1 ? "R" : "L",
+         max_active_full, max_active_dec,
+         (double)(max_total_ankle * 1000.0f), max_total_tick,
+         (double)max_full_lean, (double)max_dec_lean,
+         (double)max_full_step, (double)max_dec_step,
+         seen_f, seen_d, side_mismatch,
+         plant_flicker, extra_events, step_events, lean_scan_ok,
+         lean_ok ? "ok" : "FAIL");
+  if (!lean_ok) exit(1);
 }
 
 static void cmd_netfill(sim_ctx_t *s) {
@@ -2206,7 +2911,9 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"padsync", cmd_padsync}, {"netfuzz", cmd_netfuzz},
   {"netdeath", cmd_netdeath}, {"netclient", cmd_netclient},
   {"figbury", cmd_figbury}, {"figm", cmd_figm},
-  {"pos", cmd_pos}, {"vmtrig", cmd_vmtrig}, {"flinch", cmd_flinch},
+  {"pos", cmd_pos}, {"vmtrig", cmd_vmtrig},
+  {"vmtrigfacet", cmd_vmtrigfacet}, {"vmfiref1c", cmd_vmfiref1c},
+  {"flinch", cmd_flinch},
   {"wait", cmd_wait}, {"tap", cmd_tap}, {"look", cmd_look},
   {"wheel", cmd_wheel}, {"key", cmd_key}, {"weapon", cmd_weapon},
   {"aim", cmd_aim}, {"warp", cmd_warp}, {"aimbot", cmd_aimbot},
@@ -2215,7 +2922,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"lean", cmd_lean}, {"cfg", cmd_cfg}, {"budget", cmd_budget},
   {"netstat", cmd_netstat}, {"updinfo", cmd_updinfo}, {"updcheck", cmd_updcheck},
   {"sun", cmd_sun}, {"mood", cmd_mood}, {"scat", cmd_scat}, {"uistat", cmd_uistat},
-  {"vmsight", cmd_vmsight}, {"parity", cmd_parity},
+  {"vmsight", cmd_vmsight}, {"vmscope", cmd_vmscope}, {"parity", cmd_parity},
   {"rag", cmd_rag}, {"ragsoak", cmd_ragsoak}, {"ragx", cmd_ragx},
   {"figv", cmd_figv}, {"figcheck", cmd_figcheck}, {"kine", cmd_kine},
   {"skel", cmd_skel}, {"vmhand", cmd_vmhand}, {"vmorbit", cmd_vmorbit},
@@ -2223,15 +2930,19 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"hud", cmd_hud}, {"showfps", cmd_showfps}, {"trace", cmd_trace},
   {"shot", cmd_shot}, {"capture", cmd_capture}, {"cam", cmd_cam},
   {"camaim", cmd_camaim}, {"cambot", cmd_cambot}, {"camorbit", cmd_camorbit},
-  {"home", cmd_home}, {"menu", cmd_menu}, {"cursor", cmd_cursor}, {"mdown", cmd_mdown},
+  {"homeui", cmd_homeui}, {"home", cmd_home}, {"menu", cmd_menu},
+  {"cursor", cmd_cursor}, {"mdown", cmd_mdown},
   {"mup", cmd_mup}, {"uiframe", cmd_uiframe}, {"appframe", cmd_appframe}, {"pad", cmd_pad},
   {"padscan", cmd_padscan}, {"padlook", cmd_padlook}, {"padstat", cmd_padstat}, {"padcurve", cmd_padcurve},
   {"nav", cmd_nav}, {"netloop", cmd_netloop}, {"netpack", cmd_netpack}, {"netpredict", cmd_netpredict},
   {"netlagcomp", cmd_netlagcomp}, {"netstall", cmd_netstall}, {"netanim", cmd_netanim}, {"netfill", cmd_netfill},
-  {"netcarry", cmd_netcarry}, {"netfigure", cmd_netfigure}, {"netleave", cmd_netleave}, {"tele", cmd_tele}, {"humans", cmd_humans}, {"localent", cmd_localent},
+  {"netcarry", cmd_netcarry}, {"netfigure", cmd_netfigure},
+  {"recoil", cmd_recoil}, {"netrecoil", cmd_netrecoil}, {"vmframe", cmd_vmframe},
+  {"netleave", cmd_netleave}, {"tele", cmd_tele}, {"humans", cmd_humans}, {"localent", cmd_localent},
   {"tacstat", cmd_tacstat}, {"netdebug", cmd_netdebug}, {"dev", cmd_dev}, {"bots", cmd_bots},
   {"skill", cmd_skill}, {"fraglimit", cmd_fraglimit}, {"restart", cmd_restart}, {"sfxlog", cmd_sfxlog},
   {"sfx", cmd_sfx}, {"mixdown", cmd_mixdown}, {"mapcheck", cmd_mapcheck},
+  {"leanstep", cmd_leanstep},
   {NULL, NULL},
 };
 
@@ -2256,25 +2967,54 @@ static void run_script(char *script, sim_ctx_t *s) {
       // `cross` is tracked as its own maximum over the sweep and deliberately kept OUT
       // of the score that picks the worst state.
       int worst_cross = 0;
-      int worst_score = -1, tris = 0;
+      int worst_score = -1, tris = 0, structural_bad = 0;
+      fchk_res_t structural_max = {0};
       const char *worst_state = "";
       char label[64];
+      int recoil_states = 0;
       for (int wi = 0; wi < WPN_COUNT; wi++) {
         tmp.wp.cur = wi;
         for (int a = 0; a <= 10; a++) {
-          // Phases 4/5 are a full lean each way, at rest and mid-ramp (the lag term is
+          // Base phases 3/4 are a full lean each way, at rest and mid-ramp (the lag term is
           // only nonzero while the lean is MOVING, so a settled lean would never
-          // exercise it).
-          for (int phase = 0; phase < 7; phase++) {
+          // exercise it). At Hip and full ADS, append the five frames sampled by
+          // vmtrig from the real presentation impulses and springs: back/lift peaks,
+          // both learned side signs and the first return overshoot. No authored recoil
+          // amplitude exists in this proof.
+          int nstate = 6 + ((a == 0 || a == 10) ? 5 : 0);
+          for (int state = 0; state < nstate; state++) {
+            int phase = state < 6 ? state : 0;
+            int rec = state - 6;
             tmp.wp.ads_lin = (float)a / 10.0f;
             tmp.wp.ads_s = tmp.wp.prev_ads_s = smooth01(tmp.wp.ads_lin);
             tmp.wp.reload_t = phase == 1 ? WPN_DEF[wi].reload_ticks / 2
-                            : phase == 6 ? (WPN_DEF[wi].reload_ticks * 73) / 100
+                            : phase == 5 ? (WPN_DEF[wi].reload_ticks * 73) / 100
                             : 0;
             tmp.wp.switch_t = phase == 2 ? GUN_SWITCH_TICKS / 2 : 0;
             tmp.wp.prev_switch = (float)tmp.wp.switch_t / GUN_SWITCH_TICKS;
-            tmp.vm.kick = tmp.vm.prev_kick = phase == 3 ? 1.0f : 0.0f;
-            tmp.lean = tmp.prev_lean = phase == 4 ? 1.0f : phase == 5 ? -1.0f : 0.0f;
+            tmp.vm.kick_back = tmp.vm.prev_kick_back = tmp.vm.kick_back_v = 0.0f;
+            tmp.vm.kick_lift = tmp.vm.prev_kick_lift = tmp.vm.kick_lift_v = 0.0f;
+            tmp.vm.kick_side = tmp.vm.prev_kick_side = tmp.vm.kick_side_v = 0.0f;
+            const char *tag = phase == 1 ? "reload" : phase == 2 ? "swap" :
+                              phase == 3 ? "lean_r" : phase == 4 ? "lean_l" :
+                              phase == 5 ? "magout" : "idle";
+            if (state >= 6) {
+              static const int WHICH[5] = {
+                VMTRIG_REC_BACK, VMTRIG_REC_LIFT, VMTRIG_REC_SIDE_POS,
+                VMTRIG_REC_SIDE_NEG, VMTRIG_REC_OVERSHOOT,
+              };
+              static const char *const NAME[5] = {
+                "back_peak", "lift_peak", "side_pos", "side_neg", "overshoot",
+              };
+              vmtrig_recoil_state_t rs = vmtrig_recoil_sample(
+                  0, wi, tmp.wp.ads_s, WHICH[rec]);
+              tmp.vm.kick_back = tmp.vm.prev_kick_back = rs.back;
+              tmp.vm.kick_lift = tmp.vm.prev_kick_lift = rs.lift;
+              tmp.vm.kick_side = tmp.vm.prev_kick_side = rs.side;
+              tag = NAME[rec];
+              recoil_states++;
+            }
+            tmp.lean = tmp.prev_lean = phase == 3 ? 1.0f : phase == 4 ? -1.0f : 0.0f;
             tmp.vm.lean_lag = tmp.vm.prev_lean_lag = tmp.lean * 0.45f;
             // Probes on, exactly as figcheck does it: a bare triangle index is not a
             // diagnosis. `vm_gun`/`vm_hands` is the granularity vm_build publishes, and
@@ -2282,35 +3022,40 @@ static void run_script(char *script, sim_ctx_t *s) {
             // the offending pair inside the weapon, or is it a hand closing on it.
             g_nprobe = 0;
             g_probe_on = 1;
-            vm_build(&tmp, 1.0f, eye, rgt, upv, fwd);
+            vm_build(&tmp, 1.0f, eye, rgt, upv, fwd, 1.0f);
             probe(NULL);
             g_probe_on = 0;
             fchk_res_t r = fchk_scene();
             tris = r.tris;
             int sc = r.open * 100 + r.flip * 100 + r.dup * 100 + r.degen * 100 +
                      r.zfight * 10 + r.near;
+            structural_bad |= r.open || r.flip || r.dup || r.zfight || r.degen;
+            if (r.open > structural_max.open) structural_max.open = r.open;
+            if (r.flip > structural_max.flip) structural_max.flip = r.flip;
+            if (r.dup > structural_max.dup) structural_max.dup = r.dup;
+            if (r.zfight > structural_max.zfight) structural_max.zfight = r.zfight;
+            if (r.degen > structural_max.degen) structural_max.degen = r.degen;
             if (r.cross > worst_cross) worst_cross = r.cross;
             if (sc > worst_score) {
               worst_score = sc;
               worst = r;
               snprintf(label, sizeof label, "%s ads=%.1f %s", WPN_DEF[wi].prefix,
-                       (double)tmp.wp.ads_lin,
-                       phase == 1 ? "reload" : phase == 2 ? "swap" :
-                       phase == 3 ? "kick" : phase == 4 ? "lean_r" :
-                       phase == 5 ? "lean_l" : phase == 6 ? "magout" : "idle");
+                       (double)tmp.wp.ads_lin, tag);
               worst_state = label;
             }
           }
         }
       }
       printf("vmcheck tris=%d worst=[%s] open=%d flip=%d dup=%d zfight=%d "
-             "near=%d cross=%d degen=%d\n", tris, worst_state, worst.open,
-             worst.flip, worst.dup, worst.zfight, worst.near, worst_cross,
-             worst.degen);
+             "near=%d cross=%d degen=%d recoil_states=%d\n", tris, worst_state,
+             structural_max.open, structural_max.flip, structural_max.dup,
+             structural_max.zfight, worst.near, worst_cross,
+             structural_max.degen, recoil_states);
+      if (structural_bad || recoil_states != WPN_COUNT * 2 * 5)
+        exit(1);
     } else {
       fprintf(stderr, "script: unknown command '%s'\n", t);
       exit(1);
     }
   }
 }
-

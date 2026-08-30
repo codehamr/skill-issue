@@ -2,9 +2,11 @@
 // sim/skeleton.inc  —  anim_tick, skel_solve, anim_carry_floor. Do NOT
 // decompose anim_tick/skel_solve further: a verbatim block move changes FP
 // rounding under -O3 -ffast-math -flto (measured: one hoist flipped flank_pct
-// by a full tick). skel_solve advances no clock, so it may be RE-RUN on a pose
-// whose blends changed mid-tick — the shot's event does exactly that.
-// Proof: skel, kine, figm, netfigure. One TU: included once by game.c, in
+// by a full tick). SKEL_POSE_ONLY advances no state, so event/proof restaging may
+// RE-RUN a pose whose blends changed mid-tick — a shot does exactly that.
+// SKEL_ADVANCE_STATE mutates the persistent ground/ankle followers and belongs only
+// to anim_tick/reset.
+// Proof: skel, kine, figm, netfigure, vmframe. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // =============================================================================
 // ---------------------------------------------------------------------------
@@ -43,7 +45,8 @@
 // FIRST-PERSON arms (vm_build) anchor their shoulders and clamp their reach
 // off the same numbers, and a retune that moved only one copy would silently
 // split the FP man from the 3P one.
-#define ANIM_BLADE       0.52f
+#define ANIM_BLADE       0.38f
+#define ADS_SEAT_BACK_M  0.135f
 #define ANIM_ARM_REACH_K 0.96f
 // Swing fraction of the FULL cycle per foot (stance = 1 - duty).
 #define ANIM_DUTY     0.40f   // walking
@@ -55,6 +58,253 @@
 #define ANIM_DUTY_MAX 0.88f   // never leave a foot less than 12% of the cycle on
                               // the ground — below that a plant is a touch
 #define ANIM_RUN_REF  5.5f    // m/s that counts as "full run" for pose scaling
+
+// Presentation-only Lean step: 80/25 mm foot travel with a 30 mm local
+// weight-transfer drop. The small same-direction hip follow shortens the active leg
+// enough for 8--15 degrees of extra knee bend. These values are published beside the
+// state and diagnostics so the harness proves production values rather than copies.
+#define LEAN_STEP_OUT_M       0.080f
+#define LEAN_STEP_FWD_M       0.025f
+#define LEAN_STEP_HIP_DROP_M  0.030f
+#define LEAN_STEP_HIP_FOLLOW_M 0.032f
+#define LEAN_STEP_CROUCH_K    0.52f
+// The toe-out boot needs 72 mm of radial clearance at its widest projected edge. This
+// module owns the 80 mm Lean-only floor; the renderer applies no second correction.
+#define LEAN_STEP_MARGIN_M    0.080f
+#define LEAN_STEP_RESPONSE_HZ 3.5f
+#define LEAN_PRESENT_HZ      40.0f
+
+// Presentation recoil has one authored source for both views. Impulses are velocities:
+// the event tick changes no pose value, then the fixed-tick springs produce a fast
+// shoulder compression, a later muzzle rise and a very small deterministic side beat.
+// Gameplay recoil/spread and their RNG stream never read this table.
+typedef struct {
+  // Unit gun-space human targets for one FP hand. Hip and ADS are explicit even
+  // where they currently agree, so a later sight retune cannot silently change the
+  // firing grip. Reload and bolt bearings/offsets are bounded end targets, blended
+  // only by the production gunanim lobes.
+  v3 bearing_hip, bearing_ads, bearing_reload, bearing_bolt;
+  float axial_hip, axial_ads, lift_hip, lift_ads;
+  float reload_axial, reload_lift, bolt_axial, bolt_lift;
+  float ext_hip, ext_ads, dev_hip, dev_ads;
+  float bias_hip, bias_ads, bias_reload;
+} gun_hand_pose_t;
+
+typedef struct {
+  float vm_back_v, vm_lift_v, vm_side_v;
+  float body_back_v, body_lift_v, body_side_v;
+  float ads_k;
+} recoil_pose_t;
+
+static const recoil_pose_t RECOIL_POSE[WPN_COUNT] = {
+  [WPN_AR] = {1.25f, 0.95f, 0.20f, 3.10f, 1.15f, 0.24f, 0.72f},
+  [WPN_SR] = {2.25f, 2.90f, 0.32f, 5.30f, 3.00f, 0.36f, 0.65f},
+};
+
+// Solved against the 120 Hz semi-implicit recurrence: back peaks on tick 3 and lift
+// on tick 5, both settle inside ~200 ms with a small first overshoot.
+#define RECOIL_BACK_K 1200.0f
+#define RECOIL_BACK_C   44.0f
+#define RECOIL_LIFT_K  600.0f
+#define RECOIL_LIFT_C   36.0f
+#define RECOIL_SIDE_K 1000.0f
+#define RECOIL_SIDE_C   45.0f
+
+static const recoil_pose_t *recoil_pose(int wpn) {
+  return &RECOIL_POSE[wpn >= 0 && wpn < WPN_COUNT ? wpn : WPN_AR];
+}
+
+// Stateless presentation variation. The pattern chooses the learnable side whenever
+// it has one; its zero steps use a hash bit. A different hash byte adds only +/-15%
+// amplitude, with no draw from either gameplay RNG stream.
+static uint32_t recoil_hash(int src, int shot, int wpn) {
+  uint32_t x = (uint32_t)src * 0x9e3779b9u ^
+               (uint32_t)shot * 0x85ebca6bu ^
+               (uint32_t)wpn * 0xc2b2ae35u ^ 0x27d4eb2fu;
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  return x ^ (x >> 16);
+}
+
+static float recoil_side_sample(int src, int shot, int wpn) {
+  uint32_t h = recoil_hash(src, shot, wpn);
+  float p = GUN_PATTERN[(uint32_t)shot & 31u];
+  float sign = p > 0.001f ? 1.0f : p < -0.001f ? -1.0f
+                                                   : (h & 1u) ? 1.0f : -1.0f;
+  float amp = 0.85f + (float)((h >> 8) & 255u) * (0.30f / 255.0f);
+  return sign * amp;
+}
+
+static float recoil_brace(const recoil_pose_t *r, float ads) {
+  return 1.0f + (r->ads_k - 1.0f) * f_clamp(ads, 0.0f, 1.0f);
+}
+
+// The local view and the event-fed body deliberately share the same source values,
+// bracing rule and stateless side sample. Proofs call these two entry points too, so
+// they can exercise production impulses without copying presentation constants.
+static void recoil_vm_impulse(vm_t *vm, int src, int shot, int wpn, float ads) {
+  const recoil_pose_t *rp = recoil_pose(wpn);
+  float brace = recoil_brace(rp, ads);
+  float side = recoil_side_sample(src, shot, wpn);
+  vm->kick_back_v += rp->vm_back_v * brace;
+  vm->kick_lift_v += rp->vm_lift_v * brace;
+  vm->kick_side_v += rp->vm_side_v * brace * side;
+}
+
+static void recoil_spring(float *value, float *velocity, float k, float c) {
+  // Idle figures dominate a normal frame. Preserve the exact zero fixed point
+  // without paying three spring integrations per figure and tick.
+  if (*value == 0.0f && *velocity == 0.0f) return;
+  *velocity += (-k * *value - c * *velocity) * TICK_DT;
+  *value += *velocity * TICK_DT;
+}
+
+// One weapon-aware human/weapon relationship for both views. Vectors use
+// {gun-right, gun-up, gun-forward}; their metres are authored at unit model scale and
+// every consumer supplies its scale explicitly. Angles and pole directions do not
+// scale. GUN_HOLD remains the sole source for the actual grip cylinders -- these values
+// describe the wrists and arms around those contacts, never a second weapon surface.
+typedef struct {
+  float carry_down, carry_down_run;
+  float carry_cross, carry_cross_run;
+  v3 butt_pin;
+  float carry_axial, carry_right, carry_up, carry_body_forward;
+  v3 trigger_wrist;
+  v3 trigger_wrist_idle_delta, trigger_wrist_slide_delta;
+  v3 support_wrist_ready, support_wrist_delta;
+  v3 bolt_wrist;
+  v3 reload_route;
+  v3 trigger_pole, support_pole;
+  v3 trigger_pole_ads_delta, trigger_pole_idle_delta, trigger_pole_slide_delta;
+  gun_hand_pose_t fp_hand[2];
+  // Relative FP low-ready composition: camera right/up/forward metres followed by
+  // pitch/yaw/roll radians in the vm_stage_springs rotation convention. It is read
+  // only through the shared ready blend and is therefore exactly zero in ADS/busy.
+  v3 fp_low_pos, fp_low_ang;
+} gun_pose_desc_t;
+
+#define GPOSE_M(v) ((v) * (1.0f / GUN_GIRTH_3P))
+static const gun_pose_desc_t GUN_POSE[WPN_COUNT] = {
+  [WPN_AR] = {
+    .carry_down = 0.60f, .carry_down_run = 0.22f,
+    .carry_cross = 0.50f, .carry_cross_run = 0.10f,
+    // These exact inverse-scale floats make the explicit x1.05 round trip reproduce
+    // the authored 3P AR coefficients bit-identically.
+    .butt_pin = {{0.0f, GPOSE_M(-0.050f), -0x1.c86954p-3f}},
+    .carry_axial = GPOSE_M(0.040f), .carry_right = GPOSE_M(0.165f),
+    .carry_up = GPOSE_M(0.070f), .carry_body_forward = GPOSE_M(0.065f),
+    .trigger_wrist = {{GPOSE_M(0.029f), GPOSE_M(-0.137f), GPOSE_M(-0.080f)}},
+    .trigger_wrist_slide_delta = {{0.0f, GPOSE_M(0.022f), 0.0f}},
+    .support_wrist_ready = {{GPOSE_M(-0.075f), GPOSE_M(-0.073f), GPOSE_M(0.190f)}},
+    .support_wrist_delta = {{0.0f, GPOSE_M(0.050f), GPOSE_M(0.060f)}},
+    .reload_route = {{-0.086f, 0.0f, 0.020f}},
+    .trigger_pole = {{1.0f, -1.6f, 0.8f}},
+    .trigger_pole_ads_delta = {{0.30f, 1.30f, -0.98f}},
+    .trigger_pole_idle_delta = {{0.0f, 0.0f, -1.0f}},
+    .support_pole = {{-0.60f, -0.95f, -0.10f}},
+    .fp_hand = {
+      [0] = { // firing hand; the renderer's named enum is defined later
+        .bearing_hip = {{0.34f, 0.16f, -0.92f}},
+        .bearing_ads = {{0.34f, 0.16f, -0.92f}},
+        .bearing_reload = {{0.34f, 0.16f, -0.92f}},
+        .bearing_bolt = {{0.34f, 0.16f, -0.92f}},
+        .axial_hip = -0.048f, .axial_ads = -0.048f,
+        .lift_hip = 0.070f, .lift_ads = 0.070f,
+        .ext_hip = 20.0f * DEG2RAD, .ext_ads = 20.0f * DEG2RAD,
+        .dev_hip = 15.0f * DEG2RAD, .dev_ads = 15.0f * DEG2RAD,
+        .bias_hip = -0.16f, .bias_ads = -0.16f,
+      },
+      [1] = { // support hand
+        .bearing_hip = {{-0.55f, -0.84f, 0.0f}},
+        .bearing_ads = {{-0.55f, -0.84f, 0.0f}},
+        .bearing_reload = {{-0.82f, 0.0f, 0.57f}},
+        .bearing_bolt = {{-0.55f, -0.84f, 0.0f}},
+        .axial_hip = -0.046f, .axial_ads = -0.046f,
+        .lift_hip = 0.066f, .lift_ads = 0.066f,
+        .reload_axial = 0.010f, .reload_lift = 0.004f,
+        .ext_hip = 10.0f * DEG2RAD, .ext_ads = 10.0f * DEG2RAD,
+        .dev_hip = -6.0f * DEG2RAD, .dev_ads = -6.0f * DEG2RAD,
+        .bias_hip = -0.30f, .bias_ads = -0.30f, .bias_reload = -0.60f,
+      },
+    },
+  },
+  [WPN_SR] = {
+    // The long rifle stays close to the shoulder pocket at a calm 20-degree
+    // depression and 15-degree cross-body angle.
+    .carry_down = 20.0f * DEG2RAD, .carry_down_run = 7.5f * DEG2RAD,
+    .carry_cross = 15.0f * DEG2RAD, .carry_cross_run = 3.0f * DEG2RAD,
+    .butt_pin = {{0.0f, GPOSE_M(-0.070f), GPOSE_M(-0.234f)}},
+    .carry_axial = GPOSE_M(0.040f), .carry_right = GPOSE_M(0.165f),
+    .carry_up = GPOSE_M(0.070f), .carry_body_forward = GPOSE_M(0.065f),
+    // The SR grip and fore-end sit lower/rearward than the AR's. These bearings keep
+    // the same palm relationship while giving the two elbow solves their own poles.
+    .trigger_wrist = {{GPOSE_M(0.029f), GPOSE_M(-0.144f), GPOSE_M(-0.054f)}},
+    .trigger_wrist_idle_delta = {{0.0f, 0.0f, GPOSE_M(-0.012f)}},
+    .trigger_wrist_slide_delta = {{0.0f, GPOSE_M(0.064f), GPOSE_M(-0.006f)}},
+    .support_wrist_ready = {{GPOSE_M(-0.075f), GPOSE_M(-0.099f), GPOSE_M(0.181f)}},
+    .support_wrist_delta = {{0.0f, GPOSE_M(0.050f), 0x1.d41d42p-6f}},
+    .bolt_wrist = {{GPOSE_M(0.090f), GPOSE_M(0.060f), GPOSE_M(0.030f)}},
+    .reload_route = {{-0.086f, 0.0f, 0.020f}},
+    .trigger_pole = {{-3.4f, -2.5f, -0.7f}},
+    .trigger_pole_ads_delta = {{4.70f, 2.20f, 0.52f}},
+    .trigger_pole_idle_delta = {{6.0f, 0.0f, -2.0f}},
+    .trigger_pole_slide_delta = {{8.0f, 3.0f, 0.0f}},
+    .support_pole = {{-0.78f, -0.62f, -0.12f}},
+    .fp_hand = {
+      [0] = { // firing hand; the renderer's named enum is defined later
+        .bearing_hip = {{0.34f, 0.16f, -0.92f}},
+        .bearing_ads = {{0.34f, 0.16f, -0.92f}},
+        .bearing_reload = {{0.34f, 0.16f, -0.92f}},
+        .bearing_bolt = {{0.0f, 0.75f, 0.66f}},
+        .axial_hip = -0.048f, .axial_ads = -0.048f,
+        .bolt_axial = 0.118f,
+        .lift_hip = 0.070f, .lift_ads = 0.070f,
+        .ext_hip = 22.0f * DEG2RAD, .ext_ads = 22.0f * DEG2RAD,
+        .dev_hip = 12.0f * DEG2RAD, .dev_ads = 12.0f * DEG2RAD,
+        .bias_hip = -0.18f, .bias_ads = -0.18f,
+      },
+      [1] = { // support hand
+        .bearing_hip = {{-0.55f, -0.84f, 0.0f}},
+        .bearing_ads = {{-0.55f, -0.84f, 0.0f}},
+        .bearing_reload = {{-0.82f, 0.0f, 0.57f}},
+        .bearing_bolt = {{-0.55f, -0.84f, 0.0f}},
+        .axial_hip = -0.046f, .axial_ads = -0.046f,
+        .lift_hip = 0.066f, .lift_ads = 0.066f,
+        .reload_axial = 0.010f, .reload_lift = 0.004f,
+        .ext_hip = 14.0f * DEG2RAD, .ext_ads = 14.0f * DEG2RAD,
+        .dev_hip = -8.0f * DEG2RAD, .dev_ads = -8.0f * DEG2RAD,
+        .bias_hip = -0.34f, .bias_ads = -0.34f, .bias_reload = -0.60f,
+      },
+    },
+    // The SR FP low-ready composition is a deliberately small relative offset, not
+    // the 20/15-degree third-person carriage.
+    .fp_low_pos = {{-0.006f, -0.010f, -0.004f}},
+    .fp_low_ang = {{-3.0f * DEG2RAD, 1.5f * DEG2RAD, -1.0f * DEG2RAD}},
+  },
+};
+#undef GPOSE_M
+
+static const gun_pose_desc_t *gun_pose_desc(int wpn) {
+  return &GUN_POSE[wpn >= 0 && wpn < WPN_COUNT ? wpn : WPN_AR];
+}
+
+static v3 gun_pose_offset(v3 right, v3 up, v3 forward, v3 authored, float scale) {
+  return v3_add(v3_scale(forward, authored.z * scale),
+         v3_add(v3_scale(up, authored.y * scale),
+                v3_scale(right, authored.x * scale)));
+}
+
+// One C1 local-space detour for FP contact, 3P contact and the 3P wrist: zero value
+// and slope at either live grip, with a flat maximum through the detached travel.
+static v3 gun_reload_route_offset(const gun_pose_desc_t *erg,
+                                  v3 right, v3 up, v3 forward,
+                                  float hand01, float scale) {
+  float edge = fminf(hand01, 1.0f - hand01);
+  float route = smooth01(f_clamp(edge / 0.10f, 0.0f, 1.0f));
+  return gun_pose_offset(right, up, forward, erg->reload_route, scale * route);
+}
 
 typedef struct {
   // world-space joint positions first (a death topple rotates these around
@@ -183,7 +433,12 @@ typedef struct {
   float   fall;              // most negative vel.y of the current air time
   float   brace;             // 0..1 preparation for a landing that is coming
   float   lean_f, lean_r;    // fwd/right acceleration lean (rad)
-  float   fire_k;            // gun recoil kick, decays
+  float   fire_k;            // shot/carry-floor latch, decays; not recoil distance
+  // Third-person shoulder response. prev_pose, rather than duplicate prev scalars,
+  // interpolates the solved gun and hands for rendering.
+  float   recoil_back, recoil_back_v;  // m toward the shoulder
+  float   recoil_lift, recoil_lift_v;  // rad of muzzle rise
+  float   recoil_side, recoil_side_v;  // m, signed in gun-right
   float   hit_k;             // TAKING a round: body flinch impulse, decays
   float   hit_s;             // ...and what the POSE sees, chasing it: assigned
                              // outright the impulse stepped the chest 42 mm and
@@ -234,15 +489,49 @@ typedef struct {
   v3      ant_p, ant_v;      // antenna follower: offset + velocity (2nd order)
   float   yaw_prev;          // last tick's aim yaw for the rate estimate
   float   ads_s;             // eased shouldered-weapon blend, 0 = hip, 1 = aimed
-  float   ready_s;           // eased carry state: 1 = stock in the shoulder,
-                             // 0 = low-ready / sprint carry (muzzle depressed)
+  float   ready_s, prev_ready_s; // eased carry state and render-interpolation twin:
+                                 // 1 = stock in shoulder, 0 = low-ready
   float   lean_s;            // eased lateral body lean, -1 = left .. +1 = right
+  v3      lean_step_off;     // presentation ankle offset; never written to afoot_t
+  float   lean_step_k;       // signed achieved lean: -left .. +right
   float   stance[2];         // 0..1 progress through the current foot contact
   float   fpitch[2];         // eased ankle pitch (+ = toe up), keeps the heel
                              // strike continuous across the swing->stance seam
   afoot_t foot[2];
   pose_t  pose, prev_pose;   // solved joints, cur + prev tick for interpolation
 } anim_t;
+
+// Last-solve diagnostics plus a monotonic call counter. anim_tick writes all of these
+// from the same clamp result that drives the pose; skel_solve and render never scan.
+static long  g_lean_step_scans;
+static v3    g_lean_step_want_off, g_lean_step_got_off;
+static float g_lean_step_ratio;
+static int   g_lean_step_side = -1;
+
+static void recoil_body_impulse(anim_t *a, int src, int shot, int wpn, float ads) {
+  const recoil_pose_t *rp = recoil_pose(wpn);
+  float brace = recoil_brace(rp, ads);
+  float side = recoil_side_sample(src, shot, wpn);
+  a->recoil_back_v += rp->body_back_v * brace;
+  a->recoil_lift_v += rp->body_lift_v * brace;
+  a->recoil_side_v += rp->body_side_v * brace * side;
+}
+
+// A low-ready lobe is allowed only by real state, never by a transient gun-animation
+// curve. The helper is pure so server, prediction, remote presentation and proofs make
+// the same decision. A plain ready intent is deliberately NOT a hard gate: it is the
+// target of ready_s and must remain visible as the fast raise transition. Cooldown
+// includes the SR bolt cycle; fire_k covers the immediate carry floor before that
+// clock can be observed by a viewer.
+static int gun_pose_idle_ok(const weapon_t *w, const anim_t *a, v3 vel,
+                            int grounded, int slide) {
+  int cur = w->cur >= 0 && w->cur < WPN_COUNT ? w->cur : WPN_AR;
+  float hspd2 = vel.x * vel.x + vel.z * vel.z;
+  return grounded && !slide && hspd2 <= 0.20f * 0.20f &&
+         !w->ads_want && w->ads_s <= 0.01f &&
+         w->reload_t == 0 && w->switch_t == 0 && w->cool[cur] == 0 &&
+         a->fire_k <= 0.01f;
+}
 
 
 // Clamp a foot target so it never pokes into world geometry: cast from the body center
@@ -281,6 +570,87 @@ static v3 foot_clamp_m(v3 base, v3 tgt, float margin) {
 }
 
 static v3 foot_clamp_world(v3 base, v3 tgt) { return foot_clamp_m(base, tgt, 0.06f); }
+
+typedef struct {
+  v3 p;
+  int escaped;
+} lean_foot_sweep_t;
+
+// Sweep the ACTUAL rendered ankle chord, not another radial proxy from the body.
+// The renderer linearly interpolates prev_pose -> pose; consequently this segment is
+// the only segment whose clearance can make that interpolation a construction
+// guarantee. A synthetic proof may introduce a wall around the previously rendered
+// endpoint. In that discontinuous case `escaped` returns the first point outside the
+// union of the margin-expanded boxes and the caller snaps to it; ordinary/static
+// geometry starts outside and retains the motion ease. One call is one solid traversal.
+static lean_foot_sweep_t lean_foot_sweep(v3 from, v3 to, float margin) {
+  lean_foot_sweep_t out = {.p = to, .escaped = 0};
+  v3 o = from;
+  v3 d = v3_sub(to, from);
+  float len = v3_len(d);
+  g_lean_step_scans++;
+  if (len < 1e-6f) return out;
+  d = v3_scale(d, 1.0f / len);
+
+  // Intervals are collected during the single world traversal, then merged in local
+  // storage.  This also handles abutting boxes without rescanning the world.
+  float lo[MAX_SOLIDS], hi[MAX_SOLIDS];
+  int n = 0;
+  for (int i = 0; i < g_num_solids; i++) {
+    const solid_t *s = &g_solids[i];
+    float mn[3] = {s->min.x - margin, s->min.y - 1e-3f,
+                   s->min.z - margin};
+    float mx[3] = {s->max.x + margin, s->max.y + 1e-3f,
+                   s->max.z + margin};
+    float org[3] = {o.x, o.y, o.z}, dir[3] = {d.x, d.y, d.z};
+    float a = -1e30f, b = 1e30f;
+    int hit = 1;
+    for (int k = 0; k < 3; k++) {
+      if (fabsf(dir[k]) < 1e-8f) {
+        if (org[k] < mn[k] || org[k] > mx[k]) { hit = 0; break; }
+      } else {
+        float ta = (mn[k] - org[k]) / dir[k];
+        float tb = (mx[k] - org[k]) / dir[k];
+        if (ta > tb) { float tmp = ta; ta = tb; tb = tmp; }
+        if (ta > a) a = ta;
+        if (tb < b) b = tb;
+        if (a > b) { hit = 0; break; }
+      }
+    }
+    if (!hit || b < 0.0f || a > len) continue;
+    lo[n] = a;
+    hi[n] = b;
+    n++;
+  }
+  for (int i = 1; i < n; i++) {
+    float al = lo[i], ah = hi[i];
+    int j = i;
+    while (j > 0 && lo[j - 1] > al) {
+      lo[j] = lo[j - 1];
+      hi[j] = hi[j - 1];
+      j--;
+    }
+    lo[j] = al;
+    hi[j] = ah;
+  }
+
+  const float eps = 1e-4f;
+  if (n > 0 && lo[0] <= 0.0f && hi[0] >= 0.0f) {
+    float leave = hi[0];
+    for (int i = 1; i < n && lo[i] <= leave + eps; i++)
+      if (hi[i] > leave) leave = hi[i];
+    if (leave + eps <= len) {
+      out.p = v3_add(o, v3_scale(d, leave + eps));
+      out.escaped = 1;
+    }
+    return out;
+  }
+  if (n > 0 && lo[0] <= len) {
+    float stop = f_clamp(lo[0] - eps, 0.0f, len);
+    out.p = v3_add(o, v3_scale(d, stop));
+  }
+  return out;
+}
 
 // Distance from `p` straight down to the first surface under it, capped at `maxd`.
 static float ground_drop(v3 p, float maxd) {
@@ -365,9 +735,17 @@ static float anim_duty(const anim_t *a) {
   }
   return d;
 }
+enum { SKEL_POSE_ONLY, SKEL_ADVANCE_STATE };
+
 // Solve the full pose from the current animation state. base = feet-center
-// world position (the entity's physics origin), yaw/pitch = aim.
-static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
+// world position (the entity's physics origin), yaw/pitch = aim. Only the one
+// tick/reset owner may advance persistent followers; event anchors, renderer
+// diagnostics and counterfactual proofs re-solve the existing instant without
+// integrating sink, stance progress or ankle pitch a second time.
+static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
+                       int wpn, int idle_ok, int advance_state) {
+  const gun_pose_desc_t *erg = gun_pose_desc(wpn);
+  const float pose_scale = GUN_GIRTH_3P;
   pose_t *P = &a->pose;
   float ly = a->leg_yaw;
   v3 R = {{cosf(ly), 0, sinf(ly)}};
@@ -493,7 +871,8 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
       float have = hip.y - a->foot[i].pos.y;
       if (have > need) want = fmaxf(want, have - need);
     }
-    a->sink += (fminf(want, 0.13f) - a->sink) * ease_k(18.0f);
+    if (advance_state)
+      a->sink += (fminf(want, 0.13f) - a->sink) * ease_k(18.0f);
     pelvis.y -= a->sink;
   }
   // A ROUND LOW ON THE BODY PUSHES THE HIPS, NOT THE CHEST. The lever about the waist
@@ -560,11 +939,8 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // the head runs ~0.2 s of yaw rate ahead of the aim (capped ~14 deg).
   float hyaw = yaw + f_clamp(a->yaw_vel * 0.20f, -0.25f, 0.25f);
   v3 head_f = {{sinf(hyaw) * cosf(hp), sinf(hp), -cosf(hyaw) * cosf(hp)}};
-  // THE NECK GETS LONGER IN A SLIDE, and that is geometry rather than taste: the neck
-  // sits 0.10 along the spine and the skull 0.16 above it, both measured on an UPRIGHT
-  // spine, so reclining the trunk puts the skull ~50 mm lower over the chest — straight
-  // into the collar.
-  v3 head = v3_add(v3_add(neck, v3_scale(head_up, 0.16f + 0.022f * a->slide_s)),
+  // Keep the skull close to the collar while the torso reclines into a slide.
+  v3 head = v3_add(v3_add(neck, v3_scale(head_up, 0.16f + 0.006f * a->slide_s)),
                    v3_scale(head_f, 0.02f));
   // ...AND IT COMES FORWARD OUT OVER THE CHEST, which is the half lifting it could
   // never fix.
@@ -579,12 +955,15 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   weld_dn -= weld_dn * (0.85f * a->slide_s);
   head = v3_add(head, v3_add(v3_scale(U, weld_dn),
                     v3_add(v3_scale(Rc,   0.068f * a->ads_s),
-                           // 0.135, not 0.100: `figm weld` reports where along
-                           // the weapon the eye sits, and at 0.100 it was
-                           // 76 mm in front of the butt pad — a cheek on the
-                           // PAD rather than on the comb. 109 mm now, for both
-                           // rifles, which is what a length of pull is for.
-                           v3_scale(F,    0.135f * a->ads_s))));
+                           // Preserve the authored comb position, then move the
+                           // complete ADS complex backward along the real aim vector
+                           // below. The weapon uses the same ADS_SEAT_BACK_M through
+                           // carry_axial, so eye relief and off-axis stay invariant.
+                           v3_scale(F,    ADS_SEAT_BACK_M * a->ads_s))));
+  v3 ads_seat_axis = {{sinf(yaw) * cosf(pitch), sinf(pitch),
+                       -cosf(yaw) * cosf(pitch)}};
+  head = v3_add(head, v3_scale(ads_seat_axis,
+                               -ADS_SEAT_BACK_M * a->ads_s));
   // Crouching, the head TUCKS onto the shoulders — the cheap half of putting the
   // rendered head back inside the crouched HEAD HITBOX (which tops out at eye + 0.18).
   head = v3_add(head, v3_scale(U, -0.075f * a->crouch_s * (1.0f - 0.80f * a->slide_s)
@@ -625,13 +1004,35 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
     }
     v3 hip = v3_add(pelvis, hoff);
     v3 ank = a->foot[i].pos;
-    v3 dd = v3_sub(ank, hip);  // never let a segment stretch past its bones
-    // Strike pre-flex: a runner lands on a knee already bent 15-20 deg, not a
-    // pole. Early stance shortens the effective leg, easing out by mid-stance.
+    // First solve the ordinary gait ankle against the ordinary hip.  The Lean offset
+    // is presentation DELTA from this baseline, not a relabelling of whatever amount
+    // the existing leg-reach clamp had already moved a difficult stance ankle.
     float preflex = (a->foot[i].t >= 1.0f)
                         ? 0.045f * (1.0f - a->stance[i]) * runT * ground
                         : 0.0f;
-    float dl = v3_len(dd), mx = ANIM_LEG * (ANIM_REACH_K - preflex);
+    float mx = ANIM_LEG * (ANIM_REACH_K - preflex);
+    v3 dd = v3_sub(ank, hip);
+    float dl = v3_len(dd);
+    if (dl > mx) ank = v3_add(hip, v3_scale(dd, mx / dl));
+    // The global stance solve above has already chosen and applied `sink`. The lean
+    // step is deliberately local after that point: one ankle goes out, its hip gives
+    // the authored amount, and the unchanged IK below supplies the knee flex. The
+    // controller's foot, stance and phase bytes never see this presentation offset.
+    int lean_side = a->lean_step_k > 1e-4f ? 1
+                  : a->lean_step_k < -1e-4f ? 0 : -1;
+    if (i == lean_side) {
+      ank = v3_add(ank, a->lean_step_off);
+      float lean_k = fabsf(a->lean_step_k);
+      v3 follow = a->lean_step_off;
+      follow.y = 0.0f;
+      float follow_len = v3_len(follow);
+      if (follow_len > 1e-6f)
+        hip = v3_add(hip, v3_scale(follow,
+            LEAN_STEP_HIP_FOLLOW_M * lean_k / follow_len));
+      hip.y -= LEAN_STEP_HIP_DROP_M * lean_k;
+    }
+    dd = v3_sub(ank, hip);  // never let a segment stretch past its bones
+    dl = v3_len(dd);
     if (dl > mx) ank = v3_add(hip, v3_scale(dd, mx / dl));
     float fy = a->foot[i].yaw;
     v3 footF = {{sinf(fy), 0, -cosf(fy)}};
@@ -672,7 +1073,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
       float wp = bph - ws;
       if (wp < 0) wp += 1.0f;
       float sp = f_clamp((wp - duty) / fmaxf(1.0f - duty, 0.05f), 0.0f, 1.0f);
-      a->stance[i] = sp;
+      if (advance_state) a->stance[i] = sp;
       float g = movT * ground;
       // Forward: heel strike, roll flat, heel off.
       float fw = 0.0f;
@@ -693,7 +1094,8 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
     // Ease, never snap: the foot does not reach its plant at a fixed point of the cycle
     // (measured sp ~0.17 at 2 m/s), so switching from the swing formula to the stance
     // one on contact would jump the pitch by ~11 degrees in one tick.
-    a->fpitch[i] += (want - a->fpitch[i]) * ease_k(22.0f);
+    if (advance_state)
+      a->fpitch[i] += (want - a->fpitch[i]) * ease_k(22.0f);
     float pitch_f = a->fpitch[i];
     // Rotating the foot about the ANKLE would drive the loaded end into the
     // ground; rotate it about the contact point that carries the weight — the
@@ -731,16 +1133,21 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // CARRY: a soldier who is not aiming does not walk around shouldered.
   v3 gd = aimd;
   v3 carry_pin = {{0, 0, 0}};
-  float rl = 1.0f - a->ready_s;
+  // `ready_s` owns the soft lower/raise transition. The REAL state gate owns
+  // whether the SR's idle lobe may exist at all: interpolation cannot resurrect
+  // low-ready for one frame in the middle of ADS, reload, bolt, swap, slide or
+  // fire. AR uses its standard carriage; the relative idle pose applies only to SR.
+  float ready_pose = wpn == WPN_SR && !idle_ok ? 1.0f : a->ready_s;
+  float rl = 1.0f - ready_pose;
   if (rl > 0.003f) {
     v3 gr0 = v3_cross(aimd, U);
     gr0 = v3_dot(gr0, gr0) > 1e-6f ? v3_norm(gr0) : Rc;
-    float down = (0.60f - 0.22f * runT) * rl;      // ~34 deg still, ~22 sprinting
+    float down = (erg->carry_down - erg->carry_down_run * runT) * rl;
     // Crossed enough that the fore-end actually arrives at the weak hand: at
     // the old 4.6 deg the guard stayed on the strong side and the support
     // wrist target sat at 0.60 m from a 0.58 m arm — a straight rod of an arm
     // pointing at a rifle it never touches.
-    float yin = (0.50f - 0.10f * runT) * rl;       // muzzle across the body
+    float yin = (erg->carry_cross - erg->carry_cross_run * runT) * rl;
     gd = v3_rot_axis(aimd, gr0, -down);
     gd = v3_norm(v3_rot_axis(gd, U, yin));
     // PIN THE BUTTSTOCK THROUGH THE ROTATION. Both rotations above go through the
@@ -748,10 +1155,8 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
     // it 29 swings the buttstock up and rearward into the ribs (`figbury`: the AR's
     // butt pad 71 mm INSIDE the trunk, 14.6% of the weapon buried, a rifle sawn off
     // behind the ejection port from outside).
-    #define POSE_BUTT_FW (-0.234f)
-    #define POSE_BUTT_UP (-0.050f)
     v3 up0 = v3_norm(v3_cross(gr0, aimd));
-    v3 b0 = v3_add(v3_scale(aimd, POSE_BUTT_FW), v3_scale(up0, POSE_BUTT_UP));
+    v3 b0 = gun_pose_offset(gr0, up0, aimd, erg->butt_pin, pose_scale);
     v3 b1 = v3_rot_axis(v3_rot_axis(b0, gr0, -down), U, yin);
     carry_pin = v3_sub(b0, b1);
   }
@@ -783,18 +1188,19 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // and crosses the weapon but must NOT pull it closer, or the rotated butt goes into
   // the chest.
   v3 gun_o = v3_add(v3_add(chest, carry_pin),
-             v3_add(v3_scale(gd, 0.185f + 0.175f * a->ready_s + 0.000f * a->ads_s
+             v3_add(v3_scale(gd, 0.185f + erg->carry_axial * pose_scale * ready_pose
+                                                + 0.000f * a->ads_s
                                                 + 0.105f * a->slide_s
                                                 + 0.045f * a->crouch_s
-                                                - 0.05f * runT      // tucked in at sprint
-                                                - 0.05f * a->fire_k),
+                                                - 0.05f * runT),    // tucked in at sprint
              // The carry rides 165 mm FURTHER OUTBOARD and 30 mm higher than the ready,
              // where it used to ride 65 mm inboard and 110 mm lower.
-             v3_add(v3_scale(Rc, 0.150f - 0.072f * a->ads_s + 0.165f * rl
+             v3_add(v3_scale(Rc, 0.150f - 0.072f * a->ads_s
+                                       + erg->carry_right * pose_scale * rl
                                        + 0.070f * a->slide_s),
              // ...and 65 mm STRAIGHT OUT OF THE CHEST at the low ready, along the
              // trunk's own forward rather than along the (dropped, crossed) bore.
-             v3_add(v3_scale(F, 0.065f * rl),
+             v3_add(v3_scale(F, erg->carry_body_forward * pose_scale * rl),
                     // THE STOCK STAYS IN THE POCKET WHEN THE RIFLE COMES UP. Going from
                     // ready to ADS used to LIFT the whole weapon 170 mm and pull it 95
                     // mm inboard onto the cheek, which took the butt pad clean off the
@@ -802,7 +1208,8 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
                     // body in ADS against an 11 mm bite at the ready — a rifle held in
                     // front of a man rather than against him.
                     v3_scale(U, -0.020f + 0.205f * a->ads_s + 0.20f * a->slide_s
-                                + 0.070f * rl)))));   // ...and 70 mm of carry LIFT,
+                                + erg->carry_up * pose_scale * rl)))));
+             // ...and 70 mm of carry LIFT,
              // not 30: the shortened magazine still dipped 49 mm into the strong-side
              // thigh at the low ready, which is the one part of a carried rifle that
              // hangs into a leg. 22 mm now — a magazine touching a trouser, which is
@@ -832,13 +1239,50 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // see of a distant enemy, and a perfectly rigid one reads as scenery.
   gun_o = v3_add(gun_o, v3_add(v3_scale(U, sinf(a->idle_t * 1.60f) * 0.0045f * still),
                                v3_scale(Rc, sinf(a->idle_t * 0.92f) * 0.0035f * still)));
+  // SHOULDER RESPONSE. fire_k is solely the carry-floor latch. Event-fed springs move
+  // one coherent weapon frame, and the wrist/elbow solve makes the arms compress while
+  // the shoulder anchors remain on the torso. Lift follows back; signed side adds only
+  // millimetres and a few tenths of a degree.
+  {
+    v3 gun_r = v3_cross(gd, U);
+    if (v3_dot(gun_r, gun_r) < 1e-6f) gun_r = Rc;
+    else gun_r = v3_norm(gun_r);
+    if (a->recoil_lift != 0.0f)
+      gd = v3_norm(v3_rot_axis(gd, gun_r, a->recoil_lift));
+    if (a->recoil_side != 0.0f)
+      gd = v3_norm(v3_rot_axis(gd, U, a->recoil_side));
+    gun_r = v3_cross(gd, U);
+    if (v3_dot(gun_r, gun_r) < 1e-6f) gun_r = Rc;
+    else gun_r = v3_norm(gun_r);
+    gun_o = v3_add(gun_o, v3_add(v3_scale(gd, -a->recoil_back),
+                                  v3_scale(gun_r, a->recoil_side)));
+  }
   // Wrist targets track the WEAPON's own stations, not the anchor plane: the bore is
   // ~0.10 below gun_o and the grip another 0.05 under that, so a trigger wrist at
   // -0.050 U hovered 10 cm above the grip and the support wrist at -0.030 U sat ON TOP
   // of the handguard — both forearms then came down onto the rifle from above, the
   // tray-carry look.
-  v3 wriR = v3_add(gun_o, v3_add(v3_scale(gd, -0.100f),
-             v3_add(v3_scale(U, -0.075f), v3_scale(Rc, 0.012f))));
+  // These descriptors are authored in the weapon's frame. At low ready the bore is
+  // both depressed and crossed, so body-right/world-up would leave the wrists behind
+  // while the rifle rotated through them. Build the same orthonormal frame that the
+  // renderer later derives from gun_f/gun_u and keep both hands rigidly related to it.
+  v3 gun_r = v3_cross(gd, U);
+  if (v3_dot(gun_r, gun_r) < 1e-6f) gun_r = Rc;
+  else gun_r = v3_norm(gun_r);
+  v3 gun_u = v3_norm(v3_cross(gun_r, gd));
+  // State corrections stay in the weapon frame. Zero-initialized descriptors retain
+  // their base pose exactly; SR's busy-ready gate also keeps rl at zero in a slide.
+  v3 trigger_wrist = v3_add(
+      erg->trigger_wrist,
+      v3_add(v3_scale(erg->trigger_wrist_idle_delta, rl),
+             v3_scale(erg->trigger_wrist_slide_delta, a->slide_s)));
+  v3 trigger_pole = v3_add(
+      erg->trigger_pole,
+      v3_add(v3_scale(erg->trigger_pole_ads_delta, a->ads_s),
+             v3_add(v3_scale(erg->trigger_pole_idle_delta, rl),
+                    v3_scale(erg->trigger_pole_slide_delta, a->slide_s))));
+  v3 wriR = v3_add(gun_o,
+                   gun_pose_offset(gun_r, gun_u, gd, trigger_wrist, pose_scale));
   // In the CARRY the support hand slides BACK to the magwell end of the guard: with the
   // muzzle rotated 34 degrees down, the far fore-end station sits ~0.76 m from the weak
   // shoulder against a 0.58 m arm — the IK then points a straight arm at a target it
@@ -847,9 +1291,13 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // wrist sat 602 mm from the weak shoulder against a 580 mm arm — the IK was OVER-
   // EXTENDED, so it pointed a dead-straight arm at a handguard it could not touch and
   // fig_hand stretched the palm across the gap.
-  v3 wriL = v3_add(gun_o, v3_add(v3_scale(gd, 0.170f + 0.030f * rl),
-             v3_add(v3_scale(U, -0.040f + 0.050f * rl),
-                    v3_scale(Rc, -0.020f))));
+  v3 sw = {{erg->support_wrist_ready.x * pose_scale
+               + erg->support_wrist_delta.x * pose_scale * rl,
+            erg->support_wrist_ready.y * pose_scale
+               + erg->support_wrist_delta.y * pose_scale * rl,
+            erg->support_wrist_ready.z * pose_scale
+               + erg->support_wrist_delta.z * pose_scale * rl}};
+  v3 wriL = v3_add(gun_o, gun_pose_offset(gun_r, gun_u, gd, sw, 1.0f));
   if (a->slide_s > 0.001f) {
     // Off hand braces ON THE GROUND behind the hip — that contact is most of what sells
     // a slide.
@@ -884,12 +1332,13 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   // every other number fought every other number: with the shoulder line held SQUARE to
   // the target, the butt pad can be in the shoulder pocket or the support hand can be
   // on the handguard, but never both.
-  float blade = ANIM_BLADE * a->ready_s + 0.20f * runT * (1.0f - a->ready_s);
+  float blade = ANIM_BLADE * ready_pose + 0.20f * runT * (1.0f - ready_pose);
   float blc = cosf(blade), bls = sinf(blade);
   v3 fwdh = v3_norm((v3){{aimd.x, 0.0f, aimd.z}});
   for (int i = 0; i < 2; i++) {
     float s = i ? 1.0f : -1.0f;
-    v3 sho = v3_add(chest, v3_add(v3_add(v3_scale(Rc, s * ANIM_SHO_HALF * trc * blc),
+    float shoulder_clear = 0.012f * (1.0f - f_smoothstep(0.20f, 0.85f, ready_pose));
+    v3 sho = v3_add(chest, v3_add(v3_add(v3_scale(Rc, s * (ANIM_SHO_HALF + shoulder_clear) * trc * blc),
                                  v3_add(v3_scale(U, s * ANIM_SHO_HALF * trs),
                                         v3_scale(fwdh, -s * ANIM_SHO_HALF * bls))),
                                   v3_scale(spine, 0.05f)));
@@ -897,15 +1346,20 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
     // Elbows are driven wide and down: a rifle stance reads as a triangle, and an elbow
     // tucked against the ribs is exactly where an upper arm starts ploughing through
     // the chest.
-    v3 pole = i ? v3_norm(v3_add(v3_scale(Rc, 1.30f + 0.30f * a->crouch_s),
-                          v3_add(v3_scale(U, -0.30f + 0.55f * a->air_s),
-                                 v3_scale(aimd, -0.18f))))
-                : v3_norm(v3_add(v3_scale(Rc, -0.60f - 0.20f * a->crouch_s
+    v3 pole = i ? v3_norm(v3_add(v3_scale(Rc, trigger_pole.x
+                                                   + 0.30f * a->crouch_s),
+                          v3_add(v3_scale(U, trigger_pole.y
+                                            + 0.55f * a->air_s),
+                                 v3_scale(aimd, trigger_pole.z))))
+                : v3_norm(v3_add(v3_scale(Rc, erg->support_pole.x
+                                              - 0.20f * a->crouch_s
                                               - 0.85f * a->slide_s
                                               - 0.40f * a->air_s),
-                          v3_add(v3_scale(U, -0.95f + 0.75f * a->slide_s
+                          v3_add(v3_scale(U, erg->support_pole.y
+                                              + 0.75f * a->slide_s
                                               + 0.50f * a->air_s),
-                                 v3_scale(aimd, -0.10f - 0.30f * a->slide_s))));
+                                 v3_scale(aimd, erg->support_pole.z
+                                                - 0.30f * a->slide_s))));
     // (airborne both elbows flare up and out — the braced-in-flight look) A WRIST NEVER
     // GETS FURTHER FROM ITS SHOULDER THAN THE ARM CAN REACH, and the guard is set at
     // 96% rather than 100 for the reason this file already records: near full extension
@@ -933,6 +1387,8 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch) {
   v3 gr = v3_cross(gd, U);
   if (v3_dot(gr, gr) < 1e-6f) gr = Rc;
   P->gun_u = v3_norm(v3_cross(v3_norm(gr), gd));
+  if (a->recoil_side != 0.0f)
+    P->gun_u = v3_norm(v3_rot_axis(P->gun_u, gd, -1.4f * a->recoil_side));
 
   // Lean, part 2 of 2: ONE rigid rotation of everything above the waist, about the
   // aim's horizontal forward axis.
@@ -979,8 +1435,9 @@ static void foot_ride(afoot_t *f, v3 base, v3 tgt, v3 vel, float yaw, float kf) 
 }
 
 // A WEAPON THAT JUST FIRED IS UP, and this is the ONE copy of that rule. `fire_k` is
-// the shot's own impulse — 1.0 at the shot, ~60 ms to decay — so it doubles as the
-// floor under the carry blend: the round leaves along the aim axis on the tick the
+// a carry latch — 1.0 at the shot, ~60 ms to decay — and solely the floor under the
+// carry blend. Physical recoil lives in the three springs above. The round leaves
+// along the aim axis on the tick the
 // trigger breaks, and a blend still ramping toward the shoulder draws the muzzle
 // somewhere the round did not come from (measured on a foreign player hip-firing: the
 // bore 43 degrees off, the muzzle 39 cm below and 35 cm inboard of the rifle the round
@@ -1001,19 +1458,27 @@ static int anim_carry_floor(anim_t *a) {
 // Advance the animation one 120 Hz tick from the entity's physics state.
 static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
                       int grounded, int crouch, float tuck, int slide, float ads,
-                      float lean, int ready, int ent) {
+                      float lean, int ready, int ent, int wpn, int idle_ok) {
   a->live_t = g_tick;   // this pose is solved THIS tick — see anim_t.live_t
   a->prev_pose = a->pose;
-  // The lean arrives already eased — the player's sim eases it, the puppet eases it
-  // with the same two constants — so this is an ASSIGNMENT, not a second filter.
-  a->lean_s = lean;
+  a->prev_ready_s = a->ready_s;
+  // The lean arrives already eased by the sim, so authoritative/offline poses assign
+  // it directly. A foreign online figure instead sees a snapshot-held level; a very
+  // short presentation follower removes that sampling edge (including one lost 60 Hz
+  // snapshot) and keeps its complete solved ankles within 5 mm of the 120 Hz pose.
+  // This state is cosmetic only; eye exposure, origin, hitbox and wire keep `lean`.
+  if (g_online && ent != g_local_ent)
+    a->lean_s += (lean - a->lean_s) * ease_k(LEAN_PRESENT_HZ);
+  else
+    a->lean_s = lean;
   // A third-person figure that is AIMING has to look like it: the stock comes into the
   // shoulder, the weapon rises onto the eye line and the head drops onto the comb.
   a->ads_s += (ads - a->ads_s) * ease_k(14.0f);
   // Carry state: the raise snaps (~110 ms), the lower is deliberate (~0.7 s after the
   // fight ends).
   {
-    float want = (ready || ads > 0.05f) ? 1.0f : 0.0f;
+    float want = (ready || ads > 0.05f || (wpn == WPN_SR && !idle_ok))
+                   ? 1.0f : 0.0f;
     a->ready_s += (want - a->ready_s) * ease_k(want > 0.5f ? 20.0f : 4.5f);
     // A SHOT MUST NEVER LEAVE A LOWERED RIFLE — see anim_carry_floor for the rule.
     anim_carry_floor(a);
@@ -1100,6 +1565,9 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     a->lean_r += (want_r - a->lean_r) * kl;
   }
   a->fire_k *= expf(-16.0f * TICK_DT);
+  recoil_spring(&a->recoil_back, &a->recoil_back_v, RECOIL_BACK_K, RECOIL_BACK_C);
+  recoil_spring(&a->recoil_lift, &a->recoil_lift_v, RECOIL_LIFT_K, RECOIL_LIFT_C);
+  recoil_spring(&a->recoil_side, &a->recoil_side_v, RECOIL_SIDE_K, RECOIL_SIDE_C);
   // ...and the other half of a firefight.
   a->hit_k *= expf(-11.0f * TICK_DT);
   // ...and the POSE chases the impulse, exactly as `land` chases `land_i` a few lines
@@ -1462,6 +1930,127 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     }
   }
 
+  // Presentation-only lean step. It is intentionally downstream of every afoot/phase
+  // mutation above: the controller has finished, then one absolute ankle target is
+  // constrained and scanned once. `lean_s` is already the production-smoothed signal;
+  // the small follower here belongs to the FOOT, not to the torso lean. It limits the
+  // physical grow/retract rate so full-rate and held snapshot samples cannot disagree
+  // by an entire footstep. On a sign change the old side retracts to sub-millimetre
+  // zero before the other side grows, and extension is bounded by the same follower.
+  {
+    g_lean_step_want_off = (v3){{0, 0, 0}};
+    g_lean_step_got_off = (v3){{0, 0, 0}};
+    g_lean_step_ratio = 0.0f;
+    g_lean_step_side = -1;
+
+    int want_side = a->lean_s > 1e-4f ? 1 : a->lean_s < -1e-4f ? 0 : -1;
+    int have_side = a->lean_step_k > 1e-4f ? 1
+                  : a->lean_step_k < -1e-4f ? 0 : -1;
+    v3 old_off = a->lean_step_off;
+    float run = g_sim_mv[MV_RUN] > 0.1f ? g_sim_mv[MV_RUN] : 0.1f;
+    float raw_spd = sqrtf(vel.x * vel.x + vel.z * vel.z);
+    float speed_k = 1.0f - f_clamp((raw_spd / run - LEAN_SPD_LO) /
+                                    (LEAN_SPD_HI - LEAN_SPD_LO), 0.0f, 1.0f);
+    int hard_clear = !grounded || slide;
+    int active = !hard_clear && want_side >= 0 && speed_k > 1e-4f;
+
+    if (hard_clear) {
+      a->lean_step_off = (v3){{0, 0, 0}};
+      a->lean_step_k = 0.0f;
+    } else {
+      int solve_side = -1;
+      v3 want_off = {{0, 0, 0}};
+      float crouch_k = 1.0f + (LEAN_STEP_CROUCH_K - 1.0f) * a->crouch_s;
+
+      // A sign change, speed fade or released key retracts the old side first. It is
+      // still a rendered moving ankle, so it gets the same swept query as extension;
+      // changing foot home or yaw never reuses a stale radial clearance segment.
+      if (have_side >= 0 && (!active || have_side != want_side)) {
+        solve_side = have_side;
+      } else if (active) {
+        solve_side = want_side;
+        float side_sign = want_side ? 1.0f : -1.0f;
+        float amount = fabsf(a->lean_s) * crouch_k * speed_k;
+        v3 aim_r = {{cosf(yaw), 0, sinf(yaw)}};
+        v3 aim_f = {{sinf(yaw), 0, -cosf(yaw)}};
+        v3 authored = v3_add(v3_scale(aim_r, side_sign * LEAN_STEP_OUT_M),
+                             v3_scale(aim_f, LEAN_STEP_FWD_M));
+        v3 authored_dir = v3_norm(authored);
+        v3 start = a->foot[want_side].pos;
+        v3 desired = v3_add(start, v3_scale(authored, amount));
+
+        // Clamp `desired` to the intersection of the reach disk and stance-side slab
+        // in the orthonormal leg frame. Only an outward delta may become an active
+        // Lean target.
+        float hmax = anim_hmax(a) * 0.97f;
+        float bx = desired.x - base.x, bz = desired.z - base.z;
+        float lat = bx * rx + bz * rz;
+        float fwd = bx * fx + bz * fz;
+        float lat_mag = f_clamp(side_sign * lat, ANIM_STANCE_MIN,
+                                 fminf(0.30f, hmax));
+        lat = side_sign * lat_mag;
+        float fmax = sqrtf(fmaxf(0.0f, hmax * hmax - lat * lat));
+        fwd = f_clamp(fwd, -fmax, fmax);
+        desired.x = base.x + rx * lat + fx * fwd;
+        desired.z = base.z + rz * lat + fz * fwd;
+        want_off = v3_sub(desired, start);
+
+        // No capacity in the authored direction means no Lean target.  Keep an old
+        // presentation foot only long enough to retract; never turn an inward reach
+        // correction into a new active lunge.
+        if (v3_dot(want_off, authored_dir) <= 1e-6f) {
+          want_off = (v3){{0, 0, 0}};
+          if (have_side < 0) solve_side = -1;
+        }
+      }
+
+      if (solve_side >= 0) {
+        v3 start = a->foot[solve_side].pos;
+        v3 desired = v3_add(start, want_off);
+        v3 previous = a->prev_pose.ankle[solve_side];
+        lean_foot_sweep_t sw = lean_foot_sweep(previous, desired,
+                                               LEAN_STEP_MARGIN_M);
+        // The solid result is a hard cap; the presentation DELTA has its own follower.
+        // Keeping these two quantities separate prevents an ordinary IK reach
+        // correction (or a moving afoot home) from becoming self-sustaining Lean state.
+        // If a synthetic/new obstacle surrounds the previous endpoint, geometry wins
+        // immediately at the first safe exit; there is no valid eased point inside it.
+        v3 safe_off = v3_sub(sw.p, start);
+        a->lean_step_off = sw.escaped ? safe_off
+                                      : v3_lerp(old_off, safe_off,
+                                                ease_k(LEAN_STEP_RESPONSE_HZ));
+        a->lean_step_off.y = 0.0f;
+        float got = v3_len(a->lean_step_off);
+        if (got < 0.0005f) {
+          a->lean_step_off = (v3){{0, 0, 0}};
+          got = 0.0f;
+        }
+
+        // `lean_step_off`, `lean_step_k`, and hip/knee weight derive from the same
+        // eased presentation vector. The achieved ratio is got/want; `sw.p` remains
+        // only the hard clearance endpoint.
+        float want = v3_len(want_off);
+        float got_along = got;
+        if (want > 1e-6f) {
+          v3 step_dir = v3_scale(want_off, 1.0f / want);
+          got_along = f_clamp(v3_dot(a->lean_step_off, step_dir), 0.0f, want);
+          g_lean_step_ratio = got_along / want;
+        }
+        float full_len = sqrtf(LEAN_STEP_OUT_M * LEAN_STEP_OUT_M +
+                               LEAN_STEP_FWD_M * LEAN_STEP_FWD_M);
+        // Crouch deliberately shortens the horizontal step, not the weight transfer.
+        float pose_len = full_len * crouch_k;
+        float achieved = pose_len > 1e-6f
+                           ? f_clamp(got / pose_len, 0.0f, 1.0f) : 0.0f;
+        float side_sign = solve_side ? 1.0f : -1.0f;
+        a->lean_step_k = side_sign * achieved;
+        g_lean_step_want_off = want_off;
+        g_lean_step_got_off = a->lean_step_off;
+        g_lean_step_side = achieved > 0.0f ? solve_side : -1;
+      }
+    }
+  }
+
   {
     // Antenna whip: a 3 Hz, zeta 0.45 follower on the chest's acceleration.
     const float w0 = F_TAU * 3.0f;
@@ -1477,13 +2066,17 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     float m = v3_len(a->ant_p);
     if (m > 0.11f) a->ant_p = v3_scale(a->ant_p, 0.11f / m);
   }
-  skel_solve(a, base, yaw, pitch);
+  skel_solve(a, base, yaw, pitch, wpn, idle_ok, SKEL_ADVANCE_STATE);
 }
 
 // Fresh spawn: feet planted at their home spots, pose solved once so the
 // very first rendered frame already stands correctly.
-static void anim_reset(anim_t *a, v3 pos, float yaw) {
+static void anim_reset(anim_t *a, v3 pos, float yaw, int wpn) {
   memset(a, 0, sizeof *a);
+  // Reset solves a combat-safe shouldered pose (`idle_ok = 0`). Initialize the SR
+  // follower to that pose; the first real idle tick lowers it softly, keeping follower
+  // and pose consistent at spawn or teleport.
+  if (wpn == WPN_SR) a->ready_s = a->prev_ready_s = 1.0f;
   a->leg_yaw = yaw;
   a->was_grounded = 1;
   for (int i = 0; i < 2; i++) {
@@ -1494,7 +2087,7 @@ static void anim_reset(anim_t *a, v3 pos, float yaw) {
     a->foot[i].yaw = yaw;
     a->foot[i].t = 1.0f;
   }
-  skel_solve(a, pos, yaw, 0.0f);
+  skel_solve(a, pos, yaw, 0.0f, wpn, 0, SKEL_ADVANCE_STATE);
   // Prime BOTH histories that get differentiated, or the first tick after a spawn
   // measures a step out of nothing: the pelvis against zero (a 116 m/s trunk step) and
   // the aim yaw against zero — a body spawning at yaw = pi registered ~377 rad/s of
@@ -1523,4 +2116,3 @@ static int   g_player_corpse_q_all[SRV_LOBBIES][MAX_HUMANS];  // launch awaits h
 // is the one-copy rule. ~1.5 KB per human with the anim/rag arrays above.
 static player_t g_players_all[SRV_LOBBIES][MAX_HUMANS];
 #define g_players (g_players_all[g_lobby])
-

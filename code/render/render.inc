@@ -275,6 +275,18 @@ static int g_hud_visible = 1;  // harness capture switch; menus remain visible
 // Where on the ADS ramp the scope picture starts to open.
 #define SCOPE_ADS_OPEN 0.55f
 
+// The PiP aperture is a presentation contract shared by the renderer and its
+// optical proof. Keep alignment, ADS threshold and easing in one expression.
+static float scope_pip_radius(float scope, float vw, float vh) {
+  float off = sqrtf((g_scope_cx - vw * 0.5f) * (g_scope_cx - vw * 0.5f) +
+                    (g_scope_cy - vh * 0.5f) * (g_scope_cy - vh * 0.5f));
+  float aligned = 1.0f - f_clamp((off - g_scope_r * 0.30f) /
+                                 fmaxf(1.0f, g_scope_r * 0.55f), 0.0f, 1.0f);
+  return g_scope_r *
+         smooth01(f_clamp((scope - SCOPE_ADS_OPEN) / 0.42f, 0.0f, 1.0f)) *
+         aligned;
+}
+
 // Every uniform GLSL_ENV declares, for one program. One struct, so adding a
 // light to the rig cannot be half-wired.
 typedef struct {
@@ -656,4 +668,3 @@ static gsurf_t ground_sample(float x, float z) {
 static float ground_skirt_ao(float x, float z) {
   return 1.0f - 0.34f * ground_sample(x, z).skirt;
 }
-

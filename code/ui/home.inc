@@ -230,7 +230,8 @@ static void home_stage(player_t *p) {
   // passed to scene_draw_figure.
   {
     int h = (int)(p - g_players);
-    if (h >= 0 && h < MAX_HUMANS) anim_reset(&g_player_anim[h], p->pos, p->yaw);
+    if (h >= 0 && h < MAX_HUMANS)
+      anim_reset(&g_player_anim[h], p->pos, p->yaw, p->wp.cur);
   }
 }
 
@@ -536,4 +537,3 @@ static int home_camera(cam_override_t *ov, const player_t *p, float alpha,
   g_vmorb.comp = 0.16f;
   return 1;
 }
-

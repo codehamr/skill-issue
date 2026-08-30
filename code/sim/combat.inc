@@ -2,14 +2,14 @@
 // sim/combat.inc  —  player_respawn, ent_damage, match_on_kill, gun_shoot/
 // gun_anim, ent_on_event (the impulse echo), mv_locomote (the bot+puppet
 // locomotion dispatch), tactical steering.
-// Proof: parity, botflank, botweapon, netfigure. One TU: included once by
+// Proof: parity, botflank, botweapon, netfigure, vmframe. One TU: included once by
 // game.c, in definition order — moving a definition out is a semantic change.
 // Contract: gun_shoot/gun_build/gun_anim are each the ONE copy for every
 // view and every shooter; PEN_PATH (1.20 m, core/hitscan.inc) is a path
-// length, not a per-weapon budget. An action's PRESENTATION is not written
-// at the action: the kick, the reload clock and the flinch leave through
-// ev_push and land in ent_on_event, which is the only version of them a
-// viewer of a FOREIGN entity ever runs.
+// length, not a per-weapon budget. Shared presentation leaves through ev_push and
+// lands in ent_on_event, the only version a viewer of a FOREIGN entity runs. The
+// sole action-site exception is the local carry latch while prediction suppresses
+// that event; it owns no VFX or physical 3P recoil and is replay-safe.
 // =============================================================================
 static void player_respawn(player_t *p, int ent) {
   int h = human_of_ent(ent);
@@ -36,7 +36,7 @@ static void player_respawn(player_t *p, int ent) {
   p->pos = p->prev_pos = s;
   p->yaw = atan2f(-s.x, s.z);  // face the arena center
   g_spawn_seq[ent]++;          // snapshot readers see a teleport, not motion
-  anim_reset(&g_player_anim[h], p->pos, p->yaw);
+  anim_reset(&g_player_anim[h], p->pos, p->yaw, p->wp.cur);
   ev_push((event_t){.type = EV_RESPAWN, .dst = ent});
 }
 
@@ -282,8 +282,12 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   const wpn_def_t *def = &WPN_DEF[w->cur];
   const float *wp = g_sim_wp[w->cur];
   w->ammo[w->cur]--;
-  g_match.shots[ent]++;
-  bot_noise_emit(ent, BOT_NOISE_SHOT, o, 34.0f);
+  // Rollback recomputes weapon/RNG/VM state, but these one-shot effects already
+  // happened on the original forward-prediction tick and are not rewindable state.
+  if (!g_prediction_replay) {
+    g_match.shots[ent]++;
+    bot_noise_emit(ent, BOT_NOISE_SHOT, o, 34.0f);
+  }
   w->cool[w->cur] = (int)((float)TICK_HZ * 60.0f / wp[WP_RPM] + 0.5f);
   if (w->cool[w->cur] < 1) w->cool[w->cur] = 1;
 
@@ -318,17 +322,27 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
                                    : (w->idx & 1) ? 1.0f : -1.0f) *
                       GUN_PUNCH_SHOT * wp[WP_PUNCH] * GUN_PUNCH_V * GUN_ROLL_K;
   }
-  // SPLIT, not converted (the one line that fused both meanings): shots++ is INDEX —
-  // every human's lifetime counter, the trace contract — while the viewmodel kick is
-  // LOKAL, per-client.
+  // SPLIT, not converted: shots++ is INDEX — every human's lifetime counter and the
+  // trace contract — while the viewmodel response is LOCAL presentation. It takes
+  // velocity impulses only; values remain continuous, including through a burst.
   int sh = human_of_ent(ent);
-  if (sh >= 0) g_players[sh].shots++;
-  if (ent == g_local_ent && sh >= 0)
-    g_players[sh].vm.kick_v += 0.8f + 0.5f * wp[WP_PUNCH];  // gun slams back
-  // The third-person body's kick is NOT set here: it is the shot's presentation and it
-  // rides EV_FIRE (see ent_on_event), which is the only version of this shot a viewer
-  // of a FOREIGN entity ever receives. Set from inside the sim it reached exactly the
-  // figures nobody was looking at.
+  if (sh >= 0 && !g_prediction_replay) g_players[sh].shots++;
+  if (ent == g_local_ent && sh >= 0) {
+    recoil_vm_impulse(&g_players[sh].vm, ent, w->idx, w->cur, w->ads_s);
+    // Online forward prediction deliberately suppresses ev_push, including the
+    // ent_on_event carry latch which normally raises the shot pose. Reproduce only
+    // that local presentation edge here; the authoritative echo still owns VFX and
+    // the third-person recoil velocity, so neither can be doubled by replay. Re-solve
+    // immediately for the same T0 muzzle contract as the ordinary EV_FIRE path.
+    if (g_predicting && !g_prediction_replay) {
+      anim_t *a = &g_player_anim[sh];
+      a->fire_k = 1.0f;
+      if (anim_carry_floor(a))
+        skel_solve(a, ent_pos(ent), yaw, pitch, w->cur, 0, SKEL_POSE_ONLY);
+    }
+  }
+  // The third-person body is NOT set here: that presentation rides EV_FIRE (see
+  // ent_on_event), the only version of the shot every viewer of a foreign entity gets.
 
   // THE ROUND'S FLIGHT, one segment per piece of material it crosses.
   v3 nrm = {{0, 1, 0}};                 // the face the round finally stopped on
@@ -641,8 +655,11 @@ static void ent_on_event(const event_t *e) {
   case EV_FIRE: {
     if (e->src < 0 || e->src >= MAX_ENTS) return;
     anim_t *a = ent_anim(e->src);
-    // The gun kick. gun_shoot no longer sets it: this is the one copy, and it runs on
-    // the shooter's own machine and on every machine watching him, off one event.
+    // The body answers the one event every viewer receives. Only velocities change on
+    // T+0, so the already-solved muzzle/flash pose remains the pose the round left;
+    // compression and lift arrive on the following animation ticks.
+    recoil_body_impulse(a, e->src, e->i, e->wpn, e->g);
+    // fire_k is solely the immediate carry-floor latch, not recoil distance.
     a->fire_k = 1.0f;
     // ...AND THE POSE THE SHOT LEAVES FROM. The carry floor lands in anim_tick, at the
     // END of this tick — but the tracer and the muzzle flash are anchored two lines
@@ -658,7 +675,7 @@ static void ent_on_event(const event_t *e) {
     if (anim_carry_floor(a)) {
       float yaw, pitch;
       ent_aim(e->src, &yaw, &pitch);
-      skel_solve(a, ent_pos(e->src), yaw, pitch);
+      skel_solve(a, ent_pos(e->src), yaw, pitch, e->wpn, 0, SKEL_POSE_ONLY);
     }
     return;
   }
@@ -715,7 +732,7 @@ static void ent_on_event(const event_t *e) {
 // both death paths call it and the pool is defined a long way below.
 static void corpse_add(const anim_t *A, v3 pos, v3 prev_pos, rag_t rag,
                        float yaw, float slack, float prev_slack, gunanim_t gs,
-                       int wpn, int pal, int owner);
+                       int wpn, int owner);
 
 static void bot_fire(int bi) {
   bot_t *b = &g_bots[bi];
@@ -792,9 +809,11 @@ static void bot_puppet_tick(bot_t *b, int bi) {
            b->crouch ? HEIGHT_CROUCH : HEIGHT_STAND);
   arena_clamp(&b->pos);
   b->wp.ready_want = (unsigned char)(b->pup_ready ? 1 : 0);
+  int idle_ok = gun_pose_idle_ok(&b->wp, &b->anim, b->vel,
+                                 b->grounded, b->sliding);
   anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
             b->crouch, 0.0f, b->sliding, b->wp.ads_s, b->pup_lean,
-            b->wp.ready_want, bi + 1);  // REAL entity id: hardwired 1, every
+            b->wp.ready_want, bi + 1, b->wp.cur, idle_ok);  // REAL entity id: hardwired 1, every
                                     // puppet != bot 0 pushed EV_STEP/EV_LAND
                                     // with .src = 1 and stepped from the wrong
                                     // body — no tuck, see bot_tick
@@ -1222,4 +1241,3 @@ static int bot_target_breaks_hidden(const bot_t *b, bot_target_choice_t c) {
   }
   return "patrol";
 }
-

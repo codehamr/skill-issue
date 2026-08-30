@@ -29,7 +29,6 @@ static const float GUN_GRIP[2][3] = {{0.0f, -0.034f, 0.006f},    // AR
 // pose_muzzle, so a streak's origin cannot drift from the barrel the renderer actually
 // draws — the drift it replaces was 1.6 m of "in front of the camera", which read as
 // shooting from the eye.
-#define GUN_GIRTH_3P 1.05f
 static const float GUN_MUZ[2][3] = {{0.0f, 0.0225f, 0.494f},     // AR
                                     // 0.782, not 0.498: the bolt gun is a CLASS longer
                                     // than the carbine now (1.44x against 1.04x), and
@@ -37,8 +36,23 @@ static const float GUN_MUZ[2][3] = {{0.0f, 0.0225f, 0.494f},     // AR
                                     // that. See the note at the top of the SR branch.
                                     {0.0f, 0.0160f, 0.7820f}};   // SR
 
+// One pure local->world transform for every owner of the barrel tip.  The builder,
+// third-person event pose and mesh-free first-person publish deliberately differ only
+// in scale; none may restate GUNP and silently acquire a different muzzle.
+static v3 gun_muzzle_point(int cur, v3 org, v3 gx, v3 gy, v3 gz, float scale) {
+  const float *m = GUN_MUZ[cur];
+  return v3_add(org, v3_add(v3_scale(gx, m[0] * scale),
+         v3_add(v3_scale(gy, m[1] * scale),
+                v3_scale(gz, m[2] * scale))));
+}
+
 // HOW FAR THE MODEL HANGS BELOW ITS OWN ORIGIN, in model units, per weapon.
 static float g_gun_low[2];
+
+// The complete mesh emitted by the most recent SR optic build. This is a raw
+// g_scene_floats interval rather than a nested probe range, so vmscope can
+// inspect every body, turret and lens without disturbing the caller's probe.
+static int g_gun_sr_scope_v0 = -1, g_gun_sr_scope_v1 = -1;
 
 // The rifle model's frame from a solved pose: exactly the anchor scene_draw_figure uses
 // to place gun_build so the trigger hand lands on the pistol grip.
@@ -53,9 +67,9 @@ static void pose_gun_frame(const pose_t *P, int wpn,
   // decides whether the third-person hand is ON the grip at all.
   v3 gw = v3_add(P->gun_o, v3_add(v3_scale(*fw, 0.005f),
                                   v3_scale(*up, -0.098f)));
-  // TWO WEAPON-AWARE SEATS, and this is the only place that can apply them:
-  // `skel_solve` does not know which rifle it is holding, and the two rifles differ in
-  // exactly the two ways a cheek weld cares about.
+  // TWO WEAPON-AWARE SEATS, and this is the only place that can apply them. The pose
+  // solver knows the weapon for human ergonomics, but only this model frame owns the
+  // two rifles' grip, butt and sight geometry.
   static const float GUN_BUTT_Z[WPN_COUNT] = {-0.2220f, -0.2480f};  // figbury-butt
   #define GUN_SEAT_(w, gz) (GUN_BUTT_Z[w] * GUN_GIRTH_3P - (gz))
   float seat = GUN_SEAT_(WPN_AR, GUN_GRIP[WPN_AR][2]) - GUN_SEAT_(wpn, gp[2]);
@@ -103,12 +117,9 @@ static void pose_head_frame(const pose_t *P, float cant,
 static v3 pose_muzzle(const pose_t *P, int wpn) {
   v3 org, rt, up, fw;
   pose_gun_frame(P, wpn, &org, &rt, &up, &fw);
-  const float *m = GUN_MUZ[wpn];
   // The third-person rifle draws at GUN_GIRTH_3P, so the flash/tracer anchor
   // has to sit on the SCALED barrel tip or bursts detach from the muzzle.
-  return v3_add(org, v3_add(v3_scale(rt, m[0] * GUN_GIRTH_3P),
-               v3_add(v3_scale(up, m[1] * GUN_GIRTH_3P),
-                      v3_scale(fw, m[2] * GUN_GIRTH_3P))));
+  return gun_muzzle_point(wpn, org, rt, up, fw, GUN_GIRTH_3P);
 }
 
 // The two CYLINDERS a pair of hands closes around, in gun-local space: {cx, cy, cz,
@@ -129,26 +140,132 @@ static const float GUN_HOLD[2][4][7] = {
   // THE PUBLISHED RADIUS IS THE ONE THE HAND CLOSES ON, so it has to be the radius the
   // grip ACTUALLY HAS along the row the fingers occupy — not an independent number.
   { { 0.0f, -0.0500f,  -0.0078f, 0.0130f,  0.0f, 0.921f,  0.386f },   // AR grip
-    { 0.0f,  0.0190f,   0.3050f, 0.0123f,  0.0f, 0.0f,    1.0f   },   // AR fore-end
-    // The magazine. A hand wraps its NARROW axis, so the radius is the small half-
-    // extent of the mag chain at that station, not its 19 mm depth.
-    { 0.0f, -0.0640f,   0.1010f, 0.0124f,  0.0f, 0.959f,  0.283f },   // AR mag
+    { 0.0f,  0.0190f,   0.2630f, 0.0123f,  0.0f, 0.0f,    1.0f   },   // AR fore-end
+    // Magazine reference row on the ACTUAL raked chain axis. Its scalar is only the
+    // interpolation marker; fig_hand reads the published k=8 cross-section below.
+    { 0.0f, -0.1040f,   0.0848f, 0.01405f, 0.0f, 0.95783f, 0.28735f }, // AR mag
     // Third person: the REAR of the same handguard, just ahead of the delta
     // ring (the guard body spans z 0.196-0.330), which is 100 mm closer to the
     // butt than GH_FORE and exactly what buys the elbow its bend.
-    { 0.0f,  0.0190f,   0.1780f, 0.0135f,  0.0f, 0.0f,    1.0f   } }, // AR fore, 3p
+    { 0.0f,  0.0190f,   0.2550f, 0.0135f,  0.0f, 0.0f,    1.0f   } }, // AR fore, 3p
   // 10.4-14.1 mm measured the same way; 12.6 is the mean over the finger row.
   { { 0.0f, -0.0510f,  -0.0444f, 0.0126f,  0.0f, 0.900f,  0.436f },   // SR grip
     // 0.0139, not 0.0121: the fore-end is a k=8 chassis now, and on that profile the
     // touchable radius is min(rx, rz) * cos(pi/8) at the finger row — 0.0150 * 0.924.
     { 0.0f,  0.0130f,   0.2080f, 0.0139f,  0.0f, 0.0f,    1.0f   },   // SR fore-end
-    // The sniper changes a magazine too now.
-    { 0.0f, -0.0480f,   0.0640f, 0.0129f,  0.0f, 0.9997f, -0.0256f },   // SR mag
+    // A full finger row inside the extended 102 mm AICS body below the chassis.
+    { 0.0f, -0.1060f,   0.06277f, 0.01780f, 0.0f, 0.99982f, 0.01923f }, // SR mag
     // The sniper's fore-end is already 100 mm nearer its butt than the AR's, so
     // the third-person station moves less; it still moves, because the sniper's
     // butt is further back again.
-    { 0.0f,  0.0130f,   0.1480f, 0.0152f,  0.0f, 0.0f,    1.0f   } }, // SR fore, 3p
+    { 0.0f,  0.0130f,   0.2300f, 0.0152f,  0.0f, 0.0f,    1.0f   } }, // SR fore, 3p
 };
+
+// The three rendered grip sections are also the only source for the hand's axial
+// contact profile and the AR's panel relief. `profile_r` is GN's first radius in the
+// grip plane; `lateral_r` is its second radius along the weapon's right axis.
+typedef struct {
+  float y, z, profile_r, lateral_r;
+} gun_grip_section_t;
+static const gun_grip_section_t GUN_GRIP_SECTION[2][3] = {
+  [WPN_AR] = {
+    {-0.0140f,  0.0080f, 0.0121f, 0.0116f},
+    {-0.0520f, -0.0100f, 0.0114f, 0.0126f},
+    {-0.0900f, -0.0239f, 0.0095f, 0.0105f},
+  },
+  [WPN_SR] = {
+    {-0.0072f, -0.0233f, 0.0117f, 0.0113f},
+    {-0.0500f, -0.0460f, 0.0108f, 0.0122f},
+    {-0.0920f, -0.0640f, 0.0092f, 0.0102f},
+  },
+};
+
+// The swept k=8 bodies that hands close on. Render and contact sample the same final
+// rows, so hand placement always follows current section data. `rx` is along the chain
+// hint (weapon up for fore-ends, magazine fore/aft for magazines); `rz` is weapon right.
+typedef struct { float y, z, rx, rz; } gun_sweep_section_t;
+#define GUN_FORE_SECTION_MAX 6
+#define GUN_MAG_SECTION_MAX 5
+static const gun_sweep_section_t GUN_FORE_SECTION[2][GUN_FORE_SECTION_MAX] = {
+  [WPN_AR] = {
+    {0.0190f, 0.1780f, 0.0180f, 0.0154f},
+    {0.0190f, 0.1960f, 0.0158f, 0.0148f},
+    {0.0190f, 0.3000f, 0.0156f, 0.0144f},
+    {0.0190f, 0.3300f, 0.0152f, 0.0140f},
+  },
+  [WPN_SR] = {
+    {0.0116f, 0.1360f, 0.0176f, 0.0170f},
+    {0.0124f, 0.1620f, 0.0166f, 0.0158f},
+    {0.0132f, 0.2080f, 0.0156f, 0.0150f},
+    {0.0142f, 0.2640f, 0.0158f, 0.0162f},
+    {0.0152f, 0.3200f, 0.0162f, 0.0176f},
+    {0.0160f, 0.3600f, 0.0166f, 0.0150f},
+  },
+};
+static const int GUN_FORE_SECTION_N[2] = {4, 6};
+static const gun_sweep_section_t GUN_MAG_SECTION[2][GUN_MAG_SECTION_MAX] = {
+  [WPN_AR] = {
+    {-0.0300f, 0.1070f, 0.0196f, 0.0120f},
+    {-0.0900f, 0.0890f, 0.0190f, 0.0117f},
+    {-0.1400f, 0.0740f, 0.0184f, 0.0114f},
+  },
+  [WPN_SR] = {
+    {-0.0180f, 0.0640f, 0.0350f, 0.0140f},
+    {-0.0460f, 0.0638f, 0.0344f, 0.0138f},
+    {-0.0720f, 0.0634f, 0.0336f, 0.0135f},
+    {-0.0940f, 0.0630f, 0.0326f, 0.0132f},
+    {-0.1200f, 0.0625f, 0.0318f, 0.0129f},
+  },
+};
+static const int GUN_MAG_SECTION_N[2] = {3, 5};
+
+// Intersect the contact plane (normal `ay,az`) with a monotone swept centreline,
+// then interpolate the exact two radii carried by that render segment.
+static gun_sweep_section_t gun_sweep_section_at(
+    const gun_sweep_section_t *section, int n, float y, float z,
+    float ay, float az) {
+  float target = y * ay + z * az;
+  int best = 0;
+  float best_d = 1e9f;
+  for (int i = 0; i + 1 < n; i++) {
+    float a = section[i].y * ay + section[i].z * az;
+    float b = section[i + 1].y * ay + section[i + 1].z * az;
+    float lo = fminf(a, b), hi = fmaxf(a, b);
+    float d = target < lo ? lo - target : target > hi ? target - hi : 0.0f;
+    if (d < best_d) { best = i; best_d = d; }
+    if (d == 0.0f) break;
+  }
+  float a = section[best].y * ay + section[best].z * az;
+  float b = section[best + 1].y * ay + section[best + 1].z * az;
+  float den = b - a;
+  float t = fabsf(den) > 1e-7f ? f_clamp((target - a) / den, 0.0f, 1.0f)
+                                : 0.0f;
+  const gun_sweep_section_t *s0 = &section[best], *s1 = &section[best + 1];
+  return (gun_sweep_section_t){
+    s0->y + (s1->y - s0->y) * t,
+    s0->z + (s1->z - s0->z) * t,
+    s0->rx + (s1->rx - s0->rx) * t,
+    s0->rz + (s1->rz - s0->rz) * t,
+  };
+}
+
+static gun_grip_section_t gun_grip_section_at(int cur, float t) {
+  const gun_grip_section_t *s = GUN_GRIP_SECTION[cur];
+  int i = t <= 0.5f ? 0 : 1;
+  float u = i == 0 ? f_clamp(t * 2.0f, 0.0f, 1.0f)
+                   : f_clamp((t - 0.5f) * 2.0f, 0.0f, 1.0f);
+  return (gun_grip_section_t){
+    s[i].y + (s[i + 1].y - s[i].y) * u,
+    s[i].z + (s[i + 1].z - s[i].z) * u,
+    s[i].profile_r + (s[i + 1].profile_r - s[i].profile_r) * u,
+    s[i].lateral_r + (s[i + 1].lateral_r - s[i].lateral_r) * u,
+  };
+}
+
+static float gun_grip_lateral_flat(int cur, float t) {
+  // k=12 rings put edge midpoints, not vertices, on the cardinal axes.
+  return gun_grip_section_at(cur, t).lateral_r * 0.965925826f;
+}
 // The magazine's reload travel (down, camera-side) per weapon, published ONCE beside
 // the grip surfaces for the same reason they are: the model (gun_build), the
 // viewmodel's hand-follow (vm_build) and the third-person hand-follow all move a hand
@@ -173,6 +290,69 @@ static void gun_hold(int cur, int which, v3 org, v3 gx, v3 gy, v3 gz,
   *r = h[3] * gg;
 }
 
+static gun_hold_profile_t gun_grip_profile(int cur, v3 org, v3 gx, v3 gy,
+                                           v3 gz, float gg) {
+  const gun_grip_section_t *s = GUN_GRIP_SECTION[cur];
+  v3 c, a;
+  float ref_r;
+  gun_hold(cur, GH_GRIP, org, gx, gy, gz, &c, &a, &ref_r);
+  v3 u = fig_perp(a, gz);
+  v3 p0 = v3_add(org, v3_add(v3_scale(gy, s[0].y * gg),
+                              v3_scale(gz, s[0].z * gg)));
+  v3 p1 = v3_add(org, v3_add(v3_scale(gy, s[1].y * gg),
+                              v3_scale(gz, s[1].z * gg)));
+  v3 p2 = v3_add(org, v3_add(v3_scale(gy, s[2].y * gg),
+                              v3_scale(gz, s[2].z * gg)));
+  float ax0 = v3_dot(v3_sub(p0, c), a);
+  float ax1 = v3_dot(v3_sub(p1, c), a);
+  float ax2 = v3_dot(v3_sub(p2, c), a);
+  float center0 = v3_dot(v3_sub(p0, v3_add(c, v3_scale(a, ax0))), u);
+  float center1 = v3_dot(v3_sub(p1, v3_add(c, v3_scale(a, ax1))), u);
+  float center2 = v3_dot(v3_sub(p2, v3_add(c, v3_scale(a, ax2))), u);
+  return (gun_hold_profile_t){
+    .u = u,
+    .rx = s[1].profile_r * gg,
+    .rz = s[1].lateral_r * gg,
+    .ref_r = ref_r,
+    .axial_lo = ax2,
+    .axial_mid = ax1,
+    .axial_hi = ax0,
+    .axial_rx_lo = s[2].profile_r * gg,
+    .axial_rz_lo = s[2].lateral_r * gg,
+    .axial_rx_hi = s[0].profile_r * gg,
+    .axial_rz_hi = s[0].lateral_r * gg,
+    .axial_center_lo = center2,
+    .axial_center_mid = center1,
+    .axial_center_hi = center0,
+    // Hero/near emits this grip as a regular k=12 ring. Keep the established
+    // analytic far-hand proxy at k=8/6 so its merged-hand census is unchanged.
+    .axial3 = 1, .sides = g_fig_k >= 12 ? 12 : 0,
+    .enabled = 1,
+  };
+}
+
+static gun_hold_profile_t gun_mag_profile(int cur, v3 gx, v3 gy, v3 gz,
+                                          float gg) {
+  const float *hold = GUN_HOLD[cur][GH_RELD];
+  gun_sweep_section_t section = gun_sweep_section_at(
+    GUN_MAG_SECTION[cur], GUN_MAG_SECTION_N[cur], hold[1], hold[2],
+    hold[5], hold[6]);
+  v3 axis = v3_norm(v3_add(v3_scale(gx, hold[4]),
+                  v3_add(v3_scale(gy, hold[5]), v3_scale(gz, hold[6]))));
+  v3 u = fig_perp(axis, gz);
+  v3 center_delta = v3_add(v3_scale(gy, section.y - hold[1]),
+                           v3_scale(gz, section.z - hold[2]));
+  return (gun_hold_profile_t){
+    .u = u,
+    .rx = section.rx * gg, .rz = section.rz * gg,
+    .box01 = 1.0f, .ref_r = hold[3] * gg,
+    .fore_r = GUN_HOLD[cur][GH_FORE][3] * gg,
+    .fore3_r = GUN_HOLD[cur][GH_FORE3][3] * gg,
+    .center = v3_dot(center_delta, u) * gg,
+    .enabled = 1,
+  };
+}
+
 static float gun_sight_y(int cur) { return cur == WPN_SR ? VM_SIGHT_SR : VM_SIGHT_AR; }
 // ...and WHERE along the bore the shooter's eye is supposed to sit behind.
 #define AR_APERTURE_Z 0.2150f
@@ -190,15 +370,19 @@ static void gun_bolt_phase(float bolt01, float *lift, float *draw) {
 }
 // ...and the knob's world position for that phase. The rotation is about the weapon's
 // own right axis through the bolt's centreline at y = 0.014.
-#define BOLT_LIFT_A  -1.22f   // rad of bolt lift at full phase (~70 degrees)
+#define BOLT_LIFT_A   0.60f   // rad: the right-side handle lifts up, clear of the grip
 // 0.016, not 0.014: the bore, the barrel chain and the bolt axis are ONE line, and
 // they disagreed by 2 mm — so the handle rotated about an axis the bolt is not on.
 #define BOLT_PIVOT_Y  0.016f  // the bolt axis the handle rotates about
-#define BOLT_KNOB_U   0.0310f // knob station along the receiver's right
+#define BOLT_KNOB_U   0.0770f // knob station along the receiver's right
 #define BOLT_KNOB_Z  -0.037f  // ...and along the bore
 // 0.044: a .338 bolt travels further than a .308 one. Capped by the cheek piece — the
 // shroud's rear at full draw is -0.152 against the riser's front face at -0.156.
 #define BOLT_DRAW_M   0.044f  // rearward throw of a full draw
+// The glove compresses about 1.7 mm into the 9.4 mm knob; unlike the magazine this
+// contact is circular, so one local grip radius is truthful and needs no style-wide
+// radial offset in fig_hand.
+#define BOLT_HAND_R   0.0077f
 static v3 gun_bolt_knob(float bolt01, v3 org, v3 gx, v3 gy, v3 gz, float gg) {
   float lift, draw;
   gun_bolt_phase(bolt01, &lift, &draw);
@@ -227,11 +411,329 @@ static float g_gun_sight_r;   // its smaller half-extent (the tighter constraint
 #define SRTRIG_Z 0.0180f
 #define ARTRIG_Z 0.0400f
 
+// Shared render/contact dimensions for the few raised held surfaces. The render loops
+// and the compact seating envelopes below consume these same constants; there is no
+// second hand-only copy of the rail or relief geometry.
+#define AR_PANEL_T0       0.24f
+#define AR_PANEL_DT       0.26f
+#define AR_PANEL_RELIEF   0.0003f
+#define AR_PANEL_HY       0.0030f
+#define AR_PANEL_HZ       0.0040f
+#define AR_MLOK_INNER_X   0.0094f
+#define AR_MLOK_OUTER_X   0.0148f
+#define AR_MLOK_X        ((AR_MLOK_INNER_X + AR_MLOK_OUTER_X) * 0.5f)
+#define AR_MLOK_Y         0.0190f
+#define AR_MLOK_Z0        0.2140f
+#define AR_MLOK_DZ        0.0225f
+#define AR_MLOK_HX       ((AR_MLOK_OUTER_X - AR_MLOK_INNER_X) * 0.5f)
+#define AR_MLOK_HY        0.0038f
+#define AR_MLOK_HZ        0.0082f
+#define AR_UNDER_Y        0.0050f
+#define AR_UNDER_Z        0.2620f
+#define AR_UNDER_HX       0.0048f
+#define AR_UNDER_HY       0.0050f
+#define AR_UNDER_HZ       0.0330f
+#define SR_MLOK_INNER_X   0.0102f
+#define SR_MLOK_OUTER_X   0.0155f
+#define SR_MLOK_X        ((SR_MLOK_INNER_X + SR_MLOK_OUTER_X) * 0.5f)
+#define SR_MLOK_Y         0.0138f
+#define SR_MLOK_Z0        0.1980f
+#define SR_MLOK_DZ        0.0270f
+#define SR_MLOK_HX       ((SR_MLOK_OUTER_X - SR_MLOK_INNER_X) * 0.5f)
+#define SR_MLOK_HY        0.0044f
+#define SR_MLOK_HZ        0.0094f
+#define SR_UNDER_Z        0.2560f
+typedef struct {
+  float y, hx, hy, hz;
+} gun_under_step_t;
+// Shared by the emitted boxes and the held-surface ray exits below. The lower stage
+// is deliberately narrower; collapsing both into one bounding rectangle creates
+// contact corners that do not exist in the rendered chassis.
+static const gun_under_step_t SR_UNDER_STEP[2] = {
+  {-0.0034f, 0.0089f, 0.0032f, 0.0900f},
+  {-0.0056f, 0.0057f, 0.0060f, 0.0880f},
+};
+
+static void gun_fore_profile_sections(gun_hold_profile_t *profile, int cur,
+                                      const float *hold_row, float gg) {
+  // Far/corpse hands retain the historical compact proxy exactly. Only the
+  // Hero/Near tiers emit the authored multi-section fore sweep this describes.
+  if (g_fig_k < 12) return;
+  int n = GUN_FORE_SECTION_N[cur];
+  if (n > GUN_HOLD_SECTION_MAX) n = GUN_HOLD_SECTION_MAX;
+  profile->section_n = n;
+  for (int i = 0; i < n; i++) {
+    const gun_sweep_section_t *s = &GUN_FORE_SECTION[cur][i];
+    profile->section_along[i] = (s->z - hold_row[2]) * gg;
+    profile->section_rx[i] = s->rx * gg;
+    profile->section_rz[i] = s->rz * gg;
+    profile->section_center[i] = (s->y - hold_row[1]) * gg;
+  }
+}
+
+static gun_hold_profile_t gun_fore_profile(int cur, v3 gy, float gg) {
+  int hold = gg > 1.01f ? GH_FORE3 : GH_FORE;
+  const float *hold_row = GUN_HOLD[cur][hold];
+  gun_sweep_section_t section = gun_sweep_section_at(
+    GUN_FORE_SECTION[cur], GUN_FORE_SECTION_N[cur], hold_row[1], hold_row[2],
+    hold_row[5], hold_row[6]);
+  if (cur == WPN_AR) {
+    // The hand spans the tapered guard, not one remembered cross-section. These
+    // are the three straight-body nodes emitted by gun_ar_barrel (the delta-ring
+    // transition is deliberately outside the contact span).
+    const gun_sweep_section_t *lo = &GUN_FORE_SECTION[WPN_AR][1];
+    const gun_sweep_section_t *mid = &GUN_FORE_SECTION[WPN_AR][2];
+    const gun_sweep_section_t *hi = &GUN_FORE_SECTION[WPN_AR][3];
+    gun_hold_profile_t profile = {
+      .u = gy,
+      .rx = mid->rx * gg,
+      .rz = mid->rz * gg,
+      .box01 = 1.0f,
+      .ref_r = hold_row[3] * gg,
+      .center = (mid->y - hold_row[1]) * gg,
+      .axial_lo = (lo->z - hold_row[2]) * gg,
+      .axial_mid = (mid->z - hold_row[2]) * gg,
+      .axial_hi = (hi->z - hold_row[2]) * gg,
+      .axial_rx_lo = lo->rx * gg,
+      .axial_rz_lo = lo->rz * gg,
+      .axial_rx_hi = hi->rx * gg,
+      .axial_rz_hi = hi->rz * gg,
+      .axial_center_lo = (lo->y - hold_row[1]) * gg,
+      .axial_center_mid = (mid->y - hold_row[1]) * gg,
+      .axial_center_hi = (hi->y - hold_row[1]) * gg,
+      .side_inner = g_gun_hero ? AR_MLOK_INNER_X * gg : -1.0f,
+      .side_outer = g_gun_hero ? AR_MLOK_OUTER_X * gg : 0.0f,
+      .side_u_lo = (AR_MLOK_Y - AR_MLOK_HY - mid->y) * gg,
+      .side_u_hi = (AR_MLOK_Y + AR_MLOK_HY - mid->y) * gg,
+      .under = {{
+        .inner = (mid->y - (AR_UNDER_Y + AR_UNDER_HY)) * gg,
+        .outer = (mid->y - (AR_UNDER_Y - AR_UNDER_HY)) * gg,
+        .v_half = AR_UNDER_HX * gg,
+      }},
+      .under_count = 1,
+      .axial3 = 1,
+      .enabled = 1,
+    };
+    gun_fore_profile_sections(&profile, cur, hold_row, gg);
+    return profile;
+  }
+  gun_hold_profile_t profile = {
+    .u = gy,
+    .rx = section.rx * gg,
+    .rz = section.rz * gg,
+    .box01 = 1.0f,
+    .ref_r = hold_row[3] * gg,
+    .center = (section.y - hold_row[1]) * gg,
+    .side_inner = g_gun_hero ? SR_MLOK_INNER_X * gg : -1.0f,
+    .side_outer = g_gun_hero ? SR_MLOK_OUTER_X * gg : 0.0f,
+    .side_u_lo = (SR_MLOK_Y - SR_MLOK_HY - section.y) * gg,
+    .side_u_hi = (SR_MLOK_Y + SR_MLOK_HY - section.y) * gg,
+    .under_count = 2,
+    .enabled = 1,
+  };
+  for (int i = 0; i < 2; i++) {
+    const gun_under_step_t *s = &SR_UNDER_STEP[i];
+    profile.under[i] = (gun_hold_under_t){
+      .inner = (section.y - (s->y + s->hy)) * gg,
+      .outer = (section.y - (s->y - s->hy)) * gg,
+      .v_half = s->hx * gg,
+    };
+  }
+  gun_fore_profile_sections(&profile, cur, hold_row, gg);
+  return profile;
+}
+
+#ifndef _WIN32
+// Synthetic rays through the real SR rectangles certify side-wall exits and reject
+// cross-stage bounding-box unions. Values are radial ray lengths, not axis depths.
+static int gun_profile_under_selftest(float *side_mm, float *union_mm,
+                                      float *bounding_mm) {
+  int saved_hero = g_gun_hero;
+  int saved_k = g_fig_k;
+  g_gun_hero = 1;
+  g_fig_k = 16;
+  gun_hold_profile_t profile =
+    gun_fore_profile(WPN_SR, (v3){{0, 1, 0}}, 1.0f);
+  g_fig_k = 8;
+  gun_hold_profile_t far_profile =
+    gun_fore_profile(WPN_SR, (v3){{0, 1, 0}}, 1.0f);
+  g_fig_k = 16;
+  g_gun_hero = saved_hero;
+  gun_hold_profile_t saved_fore = g_gun_fore_profile;
+  g_gun_fore_profile = profile;
+  gun_hold_profile_t consumed =
+    fig_hand_contact_profile(FIG_HAND_CONTACT_FORE);
+  g_gun_fore_profile = saved_fore;
+  float q_union = 0.4f, down_union = 1.0f / sqrtf(1.0f + q_union * q_union);
+  float across_union = q_union * down_union;
+  float exact_union = gun_profile_under_ray_exit(&profile, -down_union,
+                                                  across_union, 0.0f, NULL);
+  float want_union = profile.under[0].outer / down_union;
+  float bounding = fminf(profile.under[1].outer / down_union,
+                         profile.under[0].v_half / across_union);
+
+  float q_side = 0.6f, down_side = 1.0f / sqrtf(1.0f + q_side * q_side);
+  float across_side = q_side * down_side;
+  float exact_side = gun_profile_under_ray_exit(&profile, -down_side,
+                                                 across_side, 0.0f, NULL);
+  float want_side = profile.under[0].v_half / across_side;
+  float straight = gun_profile_under_ray_exit(&profile, -1.0f, 0.0f,
+                                                0.0f, NULL);
+  // The real gun basis is (right, up, forward) with right=cross(forward,up).
+  // FORE must retain the published +up orientation, and a ray just beyond the
+  // side_outer corner must leave through the rectangle's +u wall rather than vanish.
+  float rail_q = 0.250f;
+  float rail_v = 1.0f / sqrtf(1.0f + rail_q * rail_q);
+  float rail_u = -rail_q * rail_v;
+  float rail_exit = gun_profile_side_ray_exit(&profile, rail_u, rail_v,
+                                               0.0f, NULL);
+  float rail_want = profile.side_u_lo / rail_u;
+  v3 rail_dir = {{-rail_v, rail_u, 0.0f}};
+  float rail_surface = gun_profile_radius_at(
+    &profile, (v3){{0, 0, 1}}, rail_dir, 0.0f);
+  gun_profile_hit_t rail_hit = gun_profile_query(
+    &profile, (v3){{0, 0, 1}}, rail_dir, 0.0f);
+  gun_profile_hit_t under_hit = gun_profile_query(
+    &profile, (v3){{0, 0, 1}}, (v3){{0, -1, 0}}, 0.0f);
+  gun_hold_profile_t polygon = {
+    .u = {{1, 0, 0}}, .rx = 0.012f, .rz = 0.010f,
+    .ref_r = 0.010f, .sides = 12, .enabled = 1,
+  };
+  gun_profile_hit_t polygon_hit = gun_profile_query(
+    &polygon, (v3){{0, 0, 1}}, (v3){{1, 0, 0}}, 0.0f);
+  if (!g_prof_ready) fig_prof_init();
+  const float (*polygon_pr)[2] = g_prof[fig_pi(12)];
+  v3 polygon_seam_dir = v3_norm((v3){{
+    polygon_pr[0][0] * polygon.rx,
+    -polygon_pr[0][1] * polygon.rz,
+    0.0f,
+  }});
+  gun_profile_hit_t polygon_seam = gun_profile_query(
+    &polygon, (v3){{0, 0, 1}}, polygon_seam_dir, 0.0f);
+  gun_profile_ray_hit_t under_corner = {0};
+  gun_profile_ray_hit_t side_corner[2] = {0};
+  gun_hold_profile_t corner_profile = profile;
+  corner_profile.under_count = 1;
+  float corner_q = corner_profile.under[0].v_half /
+                   corner_profile.under[0].outer;
+  float corner_down = 1.0f / sqrtf(1.0f + corner_q * corner_q);
+  (void)gun_profile_under_ray_exit(&corner_profile, -corner_down,
+                                    corner_q * corner_down, 0.0f,
+                                    &under_corner);
+  float side_corner_u[2] = {profile.side_u_lo, profile.side_u_hi};
+  for (int i = 0; i < 2; i++) {
+    float l = sqrtf(side_corner_u[i] * side_corner_u[i] +
+                    profile.side_outer * profile.side_outer);
+    (void)gun_profile_side_ray_exit(&profile, side_corner_u[i] / l,
+                                     profile.side_outer / l, 0.0f,
+                                     &side_corner[i]);
+  }
+  // A near corner remains ambiguous, but its exact nearer wall and normal win.
+  const float near_gap = 0.5e-6f;
+  gun_profile_ray_hit_t side_near[2] = {0};
+  int side_exact_fail = 0;
+  for (int i = 0; i < 2; i++) {
+    float q = fabsf(side_corner_u[i]) / (profile.side_outer - near_gap);
+    float near_dv = 1.0f / sqrtf(1.0f + q * q);
+    float du = (i ? 1.0f : -1.0f) * q * near_dv;
+    float exact_u = side_corner_u[i] / du;
+    float exact_outer = profile.side_outer / near_dv;
+    float got = gun_profile_side_ray_exit(&profile, du, near_dv, 0.0f,
+                                           &side_near[i]);
+    side_exact_fail |= !(exact_u < exact_outer) ||
+                       exact_outer - exact_u > GUN_PROFILE_TIE_EPS ||
+                       fabsf(got - exact_u) > 1e-8f ||
+                       !side_near[i].valid || !side_near[i].ambiguous ||
+                       side_near[i].nu != (i ? 1.0f : -1.0f) ||
+                       side_near[i].nv != 0.0f;
+  }
+  // Only witnesses within one micron of the exact final maximum compete. A~B
+  // and B~C must not make the materially separated A and C transitively tied.
+  v3 tie_dir = v3_norm((v3){{1, 1, 0}});
+  gun_profile_hit_t tied_candidate[2] = {0};
+  (void)gun_profile_hit_candidate(&tied_candidate[0], 0.0100000f,
+                                   (v3){{1, 0, 0}}, 0, tie_dir);
+  (void)gun_profile_hit_candidate(&tied_candidate[1], 0.0100005f,
+                                   (v3){{0, 1, 0}}, 0, tie_dir);
+  gun_profile_hit_t tied = gun_profile_hit_reduce(tied_candidate, 2, 1);
+  gun_profile_hit_t chain_candidate[3] = {0};
+  (void)gun_profile_hit_candidate(&chain_candidate[0], 0.0100000f,
+                                   (v3){{1, 0, 0}}, 0, tie_dir);
+  (void)gun_profile_hit_candidate(&chain_candidate[1], 0.0100009f,
+                                   (v3){{0, 1, 0}}, 0, tie_dir);
+  (void)gun_profile_hit_candidate(&chain_candidate[2], 0.0100018f,
+                                   (v3){{0, 1, 0}}, 0, tie_dir);
+  gun_profile_hit_t nontransitive =
+    gun_profile_hit_reduce(chain_candidate, 3, 1);
+  float polygon_want = polygon.rx * cosf(F_PI / 12.0f);
+  int query_fail = !rail_hit.valid || rail_hit.ambiguous ||
+                   fabsf(rail_hit.t - rail_surface) > 1e-6f ||
+                   v3_dot(rail_hit.normal, v3_scale(profile.u, -1.0f)) <
+                     0.9999f ||
+                   !under_hit.valid || under_hit.ambiguous ||
+                   fabsf(under_hit.t - straight) > 1e-6f ||
+                   v3_dot(under_hit.normal, v3_scale(profile.u, -1.0f)) <
+                     0.9999f ||
+                   !polygon_hit.valid || polygon_hit.ambiguous ||
+                   fabsf(polygon_hit.t - polygon_want) > 1e-6f ||
+                   v3_dot(polygon_hit.normal, (v3){{1, 0, 0}}) < 0.9999f ||
+                   !polygon_seam.valid || !polygon_seam.ambiguous ||
+                   !under_corner.valid || !under_corner.ambiguous ||
+                   !side_corner[0].ambiguous || !side_corner[1].ambiguous ||
+                   side_exact_fail || !tied.valid || !tied.ambiguous ||
+                   !nontransitive.valid || nontransitive.ambiguous ||
+                   fabsf(nontransitive.t - 0.0100018f) > 1e-8f ||
+                   v3_dot(nontransitive.normal, (v3){{0, 1, 0}}) < 0.9999f;
+  int section_fail = profile.section_n != GUN_FORE_SECTION_N[WPN_SR];
+  for (int i = 0; i < profile.section_n; i++) {
+    float rx, rz, center;
+    gun_profile_section(&profile, profile.section_along[i],
+                        &rx, &rz, &center);
+    section_fail |= fabsf(rx - profile.section_rx[i]) > 1e-6f ||
+                    fabsf(rz - profile.section_rz[i]) > 1e-6f ||
+                    fabsf(center - profile.section_center[i]) > 1e-6f;
+    if (i && profile.section_along[i] <= profile.section_along[i - 1])
+      section_fail = 1;
+  }
+  int si = profile.section_n - 2;
+  float center_shift = profile.section_center[si] - profile.center;
+  float shifted_straight = gun_profile_under_ray_exit(
+    &profile, -1.0f, 0.0f, center_shift, NULL);
+  if (side_mm) *side_mm = exact_side * 1000.0f;
+  if (union_mm) *union_mm = exact_union * 1000.0f;
+  if (bounding_mm) *bounding_mm = bounding * 1000.0f;
+  int fail = query_fail || section_fail || far_profile.section_n != 0 ||
+             profile.under_count != 2 ||
+             profile.under[0].v_half <= profile.under[1].v_half ||
+             profile.under[0].outer >= profile.under[1].outer ||
+             fabsf(exact_side - want_side) > 1e-6f ||
+             fabsf(exact_union - want_union) > 1e-6f ||
+             exact_union >= bounding - 1e-6f ||
+             fabsf(straight - profile.under[1].outer) > 1e-6f ||
+             fabsf(shifted_straight -
+                   (profile.under[1].outer + center_shift)) > 1e-6f ||
+             v3_dot(profile.u, (v3){{0, 1, 0}}) < 0.9999f ||
+             v3_dot(consumed.u, (v3){{0, 1, 0}}) < 0.9999f ||
+             fabsf(rail_exit - rail_want) > 1e-6f ||
+             fabsf(rail_surface - rail_want) > 1e-6f;
+  g_fig_k = saved_k;
+  return fail;
+}
+#endif
+
   #define GUNP(u, vy, wz) v3_add(org, v3_add(v3_scale(gx, (u) * gg), \
                           v3_add(v3_scale(gy, (vy) * gg), v3_scale(gz, (wz) * gg))))
-  #define GBOX(u, vy, wz, hx, hy, hz, col) \
-    scene_box(GUNP(u, vy, wz), v3_scale(gx, (hx) * gg), v3_scale(gy, (hy) * gg), \
-              v3_scale(gz, (hz) * gg), col)
+  #define GBOX(u, vy, wz, hx, hy, hz, col) do {                              \
+    int contact_v0_ = g_scene_floats;                                        \
+    scene_box(GUNP(u, vy, wz), v3_scale(gx, (hx) * gg),                      \
+              v3_scale(gy, (hy) * gg), v3_scale(gz, (hz) * gg), col);        \
+    gun_contact_mesh_add_active(contact_v0_);                                 \
+  } while (0)
+  #define GBOXW(c, e0, e1, e2, col) do {                                     \
+    int contact_v0_ = g_scene_floats;                                        \
+    scene_box(c, e0, e1, e2, col);                                           \
+    gun_contact_mesh_add_active(contact_v0_);                                 \
+  } while (0)
   // Placement discipline: neighboring parts INTERPENETRATE by >=1 mm with
   // different cross-sections (hidden faces, no coplanar pairs) — nothing
   // floats, nothing shares a plane.
@@ -243,7 +745,9 @@ static float g_gun_sight_r;   // its smaller half-extent (the tighter constraint
     int n_ = (int)(sizeof nd_ / sizeof *nd_);                                  \
     for (int i_ = 0; i_ < n_; i_++)                                            \
       nd_[i_].p = GUNP(nd_[i_].p.x, nd_[i_].p.y, nd_[i_].p.z);                 \
+    int contact_v0_ = g_scene_floats;                                          \
     fig_chain(nd_, n_, k, c0, c1, hint);                                       \
+    gun_contact_mesh_add_active(contact_v0_);                                  \
   } while (0)
   #define GN(u, vy, wz, r, rr, c) \
     (fnode_t){.p = {{u, vy, wz}}, .col = c, .bcol = c, \
@@ -257,7 +761,9 @@ static float g_gun_sight_r;   // its smaller half-extent (the tighter constraint
     int n_ = (int)(sizeof nd_ / sizeof *nd_);                                 \
     for (int i_ = 0; i_ < n_; i_++)                                           \
       nd_[i_].p = GUNP(nd_[i_].p.x, nd_[i_].p.y, nd_[i_].p.z);                \
+    int contact_v0_ = g_scene_floats;                                         \
     fig_chain(nd_, n_, k, c0, c1, hint);                                      \
+    gun_contact_mesh_add_active(contact_v0_);                                 \
     for (int i_ = 0; i_ < 4; i_++) g_gun_guard[i_] = nd_[i_].p;               \
     g_gun_guard_r = (guard_r) * gg;                                           \
   } while (0)
@@ -266,6 +772,7 @@ static void gun_ar_receiver(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                             v3 alloy, v3 alloy2, v3 upper, v3 steel,
                             v3 black, float bolt01) {
     // ---- receiver group (flat-sided: boxes) ----
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // THE UPPER RECEIVER IS A SECTION, NOT A BOX. It was one 31 x 29 x 210 mm cuboid,
     // so its flank was a single unbroken plane 21 cm long and took one unbroken
@@ -283,6 +790,7 @@ static void gun_ar_receiver(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       GN(0, 0.0208f,  0.1250f, 0.0151f, 0.0145f, alloy),
       GN(0, 0.0206f,  0.1900f, 0.0145f, 0.0138f, alloy),  // barrel-nut shoulder
     });
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
     // ONE CONTINUOUS TOP RAIL, receiver rear to handguard end — the monolithic rail
     // line that makes an HK416 read as one machine (ref: commons HK416N).
     // A PICATINNY RAIL IS THE RECEIVER'S OWN MATERIAL, not a black rubber strip: it
@@ -300,15 +808,24 @@ static void gun_ar_receiver(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // tooth 0.2 mm proud of the crown, 24 teeth put 285 parallel-within-1-mm pairs into
     // vmcheck's near tier. Base 10.2, crown 7.2, tooth 8.7: every neighbouring pair is
     // 1.5 mm apart, which is outside the near band on both sides.
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_RAIL_BASE,
+                                GUN_MESH_PART_FORE_BODY);
     GBOX(0,  0.0356f, 0.155f, 0.0102f, 0.0018f, 0.169f, alloy);  // rail base
+    gun_contact_mesh_role_end(GUN_MESH_PART_RAIL_BASE);
     // ...and the crown is INSET 2.5 mm at both ends for the same reason the sight's
     // hood bridge is: two boxes that share a z plane and overlap in projection are a
     // z-fight wherever they meet, and a rail sitting on a rail shares both ends.
     // The crown is the SLOT FLOOR, and a recess that sees less sky than the teeth
     // standing on it is 16% darker. Free: ao_off() is on for the whole weapon, so a
     // machined step gets no contact darkening unless it is authored.
+    gun_contact_mesh_role_begin(GUN_MESH_PART_RAIL_CROWN,
+                                GUN_MESH_PART_RAIL_BASE);
     GBOX(0,  0.0384f, 0.155f, 0.0072f, 0.0021f, 0.1665f,
          v3_scale(alloy, 0.84f));                                // rail crown
+    gun_contact_mesh_role_end(GUN_MESH_PART_RAIL_CROWN);
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     mat_set(MAT_ALLOY2_R, MAT_ALLOY_M);
     GBOX(0, -0.005f,  0.058f, 0.0145f, 0.0135f, 0.072f, alloy2); // lower receiver
     mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
@@ -329,6 +846,7 @@ static void gun_ar_receiver(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // on a rifle is invisible for the whole match.
     GBOX(-0.0158f, 0.0195f, 0.0550f, 0.0038f, 0.0072f, 0.0244f, alloy);  // port frame
     GBOX(-0.0176f, 0.0195f, 0.0550f, 0.0026f, 0.0052f, 0.0210f, black);  // ...and its cut
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
     // MIL-STD-1913 TEETH, AT THE PITCH THE STANDARD ACTUALLY SPECIFIES. Six teeth on
     // 21 mm centres across 338 mm of rail is half the real density, and a rhythm at
     // half rate does not read as a rail, it reads as six blocks. The standard is a
@@ -340,10 +858,17 @@ static void gun_ar_receiver(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // 3168 verts in the one view that can resolve a 4.7 mm land, and ZERO in the view
     // that put them 2.6 mm proud purely to stop them z-fighting at 28 m. The dovetail
     // bar above carries the rail's silhouette at every other range.
-    if (g_gun_hero)
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
+    if (g_gun_hero) {
+      gun_contact_mesh_role_begin(GUN_MESH_PART_RAIL_TOOTH,
+                                  GUN_MESH_PART_RAIL_CROWN);
       for (int r = 0; r < 24; r++)
         GBOX(0, 0.0400f, -0.0090f + 0.0140f * (float)r,
              0.0087f, 0.0026f, 0.0033f, alloy);
+      gun_contact_mesh_role_end(GUN_MESH_PART_RAIL_TOOTH);
+    }
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     // The controls are phosphated STEEL parts in an alloy receiver, which is a real
     // material step and the only thing that makes them read as separate pieces.
     mat_lathe(MAT_PARK_R, MAT_PARK_M);
@@ -403,6 +928,7 @@ static void gun_ar_receiver(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // through the well's top face) so nothing grazes.
     GBOX(0, -0.0122f, 0.1070f, 0.0158f, 0.0036f, 0.0250f, alloy2); // magwell flare
     mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
 }
 
 static void gun_ar_stock(v3 org, v3 gx, v3 gy, v3 gz, float gg,
@@ -515,33 +1041,54 @@ static void gun_ar_stock(v3 org, v3 gx, v3 gy, v3 gz, float gg,
 static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                            v3 body, v3 alloy2, v3 steel, v3 black, v3 mag,
                            float md01) {
+    const gun_grip_section_t *grip_sec = GUN_GRIP_SECTION[WPN_AR];
+    const gun_sweep_section_t *mag_sec = GUN_MAG_SECTION[WPN_AR];
     // ---- grip, trigger, magazine ----
     mat_set(MAT_POLY_R, 0.0f);
     // A PISTOL GRIP HAS TO BE AS LONG AS THE HAND ON IT. This was 62 mm from the
     // receiver to the butt against a hand breadth of 90 mm (ANSUR 88, x1.13 here), so
     // the palm overhung both ends: its index-side corner ran up inside the receiver and
     // its little-finger corner hung 7 mm off the bottom in open air.
+    gun_contact_mesh_begin(GUN_CONTACT_GRIP);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_GRIP_BODY, 0);
+    gun_contact_surface_begin();
     GCH(12, 1, 1, gz, {  // pistol grip, raked back and tapering into a swell
-      GN(0, -0.014f, 0.008f, 0.0121f, 0.0116f, body),
-      GN(0, -0.052f, -0.0100f, 0.0114f, 0.0126f, body),
-      GN(0, -0.090f, -0.0239f, 0.0095f, 0.0105f, black),
+      GN(0, grip_sec[0].y, grip_sec[0].z,
+         grip_sec[0].profile_r, grip_sec[0].lateral_r, body),
+      GN(0, grip_sec[1].y, grip_sec[1].z,
+         grip_sec[1].profile_r, grip_sec[1].lateral_r, body),
+      GN(0, grip_sec[2].y, grip_sec[2].z,
+         grip_sec[2].profile_r, grip_sec[2].lateral_r, black),
     });
+    gun_contact_surface_end();
+    gun_contact_mesh_role_end(GUN_MESH_PART_GRIP_BODY);
+    gun_contact_mesh_end(GUN_CONTACT_GRIP);
     // THE BEAVERTAIL is the only part of a grip that is NEVER under the hand and always
     // in the first-person frame — the camera sits above and to the left of it. Highest
     // return per box on the whole grip, and it changes no hold station.
-    scene_box(GUNP(0, -0.0215f, -0.0055f), v3_scale(gx, 0.0100f * gg),
-              v3_scale(gy, 0.0092f * gg), v3_scale(gz, 0.0044f * gg), body);
+    GBOXW(GUNP(0, -0.0215f, -0.0055f), v3_scale(gx, 0.0100f * gg),
+          v3_scale(gy, 0.0092f * gg), v3_scale(gz, 0.0044f * gg), body);
+    gun_contact_mesh_begin(GUN_CONTACT_GRIP);
     if (g_gun_hero) {
       // Texture panels as a VALUE STEP, not as holes: the magazine already taught this
       // function that `black` against the body reads as a window punched through it.
       v3 pan = v3_scale(body, 0.80f);
+      gun_contact_mesh_role_begin(GUN_MESH_PART_GRIP_PANEL,
+                                  GUN_MESH_PART_GRIP_BODY);
+      gun_contact_surface_begin();
       for (int gp = 0; gp < 3; gp++) {
-        float t = 0.24f + 0.26f * (float)gp;
-        scene_box(GUNP(0, -0.014f - 0.076f * t, 0.008f - 0.0319f * t),
-                  v3_scale(gx, 0.0124f * gg), v3_scale(gy, 0.0052f * gg),
-                  v3_scale(gz, 0.0040f * gg), pan);
+        float t = AR_PANEL_T0 + AR_PANEL_DT * (float)gp;
+        gun_grip_section_t panel = gun_grip_section_at(WPN_AR, t);
+        float panel_hx = gun_grip_lateral_flat(WPN_AR, t) + AR_PANEL_RELIEF;
+        GBOXW(GUNP(0, panel.y, panel.z),
+              v3_scale(gx, panel_hx * gg),
+              v3_scale(gy, AR_PANEL_HY * gg),
+              v3_scale(gz, AR_PANEL_HZ * gg), pan);
       }
+      gun_contact_surface_end();
+      gun_contact_mesh_role_end(GUN_MESH_PART_GRIP_PANEL);
     }
+    gun_contact_mesh_end(GUN_CONTACT_GRIP);
     // THE TRIGGER GROUP. A FINGER HAS TO FIT THROUGH THE GUARD, and this one's opening
     // was 25 x 10 mm — a curled index finger's distal phalanx is 17-19 mm thick, so
     // there was no pose in which the digit could be inside the bow rather than through
@@ -556,12 +1103,14 @@ static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // short of it in open air.
     // FOUR NODES, and that is a contract: GCH_PUB copies exactly nd_[0..3] into
     // g_gun_guard, so a fifth node would leave vmtrig testing half the bow.
+    gun_contact_mesh_pause();
     GCH_PUB(6, 1, 1, gy, 0.0042f, {   // ...and publishes g_gun_guard for vmtrig
       GN(0, -0.0170f, 0.0140f, 0.0034f, 0.0034f, alloy2),  // buried in the receiver
       GN(0, -0.0505f, 0.0255f, 0.0026f, 0.0042f, alloy2),
       GN(0, -0.0510f, 0.0530f, 0.0026f, 0.0042f, alloy2),
       GN(0, -0.0180f, 0.0790f, 0.0034f, 0.0034f, alloy2),  // buried in the magwell
     });
+    gun_contact_mesh_resume();
     mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // The blade: a real curved trigger, not a 5 mm box, and a RIGID one — it does not
     // travel. See gunanim_t for why the press is not modelled.
@@ -582,7 +1131,11 @@ static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
         {TRIGP(0.0016f, -0.0016f), steel, steel, 0.0026f * gg, 0.0042f * gg, 0, 0.0f},
         {TRIGP(-0.0122f, -0.0034f), steel, steel, 0.0026f * gg, 0.0040f * gg, 0, 0.0f},
         {TRIGP(-0.0226f, -0.0068f), steel, steel, 0.0024f * gg, 0.0034f * gg, 0, 0.0f}};
+      gun_contact_mesh_pause();
+      int contact_v0 = g_scene_floats;
       fig_chain(tb, 3, 8, 1, 1, gz);
+      gun_contact_mesh_add_active(contact_v0);
+      gun_contact_mesh_resume();
       for (int q = 0; q < 3; q++) g_gun_blade[q] = tb[q].p;
       g_gun_blade_r = 0.0042f * gg;   // the chain's own widest rz
       // THE PAD IS BEHIND THE BLADE, NOT IN FRONT OF IT. This used to publish the
@@ -622,11 +1175,22 @@ static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       // albedo as the lower receiver and the magwell it hangs out of, so the one object
       // a reload is about had no silhouette against the part it separates from —
       // invisible for a different reason than being off screen, and just as complete.
+      gun_contact_mesh_begin(GUN_CONTACT_MAG);
+      gun_contact_mesh_role_begin(GUN_MESH_PART_MAG_BODY, 0);
+      gun_contact_surface_begin();
       GCH(8, 1, 1, gz, {
-        GN(mdx, -0.030f - md, 0.107f, 0.0196f, 0.0120f, mag),
-        GN(mdx, -0.090f - md, 0.089f, 0.0190f, 0.0117f, mag),
-        GN(mdx, -0.140f - md, 0.074f, 0.0184f, 0.0114f, mag),
+        GN(mdx, mag_sec[0].y - md, mag_sec[0].z,
+           mag_sec[0].rx, mag_sec[0].rz, mag),
+        GN(mdx, mag_sec[1].y - md, mag_sec[1].z,
+           mag_sec[1].rx, mag_sec[1].rz, mag),
+        GN(mdx, mag_sec[2].y - md, mag_sec[2].z,
+           mag_sec[2].rx, mag_sec[2].rz, mag),
       });
+      gun_contact_surface_end();
+      gun_contact_mesh_role_end(GUN_MESH_PART_MAG_BODY);
+      gun_contact_mesh_role_begin(GUN_MESH_PART_MAG_DETAIL,
+                                  GUN_MESH_PART_MAG_BODY);
+      gun_contact_surface_begin();
       // GRIP RIBS. A polymer magazine is moulded with a texture panel down each flank —
       // it is the one surface on the weapon that exists to be held with a wet hand, and
       // it was a bare 110 mm plane. Four shallow bands, on the magazine's OWN rake
@@ -642,8 +1206,8 @@ static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
         for (int rb = 0; rb < 5; rb++) {
           v3 rc = GUNP(mdx, -0.046f - md - 0.0192f * (float)rb,
                        0.1020f - 0.0058f * (float)rb);
-          scene_box(rc, v3_scale(gx, 0.0123f * gg), v3_scale(rup, 0.0030f * gg),
-                    v3_scale(rfw, 0.0128f * gg), rib);
+          GBOXW(rc, v3_scale(gx, 0.0123f * gg), v3_scale(rup, 0.0030f * gg),
+                v3_scale(rfw, 0.0128f * gg), rib);
         }
       }
       // Floor plate: proud of the body on every side, which is what gives a magazine
@@ -655,25 +1219,32 @@ static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       // cap is TILTED, while these two boxes were axis-aligned in GUN space.
       v3 mup = v3_norm(v3_add(v3_scale(gy, 0.9580f), v3_scale(gz, 0.2870f)));
       v3 mfw = v3_norm(v3_add(v3_scale(gy, -0.2870f), v3_scale(gz, 0.9580f)));
-      v3 mbt = GUNP(mdx, -0.140f - md, 0.074f);   // the chain's last node
-      scene_box(v3_add(mbt, v3_scale(mup, -0.0028f * gg)),
-                v3_scale(gx, 0.0134f * gg), v3_scale(mup, 0.0058f * gg),
-                v3_scale(mfw, 0.0206f * gg), black);
-      scene_box(v3_add(mbt, v3_scale(mup, -0.0108f * gg)),
-                v3_scale(gx, 0.0122f * gg), v3_scale(mup, 0.0034f * gg),
-                v3_scale(mfw, 0.0192f * gg), black);
+      v3 mbt = GUNP(mdx, mag_sec[2].y - md, mag_sec[2].z); // chain's last node
+      GBOXW(v3_add(mbt, v3_scale(mup, -0.0028f * gg)),
+            v3_scale(gx, 0.0134f * gg), v3_scale(mup, 0.0058f * gg),
+            v3_scale(mfw, 0.0206f * gg), black);
+      GBOXW(v3_add(mbt, v3_scale(mup, -0.0108f * gg)),
+            v3_scale(gx, 0.0122f * gg), v3_scale(mup, 0.0034f * gg),
+            v3_scale(mfw, 0.0192f * gg), black);
+      gun_contact_surface_end();
+      gun_contact_mesh_role_end(GUN_MESH_PART_MAG_DETAIL);
+      gun_contact_mesh_end(GUN_CONTACT_MAG);
       mat_set(MAT_POLY_R, 0.0f);
     }
 }
 
 static void gun_ar_barrel(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                           v3 alloy, v3 upper, v3 steel, v3 black) {
+    const gun_sweep_section_t *fore_sec = GUN_FORE_SECTION[WPN_AR];
     // ---- handguard, barrel, muzzle ----
     mat_set(MAT_POLY_R, 0.0f);
     mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // QUAD-RAIL HANDGUARD: a chunky faceted block (k=8 — the facet IS the look),
     // SHORTER than the old tube so real barrel shows ahead of it (ref: the HK416's
     // exposed muzzle end), entered through a delta-ring taper at the receiver.
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_BODY, 0);
+    gun_contact_surface_begin();
     GCH(8, 1, 1, gy, {
       // THE RAIL WAS NOT TOUCHING THE HANDGUARD. The guard's top sat at 32.8 mm and
       // the rail base's underside at 33.8 — a millimetre of open sky along the whole
@@ -682,43 +1253,77 @@ static void gun_ar_barrel(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       // guard's `rx` ALONE (0.0138 -> 0.0158), because the hand stations GH_FORE and
       // GH_FORE3 are pinned to y 0.0190 and may not move: the top rises 2 mm into the
       // rail and the bottom drops 2 mm, which the 6 o'clock stub already covers.
-      GN(0, 0.019f, 0.178f, 0.0180f, 0.0154f, alloy),  // delta ring
-      GN(0, 0.019f, 0.196f, 0.0158f, 0.0148f, alloy),
-      GN(0, 0.019f, 0.300f, 0.0156f, 0.0144f, alloy),
-      GN(0, 0.019f, 0.330f, 0.0152f, 0.0140f, alloy),
+      GN(0, fore_sec[0].y, fore_sec[0].z,
+         fore_sec[0].rx, fore_sec[0].rz, alloy),  // delta ring
+      GN(0, fore_sec[1].y, fore_sec[1].z,
+         fore_sec[1].rx, fore_sec[1].rz, alloy),
+      GN(0, fore_sec[2].y, fore_sec[2].z,
+         fore_sec[2].rx, fore_sec[2].rz, alloy),
+      GN(0, fore_sec[3].y, fore_sec[3].z,
+         fore_sec[3].rx, fore_sec[3].rz, alloy),
     });
+    gun_contact_surface_end();
+    gun_contact_mesh_role_end(GUN_MESH_PART_FORE_BODY);
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
     // M-LOK, NOT THREE SLABS. The guard used to carry one 112 mm bar per side and one
     // underneath — three long unbroken strips on the one part whose whole job is to be
     // GRIPPED, so the hand's own surface was the smoothest thing on the weapon. A
     // modern free-float rail is a slotted tube, and what a slot row reads as at any
     // range is a RHYTHM of dark lands: five short bars beat one long one for the same
     // vertex count, and the gaps between them do the work the slabs could not.
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
     mat_set(MAT_POLY_R, 0.0f);
-    for (int m = 0; gun_tier() && m < 5; m++) {
-      float mz = 0.2140f + 0.0225f * (float)m;
-      GBOX( 0.0152f, 0.019f, mz, 0.0026f, 0.0038f, 0.0082f, black);
-      GBOX(-0.0152f, 0.019f, mz, 0.0026f, 0.0038f, 0.0082f, black);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_DETAIL,
+                                GUN_MESH_PART_FORE_BODY);
+    gun_contact_surface_begin();
+    // Emit the 4.7 mm lands only in the hero view. Lower tiers retain one closed
+    // handguard body, avoiding overlapping same-facing surfaces.
+    for (int m = 0; g_gun_hero && m < 5; m++) {
+      float mz = AR_MLOK_Z0 + AR_MLOK_DZ * (float)m;
+      GBOX( AR_MLOK_X, AR_MLOK_Y, mz,
+            AR_MLOK_HX, AR_MLOK_HY, AR_MLOK_HZ, black);
+      GBOX(-AR_MLOK_X, AR_MLOK_Y, mz,
+            AR_MLOK_HX, AR_MLOK_HY, AR_MLOK_HZ, black);
     }
+    gun_contact_mesh_role_end(GUN_MESH_PART_FORE_DETAIL);
     mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     // The 6 o'clock position keeps a REAL rail stub, because that is where a grip or a
     // light goes and it is the one place on the guard a bolt-on section belongs.
-    GBOX(0, 0.0034f, 0.2620f, 0.0048f, 0.0034f, 0.0330f, alloy);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_UNDER_OUTER,
+                                GUN_MESH_PART_FORE_BODY);
+    GBOX(0, AR_UNDER_Y, AR_UNDER_Z,
+         AR_UNDER_HX, AR_UNDER_HY, AR_UNDER_HZ, alloy);
+    gun_contact_mesh_role_end(GUN_MESH_PART_UNDER_OUTER);
+    gun_contact_surface_end();
     if (g_gun_hero) {
+      // Tooth crests are decorative relief, not a continuous soft-pad surface.
+      gun_contact_mesh_role_begin(GUN_MESH_PART_UNDER_TOOTH,
+                                  GUN_MESH_PART_UNDER_OUTER);
       for (int r = 0; r < 5; r++)
         GBOX(0, 0.0006f, 0.2340f + 0.0140f * (float)r,
              0.0034f, 0.0026f, 0.0033f, alloy);
+      gun_contact_mesh_role_end(GUN_MESH_PART_UNDER_TOOTH);
       // The QD sling cup at the guard's rear, on the side the camera can see: the
       // first-person camera sits on the weapon's LEFT, so furniture on +x is furniture
       // nobody renders.
       mat_lathe(MAT_PARK_R, MAT_PARK_M);
+      gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_ATTACHMENT,
+                                  GUN_MESH_PART_FORE_BODY);
       GBOX(-0.0141f, 0.0100f, 0.2080f, 0.0026f, 0.0044f, 0.0044f, upper);
+      gun_contact_mesh_role_end(GUN_MESH_PART_FORE_ATTACHMENT);
       mat_set(MAT_ALLOY_R, MAT_ALLOY_M);
     }
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
     // Gas tube running from the low block back under the rail into the guard.
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_ATTACHMENT,
+                                GUN_MESH_PART_FORE_BODY);
     GCH(8, 1, 1, gy, {
       GN(0, 0.0306f, 0.186f, 0.0019f, 0.0019f, steel),
       GN(0, 0.0306f, 0.368f, 0.0019f, 0.0019f, steel),
     });
+    gun_contact_mesh_role_end(GUN_MESH_PART_FORE_ATTACHMENT);
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
     // AN EXPOSED BARREL IS NITRIDED OR PHOSPHATED, NOT BARE. At MAT_BARE_C (0.740) and
     // MAT_STEEL_R this was brighter and smoother than the receiver, the optic and the
     // brake put together, and it sits dead centre-right of the hip frame — the value
@@ -754,8 +1359,18 @@ static void gun_ar_barrel(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // Sling loop at the guard's mouth — the quad-rail block carries the rail
     // furniture now, so the loop is the guard's one remaining jewel.
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
-    fig_tube(GUNP(-0.0130f, 0.0090f, 0.196f), GUNP(-0.0182f, 0.0090f, 0.196f),
-             0.0068f * gg, 0.0068f * gg, 0.0040f * gg, 0.0040f * gg, 12, steel, gy);   // front sling loop
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
+    {
+      gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_ATTACHMENT,
+                                  GUN_MESH_PART_FORE_BODY);
+      int contact_v0 = g_scene_floats;
+      fig_tube(GUNP(-0.0130f, 0.0090f, 0.196f), GUNP(-0.0182f, 0.0090f, 0.196f),
+               0.0068f * gg, 0.0068f * gg, 0.0040f * gg, 0.0040f * gg,
+               12, steel, gy);   // front sling loop
+      gun_contact_mesh_add_active(contact_v0);
+      gun_contact_mesh_role_end(GUN_MESH_PART_FORE_ATTACHMENT);
+    }
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
     mat_lathe(MAT_PARK_R, MAT_PARK_M);
     // A THREE-CHAMBER BRAKE, AND THE CHAMBERS ARE WHAT MAKE IT ONE. The old head was a
     // smooth cone with two 5 mm fins stuck on its flanks: fins point OUT of a brake and
@@ -839,18 +1454,28 @@ static void gun_ar_sight(int cur, v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // The frame: a thin square tube, 1.05 mm of wall, 3.0 mm deep. Steel, not alloy —
     // the bright machined rim over a black pod is most of the sight's read.
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
-    fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0015f),
-             GUNP(0, sight_y, AR_APERTURE_Z + 0.0015f),
-             0.01155f * gg, 0.01905f * gg, 0.0105f * gg, 0.0180f * gg, 4, steel, gy);
+    {
+      int contact_v0 = g_scene_floats;
+      fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0015f),
+               GUNP(0, sight_y, AR_APERTURE_Z + 0.0015f),
+               0.01155f * gg, 0.01905f * gg, 0.0105f * gg, 0.0180f * gg,
+               4, steel, gy);
+      gun_contact_mesh_add_active(contact_v0);
+    }
     // THE COATING, AS AN ANNULUS IN THE FRAME'S OWN WALL — construction unchanged
     // from the second pass, scaled to the thinner wall: outer edges 0.3 mm inside the
     // frame's, inner edges 0.5 / 0.8 mm proud into the aperture (which is what makes
     // the glass, not the steel, the tighter constraint), z faces 1.1 mm inside the
     // frame's so no pair of the four ring faces is parallel within a millimetre.
     mat_set(MAT_GLASS_R, 0.0f);
-    fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0004f),
-             GUNP(0, sight_y, AR_APERTURE_Z + 0.0004f),
-             0.01125f * gg, 0.0188f * gg, 0.0100f * gg, 0.0172f * gg, 4, lens, gy);
+    {
+      int contact_v0 = g_scene_floats;
+      fig_tube(GUNP(0, sight_y, AR_APERTURE_Z - 0.0004f),
+               GUNP(0, sight_y, AR_APERTURE_Z + 0.0004f),
+               0.01125f * gg, 0.0188f * gg, 0.0100f * gg, 0.0172f * gg,
+               4, lens, gy);
+      gun_contact_mesh_add_active(contact_v0);
+    }
     g_gun_sight_p = GUNP(0, sight_y, gun_sight_z(cur));   // one copy; see figm weld
     // ...and the tighter constraint is the GLASS's inner edge, not the frame's:
     // the coating annulus narrows the open aperture from 21.0 to 20.0 mm.
@@ -871,6 +1496,7 @@ static void gun_sr_action(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // Everything BEHIND z 0.150 is pinned: the butt (GUN_BUTT_Z), the grip, the trigger
     // (SRTRIG_Z), the magazine and both fore-end hold stations are the contract with the
     // pose solver and the hand builder. All 284 mm of the growth is barrel.
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     mat_lathe(MAT_PARK_R, MAT_PARK_M);
     // THE ACTION IS A SECTION, NOT A BOX — the same argument the AR's upper carries.
     // One 27.6 x 30.4 x 230 mm cuboid has no shoulder line anywhere, and an AI action is
@@ -899,23 +1525,28 @@ static void gun_sr_action(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       for (int r = 0; r < 5; r++)   // only the run BEHIND the mount is ever seen
         GBOX(0, 0.0384f, -0.0620f + 0.0140f * (float)r,
              0.0078f, 0.0026f, 0.0033f, alloy);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
     // THE CHASSIS THE ACTION IS BEDDED IN, and the model had nothing for it: the
     // receiver hung in open air over the trigger group. Its side plates stand 2.4 mm
     // proud of the action, which is the AWM's signature line and the reason the class
     // reads as a chassis rifle rather than as a tube in a stock.
+    gun_contact_mesh_begin(GUN_CONTACT_CHASSIS);
     mat_set(MAT_POLY_R, 0.0f);
     GCH(8, 1, 1, gy, {
-      GN(0, 0.0000f, -0.0720f, 0.0132f, 0.0158f, chas),  // rear tang -> the spines
-      GN(0, 0.0010f, -0.0200f, 0.0140f, 0.0164f, chas),
-      GN(0, 0.0016f,  0.0300f, 0.0144f, 0.0166f, chas),
-      GN(0, 0.0020f,  0.1000f, 0.0146f, 0.0166f, chas),
-      GN(0, 0.0060f,  0.1450f, 0.0160f, 0.0170f, chas),  // into the fore-end
+      GN(0, 0.0040f, -0.0720f, 0.0132f, 0.0158f, chas),  // rear tang -> the spines
+      GN(0, 0.0050f, -0.0200f, 0.0140f, 0.0164f, chas),
+      GN(0, 0.0056f,  0.0300f, 0.0144f, 0.0166f, chas),
+      GN(0, 0.0060f,  0.1000f, 0.0146f, 0.0166f, chas),
+      GN(0, 0.0100f,  0.1450f, 0.0160f, 0.0170f, chas),  // into the fore-end
     });
+    gun_contact_mesh_end(GUN_CONTACT_CHASSIS);
 }
 
 static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                            v3 body, v3 upper, v3 steel, v3 black, v3 mag,
                            v3 chas, float md01, float bolt01) {
+    const gun_grip_section_t *grip_sec = GUN_GRIP_SECTION[WPN_SR];
+    const gun_sweep_section_t *mag_sec = GUN_MAG_SECTION[WPN_SR];
     mat_set(MAT_POLY_R, 0.0f);  // state carried in from gun_sr_action's last call (task-10 split)
     // ---- magwell and a magazine that is its own class's length ----------------
     // 0.0150 and 0.0186, not 0.0166 and 0.0174: at 0.0166 the well's side faces landed
@@ -923,8 +1554,10 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // parallel, overlapping, gap 0.000, i.e. vmcheck's zfight tier in every one of the
     // sniper's 77 poses. A well steps IN under the chassis and its fence steps back OUT
     // past it, which is also what the part does.
+    gun_contact_mesh_begin(GUN_CONTACT_CHASSIS);
     GBOX(0, -0.0090f, 0.0640f, 0.0150f, 0.0158f, 0.0340f, chas);   // magwell
     GBOX(0, -0.0224f, 0.0640f, 0.0186f, 0.0034f, 0.0352f, chas);   // magwell flare
+    gun_contact_mesh_end(GUN_CONTACT_CHASSIS);
     {
       // Same two-component travel as the AR's: down AND toward the camera, so the
       // magazine gets BIGGER in frame as it leaves rather than sliding off the bottom
@@ -936,18 +1569,45 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       // was less than half its class's length, which is why it read as a pistol mag.
       // rx is the fore-aft half-extent here and rz the width — the chain runs down y
       // with a gz hint, so the two swap against the AR's convention.
-      GCH(8, 1, 1, gz, {
-        GN(mdx, -0.0180f - md, 0.0640f, 0.0350f, 0.0140f, mag),
-        GN(mdx, -0.0460f - md, 0.0638f, 0.0344f, 0.0138f, mag),
-        GN(mdx, -0.0720f - md, 0.0634f, 0.0336f, 0.0135f, mag),
-        GN(mdx, -0.0940f - md, 0.0630f, 0.0326f, 0.0132f, mag),
-      });
+      gun_contact_mesh_begin(GUN_CONTACT_MAG);
+      gun_contact_mesh_role_begin(GUN_MESH_PART_MAG_BODY, 0);
+      gun_contact_surface_begin();
+      if (g_fig_k >= 12) {
+        GCH(8, 1, 1, gz, {
+          GN(mdx, mag_sec[0].y - md, mag_sec[0].z,
+             mag_sec[0].rx, mag_sec[0].rz, mag),
+          GN(mdx, mag_sec[1].y - md, mag_sec[1].z,
+             mag_sec[1].rx, mag_sec[1].rz, mag),
+          GN(mdx, mag_sec[2].y - md, mag_sec[2].z,
+             mag_sec[2].rx, mag_sec[2].rz, mag),
+          GN(mdx, mag_sec[3].y - md, mag_sec[3].z,
+             mag_sec[3].rx, mag_sec[3].rz, mag),
+          GN(mdx, mag_sec[4].y - md, mag_sec[4].z,
+             mag_sec[4].rx, mag_sec[4].rz, mag),
+        });
+      } else {
+        GCH(8, 1, 1, gz, {
+          GN(mdx, mag_sec[0].y - md, mag_sec[0].z,
+             mag_sec[0].rx, mag_sec[0].rz, mag),
+          GN(mdx, mag_sec[1].y - md, mag_sec[1].z,
+             mag_sec[1].rx, mag_sec[1].rz, mag),
+          GN(mdx, mag_sec[3].y - md, mag_sec[3].z,
+             mag_sec[3].rx, mag_sec[3].rz, mag),
+          GN(mdx, mag_sec[4].y - md, mag_sec[4].z,
+             mag_sec[4].rx, mag_sec[4].rz, mag),
+        });
+      }
+      gun_contact_surface_end();
+      gun_contact_mesh_role_end(GUN_MESH_PART_MAG_BODY);
+      gun_contact_mesh_role_begin(GUN_MESH_PART_MAG_DETAIL,
+                                  GUN_MESH_PART_MAG_BODY);
+      gun_contact_surface_begin();
       if (g_gun_hero) {   // witness slots, in the magazine's own frame
         v3 rib = v3_scale(mag, 0.74f);
         for (int rb = 0; rb < 4; rb++)
-          scene_box(GUNP(mdx, -0.0300f - md - 0.0200f * (float)rb, 0.0636f),
-                    v3_scale(gx, 0.0141f * gg), v3_scale(gy, 0.0030f * gg),
-                    v3_scale(gz, 0.0250f * gg), rib);
+          GBOXW(GUNP(mdx, -0.0300f - md - 0.0200f * (float)rb, 0.0636f),
+                v3_scale(gx, 0.0141f * gg), v3_scale(gy, 0.0030f * gg),
+                v3_scale(gz, 0.0250f * gg), rib);
       }
       // Floor plate, on the magazine's OWN axis: this one is nearly vertical (76 mm of
       // drop over 1 mm of z), so `mup` is almost gy — but it is DERIVED rather than
@@ -956,14 +1616,19 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       mat_set(MAT_POLY_R * 1.4f, 0.0f);
       v3 mup = v3_norm(v3_add(v3_scale(gy, 0.99989f), v3_scale(gz, -0.01316f)));
       v3 mfw = v3_norm(v3_add(v3_scale(gy, 0.01316f), v3_scale(gz, 0.99989f)));
-      v3 mbt = GUNP(mdx, -0.0940f - md, 0.0630f);
-      scene_box(v3_add(mbt, v3_scale(mup, -0.0028f * gg)),
-                v3_scale(gx, 0.0146f * gg), v3_scale(mup, 0.0058f * gg),
-                v3_scale(mfw, 0.0348f * gg), black);
+      v3 mbt = GUNP(mdx, mag_sec[4].y - md, mag_sec[4].z);
+      GBOXW(v3_add(mbt, v3_scale(mup, -0.0028f * gg)),
+            v3_scale(gx, 0.0146f * gg), v3_scale(mup, 0.0058f * gg),
+            v3_scale(mfw, 0.0348f * gg), black);
       // The finger hook a shooter actually pulls a stuck AICS mag out by.
       mat_set(MAT_POLY_R, 0.0f);
-      GBOX(mdx, -0.0820f - md, 0.1000f, 0.0110f, 0.0116f, 0.0032f, black);
+      if (gun_tier())
+        GBOX(mdx, -0.0820f - md, 0.1000f, 0.0110f, 0.0116f, 0.0032f, black);
+      gun_contact_surface_end();
+      gun_contact_mesh_role_end(GUN_MESH_PART_MAG_DETAIL);
+      gun_contact_mesh_end(GUN_CONTACT_MAG);
     }
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     // The BOLT, and it cycles. `bolt01` lifts the handle, draws it back and returns it —
     // one rotation about the receiver's axis plus one translation, so the knob traces
@@ -985,36 +1650,59 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
         {BOLTP(0, 0.0160f, -0.0980f), steel, steel, 0.0124f*gg, 0.0124f*gg, 0, 0.0f},
         {BOLTP(0, 0.0160f, -0.0900f), steel, steel, 0.0112f*gg, 0.0112f*gg, 0, 0.0f},
         {BOLTP(0, 0.0160f, -0.0760f), steel, steel, 0.0118f*gg, 0.0118f*gg, 0, 0.0f}};
+      int contact_v0 = g_scene_floats;
       fig_chain(bs, 4, 12, 1, 1, gy);
+      gun_contact_mesh_add_active(contact_v0);
       // The cocking indicator out its rear face — the one part of a rifle that tells
       // you, without touching it, whether it is ready.
-      if (gun_tier())
+      if (gun_tier()) {
+        contact_v0 = g_scene_floats;
         scene_box(BOLTP(0, 0.0160f, -0.1128f), v3_scale(gx, 0.0022f * gg),
                   v3_scale(gy, 0.0022f * gg), v3_scale(gz, 0.0042f * gg), black);
+        gun_contact_mesh_add_active(contact_v0);
+      }
+      gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
+      gun_contact_mesh_begin(GUN_CONTACT_BOLT);
       fnode_t bh[2] = {   // handle root
         {BOLTP(0.0110f, 0.0160f, -0.0300f), steel, steel, 0.0048f*gg, 0.0046f*gg, 0, 0.0f},
-        {BOLTP(0.0268f, 0.0052f, -0.0370f), steel, steel, 0.0042f*gg, 0.0042f*gg, 0, 0.0f}};
+        {BOLTP(0.0710f, 0.0052f, -0.0370f), steel, steel, 0.0042f*gg, 0.0042f*gg, 0, 0.0f}};
+      contact_v0 = g_scene_floats;
       fig_chain(bh, 2, 16, 1, 1, gy);
+      gun_contact_mesh_add_active(contact_v0);
       // ...and a BALL on the handle's own axis, not a stub on the gun's. A real AI knob
       // is 22 mm across; this was 13.8 and stood vertically, so it read as a nub.
       mat_lathe(MAT_PARK_R, MAT_PARK_M);
       fnode_t bk[4] = {
-        {BOLTP(0.0250f, -0.0018f, -0.0370f), upper, upper, 0.0056f*gg, 0.0056f*gg, 0, 0.0f},
-        {BOLTP(0.0288f, -0.0042f, -0.0370f), upper, upper, 0.0094f*gg, 0.0094f*gg, 0, 0.0f},
-        {BOLTP(0.0330f, -0.0068f, -0.0370f), upper, upper, 0.0094f*gg, 0.0094f*gg, 0, 0.0f},
-        {BOLTP(0.0362f, -0.0088f, -0.0370f), upper, upper, 0.0058f*gg, 0.0058f*gg, 0, 0.0f}};
+        {BOLTP(0.0710f, 0.0052f, -0.0370f), upper, upper, 0.0056f*gg, 0.0056f*gg, 0, 0.0f},
+        {BOLTP(0.0740f, -0.0042f, -0.0370f), upper, upper, 0.0094f*gg, 0.0094f*gg, 0, 0.0f},
+        {BOLTP(0.0800f, -0.0068f, -0.0370f), upper, upper, 0.0094f*gg, 0.0094f*gg, 0, 0.0f},
+        {BOLTP(0.0850f, -0.0088f, -0.0370f), upper, upper, 0.0058f*gg, 0.0058f*gg, 0, 0.0f}};
+      contact_v0 = g_scene_floats;
+      gun_contact_surface_begin();
       fig_chain(bk, 4, 12, 1, 1, gz);
+      gun_contact_mesh_add_active(contact_v0);
+      gun_contact_surface_end();
+      gun_contact_mesh_end(GUN_CONTACT_BOLT);
       #undef BOLTP
     }
     mat_set(MAT_POLY_R, 0.0f);
     // Same two fixes as the AR's grip (see there): the top ring floated 8.7 mm under the
     // receiver it is supposed to hang from, and the bottom ended 6.5 mm above the
     // little-finger edge of the hand that holds it.
+    gun_contact_mesh_begin(GUN_CONTACT_GRIP);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_GRIP_BODY, 0);
+    gun_contact_surface_begin();
     GCH(12, 1, 1, gz, {  // grip
-      GN(0, -0.0072f, -0.0233f, 0.0117f, 0.0113f, chas),
-      GN(0, -0.050f, -0.046f, 0.0108f, 0.0122f, chas),
-      GN(0, -0.0920f, -0.0640f, 0.0092f, 0.0102f, black),
+      GN(0, grip_sec[0].y, grip_sec[0].z,
+         grip_sec[0].profile_r, grip_sec[0].lateral_r, chas),
+      GN(0, grip_sec[1].y, grip_sec[1].z,
+         grip_sec[1].profile_r, grip_sec[1].lateral_r, chas),
+      GN(0, grip_sec[2].y, grip_sec[2].z,
+         grip_sec[2].profile_r, grip_sec[2].lateral_r, black),
     });
+    gun_contact_surface_end();
+    gun_contact_mesh_role_end(GUN_MESH_PART_GRIP_BODY);
+    gun_contact_mesh_end(GUN_CONTACT_GRIP);
     // Trigger group — same construction as the AR's, same reason (see there): the guard
     // has to have a finger-sized hole in it.
     mat_set(MAT_POLY_R, 0.0f);
@@ -1023,12 +1711,14 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // through the palm wrapped round that grip — 7.2 mm inside the hand's mesh by the
     // rewritten vmtrig, and no amount of clearing the DIGITS could reach it because the
     // offender was the palm.
+    gun_contact_mesh_pause();
     GCH_PUB(6, 1, 1, gy, 0.0042f, {   // ...and publishes g_gun_guard for vmtrig
       GN(0, -0.0008f, SRTRIG_Z - 0.0290f, 0.0034f, 0.0034f, body),  // in the chassis
       GN(0, -0.0505f, SRTRIG_Z - 0.0350f, 0.0026f, 0.0042f, body),
       GN(0, -0.0530f,  0.0272f, 0.0026f, 0.0042f, body),
       GN(0, -0.0006f,  0.0372f, 0.0034f, 0.0034f, body),   // buried in the magwell
     });
+    gun_contact_mesh_resume();
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     {
       v3 tpv = GUNP(0, -0.0010f, SRTRIG_Z);     // seat — rigid, see the AR's blade
@@ -1039,7 +1729,11 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
         {TRIGP(0.0014f, 0.0004f), steel, steel, 0.0028f * gg, 0.0038f * gg, 0, 0.0f},
         {TRIGP(-0.0126f, -0.0008f), steel, steel, 0.0028f * gg, 0.0036f * gg, 0, 0.0f},
         {TRIGP(-0.0232f, -0.0026f), steel, steel, 0.0026f * gg, 0.0032f * gg, 0, 0.0f}};
+      gun_contact_mesh_pause();
+      int contact_v0 = g_scene_floats;
       fig_chain(tb, 3, 8, 1, 1, gz);
+      gun_contact_mesh_add_active(contact_v0);
+      gun_contact_mesh_resume();
       for (int q = 0; q < 3; q++) g_gun_blade[q] = tb[q].p;
       g_gun_blade_r = 0.0038f * gg;   // the chain's own widest rz
       // The SHOOTER-side face, exactly as on the AR — see the note there. The
@@ -1076,9 +1770,9 @@ static void gun_sr_stock(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       // ...and it exits the grip's REAR at mid-height, well above the palm heel:
       // started at the heel it ran surface-on-surface under the trigger hand's own
       // up-facing palm chord (vmcheck z-fight at the one spot both are horizontal).
-      GN(0, -0.0560f, -0.0500f, 0.0072f, 0.0090f, chas),
-      GN(0, -0.0480f, -0.1000f, 0.0074f, 0.0092f, chas),
-      GN(0, -0.0400f, -0.1520f, 0.0086f, 0.0100f, chas),
+      GN(0, -0.0980f, -0.0720f, 0.0072f, 0.0090f, chas),
+      GN(0, -0.0880f, -0.1150f, 0.0074f, 0.0092f, chas),
+      GN(0, -0.0660f, -0.1650f, 0.0086f, 0.0100f, chas),
     });
     GBOX(0, -0.0180f, -0.1760f, 0.0118f, 0.0230f, 0.0380f, chas);  // the web
     GBOX(0, -0.0060f, -0.2200f, 0.0128f, 0.0330f, 0.0175f, chas);  // butt block
@@ -1099,7 +1793,9 @@ static void gun_sr_stock(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       fnode_t cw[2] = {
         {GUNP(-0.0126f, 0.0270f, -0.2020f), black, black, 0.0052f*gg, 0.0052f*gg, 0, 0.0f},
         {GUNP(-0.0172f, 0.0270f, -0.2020f), black, black, 0.0048f*gg, 0.0048f*gg, 0, 0.0f}};
+      int contact_v0 = g_scene_floats;
       fig_chain(cw, 2, 12, 1, 1, gy);
+      gun_contact_mesh_add_active(contact_v0);
     }
     mat_set(MAT_POLY_R, 0.0f);
     if (gun_tier())
@@ -1112,34 +1808,74 @@ static void gun_sr_stock(v3 org, v3 gx, v3 gy, v3 gz, float gg,
 
 static void gun_sr_foreend(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                            v3 black, v3 chas) {
+    const gun_sweep_section_t *fore_sec = GUN_FORE_SECTION[WPN_SR];
     mat_set(MAT_POLY_R, 0.0f);  // state carried in from gun_sr_stock's last call (task-10 split)
     // ---- fore-end -----------------------------------------------------------
     // FLAT-SIDED (k=8), NOT A ROUND TUBE. A k=12 ellipse is a hair-dryer; a chassis
     // fore-end is a machined box with an under-rail, slotted flanks and a barrel channel
     // you can see daylight through. rx is the vertical half-extent here, rz the
     // horizontal — the chain runs along z with a gy hint.
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
+    gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_BODY, 0);
+    gun_contact_surface_begin();
     GCH(8, 1, 1, gy, {
-      GN(0, 0.0116f, 0.1360f, 0.0176f, 0.0170f, chas),  // shoulder, into the chassis
-      GN(0, 0.0124f, 0.1620f, 0.0166f, 0.0158f, chas),  // <- GH_FORE3 station
-      GN(0, 0.0132f, 0.2080f, 0.0156f, 0.0150f, chas),  // <- GH_FORE station
-      GN(0, 0.0142f, 0.2640f, 0.0158f, 0.0162f, chas),
-      GN(0, 0.0152f, 0.3200f, 0.0162f, 0.0176f, chas),  // the bipod bay, widest
-      GN(0, 0.0160f, 0.3600f, 0.0166f, 0.0150f, chas),  // nose, concentric with the bore
+      GN(0, fore_sec[0].y, fore_sec[0].z,
+         fore_sec[0].rx, fore_sec[0].rz, chas),  // shoulder, into the chassis
+      GN(0, fore_sec[1].y, fore_sec[1].z,
+         fore_sec[1].rx, fore_sec[1].rz, chas),  // <- GH_FORE3 station
+      GN(0, fore_sec[2].y, fore_sec[2].z,
+         fore_sec[2].rx, fore_sec[2].rz, chas),  // <- GH_FORE station
+      GN(0, fore_sec[3].y, fore_sec[3].z,
+         fore_sec[3].rx, fore_sec[3].rz, chas),
+      GN(0, fore_sec[4].y, fore_sec[4].z,
+         fore_sec[4].rx, fore_sec[4].rz, chas),  // the bipod bay, widest
+      GN(0, fore_sec[5].y, fore_sec[5].z,
+         fore_sec[5].rx, fore_sec[5].rz, chas),  // nose, concentric with the bore
     });
-    // The under-rail, full length, in the same three-rung width ladder as the AR's.
-    GBOX(0, -0.0034f, 0.2560f, 0.0089f, 0.0032f, 0.0900f, chas);
-    GBOX(0, -0.0086f, 0.2560f, 0.0057f, 0.0030f, 0.0880f,
-         v3_scale(chas, 0.84f));
-    if (g_gun_hero)
+    gun_contact_surface_end();
+    gun_contact_mesh_role_end(GUN_MESH_PART_FORE_BODY);
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
+    // The under-rail is part of the held fore-end surface, not a forbidden chassis
+    // wall; the exact proof therefore keeps it in the same allowed contact class.
+    gun_contact_mesh_begin(GUN_CONTACT_FORE);
+    gun_contact_surface_begin();
+    for (int i = 0; i < 2; i++) {
+      const gun_under_step_t *s = &SR_UNDER_STEP[i];
+      v3 col = i ? v3_scale(chas, 0.84f) : chas;
+      uint32_t part = i ? GUN_MESH_PART_UNDER_INNER
+                        : GUN_MESH_PART_UNDER_OUTER;
+      uint32_t host = i ? GUN_MESH_PART_FORE_BODY |
+                              GUN_MESH_PART_UNDER_OUTER
+                        : GUN_MESH_PART_FORE_BODY;
+      gun_contact_mesh_role_begin(part, host);
+      GBOX(0, s->y, SR_UNDER_Z, s->hx, s->hy, s->hz, col);
+      gun_contact_mesh_role_end(part);
+    }
+    gun_contact_surface_end();
+    if (g_gun_hero) {
+      gun_contact_mesh_role_begin(GUN_MESH_PART_UNDER_TOOTH,
+                                  GUN_MESH_PART_UNDER_INNER);
       for (int r = 0; r < 11; r++)
         GBOX(0, -0.0108f, 0.1780f + 0.0150f * (float)r,
              0.0073f, 0.0026f, 0.0034f, chas);
-    // M-LOK flanks: a rhythm of dark lands, the same construction the AR's guard uses.
-    for (int m = 0; gun_tier() && m < 5; m++) {
-      float mz = 0.1980f + 0.0270f * (float)m;
-      GBOX( 0.0162f, 0.0138f, mz, 0.0028f, 0.0044f, 0.0094f, black);
-      GBOX(-0.0162f, 0.0138f, mz, 0.0028f, 0.0044f, 0.0094f, black);
+      gun_contact_mesh_role_end(GUN_MESH_PART_UNDER_TOOTH);
     }
+    // M-LOK flanks: a rhythm of dark lands, the same construction the AR's guard uses.
+    gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_DETAIL,
+                                GUN_MESH_PART_FORE_BODY);
+    gun_contact_surface_begin();
+    // Match the AR contract: small side lands are hero texture, not overlapping
+    // third-person solids. gun_fore_profile publishes them on exactly this predicate.
+    for (int m = 0; g_gun_hero && m < 5; m++) {
+      float mz = SR_MLOK_Z0 + SR_MLOK_DZ * (float)m;
+      GBOX( SR_MLOK_X, SR_MLOK_Y, mz,
+            SR_MLOK_HX, SR_MLOK_HY, SR_MLOK_HZ, black);
+      GBOX(-SR_MLOK_X, SR_MLOK_Y, mz,
+            SR_MLOK_HX, SR_MLOK_HY, SR_MLOK_HZ, black);
+    }
+    gun_contact_surface_end();
+    gun_contact_mesh_role_end(GUN_MESH_PART_FORE_DETAIL);
+    gun_contact_mesh_end(GUN_CONTACT_FORE);
 }
 
 static void gun_sr_barrel(v3 org, v3 gx, v3 gy, v3 gz, float gg,
@@ -1151,23 +1887,54 @@ static void gun_sr_barrel(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     // The chamber swell lives only where the action covers it: a true 34 mm breech does
     // not fit inside a fore-end the hand contract can also close around.
     mat_lathe(MAT_PARK_R, MAT_PARK_M);
-    GCH(16, 1, 1, gy, {
-      GN(0, 0.0160f, 0.1000f, 0.0126f, 0.0126f, upper),  // tenon, inside the action
-      GN(0, 0.0160f, 0.1440f, 0.0120f, 0.0120f, upper),  // breech face
-      GN(0, 0.0160f, 0.1560f, 0.0112f, 0.0112f, upper),  // chamber step
-      GN(0, 0.0160f, 0.4000f, 0.0110f, 0.0110f, upper),
-      GN(0, 0.0160f, 0.6400f, 0.0107f, 0.0107f, upper),
-      GN(0, 0.0160f, 0.6880f, 0.0106f, 0.0106f, upper),
-      GN(0, 0.0160f, 0.7040f, 0.0090f, 0.0090f, steel),  // the bare thread shank
-    });
+    // The rear run is enclosed by the held free-float fore-end. Classifying that
+    // shielded run with its contact shell prevents an authored 2--4 mm soft-hand bite
+    // from falsely becoming a forbidden hit on metal hidden behind the near wall.
+    if (g_fig_k >= 12) {
+      gun_contact_mesh_begin(GUN_CONTACT_FORE);
+      gun_contact_mesh_role_begin(GUN_MESH_PART_FORE_ATTACHMENT,
+                                  GUN_MESH_PART_FORE_BODY);
+      GCH(16, 1, 1, gy, {
+        GN(0, 0.0160f, 0.1000f, 0.0126f, 0.0126f, upper),  // tenon, inside the action
+        GN(0, 0.0160f, 0.1440f, 0.0120f, 0.0120f, upper),  // breech face
+        GN(0, 0.0160f, 0.1560f, 0.0112f, 0.0112f, upper),  // chamber step
+        // End wholly inside the fore-end with at least 4 mm buried separation from the
+        // visible run; both proof ranges remain independently closed without near-
+        // coincident hidden walls.
+        GN(0, 0.0160f, 0.3500f, 0.0112f, 0.0112f, upper),
+      });
+      gun_contact_mesh_role_end(GUN_MESH_PART_FORE_ATTACHMENT);
+      gun_contact_mesh_end(GUN_CONTACT_FORE);
+      // The visible run remains a forbidden barrel surface.
+      GCH(16, 1, 1, gy, {
+        GN(0, 0.0160f, 0.3540f, 0.0110f, 0.0110f, upper),
+        GN(0, 0.0160f, 0.4000f, 0.0110f, 0.0110f, upper),
+        GN(0, 0.0160f, 0.6400f, 0.0107f, 0.0107f, upper),
+        GN(0, 0.0160f, 0.6880f, 0.0106f, 0.0106f, upper),
+        GN(0, 0.0160f, 0.7040f, 0.0090f, 0.0090f, steel),  // the bare thread shank
+      });
+    } else {
+      GCH(16, 1, 1, gy, {
+        GN(0, 0.0160f, 0.1000f, 0.0126f, 0.0126f, upper),
+        GN(0, 0.0160f, 0.1440f, 0.0120f, 0.0120f, upper),
+        GN(0, 0.0160f, 0.1560f, 0.0112f, 0.0112f, upper),
+        GN(0, 0.0160f, 0.4000f, 0.0110f, 0.0110f, upper),
+        GN(0, 0.0160f, 0.6400f, 0.0107f, 0.0107f, upper),
+        GN(0, 0.0160f, 0.6880f, 0.0106f, 0.0106f, upper),
+        GN(0, 0.0160f, 0.7040f, 0.0090f, 0.0090f, steel),
+      });
+    }
     // Free-float counterbore: 2.4 mm of daylight around the barrel at the nose, which is
     // the cheapest one-primitive statement of "this barrel touches nothing".
-    if (gun_tier())
+    if (gun_tier()) {
+      int contact_v0 = g_scene_floats;
       fig_tube(GUNP(0, 0.0160f, 0.3550f), GUNP(0, 0.0160f, 0.3665f),
                0.0172f * gg, 0.0158f * gg, 0.0134f * gg, 0.0134f * gg, 12, chas, gy);
+      gun_contact_mesh_add_active(contact_v0);
+    }
 }
 
-static void gun_sr_bipod(v3 org, v3 gx, v3 gy, v3 gz, float gg, v3 black) {
+[[maybe_unused]] static void gun_sr_bipod(v3 org, v3 gx, v3 gy, v3 gz, float gg, v3 black) {
     // ---- bipod: a mount AND legs. Only the stud existed, and at 25 m the bipod is the
     // third strongest thing in this weapon's silhouette.
     mat_lathe(MAT_PARK_R, MAT_PARK_M);
@@ -1175,19 +1942,19 @@ static void gun_sr_bipod(v3 org, v3 gx, v3 gy, v3 gz, float gg, v3 black) {
     GBOX(0, -0.0140f, 0.3460f, 0.0110f, 0.0044f, 0.0060f, black);  // yoke
     for (int lg = 0; lg < 2; lg++) {
       float u = lg ? -1.0f : 1.0f;
-      GCH(8, 1, 1, gy, {   // folded back along the fore-end, as a bipod is carried
-        GN(u * 0.0100f, -0.0150f, 0.3400f, 0.0038f, 0.0040f, black),
-        GN(u * 0.0132f, -0.0128f, 0.2400f, 0.0030f, 0.0032f, black),
-        GN(u * 0.0148f, -0.0112f, 0.1900f, 0.0026f, 0.0028f, black),
+      GCH(8, 1, 1, gy, {   // folded forward, clear of the support-hand station
+        GN(u * 0.0210f, -0.0150f, 0.3400f, 0.0038f, 0.0040f, black),
+        GN(u * 0.0260f, -0.0128f, 0.3950f, 0.0030f, 0.0032f, black),
+        GN(u * 0.0290f, -0.0112f, 0.4480f, 0.0026f, 0.0028f, black),
       });
       if (gun_tier())
-        GBOX(u * 0.0150f, -0.0106f, 0.1830f, 0.0034f, 0.0038f, 0.0044f, black);  // foot
+        GBOX(u * 0.0300f, -0.0106f, 0.4550f, 0.0034f, 0.0038f, 0.0044f, black);  // foot
     }
 }
 
 static void gun_sr_brake(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                          v3 upper, v3 steel, v3 black) {
-    mat_lathe(MAT_PARK_R, MAT_PARK_M);  // state carried in from gun_sr_bipod's last call (task-10 split)
+    mat_lathe(MAT_PARK_R, MAT_PARK_M);
     // ---- muzzle brake -------------------------------------------------------
     GCH(12, 1, 1, gy, {
       GN(0, 0.0160f, 0.6960f, 0.0112f, 0.0110f, upper),  // collar over the thread
@@ -1208,6 +1975,7 @@ static void gun_sr_brake(v3 org, v3 gx, v3 gy, v3 gz, float gg,
 static void gun_sr_scope(v3 org, v3 gx, v3 gy, v3 gz, float gg,
                          v3 upper, v3 steel, v3 black, v3 glass, v3 lens,
                          float sight_y) {
+    g_gun_sr_scope_v0 = g_scene_floats;
     // ---- the scope, and it is the weapon's second silhouette ------------------
     // THE OBJECTIVE WAS SMALLER THAN THE OCULAR (18.8 mm against 20.5), which is
     // backwards on every telescope ever built — a scope's front bell is the whole reason
@@ -1226,7 +1994,24 @@ static void gun_sr_scope(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       GN(0, sight_y, 0.3060f, 0.0268f, 0.0268f, black),
       GN(0, sight_y, 0.3140f, 0.0250f, 0.0250f, black),
     });
-    GBOX(0, sight_y, 0.0900f, 0.0234f, 0.0230f, 0.0300f, black);   // turret saddle
+    // A short anodized saddle grows out of the 28.4 mm tube into a 39.6 mm
+    // turret housing, then returns through equally short shoulders. Unlike a
+    // black box it preserves the optic's round silhouette from every side.
+    if (g_fig_k >= 12) {
+      GCH(12, 1, 1, gy, {
+        GN(0, sight_y, 0.0690f, 0.0143f, 0.0143f, upper),
+        GN(0, sight_y, 0.0750f, 0.0175f, 0.0175f, upper),
+        GN(0, sight_y, 0.0810f, 0.0198f, 0.0198f, upper),
+        GN(0, sight_y, 0.0990f, 0.0198f, 0.0198f, upper),
+        GN(0, sight_y, 0.1050f, 0.0175f, 0.0175f, upper),
+        GN(0, sight_y, 0.1110f, 0.0143f, 0.0143f, upper),
+      });
+    } else {
+      GCH(4, 1, 1, gy, {
+        GN(0, sight_y, 0.0690f, 0.0198f, 0.0198f, upper),
+        GN(0, sight_y, 0.1110f, 0.0198f, 0.0198f, upper),
+      });
+    }
     if (gun_tier())
       GCH(12, 1, 1, gy, {   // magnification ring
         GN(0, sight_y, 0.0080f, 0.0158f, 0.0158f, black),
@@ -1242,22 +2027,27 @@ static void gun_sr_scope(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       GN(0, sight_y + 0.0409f, 0.0900f, 0.0172f, 0.0172f, black),
     });
     GCH(16, 1, 1, gy, {   // WINDAGE turret, right
-      GN(0.0200f, sight_y, 0.0900f, 0.0162f, 0.0162f, upper),
+      GN(0.0188f, sight_y, 0.0900f, 0.0162f, 0.0162f, upper),
       GN(0.0238f, sight_y, 0.0900f, 0.0158f, 0.0158f, upper),
       GN(0.0252f, sight_y, 0.0900f, 0.0168f, 0.0168f, black),
       GN(0.0270f, sight_y, 0.0900f, 0.0152f, 0.0152f, black),
     });
     if (gun_tier())
       GCH(16, 1, 1, gy, {   // PARALLAX turret — the third knob a tactical scope has
-        GN(-0.0200f, sight_y, 0.0900f, 0.0170f, 0.0170f, upper),
+        GN(-0.0188f, sight_y, 0.0900f, 0.0170f, 0.0170f, upper),
         GN(-0.0246f, sight_y, 0.0900f, 0.0166f, 0.0166f, upper),
         GN(-0.0262f, sight_y, 0.0900f, 0.0150f, 0.0150f, black),
       });
     // Ocular glass, recessed inside its retaining ring.
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
-    fig_tube(GUNP(0, sight_y, SCOPE_OCU_Z - 0.0062f),
-             GUNP(0, sight_y, SCOPE_OCU_Z + 0.0018f),
-             0.0193f * gg, 0.0191f * gg, 0.0172f * gg, 0.0170f * gg, 20, steel, gy);
+    {
+      int contact_v0 = g_scene_floats;
+      fig_tube(GUNP(0, sight_y, SCOPE_OCU_Z - 0.0062f),
+               GUNP(0, sight_y, SCOPE_OCU_Z + 0.0018f),
+               0.0193f * gg, 0.0191f * gg, 0.0172f * gg, 0.0170f * gg,
+               20, steel, gy);
+      gun_contact_mesh_add_active(contact_v0);
+    }
     mat_set(MAT_GLASS_R, 0.0f);
     GCH(20, 1, 1, gy, {
       GN(0, sight_y, SCOPE_OCU_Z - 0.0030f, 0.0168f, 0.0166f, glass),
@@ -1265,13 +2055,19 @@ static void gun_sr_scope(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     });
     // ...and the objective, which is the one lens anyone else ever sees.
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
-    fig_tube(GUNP(0, sight_y, 0.3080f), GUNP(0, sight_y, 0.3160f),
-             0.0256f * gg, 0.0254f * gg, 0.0212f * gg, 0.0210f * gg, 20, steel, gy);
+    {
+      int contact_v0 = g_scene_floats;
+      fig_tube(GUNP(0, sight_y, 0.3080f), GUNP(0, sight_y, 0.3160f),
+               0.0256f * gg, 0.0254f * gg, 0.0212f * gg, 0.0210f * gg,
+               20, steel, gy);
+      gun_contact_mesh_add_active(contact_v0);
+    }
     mat_set(MAT_GLASS_R, 0.0f);
     GCH(20, 1, 1, gy, {
       GN(0, sight_y, 0.3096f, 0.0202f, 0.0200f, lens),
       GN(0, sight_y, 0.3148f, 0.0194f, 0.0192f, lens),
     });
+    g_gun_sr_scope_v1 = g_scene_floats;
 }
 
 static void gun_sr_mount(v3 org, v3 gx, v3 gy, v3 gz, float gg,
@@ -1307,7 +2103,8 @@ static void gun_sr_mount(v3 org, v3 gx, v3 gy, v3 gz, float gg,
 static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
                     float bolt01) {
   float sight_y = gun_sight_y(cur);
-  v3 muzzle = org;
+  gun_contact_reset();
+  g_gun_sr_scope_v0 = g_gun_sr_scope_v1 = -1;
   // Shared palette: slim two-tone polymer/graphite with cool steel accents.
   // THE PALETTE IS A VALUE LADDER AND A MATERIAL LADDER AT THE SAME TIME, because at
   // 25 m hue is gone and value is not. Six steps, three material families:
@@ -1355,28 +2152,141 @@ static v3 gun_build(int cur, v3 org, v3 gx, v3 gy, v3 gz, float md01,
   mat_lathe(MAT_PARK_R, MAT_PARK_M);
 
   if (cur == WPN_AR) {
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     gun_ar_receiver(org, gx, gy, gz, gg, alloy, alloy2, upper, steel, black, bolt01);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
+    gun_contact_mesh_begin(GUN_CONTACT_STOCK);
     gun_ar_stock(org, gx, gy, gz, gg, body, alloy, black);
+    gun_contact_mesh_end(GUN_CONTACT_STOCK);
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     gun_ar_gripmag(org, gx, gy, gz, gg, body, alloy2, steel, black, mag, md01);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     gun_ar_barrel(org, gx, gy, gz, gg, alloy, upper, steel, black);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
+    gun_contact_mesh_begin(GUN_CONTACT_SCOPE);
     gun_ar_sight(cur, org, gx, gy, gz, gg, alloy, steel, black, lens, sight_y);
+    gun_contact_mesh_end(GUN_CONTACT_SCOPE);
   } else {
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     gun_sr_action(org, gx, gy, gz, gg, alloy, upper, black, chas);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     gun_sr_magwell(org, gx, gy, gz, gg, body, upper, steel, black, mag, chas, md01, bolt01);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
+    gun_contact_mesh_begin(GUN_CONTACT_STOCK);
     gun_sr_stock(org, gx, gy, gz, gg, black, chas);
+    gun_contact_mesh_end(GUN_CONTACT_STOCK);
+    gun_contact_mesh_begin(GUN_CONTACT_CHASSIS);
     gun_sr_foreend(org, gx, gy, gz, gg, black, chas);
+    gun_contact_mesh_end(GUN_CONTACT_CHASSIS);
+    gun_contact_mesh_begin(GUN_CONTACT_RECEIVER);
     gun_sr_barrel(org, gx, gy, gz, gg, upper, steel, chas);
-    gun_sr_bipod(org, gx, gy, gz, gg, black);
     gun_sr_brake(org, gx, gy, gz, gg, upper, steel, black);
+    gun_contact_mesh_end(GUN_CONTACT_RECEIVER);
+    gun_contact_mesh_begin(GUN_CONTACT_SCOPE);
     gun_sr_scope(org, gx, gy, gz, gg, upper, steel, black, glass, lens, sight_y);
     gun_sr_mount(org, gx, gy, gz, gg, alloy, steel, sight_y);
+    gun_contact_mesh_end(GUN_CONTACT_SCOPE);
   }
-  muzzle = GUNP(GUN_MUZ[cur][0], GUN_MUZ[cur][1], GUN_MUZ[cur][2]);
-  return muzzle;
+  // Compact runtime surfaces. Allowed contact OBBs do not overlap one another;
+  // receiver/scope/stock/chassis are forbidden and intentionally conservative.
+  if (cur == WPN_AR) {
+    float md = md01 * GUN_MAG_TRAVEL[WPN_AR][0];
+    float mdx = md01 * -GUN_MAG_TRAVEL[WPN_AR][1];
+    gun_contact_box(GUN_CONTACT_GRIP, GUNP(0, -0.0520f, -0.0080f),
+                    v3_scale(gx, 0.0130f * gg), v3_scale(gy, 0.0430f * gg),
+                    v3_scale(gz, 0.0240f * gg));
+    gun_contact_box(GUN_CONTACT_FORE, GUNP(0, 0.0190f, 0.2630f),
+                    v3_scale(gx, 0.0160f * gg), v3_scale(gy, 0.0170f * gg),
+                    v3_scale(gz, 0.0680f * gg));
+    gun_contact_box(GUN_CONTACT_MAG, GUNP(mdx, -0.0850f - md, 0.0910f),
+                    v3_scale(gx, 0.0122f * gg), v3_scale(gy, 0.0560f * gg),
+                    v3_scale(gz, 0.0210f * gg));
+    gun_contact_box(GUN_CONTACT_RECEIVER, GUNP(0, -0.0050f, -0.0065f),
+                    v3_scale(gx, 0.0145f * gg), v3_scale(gy, 0.0135f * gg),
+                    v3_scale(gz, 0.0075f * gg));
+    // The monolithic top-rail base/crown is a forbidden ridge inside the broader FORE
+    // class. Publish the exact base/crown proxy so every swept support-hand station and
+    // segment clears it; endpoint-only clearance is insufficient.
+    if (g_gun_hero) {
+      // x/z are exactly the base envelope; y reaches the real 42.6 mm tooth crest.
+      // Lower tiers do not build detailed held hands, so publishing this clearance
+      // proxy there would only retessellate their compact silhouette.
+      float rail_top = 0.0426f;
+      float rail_mid = 0.5f * (0.0338f + rail_top);
+      gun_contact_box(GUN_CONTACT_RECEIVER, GUNP(0, rail_mid, 0.1550f),
+                      v3_scale(gx, 0.0102f * gg),
+                      v3_scale(gy, 0.5f * (rail_top - 0.0338f) * gg),
+                      v3_scale(gz, 0.1690f * gg));
+    }
+    gun_contact_box(GUN_CONTACT_SCOPE, GUNP(0, sight_y, 0.2150f),
+                    v3_scale(gx, 0.0310f * gg), v3_scale(gy, 0.0170f * gg),
+                    // The emitted micro-dot reaches only the clamp's exact +/-7 mm
+                    // fore/aft faces.  A 40 mm half-extent described the deleted
+                    // holographic chassis and pushed the support thumb out of clear
+                    // air during the third-person swap pose.
+                    v3_scale(gz, 0.0070f * gg));
+    gun_contact_box(GUN_CONTACT_STOCK, GUNP(0, 0.0120f, -0.1980f),
+                    v3_scale(gx, 0.0350f * gg), v3_scale(gy, 0.0250f * gg),
+                    v3_scale(gz, 0.0250f * gg));
+  } else {
+    float md = md01 * GUN_MAG_TRAVEL[WPN_SR][0];
+    float mdx = md01 * -GUN_MAG_TRAVEL[WPN_SR][1];
+    gun_contact_box(GUN_CONTACT_GRIP, GUNP(0, -0.0500f, -0.0440f),
+                    v3_scale(gx, 0.0128f * gg), v3_scale(gy, 0.0440f * gg),
+                    v3_scale(gz, 0.0260f * gg));
+    gun_contact_box(GUN_CONTACT_FORE, GUNP(0, 0.0135f, 0.2560f),
+                    v3_scale(gx, 0.0180f * gg), v3_scale(gy, 0.0190f * gg),
+                    v3_scale(gz, 0.1040f * gg));
+    gun_contact_box(GUN_CONTACT_MAG, GUNP(mdx, -0.0690f - md, 0.0637f),
+                    v3_scale(gx, 0.0142f * gg), v3_scale(gy, 0.0530f * gg),
+                    v3_scale(gz, 0.0360f * gg));
+    gun_contact_box(GUN_CONTACT_RECEIVER, GUNP(0, 0.0130f, 0.1250f),
+                    v3_scale(gx, 0.0138f * gg), v3_scale(gy, 0.0152f * gg),
+                    v3_scale(gz, 0.0100f * gg));
+    gun_contact_box(GUN_CONTACT_SCOPE, GUNP(0, sight_y, 0.0950f),
+                    v3_scale(gx, 0.0160f * gg), v3_scale(gy, 0.0160f * gg),
+                    v3_scale(gz, 0.2000f * gg));
+    gun_contact_box(GUN_CONTACT_STOCK, GUNP(0, -0.0060f, -0.2200f),
+                    v3_scale(gx, 0.0140f * gg), v3_scale(gy, 0.0400f * gg),
+                    v3_scale(gz, 0.0300f * gg));
+    gun_contact_box(GUN_CONTACT_CHASSIS, GUNP(0, 0.0045f, -0.0460f),
+                    v3_scale(gx, 0.0160f * gg), v3_scale(gy, 0.0145f * gg),
+                    v3_scale(gz, 0.0300f * gg));
+  }
+  // fig_hand's magazine wrap follows this same final k=8 chain instead of a circle
+  // fitted to one viewing angle. The two weapons use different fore-aft depths, but
+  // both publish the exact cross-section at their GUN_HOLD reload row.
+  g_gun_grip_profile = gun_grip_profile(cur, org, gx, gy, gz, gg);
+  g_gun_mag_profile = gun_mag_profile(cur, gx, gy, gz, gg);
+  // Exact k=8 fore-end section at the station this build's support hand uses. The
+  // scalar GUN_HOLD radius is the inscribed contact reference; this authored profile
+  // carries the real flats/shoulders and the emitted rail rectangles into fig_hand.
+  g_gun_fore_profile = gun_fore_profile(cur, gy, gg);
+  {
+    v3 c, a;
+    float r;
+    gun_hold(cur, GH_GRIP, org, gx, gy, gz, &c, &a, &r);
+    gun_contact_cylinder(GUN_CONTACT_GRIP, c, a, r, 0.060f * gg);
+    gun_hold(cur, gg > 1.01f ? GH_FORE3 : GH_FORE,
+             org, gx, gy, gz, &c, &a, &r);
+    gun_contact_cylinder(GUN_CONTACT_FORE, c, a, r, 0.080f * gg);
+    gun_hold(cur, GH_RELD, org, gx, gy, gz, &c, &a, &r);
+    c = v3_add(c, v3_add(v3_scale(gy, -md01 * GUN_MAG_TRAVEL[cur][0]),
+                          v3_scale(gx, -md01 * GUN_MAG_TRAVEL[cur][1])));
+    gun_contact_cylinder(GUN_CONTACT_MAG, c, a, r, 0.060f * gg);
+    if (cur == WPN_SR)
+      gun_contact_cylinder(GUN_CONTACT_BOLT,
+                           gun_bolt_knob(bolt01, org, gx, gy, gz, gg), gx,
+                           0.0094f * gg, 0.0170f * gg);
+  }
+  return gun_muzzle_point(cur, org, gx, gy, gz, gg);
 }
 
 #undef GN
 #undef GCH
 #undef GCH_PUB
+#undef GBOXW
 #undef GBOX
 #undef GUNP

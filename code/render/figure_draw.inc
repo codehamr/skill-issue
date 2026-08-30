@@ -8,9 +8,58 @@
 // profile tier that may never be raised past what the corpse pool lowered
 // it to.
 // =============================================================================
-// Draw one skeleton figure from its anim state. palette 0 = bot olive,
-// 1 = the player's slate blue; wpn picks which rifle the hands are holding.
-// flash01 washes the clothes toward flash_col.
+// Draw one skeleton figure from its anim state. Every role and camera uses the
+// same Cool-Arid kit; wpn picks which rifle the hands are holding. flash01
+// washes the clothes toward flash_col.
+
+enum {
+  FIG_HEAD_CHIN,
+  FIG_HEAD_JAW,
+  FIG_HEAD_MOUTH,
+  FIG_HEAD_CHEEK,
+  FIG_HEAD_BROW,
+  FIG_HEAD_CROWN,
+  FIG_HEAD_TOP,
+  FIG_HEAD_BANDS
+};
+typedef struct {
+  float up, forward, width, depth, ao;
+} fig_head_band_t;
+typedef struct {
+  float chin_mouth_front, chin_jaw_front;
+  float chin_jaw_width_ratio, lower_face_len;
+} fig_head_metrics_t;
+
+// The renderer and harness share this authored Hero/Near profile. `forward +
+// depth` is the visible front plane; `width` is the across-head half-width.
+static const fig_head_band_t FIG_HEAD_PROFILE[FIG_HEAD_BANDS] = {
+  [FIG_HEAD_CHIN]  = {-0.0900f,  0.0395f, 0.0630f, 0.0600f, 0.74f},
+  [FIG_HEAD_JAW]   = {-0.0650f,  0.0135f, 0.0745f, 0.0840f, 0.80f},
+  [FIG_HEAD_MOUTH] = {-0.0400f, -0.0035f, 0.0752f, 0.0930f, 0.88f},
+  [FIG_HEAD_CHEEK] = {-0.0056f, -0.0090f, 0.0790f, 0.0980f, 0.94f},
+  [FIG_HEAD_BROW]  = { 0.0372f, -0.0110f, 0.0780f, 0.0965f, 0.78f},
+  [FIG_HEAD_CROWN] = { 0.0818f, -0.0190f, 0.0692f, 0.0850f, 0.00f},
+  [FIG_HEAD_TOP]   = { 0.1116f, -0.0250f, 0.0480f, 0.0605f, 0.00f},
+};
+
+// At Far and corpse tiers only the selected chin differs from the exact
+// pre-change profile. Keep that one legacy band as the LOD override instead of
+// duplicating the six unchanged authored bands.
+static const fig_head_band_t FIG_HEAD_FAR_CHIN =
+  {-0.0900f, 0.0310f, 0.0585f, 0.0600f, 0.74f};
+
+static inline fig_head_metrics_t fig_head_metrics(void) {
+  const fig_head_band_t *chin = &FIG_HEAD_PROFILE[FIG_HEAD_CHIN];
+  const fig_head_band_t *jaw = &FIG_HEAD_PROFILE[FIG_HEAD_JAW];
+  const fig_head_band_t *mouth = &FIG_HEAD_PROFILE[FIG_HEAD_MOUTH];
+  float chin_front = chin->forward + chin->depth;
+  return (fig_head_metrics_t){
+    .chin_mouth_front = chin_front - (mouth->forward + mouth->depth),
+    .chin_jaw_front = chin_front - (jaw->forward + jaw->depth),
+    .chin_jaw_width_ratio = chin->width / jaw->width,
+    .lower_face_len = mouth->up - chin->up,
+  };
+}
 
 // Neck + head + helmet, all in the look frame.
 static void sdf_head(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine) {
@@ -29,38 +78,29 @@ static void sdf_head(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine) {
     fnode_t nk[5] = {
       {v3_add(P.chest, v3_scale(spine, 0.042f)), kt.vest,  kt.vest,  0.076f, 0.079f, 0, 0.70f},
       {v3_add(P.chest, v3_scale(spine, 0.092f)), kt.vest,  kt.vest,  0.070f, 0.073f, 0, 0.72f},
-      {v3_add(P.chest, v3_scale(spine, 0.126f)), kt.olive, kt.olive, 0.066f, 0.068f, 0, 0.76f},
+      {v3_add(P.chest, v3_scale(spine, 0.126f)), kt.uniform, kt.uniform, 0.066f, 0.068f, 0, 0.76f},
       // Held BELOW the mandible.
-      {v3_add(P.chest, v3_scale(spine, 0.133f)), kt.olive, kt.olive, 0.064f, 0.066f, 0, 0.80f},
+      {v3_add(P.chest, v3_scale(spine, 0.133f)), kt.uniform, kt.uniform, 0.064f, 0.066f, 0, 0.80f},
       // The throat band is balaclava now — the whole head is covered. Slightly
       // darker than the face cloth: it lives in the helmet's shadow.
       {v3_add(P.head, v3_scale(hu, -0.056f)), v3_scale(kt.bala, 0.82f),
        v3_scale(kt.bala, 0.82f), 0.058f, 0.061f, 0, 0.62f}};
     probe("neck");
     fig_chain(nk, 5, 12, 1, 1, Rc);
-    // Seven rings up the skull.
-    fnode_t hd[7] = {  // chin -> jaw -> mouth -> cheek -> brow -> crown -> top
-      // Cavity AO down the face: under the jaw and up under the helmet's brim are both
-      // places light does not reach, and a head lit as if it were a free-floating ball
-      // is most of why the face read as a flat patch.
-      // THE CHIN PROJECTS PAST THE MOUTH. Two passes taught the lesson in
-      // steps: at c 0.021 the mentum sat 11.5 mm BEHIND the mouth band (a
-      // receding chin on every 3/4 view), at 0.027 it was still 3 mm shy and
-      // the face read soft. A masculine head is a JAW: the chin stands 1.5 mm
-      // PROUD of the mouth plane, sits 1.5 mm lower (a longer face), and the
-      // jaw ring is 9 mm wider across than the first cut — the gonial corner
-      // under the ear, not a taper — with its own front 8 mm ahead of the
-      // old one, so the jawline overhangs the throat band and throws the
-      // shadow a jaw throws.
-      {HP(0, -0.0900f, 0.0310f), kt.bala, kt.bala, 0.0585f, 0.0600f, 0, 0.74f},
-      {HP(0, -0.0650f, 0.0135f), kt.bala, kt.bala, 0.0745f, 0.0840f, 0, 0.80f},
-      {HP(0, -0.0400f, -0.0035f), kt.bala, kt.bala, 0.0752f, 0.0930f, 0, 0.88f},
-      {HP(0, -0.0056f, -0.0090f), kt.bala, kt.bala, 0.0790f, 0.0980f, 0, 0.94f},
-      {HP(0, 0.0372f, -0.0110f), kt.bala, kt.bala, 0.0780f, 0.0965f, 0, 0.78f},
-      {HP(0, 0.0818f, -0.0190f), kt.bala, kt.bala, 0.0692f, 0.0850f, 0, 0.0f},
-      {HP(0, 0.1116f, -0.0250f), kt.bala, kt.bala, 0.0480f, 0.0605f, 0, 0.0f}};
+    // Seven rings up the skull. Hero/Near uses the selected eight-sided
+    // profile: its chin is 10 mm proud of the mouth and 2 mm proud of the jaw,
+    // with a 0.846 jaw-width ratio. Far/corpse keeps the legacy shape and
+    // requested profile so its topology and scene cost remain exact.
+    const int far_head = g_fig_k <= 8;
+    fnode_t hd[FIG_HEAD_BANDS];
+    for (int i = 0; i < FIG_HEAD_BANDS; i++) {
+      fig_head_band_t b = far_head && i == FIG_HEAD_CHIN
+                        ? FIG_HEAD_FAR_CHIN : FIG_HEAD_PROFILE[i];
+      hd[i] = (fnode_t){HP(0, b.up, b.forward), kt.bala, kt.bala,
+                        b.width, b.depth, 0, b.ao};
+    }
     probe("skull");
-    fig_chain(hd, 7, 16, 1, 1, hr);
+    fig_chain(hd, FIG_HEAD_BANDS, far_head ? 16 : 8, 1, 1, hr);
     // Nose: the one feature that decides whether a head has a FRONT at 10 m. A
     // wedge, sunk into the face by more than its own depth so no cap shows.
     {
@@ -145,31 +185,13 @@ static void sdf_head(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine) {
         fig_chain(rl, 4, 8, 1, 1, hu);
       }
     }
-    // HEADSET EAR CUPS, in the helmet's high cut: two dark discs over the ears,
-    // decisively bigger and lower than the old helm-coloured temple pads —
-    // the shell stops above the ear on a modern lid and the cup fills the gap.
-    // They also give the helmet its left-right axis. Inner face 6 mm inside the
-    // skull, outer ~15 mm proud of the shell's base ring.
-    mat_set(MAT_RUBBER_R, 0.0f);
-    for (int e = 0; e < 2; e++) {
-      float es = e ? 1.0f : -1.0f;
-      v3 ec = HP(es * 0.094f, -0.030f, 0.004f);
-      fnode_t er[2] = {
-        {v3_add(ec, v3_scale(hf, 0.032f)), kt.rub, kt.rub, 0.028f, 0.019f, 0, 0.0f},
-        {v3_add(ec, v3_scale(hf, -0.046f)), kt.rub, kt.rub, 0.031f, 0.022f, 0, 0.0f}};
-      probe("ear_cup");
-      fig_chain(er, 2, 8, 1, 1, hu);
-    }
     // Visor: ONE box spanning exactly the skull's flat front facet, which is 2*0.42*rx
     // wide for the chamfered profile.
     mat_set(MAT_GLASS_R, 0.0f);          // ballistic lens: the one wet gleam
     {
       // Re-fitted to the deeper skull.
-      // The temple ends land INSIDE the ear cups (cup across-span 0.072..0.116
-      // — an end at 0.072 sat exactly ON the cup's inner face, the coincident-
-      // plane defect), and a step lower, so the band's centreline runs under
-      // the cup's top edge; the end's top and rear corners still exit the cup,
-      // but land inside the SHELL solid, so nothing shows.
+      // The temple ends bury directly under the helmet shell; their top and rear
+      // corners land inside that solid, so the band closes without a floating cap.
       const float gz_[5] = {-0.084f, -0.050f, 0.000f, 0.050f, 0.084f};  // across
       const float gd_[5] = {-0.026f, 0.056f, 0.080f, 0.056f, -0.026f};  // forward
       const float gu_[5] = {-0.006f, 0.016f, 0.020f, 0.016f, -0.006f};  // up
@@ -186,10 +208,9 @@ static void sdf_head(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine) {
       fig_chain(gg, 5, 8, 1, 1, hu);
       // NO STRAP. It existed because "goggles that stop at the temples look like a
       // sleep mask" — true of the narrow band it was written for, and no longer true of
-      // this one: the band is 144 mm across and the helmet's ear covers sit at 178, so
-      // its ends bury under them with nothing left hanging in the air.
+      // this one: the band spans the face and its ends bury under the shell.
     }
-    // Chin strap: two thin runs from the ear covers down under the jaw. Nothing
+    // Chin strap: two thin runs from the helmet rim down under the jaw. Nothing
     // says "helmet" like the thing that holds it on.
     mat_set(MAT_GEAR_R, 0.0f);
     for (int e = 0; e < 2; e++) {
@@ -199,8 +220,12 @@ static void sdf_head(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine) {
         // has already narrowed past it, so the strap emerged THROUGH the helmet for
         // five pairs.
         {HP(es * 0.084f, -0.028f, 0), kt.gear, kt.gear, 0.010f, 0.008f, 0, 0.0f},
-        {HP(es * 0.066f, -0.088f, 0), kt.gear, kt.gear, 0.009f, 0.007f, 0, 0.0f},
-        {HP(es * 0.024f, -0.098f, -0.014f), kt.gear, kt.gear, 0.009f, 0.007f, 0, 0.0f}};
+        {HP(es * (far_head ? 0.066f : 0.068f),
+            far_head ? -0.088f : -0.085f, far_head ? 0 : 0.006f),
+         kt.gear, kt.gear, 0.009f, 0.007f, 0, 0.0f},
+        {HP(es * (far_head ? 0.024f : 0.028f),
+            far_head ? -0.098f : -0.100f, far_head ? -0.014f : 0.010f),
+         kt.gear, kt.gear, 0.009f, 0.007f, 0, 0.0f}};
       probe("chinstrap");
       fig_chain(cs, 3, 8, 1, 1, hf);
     }
@@ -385,11 +410,16 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
     v3 fF = v3_sub(P.toe[i], P.ankle[i]);
     if (v3_dot(fF, fF) > 1e-6f) {
       fF = v3_norm(fF);
+      // The boot owns a ground/foot frame. `spine` follows the Leaned torso; using it
+      // as boot-up rolled the sole sideways and kinked the ankle during a Lean step.
+      v3 foot_up = v3_sub((v3){{0, 1, 0}}, v3_scale(fF, fF.y));
+      foot_up = v3_dot(foot_up, foot_up) > 1e-8f
+                  ? v3_norm(foot_up) : (v3){{0, 1, 0}};
       // Node heights are chosen so every sole vertex lands ~2 mm above the planted
       // ankle's floor (ANIM_ANKLE_Y): a boot built symmetrically around the ankle rides
       // toe-down and digs its tip into the ground.
       float sole_dip = fminf(fminf(fF.y * -0.086f, fF.y * 0.194f), 0.0f);
-      v3 av = v3_add(P.ankle[i], v3_scale(spine, -0.028f - sole_dip));
+      v3 av = v3_add(P.ankle[i], v3_scale(foot_up, -0.028f - sole_dip));
       // A MINIMAL BOOT IS TWO PIECES: a smooth rubber SLAB and a leather UPPER set
       // into it. The five it used to be (lugged outsole, proud welt, upper, lace strip,
       // cross-bars) were all authored for a distance nobody plays at — against this
@@ -418,7 +448,7 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
       // 0.031, not 0.021, and this is the single biggest z-race on the figure.
       const float UPPR_H = 0.031f;    // leather floor, well inside the slab
       #define SOLEN(H, T, RX, RZ, C, BC) {                                  \
-        v3_add(v3_add(av, v3_scale(fF, (T))), v3_scale(spine, (RX) - (H))), \
+        v3_add(v3_add(av, v3_scale(fF, (T))), v3_scale(foot_up, (RX) - (H))), \
         C, BC, (RX), (RZ), 0, 0.0f}
       // ANSUR foot length is 271 mm p50 and a combat boot's exterior is ~290; this runs
       // -0.086 to +0.194, i.e. 280 mm heel to toe with the ankle at 31% of it from the
@@ -429,9 +459,9 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
       // a dark shoe.
       v3 sole_c = v3_scale(kt.boot, 0.78f);
       fnode_t so[7] = {
-        SOLEN(SOLE_H, -0.086f, 0.0168f, 0.0410f, sole_c, sole_c),  // heel, squared
-        SOLEN(SOLE_H, -0.050f, 0.0175f, 0.0448f, sole_c, sole_c),  // heel block
-        SOLEN(SOLE_H, -0.026f, 0.0120f, 0.0424f, sole_c, sole_c),  // heel breast
+        SOLEN(SOLE_H, -0.086f, 0.0138f, 0.0390f, sole_c, sole_c),  // heel, squared
+        SOLEN(SOLE_H, -0.050f, 0.0142f, 0.0420f, sole_c, sole_c),  // heel block
+        SOLEN(SOLE_H, -0.026f, 0.0112f, 0.0410f, sole_c, sole_c),  // heel breast
         SOLEN(SOLE_H,  0.030f, 0.0134f, 0.0448f, sole_c, sole_c),  // waist
         SOLEN(SOLE_H,  0.090f, 0.0145f, 0.0520f, sole_c, sole_c),  // ball, widest
         SOLEN(SOLE_H,  0.152f, 0.0132f, 0.0486f, sole_c, sole_c),  // toe box
@@ -439,7 +469,7 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
       probe("outsole");
       // Half jitter.
       g_fig_jit = 0.5f;
-      fig_chain(so, 7, 6, 1, 1, spine);
+      fig_chain(so, 7, 6, 1, 1, foot_up);
       g_fig_jit = 1.0f;
       mat_set(MAT_LEATHER_R, 0.0f);
       // The leather upper, set INTO the slab: narrower than it at every station
@@ -449,17 +479,17 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
       v3 lea_c = v3_scale(kt.boot, 1.40f);
       v3 up_c = v3_lerp(lea_c, g_theme.ground, 0.20f);
       fnode_t bt[7] = {
-        SOLEN(UPPR_H, -0.074f, 0.0290f, 0.0352f, lea_c, lea_c),      // counter
-        SOLEN(UPPR_H, -0.040f, 0.0375f, 0.0404f, lea_c, lea_c),      // counter top
-        SOLEN(UPPR_H,  0.012f, 0.0400f, 0.0402f, up_c,   up_c),       // throat
-        SOLEN(UPPR_H,  0.068f, 0.0340f, 0.0452f, up_c,   up_c),       // instep
+        SOLEN(UPPR_H, -0.074f, 0.0240f, 0.0340f, lea_c, lea_c),      // counter
+        SOLEN(UPPR_H, -0.040f, 0.0310f, 0.0385f, lea_c, lea_c),      // counter top
+        SOLEN(UPPR_H,  0.012f, 0.0350f, 0.0390f, up_c,   up_c),       // throat
+        SOLEN(UPPR_H,  0.068f, 0.0320f, 0.0440f, up_c,   up_c),       // instep
         SOLEN(UPPR_H,  0.124f, 0.0268f, 0.0462f, up_c,   up_c),       // vamp
         SOLEN(UPPR_H,  0.172f, 0.0206f, 0.0370f, lea_c, lea_c),      // toe cap
         // Toe tip in to 0.0262: the sole was 1.0 mm wider here, which is
         // inside the same coin flip the floors were in.
         SOLEN(UPPR_H,  0.194f, 0.0132f, 0.0262f, lea_c, lea_c)};     // toe tip
       probe("boot");
-      fig_chain(bt, 7, 8, 1, 1, spine);  // sole down: rx is the boot height
+      fig_chain(bt, 7, 8, 1, 1, foot_up);  // sole down: rx is the boot height
       #undef SOLEN
       // Cuff: the shaft up the shin, decisively WIDER than the trouser it
       // swallows — at the BLOUSE. The leather boundary moved UP 48 mm and the
@@ -496,7 +526,7 @@ static void sdf_legs(pose_t P, kit_t kt, v3 spine, v3 prt) {
 // welded to the camera; a second pair posed for a third-person observer would
 // stand in the frame beside them.
 static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int wpn,
-                     gunanim_t gs) {
+                     gunanim_t gs, int relaxed) {
   float mag01 = gs.mag;
   v3 g_org, g_rt, g_up, g_fw;
   pose_gun_frame(&P, wpn, &g_org, &g_rt, &g_up, &g_fw);
@@ -506,6 +536,7 @@ static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int 
   // had a whole choreography and the third-person figure had nothing, which is the
   // first/third-person divergence in its purest form.
   if (gs.arc + gs.cyc + gs.hand + gs.bhand > 0.001f) {
+    const gun_pose_desc_t *erg = gun_pose_desc(wpn);
     // Cant about the BORE, pivoting at the trigger grip so the hand that stays on the
     // weapon does not have to travel.
     float cant = gs.arc * -0.46f + gs.cyc * (wpn == WPN_SR ? 0.52f : 0.20f);
@@ -520,6 +551,16 @@ static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int 
     g_org = v3_add(v3_add(piv, off),
                    v3_add(v3_scale(nr, ra_),
                           v3_add(v3_scale(nu, rb), v3_scale(g_fw, rc_))));
+    // Apply the action's rigid transform to the rifle and both authored wrists before
+    // either hand leaves its station; this preserves the grip pivot and rail/palm
+    // clearance.
+    for (int h = 0; h < 2; h++) {
+      rel = v3_sub(P.wri[h], piv);
+      ra_ = v3_dot(rel, g_rt); rb = v3_dot(rel, g_up); rc_ = v3_dot(rel, g_fw);
+      P.wri[h] = v3_add(v3_add(piv, off),
+                        v3_add(v3_scale(nr, ra_),
+                               v3_add(v3_scale(nu, rb), v3_scale(g_fw, rc_))));
+    }
     g_rt = nr; g_up = nu;
     // Re-solve both elbows from wherever the hands end up: a wrist that moves
     // without its elbow following is an arm that stretches, which is the defect
@@ -531,20 +572,25 @@ static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int 
       gun_hold(wpn, GH_RELD, g_org, g_rt, g_up, g_fw, &rc, &ra, &rr);
       rc = v3_add(rc, v3_add(v3_scale(g_up, -gs.mag * GUN_MAG_TRAVEL[wpn][0] * GUN_GIRTH_3P),
                              v3_scale(g_rt, -gs.mag * GUN_MAG_TRAVEL[wpn][1] * GUN_GIRTH_3P)));
+      v3 route_offset = gun_reload_route_offset(
+          erg, g_rt, g_up, g_fw, gs.hand, GUN_GIRTH_3P);
       // The wrist stands off the magazine on the side the arm comes from, the
       // same construction the viewmodel uses — the hand is a fixed size and it
       // is the CYLINDER that has to be reachable, not the palm that stretches.
       v3 br = v3_sub(P.wri[0], rc);
       br = v3_sub(br, v3_scale(ra, v3_dot(br, ra)));
       br = v3_dot(br, br) > 1e-8f ? v3_norm(br) : v3_scale(g_rt, -1.0f);
+      gun_hold_profile_t mp = gun_mag_profile(wpn, g_rt, g_up, g_fw,
+                                              GUN_GIRTH_3P);
+      float contact_r = gun_profile_radius(&mp, ra, br);
       v3 want = v3_add(rc, v3_add(v3_scale(ra, -0.046f * GUN_GIRTH_3P),
-                                  v3_scale(br, rr + 0.072f)));
-      P.wri[0] = v3_lerp(P.wri[0], want, gs.hand);
+                                  v3_scale(br, contact_r + 0.072f)));
+      P.wri[0] = v3_add(v3_lerp(P.wri[0], want, gs.hand), route_offset);
     }
     if (gs.bhand > 0.001f && wpn == WPN_SR) {  // trigger hand -> the bolt knob
       v3 knob = gun_bolt_knob(gs.bolt, g_org, g_rt, g_up, g_fw, GUN_GIRTH_3P);
-      v3 want = v3_add(knob,
-                       v3_add(v3_scale(g_rt, 0.058f), v3_scale(g_up, 0.022f)));
+      v3 want = v3_add(knob, gun_pose_offset(g_rt, g_up, g_fw,
+                                             erg->bolt_wrist, GUN_GIRTH_3P));
       P.wri[1] = v3_lerp(P.wri[1], want, gs.bhand);
     }
     P.elb[0] = ik_solve(P.sho[0], P.wri[0], ANIM_UARM, ANIM_FARM, pole0);
@@ -570,13 +616,13 @@ static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int 
     }
   }
   fig_arms(&P, &kt, Rc, spine, g_org, g_rt, g_up, g_fw, wpn,
-           A->slide_s, A->slide_dir);
+           A->slide_s, A->slide_dir, gs, relaxed);
   g_gun_girth = 1.0f;
 }
 
 static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
                               const death_t *dth, float alpha,
-                              float flash01, v3 flash_col, int palette, int wpn,
+                              float flash01, v3 flash_col, int wpn,
                               gunanim_t gs) {
   // Both consumers of `pos` below are asking where this figure's GROUND is, and an air
   // crouch folds 0.60 m of leg tuck into the entity origin in one tick (see
@@ -636,7 +682,7 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
   // which lands where the light says instead of always straight down, tracks a jump on
   // its own, and shows the pose.
   g_fig_y = pos.y;
-  kit_t kt = fig_kit(palette, flash01, flash_col);
+  kit_t kt = fig_kit(flash01, flash_col);
   v3 Rc = v3_norm(P.right);
   v3 spine = v3_norm(v3_sub(P.chest, P.pelvis));
   v3 prt = v3_norm(v3_sub(P.hip[1], P.hip[0]));      // pelvis right
@@ -646,7 +692,9 @@ static void scene_draw_figure(const anim_t *A, v3 pos, float yaw,
   // head's own point of view.
   if (!g_fig_fp) sdf_head(A, P, kt, Rc, spine);
   sdf_legs(P, kt, spine, prt);
-  if (!g_fig_fp) sdf_rifle(A, P, kt, Rc, spine, wpn, gs);
+  if (!g_fig_fp)
+    sdf_rifle(A, P, kt, Rc, spine, wpn, gs,
+              dth && dth->slack > 0.0001f);
   probe(NULL);
   ao_off();
   scene_chunk_end();
@@ -673,7 +721,7 @@ static void scene_draw_bot(const bot_t *b, float alpha) {
   // b->wp.cur, not a hardwired WPN_AR: today masked by bot_spawn always
   // issuing the AR — but any figure drawn through this path holding the SR
   // would render an AR, and the far SR report bake becomes reachable with it.
-  scene_draw_figure(&b->anim, pos, yaw, &dth, alpha, flash01, fc, 0, b->wp.cur,
+  scene_draw_figure(&b->anim, pos, yaw, &dth, alpha, flash01, fc, b->wp.cur,
                     gun_anim(&b->wp));
 }
 
@@ -966,7 +1014,7 @@ static void scene_build(const player_t *p, float alpha, int show_player,
     scene_draw_figure(&g_player_anim[h], v3_lerp(hp->prev_pos, hp->pos, alpha),
                       hp->yaw, NULL, alpha, ent_flash01(hp->flash, hp->flash_head),
                       hp->flash_head ? (v3){{1.0f, 0.22f, 0.14f}} : (v3){{1, 1, 1}},
-                      1, hp->wp.cur, gun_anim(&hp->wp));
+                      hp->wp.cur, gun_anim(&hp->wp));
   }
   for (int i = 0; i < g_match.nbots; i++)
     if (g_bots[i].active) scene_draw_bot(&g_bots[i], alpha);
@@ -984,7 +1032,7 @@ static void scene_build(const player_t *p, float alpha, int show_player,
     g_fig_diss_seed = cp->seed;
     g_fig_kcap = CORPSE_K;
     scene_draw_figure(&cp->anim, cpos, cp->yaw, &dth, alpha, 0.0f,
-                      (v3){{1, 1, 1}}, cp->pal, cp->wpn, cp->gs);
+                      (v3){{1, 1, 1}}, cp->wpn, cp->gs);
   }
   g_fig_diss = 0.0f;
   g_fig_kcap = 0;
@@ -1016,7 +1064,7 @@ static void scene_build(const player_t *p, float alpha, int show_player,
                         alpha, ent_flash01(hp->flash, hp->flash_head),
                         hp->flash_head ? (v3){{1.0f, 0.22f, 0.14f}}
                                        : (v3){{1, 1, 1}},
-                        1, hp->wp.cur, gun_anim(&hp->wp));
+                        hp->wp.cur, gun_anim(&hp->wp));
       g_fig_fp = 0;
     }
   }
@@ -1179,4 +1227,3 @@ static void fx_dust(v3 eye) {
     fx_seg(p, b, eye, w, w * 0.12f, col, z0);
   }
 }
-

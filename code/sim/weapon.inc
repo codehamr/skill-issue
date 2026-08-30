@@ -1,6 +1,7 @@
 // =============================================================================
 // sim/weapon.inc  —  trigger/swap/reload path, wpn_def_t.
-// Proof: wpn, parity. One TU: included once by game.c, in definition order —
+// Proof: wpn, parity, recoil, netrecoil, vmframe. One TU: included once by game.c,
+// in definition order —
 // moving a definition out is a semantic change.
 // Contract: wpn_def_t carries no pen column — penetration is ONE number
 // (PEN_PATH) and no per-weapon curve.
@@ -96,17 +97,18 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
   gun_recover(w, held[IN_FIRE]);
 }
 
-// The viewmodel's life comes from six springs: look sway (rotation lags the mouse),
-// move inertia (position lags acceleration — stops and direction changes drag the gun),
-// walk bob (figure-8 from a distance phase), the fire kick (impulse into a stiff return
-// spring), slide/strafe roll, and the landing dip (shared with the camera).
+// The viewmodel's life comes from spring groups: look sway, move inertia, walk bob,
+// three fire channels (back/lift/side), slide/strafe roll, and the landing dip shared
+// with the camera.
 static void vm_tick(player_t *p) {
   vm_t *v = &p->vm;
   float sc = g_cfg.wp[p->wp.cur][WP_SWAY];
   v->prev_sway_p = v->sway_p; v->prev_sway_y = v->sway_y;
   v->prev_lag_x = v->lag_x; v->prev_lag_y = v->lag_y; v->prev_lag_z = v->lag_z;
   v->prev_bob_x = v->bob_x; v->prev_bob_y = v->bob_y;
-  v->prev_kick = v->kick;
+  v->prev_kick_back = v->kick_back;
+  v->prev_kick_lift = v->kick_lift;
+  v->prev_kick_side = v->kick_side;
   v->prev_roll = v->roll;
   v->prev_lean_lag = v->lean_lag;
   v->prev_slide_s = v->slide_s;
@@ -152,9 +154,11 @@ static void vm_tick(player_t *p) {
   v->bob_x = sinf(v->bob_phase) * 0.014f * bs;
   v->bob_y = -(0.5f - 0.5f * cosf(v->bob_phase * 2.0f)) * 0.011f * bs;
 
-  // Fire kick: stiff underdamped return.
-  v->kick_v += (-1400.0f * v->kick - 55.0f * v->kick_v) * TICK_DT;
-  v->kick += v->kick_v * TICK_DT;
+  // Fire response: compression peaks first; the softer lift peaks two ticks later;
+  // signed side travel is tiny and tightly damped.
+  recoil_spring(&v->kick_back, &v->kick_back_v, RECOIL_BACK_K, RECOIL_BACK_C);
+  recoil_spring(&v->kick_lift, &v->kick_lift_v, RECOIL_LIFT_K, RECOIL_LIFT_C);
+  recoil_spring(&v->kick_side, &v->kick_side_v, RECOIL_SIDE_K, RECOIL_SIDE_C);
 
   // Lean lag. The camera's roll and offset are rigid — the gun is not: it hangs off two
   // arms, so it arrives at the new lean a beat late and settles.
@@ -436,16 +440,18 @@ static void player_present_tick(player_t *p, int ent) {
     // travels as a flag bit, and computing it a second time at the wire is exactly
     // how the pose and the packet would drift apart.
     p->wp.ready_want = (unsigned char)player_carry_ready(p);
+    int idle_ok = gun_pose_idle_ok(&p->wp, &g_player_anim[h], p->vel,
+                                   p->grounded, p->sliding);
     anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
               p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
-              p->lean, p->wp.ready_want, ent);
+              p->lean, p->wp.ready_want, ent, p->wp.cur, idle_ok);
   }
   else {
     g_player_anim[h].prev_pose = g_player_anim[h].pose;
     if (g_player_corpse_q[h]) {
       g_player_corpse_q[h] = 0;
       corpse_add(&g_player_anim[h], p->pos, p->pos, g_player_rag[h], p->yaw,
-                 0.0f, 0.0f, gun_anim(&p->wp), p->wp.cur, 1, ent);
+                 0.0f, 0.0f, gun_anim(&p->wp), p->wp.cur, ent);
     }
   }
 }
@@ -521,4 +527,3 @@ static void net_srv_consume_inputs(void);   // defined with the conn layer
   net_hist_record();
   g_num_events = 0;      // player_tick already captured them into the log
 }
-

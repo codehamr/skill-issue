@@ -724,7 +724,7 @@ typedef struct {
                     // topple twice (measured: 2.1x the tilt step and 2.3x the position
                     // step on that one tick), which is a one-frame pop at exactly the
                     // seam this whole change exists to remove.
-  int      wpn, pal, life, used;
+  int      wpn, life, used;
   int      owner;   // entity id the body was (0 = player, 1.. = bots): the
                     // `rag`/`ragx` proofs follow ONE body across the handover,
                     // and without ownership any other kill landing in their
@@ -737,18 +737,29 @@ static corpse_t g_corpses_all[SRV_LOBBIES][MAX_CORPSES];
 // ev_push: presentation state written by the tick, never read back.
 static void corpse_add(const anim_t *A, v3 pos, v3 prev_pos, rag_t rag,
                        float yaw, float slack, float prev_slack, gunanim_t gs,
-                       int wpn, int pal, int owner) {
+                       int wpn, int owner) {
   int slot = -1, oldest = 1 << 30;
   for (int i = 0; i < MAX_CORPSES; i++) {
     if (!g_corpses[i].used) { slot = i; break; }
     if (g_corpses[i].life < oldest) { oldest = g_corpses[i].life; slot = i; }
   }
-  g_corpses[slot] = (corpse_t){*A, rag, gs, pos, prev_pos, yaw,
-                               slack, prev_slack,
-                               fx_hash((uint32_t)g_tick * 2654435761u +
-                                       (uint32_t)slot * 40503u),
-                               (int)g_tick, wpn, pal,
-                               CORPSE_TICKS + CORPSE_DISS, 1, owner};
+  g_corpses[slot] = (corpse_t){
+    .anim = *A,
+    .rag = rag,
+    .gs = gs,
+    .pos = pos,
+    .prev_pos = prev_pos,
+    .yaw = yaw,
+    .slack = slack,
+    .prev_slack = prev_slack,
+    .seed = fx_hash((uint32_t)g_tick * 2654435761u +
+                    (uint32_t)slot * 40503u),
+    .born = (int)g_tick,
+    .wpn = wpn,
+    .life = CORPSE_TICKS + CORPSE_DISS,
+    .used = 1,
+    .owner = owner,
+  };
 }
 
 // Live particles at the worst tick, and how many of them were in the RESERVED
@@ -1195,7 +1206,7 @@ static void scene_quad(v3 a, v3 b, v3 c, v3 d, v3 n, v3 col) {
 // The figure's proportions are the thing that decides whether it reads as a man or as a
 // stack of tubes, and they were authored by eye against a FRONT view — which is why
 // every width was roughly right and every length and depth was not.
-#define PROBE_MAX 64
+#define PROBE_MAX 128
 typedef struct { const char *name; int v0, v1; } probe_t;
 static probe_t g_probe[PROBE_MAX];
 static int g_nprobe, g_probe_on;
