@@ -790,12 +790,14 @@ static void net_cl_present_advance(void) {
     if (!p->alive) continue;
     gun_ads(&p->wp, p->wp.ads_want);   // idempotent on the intent it re-publishes
     gun_reload_tick(&p->wp);
+    gun_recoil_step(&p->wp);
   }
   for (int i = 0; i < g_match.nbots; i++) {
     bot_t *b = &g_bots[i];
     if (!b->active || !b->alive) continue;
     gun_ads(&b->wp, b->wp.ads_want);
     gun_reload_tick(&b->wp);
+    gun_recoil_step(&b->wp);
   }
 }
 

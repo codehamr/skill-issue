@@ -74,8 +74,8 @@ typedef enum { WPN_AR, WPN_SR, WPN_COUNT } wpn_id_t;
 #define GUN_GIRTH_3P 1.05f
 
 typedef enum {
-  WP_RPM, WP_KICK_UP, WP_KICK_SIDE, WP_RECOVER_MS, WP_HIP_SPREAD, WP_SPREAD,
-  WP_BLOOM, WP_ADS_MS, WP_ADS_ZOOM, WP_PUNCH, WP_SWAY, WP_COUNT
+  WP_RPM, WP_KICK_UP, WP_KICK_SIDE, WP_RECOVER_MS, WP_HIP_KICK, WP_MOVE_KICK,
+  WP_HEAT, WP_ADS_MS, WP_ADS_ZOOM, WP_PUNCH, WP_SWAY, WP_COUNT
 } wp_param_t;
 
 // `def` is deliberately 0: defaults are PER-WEAPON, in WP_DEFAULTS, the one
@@ -85,12 +85,12 @@ static const param_def_t WP_DEF[WP_COUNT] = {
   [WP_KICK_UP]    = {"kick_up",    "KICK UP",    0,   0.0f,    3.0f,  0.05f},
   [WP_KICK_SIDE]  = {"kick_side",  "KICK SIDE",  0,   0.0f,    1.0f,  0.05f},
   [WP_RECOVER_MS] = {"recover_ms", "RECOVERY",   0,  50.0f,  800.0f, 10.0f},
-  // Promoted from wpn_def_t.hip_spread on 2026-08-25: the DEV page had an ADS
-  // spread slider and no hip one, on a pair of weapons whose entire hip/ADS
-  // trade lives in this number.
-  [WP_HIP_SPREAD] = {"hip_spread", "HIP SPREAD", 0,   0.0f,    4.0f,  0.05f},
-  [WP_SPREAD]     = {"spread",     "ADS SPREAD", 0,   0.0f,    0.5f,  0.01f},
-  [WP_BLOOM]      = {"bloom",      "BLOOM/SHOT", 0,   0.0f,    0.4f,  0.01f},
+  // Accuracy is the visible barrel now: these tune the physical impulse, never a
+  // second random cone. HIP RECOIL is a multiplier (1 = fully braced), MOVE RECOIL
+  // adds at run speed, and HEAT/SHOT accumulates into later impulses of a burst.
+  [WP_HIP_KICK]   = {"hip_recoil",  "HIP RECOIL", 0,   1.0f,    2.0f,  0.05f},
+  [WP_MOVE_KICK]  = {"move_recoil", "MOVE RECOIL",0,   0.0f,    1.0f,  0.05f},
+  [WP_HEAT]       = {"heat",        "HEAT/SHOT",  0,   0.0f,    0.4f,  0.01f},
   [WP_ADS_MS]     = {"ads_ms",     "ADS TIME",   0,  80.0f,  500.0f, 10.0f},
   [WP_ADS_ZOOM]   = {"ads_zoom",   "ADS ZOOM",   0,  40.0f,  100.0f,  1.0f},
   [WP_PUNCH]      = {"punch",      "VIEW PUNCH", 0,   0.0f,    3.0f,  0.1f},
@@ -99,13 +99,11 @@ static const param_def_t WP_DEF[WP_COUNT] = {
 
 // The AR is a controllable full-auto laser, the sniper a violent single shot.
 static const float WP_DEFAULTS[WPN_COUNT][WP_COUNT] = {
-  [WPN_AR] = {750, 0.30f, 0.15f, 200, 1.50f, 0.05f, 0.06f, 180, 80, 1.00f, 0.6f},
+  [WPN_AR] = {750, 0.30f, 0.15f, 200, 1.10f, 0.30f, 0.06f, 180, 80, 1.00f, 0.6f},
   // ads_zoom 89 not 100: the scope's PiP pass owns the magnification; the base
   // FOV drop only sells the transition. rpm caps the semi-auto trigger interval
   // at 60 ms; it is not a fire rate (fire mode is structural, in WPN_DEF).
-  // hip_spread 3.00: a scoped bolt gun fired from the hip is a coin toss, and
-  // that is the design, now as a slider instead of a struct field.
-  [WPN_SR] = {1000, 1.80f, 0.20f, 400, 3.00f, 0.02f, 0.10f, 80, 89, 2.20f, 1.0f},
+  [WPN_SR] = {1000, 1.80f, 0.20f, 400, 1.35f, 0.50f, 0.10f, 80, 89, 2.20f, 1.0f},
 };
 
 // Structural weapon identity — not sliders: these change WHAT the weapon is.
@@ -116,8 +114,6 @@ typedef struct {
   // bolt gun works its action either way, so the sniper's two are identical.
   int   reload_tac_ticks;
   int   full_auto;      // 0 = one shot per trigger press (bolt/semi)
-  // hip_spread left this struct for WP_HIP_SPREAD: it is a FEEL number the DEV
-  // page tunes, not structural identity.
   int   sfx_fire;       // which synth buffer a shot triggers
   int   sfx_reload;     // ...and which reload; a bolt gun does not change a mag
   float sfx_hit_t;      // s to delay the hit/kill confirmation by: it must clear

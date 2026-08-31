@@ -18,9 +18,10 @@
 // ---------------------------------------------------------------------------
 
 // PROTO is byte 0-1 of EVERY packet, hand-bumped on any wire change.
-// 9: WP_HIP_SPREAD joined the wp table ACCEPT carries (hip spread became a sim
-// tunable; it was a wpn_def_t constant).
-#define NET_PROTO 9
+// 9: hip spread joined the wp table ACCEPT carries.
+// 10: the three cone parameters became physical hip/move/heat recoil parameters;
+//     layout is unchanged, semantics are not, so mixed builds must not play together.
+#define NET_PROTO 10
 // Floor on an UNVERIFIED request, so the answer to one is always smaller than the
 // request was and the responder cannot be pointed at a forged source address:
 // NET_CONNECT_MIN 16 against the 7-byte COOKIE reply.
@@ -611,4 +612,3 @@ static void arena_clamp(v3 *pos) {
   pos->x = f_clamp(pos->x, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
   pos->z = f_clamp(pos->z, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
 }
-

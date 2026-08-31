@@ -23,6 +23,8 @@
 #             while the visible arms raise only partially at T1 (including prediction)
 #   slidecheck: eight-direction thigh/shin clearance, anatomical ordering, bounded
 #             joint travel and bone-length residual
+#   armcheck: running and steep-down aim sweep retain bounded elbow travel and
+#             torso clearance on both arms
 #   vmtrig  : complete 70-state FP/3P x AR/SR contact matrix, exact child/part
 #             census, no patch/pool/counter overflow, bounded work and scratch,
 #             and at most 13,000,000 bytes of static vmtrig scratch pools
@@ -162,11 +164,12 @@ say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 # - The segment-aware arm solve and collision-reactive slide legs move the same
 #   deterministic sweep to 75/75/75/61. This is the exact old/new build comparison
 #   documented with the cross census below, not an unreviewed baseline bump.
-# - 2026-08-30 closed-chain follow-up, identical O3 binary flags, seed and fresh
-#   config: the buried deltoid root adds the intended shoulder contact while the
-#   endpoint-valid continuous elbow plane removes the old counterfactual-plane grazes;
-#   the net near census remains 75/75/75/61 and all five topology classes stay zero.
-WANT_AR_NEAR="75 75 75 61"
+# - 2026-08-30 physical-bore/arm/slide pass, identical O3 flags, seed and fresh
+#   config: the AR firing carriage no longer enters low-ready, downward aim moves the
+#   complete weapon complex forward, and slide exit retains its knee bend plane. The
+#   reviewed pair-family diff moves only arm/weapon and thigh/shin contacts; all five
+#   hard topology classes remain zero.
+WANT_AR_NEAR="75 75 75 62"
 [ "$AR_NEAR" = "$WANT_AR_NEAR" ] || {
   say "GATE AR near '$AR_NEAR' != reviewed baseline '$WANT_AR_NEAR'"; fail=1;
 }
@@ -248,7 +251,7 @@ WANT_AR_NEAR="75 75 75 61"
 #   class and vmtrig's forbidden mesh/proxy crossings still zero.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_AR_CROSS="115 115 98 61"
+WANT_AR_CROSS="113 113 99 58"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -275,8 +278,8 @@ WANT_AR_CROSS="115 115 98 61"
 # The closed-chain follow-up documented in the AR census affects only shared anatomy:
 # SR near becomes 94/94/58/39 and cross falls 208/208/135/92 -> 193/193/126/85, with
 # open/flip/dup/zfight/degen still zero in every one of the eight full sweeps.
-WANT_SR_NEAR="94 94 58 39"
-WANT_SR_CROSS="193 193 126 85"
+WANT_SR_NEAR="94 94 58 41"
+WANT_SR_CROSS="203 203 125 87"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -290,10 +293,10 @@ WANT_SR_CROSS="193 193 126 85"
 # The exact near/cross witness catches shallow self-intersections between hand
 # parts (including the hero-tier thumb shoulder) that vmtrig intentionally does
 # not classify as forbidden weapon contact.
-# 2026-08-30 closed-chain A/B: the buried shared upper-arm root and continuous elbow
-# plane move cross 139 -> 145; open/flip/dup/zfight/degen remain zero and vmtrig's
-# complete 70-state forbidden mesh/proxy census remains zero.
-gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=199 cross=145 degen=0 recoil_states=20$'
+# 2026-08-30 physical-bore/arm A/B: stable downward preferred angles and the unified
+# live firing carriage move the shallow hand/weapon contact census; hard topology and
+# vmtrig's forbidden mesh/proxy census remain zero.
+gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=194 cross=138 degen=0 recoil_states=20$'
 gate_command vmsight "vmsight" '^vmsight total=0 '
 gate_command vmscope "vmscope" '^vmscope scope_tris=[1-9][0-9]* open_at=0[.]55 baseline_err=.* recoil_min_ocular=.* recoil_axis=.* recoil_center=.* recoil_pip=.* recoil_radius_delta=.* ok$'
 gate_command vmframe "vmframe" '^vmframe ok$'
@@ -322,7 +325,8 @@ grep -Eq '^vmframe fire sr T1 .*ready=0[.]000/0[.][12][0-9][0-9] .* ok$' \
     say "GATE vmframe missing partial T1 fire carry witness"; fail=1;
   }
 gate_command vmtrig "vmtrig" '^vmtrig worst .* ok$'
-gate_command slidecheck "slidecheck" '^slidecheck dirs=8 clear=[1-9][0-9][0-9][.][0-9]mm@[0-7]/[0-9][0-9]* side=[1-9][0-9][0-9][.][0-9]mm step=[0-7][0-9][.][0-9]mm@[0-7]/[0-9][0-9]* bone=[0-6][.][0-9][0-9][0-9]mm finite=1 ok$'
+gate_command slidecheck "slidecheck" '^slidecheck dirs=8 clear=[1-9][0-9][0-9][.][0-9]mm@[0-7]/[0-9][0-9]* side=[1-9][0-9][0-9][.][0-9]mm step=[0-7][0-9][.][0-9]mm@[0-7]/[0-9][0-9]* exit_step=[0-7][0-9][.][0-9]mm@[0-7]/[0-9][0-9]* exit_side=[1-4][0-9][0-9][.][0-9]mm bone=[0-6][.][0-9][0-9][0-9]mm finite=1 ok$'
+gate_command armcheck "armcheck" '^armcheck run_step=[0-9]+[.][0-9]/[0-9]+[.][0-9]mm aim_step=[0-9]+[.][0-9]/[0-9]+[.][0-9]mm run_clear=[0-9]+[.][0-9]+/[0-9]+[.][0-9]+ aim_clear=[0-9]+[.][0-9]+/[0-9]+[.][0-9]+ ok$'
 
 # Do not make field order part of the interface: parse the named witnesses from the
 # self-test, every state row, and the final census independently. `bytes` is only the

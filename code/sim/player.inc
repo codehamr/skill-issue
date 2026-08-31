@@ -86,9 +86,8 @@ static float ease_k(float rate) { return 1.0f - expf(-rate * TICK_DT); }
 // Weapon behavior constants shared by every weapon — per-weapon structure is
 // in WPN_DEF, per-weapon feel in g_cfg.wp.
 #define GUN_SWITCH_TICKS 36      // 0.3 s weapon raise on swap
-#define GUN_BLOOM_CAP    0.6f    // deg: full-auto spread growth tops out here
-#define GUN_MOVE_SPREAD  0.5f    // deg added at full run speed
-#define GUN_AIR_SPREAD   4.0f    // x: total spread multiplier while airborne
+#define GUN_HEAT_CAP     0.6f    // later recoil impulses top out at +60%
+#define GUN_AIR_KICK     1.65f   // an airborne body cannot brace the stock
 #define GUN_REC_CAP      12.0f   // deg: recoil climb hard cap
 #define GUN_PUNCH_SHOT   0.4f    // deg of visual punch per shot (x VIEW PUNCH)
 // THE PUNCH IS A SPRING AND THE AUTHORED NUMBER IS ITS PEAK. These constants were
@@ -127,8 +126,11 @@ typedef struct {
   int   reload_tac;      // ...and whether it started with a round still up
   int   switch_t;        // ticks of weapon raise remaining after a swap
   float prev_switch;     // last tick's raise fraction, for interpolation
-  float rec_p, rec_y, prev_rec_p, prev_rec_y;  // deg, applied to view AND aim
-  float bloom;           // deg of accumulated spread, decays between bursts
+  // Angular spring state of the physical barrel. The values are degrees and deg/s;
+  // camera, rendered weapon and hitscan all consume the same two angles.
+  float rec_p, rec_y, prev_rec_p, prev_rec_y;
+  float rec_p_v, rec_y_v;
+  float heat;            // later impulse multiplier, decays between bursts
   // THE DRY CLICK IS LATCHED, NOT EDGE-GATED. It used to be pushed only on a press
   // edge, so on a FULL-AUTO weapon — where prev_held is 1 on every tick of the burst —
   // the branch was unreachable and the single commonest way to run out of ammo made no

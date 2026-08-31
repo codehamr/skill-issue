@@ -509,7 +509,7 @@ static void netfigure_proof(void) {
 #define RECOIL_PROOF_SHOTS 3
 
 typedef struct {
-  float back, lift, side, muzzle_deg, punch, punch_roll;
+  float back, lift, side, muzzle_deg, bore_error, punch, punch_roll;
   float shot_yaw, shot_pitch;
   int ammo, idx;
   uint64_t rng;
@@ -531,7 +531,7 @@ typedef struct {
 } recoil_trace_t;
 
 typedef struct {
-  float back, lift, side, muzzle, punch, overshoot;
+  float back, lift, side, muzzle, bore_error, punch, overshoot;
   int back_tick, lift_tick, settle_tick;
 } recoil_metric_t;
 
@@ -731,24 +731,10 @@ static void recoil_stage(int local_presentation, int wpn, int ads) {
   g_rng_gun[0] = rng_gun_seed(1337u, 0);
 }
 
-// Angular change of the actual production weapon frame, with a calm copy evaluated at
-// the same tick. Breathing/reload/hip composition therefore cancel; only the three
-// recoil channels remain, exactly as vm_stage_springs consumes them.
+// Angular change of the authoritative barrel from calm aim. The viewmodel is aligned
+// to this same axis, so the gameplay state is the stable, render-independent measure.
 static float recoil_muzzle_delta(const player_t *p) {
-  static const v3 eye = {{0, 0, 0}}, rgt = {{1, 0, 0}};
-  static const v3 upv = {{0, 1, 0}}, fwd = {{0, 0, -1}};
-  player_t calm = *p;
-  calm.vm.kick_back = calm.vm.prev_kick_back = calm.vm.kick_back_v = 0.0f;
-  calm.vm.kick_lift = calm.vm.prev_kick_lift = calm.vm.kick_lift_v = 0.0f;
-  calm.vm.kick_side = calm.vm.prev_kick_side = calm.vm.kick_side_v = 0.0f;
-  vm_pose_t hot_pose = vm_stage_pose(p, &p->vm, &p->wp, 1.0f, 1.0f);
-  vm_pose_t calm_pose = vm_stage_pose(&calm, &calm.vm, &calm.wp, 1.0f, 1.0f);
-  vm_frame_t hot = vm_stage_springs(&hot_pose, &p->vm, 1.0f, eye, rgt, upv, fwd);
-  vm_frame_t base = vm_stage_springs(&calm_pose, &calm.vm, 1.0f,
-                                          eye, rgt, upv, fwd);
-  v3 cr = v3_cross(hot.gz, base.gz);
-  return atan2f(v3_len(cr), f_clamp(v3_dot(hot.gz, base.gz), -1.0f, 1.0f)) /
-         DEG2RAD;
+  return gun_spread(&p->wp, p->vel, p->grounded);
 }
 
 static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir) {
@@ -758,6 +744,23 @@ static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir)
   o->lift = p->vm.kick_lift;
   o->side = p->vm.kick_side;
   o->muzzle_deg = recoil_muzzle_delta(p);
+  {
+    float by, bp;
+    gun_bore_angles(&p->wp, p->yaw, p->pitch, &by, &bp);
+    v3 fwd = {{cosf(bp) * sinf(by), sinf(bp), -cosf(bp) * cosf(by)}};
+    v3 rgt = v3_norm(v3_cross(fwd, (v3){{0, 1, 0}}));
+    v3 upv = v3_norm(v3_cross(rgt, fwd));
+    vm_pose_t vp = vm_stage_pose(p, &p->vm, &p->wp, 1.0f, 1.0f);
+    vm_frame_t vf = vm_stage_springs(&vp, &p->vm, 1.0f,
+                                      (v3){{0, 0, 0}}, rgt, upv, fwd);
+    anim_t body = g_player_anim[0];
+    skel_solve(&body, p->pos, by, bp, p->wp.cur,
+               GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
+    float vm_err = acosf(f_clamp(v3_dot(v3_norm(vf.gz), fwd), -1.0f, 1.0f));
+    float body_err = acosf(f_clamp(v3_dot(v3_norm(body.pose.gun_f), fwd),
+                                   -1.0f, 1.0f));
+    o->bore_error = fmaxf(vm_err, body_err) / DEG2RAD;
+  }
   o->punch = p->wp.punch;
   o->punch_roll = p->wp.punch_roll;
   if (last_dir) {
@@ -836,6 +839,7 @@ static recoil_metric_t recoil_metrics(const recoil_trace_t *tr) {
     if (s->lift > m.lift) { m.lift = s->lift; m.lift_tick = t; }
     if (fabsf(s->side) > m.side) m.side = fabsf(s->side);
     if (s->muzzle_deg > m.muzzle) m.muzzle = s->muzzle_deg;
+    if (s->bore_error > m.bore_error) m.bore_error = s->bore_error;
     if (fabsf(s->punch) > m.punch) m.punch = fabsf(s->punch);
   }
   float over_back = 0.0f, over_lift = 0.0f;
@@ -854,7 +858,8 @@ static recoil_metric_t recoil_metrics(const recoil_trace_t *tr) {
       const recoil_sample_t *s = &tr->sample[t + j];
       if (fabsf(s->back) > m.back * 0.02f + 1e-7f ||
           fabsf(s->lift) > m.lift * 0.02f + 1e-7f ||
-          fabsf(s->side) > m.side * 0.02f + 1e-7f) quiet = 0;
+          fabsf(s->side) > m.side * 0.02f + 1e-7f ||
+          s->muzzle_deg > m.muzzle * 0.02f + 0.002f) quiet = 0;
     }
     if (quiet) { m.settle_tick = t; break; }
   }
@@ -907,12 +912,25 @@ static void recoil_proof(void) {
       recoil_print_samples(&a, &m, wi, ads, burst);
       int deterministic = !memcmp(&a, &b, sizeof a);
       int gameplay = recoil_gameplay_same(&a, &ref);
+      int bore_exact = a.nshot > 0 && fabsf(a.shot[0].wp.rec_p) < 1e-7f &&
+                       fabsf(a.shot[0].wp.rec_y) < 1e-7f;
+      int rng_static = a.nshot > 0 && a.end_rng == a.shot[0].rng;
+      for (int si = 0; si < a.nshot; si++) {
+        float sy = atan2f(a.shot[si].dir.x, -a.shot[si].dir.z) / DEG2RAD;
+        float sp = asinf(f_clamp(a.shot[si].dir.y, -1.0f, 1.0f)) / DEG2RAD;
+        if (fabsf(sy - a.shot[si].wp.rec_y) > 0.002f ||
+            fabsf(sp - a.shot[si].wp.rec_p) > 0.002f)
+          bore_exact = 0;
+      }
       int shape = a.continuous && a.nshot == (burst ? RECOIL_PROOF_SHOTS : 1) &&
-                  m.settle_tick && m.settle_tick - a.last_shot_tick >= 14 &&
-                  m.settle_tick - a.last_shot_tick <= 28 && m.overshoot < 0.20f &&
+                  bore_exact && rng_static && m.settle_tick &&
+                  m.settle_tick - a.last_shot_tick >= 14 &&
+                  m.settle_tick - a.last_shot_tick <= 58 && m.overshoot < 0.20f &&
                   m.side > 0.0002f &&
                   m.side <= (wi == WPN_SR ? 0.0041f : 0.0031f) &&
-                  m.punch > 0.05f;
+                  m.bore_error < 0.001f &&
+                  m.muzzle > (wi == WPN_SR ? 0.8f : 0.12f) &&
+                  m.muzzle < (wi == WPN_SR ? 12.5f : 2.0f);
       if (!burst) {
         static const float BACK_LO[WPN_COUNT][2] = {
           [WPN_AR] = {0.009f, 0.007f}, [WPN_SR] = {0.018f, 0.010f},
@@ -920,16 +938,9 @@ static void recoil_proof(void) {
         static const float BACK_HI[WPN_COUNT][2] = {
           [WPN_AR] = {0.014f, 0.010f}, [WPN_SR] = {0.024f, 0.016f},
         };
-        float lift_deg = m.lift / DEG2RAD;
-        // Full ADS is intentionally braced. Hip carries the plan's absolute lift
-        // range; ADS must retain at least 60% of it and never exceed that range.
-        float lift_lo = wi == WPN_SR ? (ads ? 1.35f : 1.50f) : (ads ? 0.45f : 0.50f);
-        float lift_hi = wi == WPN_SR ? 3.00f : 1.20f;
         shape &= m.back_tick >= 1 && m.back_tick <= 3 &&
-                 m.lift_tick >= m.back_tick + 1 && m.lift_tick <= m.back_tick + 3 &&
-                 m.muzzle < (wi == WPN_SR ? 3.2f : 1.5f) &&
                  m.back >= BACK_LO[wi][ads] && m.back <= BACK_HI[wi][ads] &&
-                 lift_deg >= lift_lo && lift_deg <= lift_hi;
+                 fabsf(m.lift) < 1e-7f;
         single[wi][ads] = m;
       } else {
         const recoil_metric_t *one = &single[wi][ads];
@@ -937,18 +948,18 @@ static void recoil_proof(void) {
         // return phase, so the absolute back peak need not be the final shot's peak.
         // What must remain true is continuity, compression before lift, and a bounded
         // accumulated response rather than a reset or an unbounded stack.
-        shape &= m.back_tick < m.lift_tick &&
-                 m.back > one->back * 0.95f && m.back < one->back * 3.1f &&
-                 m.lift > one->lift * 1.05f && m.lift < one->lift * 3.1f;
+        shape &= m.back > one->back * 0.95f && m.back < one->back * 3.1f &&
+                 m.muzzle > one->muzzle * 1.05f && m.muzzle < one->muzzle * 5.0f;
       }
       int case_ok = deterministic && gameplay && shape;
       printf("recoil %s %s %s peak back=%.2fmm@T%d lift=%.2fdeg@T%d "
-             "side=%.2fmm muzzle=%.2fdeg punch=%.2f overshoot=%.1f%% "
+             "side=%.2fmm muzzle=%.2fdeg bore_err=%.4fdeg punch=%.2f overshoot=%.1f%% "
              "shots=%d continuous=%d deterministic=%d gameplay_rng=%d %s\n",
              wi == WPN_SR ? "sr" : "ar", ads ? "ads" : "hip",
              burst ? "burst" : "single", (double)(m.back * 1000.0f), m.back_tick,
              (double)(m.lift / DEG2RAD), m.lift_tick, (double)(m.side * 1000.0f),
-             (double)m.muzzle, (double)m.punch, (double)(m.overshoot * 100.0f),
+             (double)m.muzzle, (double)m.bore_error, (double)m.punch,
+             (double)(m.overshoot * 100.0f),
              a.nshot, a.continuous, deterministic, gameplay,
              case_ok ? "ok" : "FAIL");
       ok &= case_ok;
@@ -1426,9 +1437,12 @@ static void vmframe_proof(void) {
     else if (c == VMF_READY)
       case_ok &= idle_ok && a.ready_s > 0.10f && a.ready_s < 0.30f &&
                  vm_err > 0.005f && body_err > 0.005f;
-    else if (c == VMF_BOLT || c == VMF_FIRE)
+    else if (c == VMF_BOLT)
       case_ok &= idle_ok == GUN_POSE_IDLE &&
                  vm_err > 0.005f && body_err > 0.02f;
+    else if (c == VMF_FIRE)
+      case_ok &= idle_ok == GUN_POSE_IDLE &&
+                 vm_err > 0.005f && body_err < 1e-6f;
     else
       case_ok &= idle_ok == GUN_POSE_BLOCKED &&
                  vm_err < 1e-6f && body_err < 1e-6f;
@@ -1845,10 +1859,12 @@ static int netrecoil_case(int burst) {
                       g_rng_gun[0] == endpoint_rng;
   anim_t *ra = &g_player_anim[rh];
   int body_impulse = ra->recoil_back == 0.0f && ra->recoil_lift == 0.0f &&
-                     ra->recoil_back_v > 0.5f && ra->recoil_lift_v > 0.3f;
+                     ra->recoil_back_v > 0.5f && ra->recoil_lift_v == 0.0f &&
+                     remote_p->wp.rec_p == 0.0f && remote_p->wp.rec_p_v > 1.0f;
   g_tick++;
   client_anim_all();
-  int body_moved = ra->recoil_back > 0.004f && ra->recoil_lift > 0.001f;
+  int body_moved = ra->recoil_back > 0.004f && ra->recoil_lift == 0.0f &&
+                   remote_p->wp.rec_p_v > 1.0f;
   int corrected = g_cl_corrections == 1 && g_cl_worst_err_mm > 50.0f;
   int snapshot_sidefx_same = p->shots == forward_player_shots &&
                              g_match.shots[0] == forward_match_shots &&
@@ -1863,13 +1879,13 @@ static int netrecoil_case(int burst) {
            forward_match_shots == expected_shots &&
            g_cl_ev_applied == 2 && g_cl_ev_dupes == 0;
   printf("netrecoil %s corr=%.1fmm peak=%.2f/%.2fmm@T%d/T%d "
-         "end_vm=%d series=%d ammo=%d/%d bloom=%.6f rec=(%.6f %.6f) "
+         "end_vm=%d series=%d ammo=%d/%d heat=%.6f rec=(%.6f %.6f) "
          "rng=%016llx echo_once=%d replay_body=%d remote3p=(%d %d) "
          "sidefx=%d/%d counts=%d/%d noise_t=%ld events=%d/%d %s\n",
          burst ? "burst" : "single", (double)g_cl_worst_err_mm,
          (double)(ref.peak * 1000.0f), (double)(peak * 1000.0f),
          ref.peak_tick, peak_tick, endpoint_same, series_same,
-         p->wp.ammo[WPN_AR], endpoint.wp.ammo[WPN_AR], (double)p->wp.bloom,
+         p->wp.ammo[WPN_AR], endpoint.wp.ammo[WPN_AR], (double)p->wp.heat,
          (double)p->wp.rec_p, (double)p->wp.rec_y,
          (unsigned long long)g_rng_gun[0], endpoint_same, replay_anim_same,
          body_impulse, body_moved, direct_sidefx_same, snapshot_sidefx_same,

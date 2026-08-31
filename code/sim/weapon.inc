@@ -442,9 +442,10 @@ static void player_present_tick(player_t *p, int ent) {
     p->wp.ready_want = (unsigned char)player_carry_ready(p);
     int idle_ok = gun_pose_state(&p->wp, &g_player_anim[h], p->vel,
                                    p->grounded, p->sliding);
-    anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch, p->grounded,
-              p->crouched && !p->sliding, p->tuck_y, p->sliding, p->wp.ads_s,
-              p->lean, p->wp.ready_want, ent, p->wp.cur, idle_ok);
+    weapon_anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch,
+                     p->grounded, p->crouched && !p->sliding, p->tuck_y,
+                     p->sliding, p->wp.ads_s, p->lean, p->wp.ready_want, ent,
+                     &p->wp, idle_ok);
   }
   else {
     g_player_anim[h].prev_pose = g_player_anim[h].pose;

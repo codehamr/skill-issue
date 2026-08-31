@@ -374,6 +374,27 @@ CAPTURES = (
     ),
 )
 
+# Consecutive samples around the deterministic slide release. A single hero frame can
+# hide the exact two faults this sequence is for: knee-pole ownership changing while
+# the pelvis rises, and gait lifting its first foot before the get-up pose is finished.
+for frame, ticks in enumerate((145, 152, 159, 166, 176, 190), start=1):
+    CAPTURES += (
+        exterior(
+            "slide",
+            f"slide_exit_{frame:02d}_ext_side.png",
+            f"Slide-to-run exit sequence frame {frame}/6 (wait {ticks})",
+            (
+                "puppet move 0 -1",
+                "puppet speed 5.5",
+                "wait 45",
+                "puppet slide",
+                f"wait {ticks}",
+            ),
+            0.78,
+            (-2.65, 1.02, 0.00),
+        ),
+    )
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()

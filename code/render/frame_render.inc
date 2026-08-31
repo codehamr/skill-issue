@@ -31,11 +31,10 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
   float leanv = p->prev_lean + (p->lean - p->prev_lean) * alpha;
   eye = v3_add(eye, lean_offset(p->yaw, leanv));
   eye.y -= lean_eye_drop(leanv);
-  // Recoil offset + visual punch land on the rendered view; the sim's
-  // yaw/pitch stay the player's own aim so compensation works.
+  // The physical barrel spring moves the rendered view. Pitch punch used to add a
+  // second, cosmetic direction that neither hitscan nor the visible bore shared.
   const weapon_t *w = &p->wp;
-  float rec_p = w->prev_rec_p + (w->rec_p - w->prev_rec_p) * alpha
-              + w->prev_punch + (w->punch - w->prev_punch) * alpha;
+  float rec_p = w->prev_rec_p + (w->rec_p - w->prev_rec_p) * alpha;
   float rec_y = w->prev_rec_y + (w->rec_y - w->prev_rec_y) * alpha;
   float ads = w->prev_ads_s + (w->ads_s - w->prev_ads_s) * alpha;
   float yaw = p->yaw + rec_y * DEG2RAD;
@@ -610,8 +609,8 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
   if (!g_menu_open && !cam_free && !g_vmorb.on) {
     float ccx = g_ui_vw * 0.5f, ccy = g_ui_vh * 0.5f;
     int in_play = p->alive && !g_match.over;
-    // Crosshair: the gap mirrors the live spread cone, so bloom/motion penalties are
-    // visible before the first shot.
+    // Crosshair: the gap mirrors the live barrel displacement. At rest the first round
+    // is exact; recoil opens it only as the visible barrel moves.
     float ch_hide = p->wp.cur == WPN_SR ? 0.02f : 0.95f;
     if ((ads < ch_hide || third) && in_play) {  // 3rd person: crosshair even in ADS
       // 2.5x on the honest cone projection — pure readability — plus the HIT KICK, so

@@ -258,27 +258,84 @@ static void ent_damage(int ent, int dmg, int part, int src, v3 from, v3 at) {
   }
 }
 
-// Spread for WHOEVER is shooting. Keyed on the shooter's weapon state and
-// motion, never on which kind of entity it is: a running bot's shots bloom the
-// same way a running player's do, and one config slider moves both.
+// The crosshair reports the actual angular distance between the calm aim and the
+// physical barrel. There is no hidden cone: this value is diagnostic, not sampled.
 static float gun_spread(const weapon_t *w, v3 vel, int grounded) {
-  float hs = sqrtf(vel.x * vel.x + vel.z * vel.z);
-  // ADS spread is the tuned base; the structural hip penalty fades out as
-  // the sight comes up. Movement and air penalties on top.
-  float s = g_sim_wp[w->cur][WP_SPREAD]
-          + g_sim_wp[w->cur][WP_HIP_SPREAD] * (1.0f - w->ads_s)
-          + w->bloom + GUN_MOVE_SPREAD * f_clamp(hs / g_sim_mv[MV_RUN], 0.0f, 1.5f);
-  if (!grounded) s *= GUN_AIR_SPREAD;
-  return s < 6.0f ? s : 6.0f;
+  (void)vel;
+  (void)grounded;
+  return sqrtf(w->rec_p * w->rec_p + w->rec_y * w->rec_y);
 }
 
 static float weapon_spread(const player_t *p) {
   return gun_spread(&p->wp, p->vel, p->grounded);
 }
 
+// One angular mass-spring-damper for gameplay and presentation. RECOVER is the
+// approximate 5%-settling time: omega=4.75/T makes a critically damped system reach
+// that bound, while zeta=0.78 retains one small, physical follow-through instead of an
+// exponential camera offset that freezes whenever the trigger is held.
+static float gun_recoil_omega(const weapon_t *w) {
+  return 4750.0f / fmaxf(g_sim_wp[w->cur][WP_RECOVER_MS], 50.0f);
+}
+
+static void gun_recoil_step(weapon_t *w) {
+  float omega = gun_recoil_omega(w);
+  float k = omega * omega;
+  float c = 2.0f * 0.78f * omega;
+  w->rec_p_v += (-k * w->rec_p - c * w->rec_p_v) * TICK_DT;
+  w->rec_y_v += (-k * w->rec_y - c * w->rec_y_v) * TICK_DT;
+  w->rec_p += w->rec_p_v * TICK_DT;
+  w->rec_y += w->rec_y_v * TICK_DT;
+  if (w->rec_p > GUN_REC_CAP) { w->rec_p = GUN_REC_CAP; if (w->rec_p_v > 0) w->rec_p_v = 0; }
+  if (w->rec_p < -GUN_REC_CAP) { w->rec_p = -GUN_REC_CAP; if (w->rec_p_v < 0) w->rec_p_v = 0; }
+  if (w->rec_y > GUN_REC_CAP) { w->rec_y = GUN_REC_CAP; if (w->rec_y_v > 0) w->rec_y_v = 0; }
+  if (w->rec_y < -GUN_REC_CAP) { w->rec_y = -GUN_REC_CAP; if (w->rec_y_v < 0) w->rec_y_v = 0; }
+}
+
+static void gun_bore_angles(const weapon_t *w, float yaw, float pitch,
+                            float *bore_yaw, float *bore_pitch) {
+  *bore_yaw = yaw + w->rec_y * DEG2RAD;
+  *bore_pitch = f_clamp(pitch + w->rec_p * DEG2RAD, -PITCH_MAX, PITCH_MAX);
+}
+
+// Production figures solve from the same barrel angles as combat. Keeping this at the
+// weapon boundary prevents six player/bot/offline/online callers from each remembering
+// to add recoil, clamp pitch and select the current weapon independently.
+static void weapon_anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
+                             int grounded, int crouch, float tuck, int slide,
+                             float ads, float lean, int ready, int ent,
+                             weapon_t *w, int idle_ok) {
+  float bore_yaw, bore_pitch;
+  gun_bore_angles(w, yaw, pitch, &bore_yaw, &bore_pitch);
+  anim_tick(a, base, vel, bore_yaw, bore_pitch, grounded, crouch, tuck, slide,
+            ads, lean, ready, ent, w->cur, idle_ok);
+}
+
+// The reaction impulse happens after the round has left. Hip stance, movement, air
+// and heat change momentum, never the pre-shot direction. The authored KICK value is
+// the calm approximate peak in degrees; v=e*omega*peak maps it to spring velocity.
+static void gun_recoil_impulse(weapon_t *w, v3 vel, int grounded,
+                               int shot, int wpn) {
+  if (wpn < 0 || wpn >= WPN_COUNT) wpn = WPN_AR;
+  const float *wp = g_sim_wp[wpn];
+  float hs = sqrtf(vel.x * vel.x + vel.z * vel.z);
+  float move = f_clamp(hs / fmaxf(g_sim_mv[MV_RUN], 0.1f), 0.0f, 1.5f);
+  float hip = 1.0f + (wp[WP_HIP_KICK] - 1.0f) * (1.0f - w->ads_s);
+  float brace = hip * (1.0f + wp[WP_MOVE_KICK] * move) *
+                (grounded ? 1.0f : GUN_AIR_KICK) * (1.0f + w->heat);
+  float omega = 4750.0f / fmaxf(wp[WP_RECOVER_MS], 50.0f);
+  float velocity_per_peak = 2.7182818f * omega;
+  float side = GUN_PATTERN[shot & 31];
+  // The zero first pattern step is genuinely vertical, not replaced by random jitter.
+  w->rec_p_v += wp[WP_KICK_UP] * brace * velocity_per_peak;
+  w->rec_y_v += wp[WP_KICK_SIDE] * side * brace * velocity_per_peak;
+  w->heat = fminf(GUN_HEAT_CAP, w->heat + wp[WP_HEAT]);
+}
+
 // ONE shot, for whoever pulled the trigger.
 static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
                       float pitch, v3 vel, int grounded, uint64_t *rng) {
+  (void)rng;  // retained in the call contract so prediction snapshots stay compatible
   const wpn_def_t *def = &WPN_DEF[w->cur];
   const float *wp = g_sim_wp[w->cur];
   w->ammo[w->cur]--;
@@ -291,21 +348,9 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   w->cool[w->cur] = (int)((float)TICK_HZ * 60.0f / wp[WP_RPM] + 0.5f);
   if (w->cool[w->cur] < 1) w->cool[w->cur] = 1;
 
-  // Spread is sampled BEFORE this shot's bloom is added: the first shot of a
-  // burst fires at base accuracy, the penalty always trails by one shot.
-  float spread = gun_spread(w, vel, grounded);
-  w->bloom += wp[WP_BLOOM];
-  if (w->bloom > GUN_BLOOM_CAP) w->bloom = GUN_BLOOM_CAP;
-
-  float ya = yaw + w->rec_y * DEG2RAD;
-  float pa = f_clamp(pitch + w->rec_p * DEG2RAD, -PITCH_MAX, PITCH_MAX);
+  float ya, pa;
+  gun_bore_angles(w, yaw, pitch, &ya, &pa);
   v3 dir = {{cosf(pa) * sinf(ya), sinf(pa), -cosf(pa) * cosf(ya)}};
-  float r = spread * DEG2RAD * sqrtf(rng_rangef(rng, 0.0f, 1.0f));
-  float phi = rng_rangef(rng, 0.0f, F_TAU);
-  v3 right = v3_norm(v3_cross(dir, (v3){{0, 1, 0}}));
-  v3 upv = v3_cross(right, dir);
-  dir = v3_norm(v3_add(dir, v3_add(v3_scale(right, r * cosf(phi)),
-                                   v3_scale(upv, r * sinf(phi)))));
 
   // The barrel is authoritative. Solve the current carry/slide pose with this shot's
   // recoil and spread, then start both hitscan and event at the model's published
@@ -314,19 +359,29 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   {
     float barrel_yaw = atan2f(dir.x, -dir.z);
     float barrel_pitch = asinf(f_clamp(dir.y, -1.0f, 1.0f));
-    anim_stage_fire_anchor(ent_anim(ent), ent_pos(ent), barrel_yaw, barrel_pitch,
+    anim_t *fire_anim = ent_anim(ent);
+    // A trigger edge is a real pose edge, not an event-only invisible rifle. Publish
+    // the aligned firing hold into the entity's live pose before reading its muzzle;
+    // otherwise the tracer can be exact to a temporary shouldered copy while viewers
+    // still see the persistent low-ready barrel 40 cm away for this same tick.
+    // A rollback rebuilds weapon history, not already-presented body history. Its
+    // event/VFX path is suppressed for the same reason, so leave the live animation
+    // sentinel untouched while still deriving the replayed trace from the pure anchor
+    // copy below.
+    if (!g_prediction_replay) {
+      fire_anim->fire_k = 1.0f;
+      skel_solve(fire_anim, ent_pos(ent), barrel_yaw, barrel_pitch, w->cur,
+                 GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
+    }
+    anim_stage_fire_anchor(fire_anim, ent_pos(ent), barrel_yaw, barrel_pitch,
                            w->cur, ent);
     o = pose_muzzle(&g_fire_anchor_pose, w->cur);
     dir = v3_norm(g_fire_anchor_pose.gun_f);
   }
 
-  // The kick lands AFTER the shot left the barrel.
-  w->rec_p += wp[WP_KICK_UP] * rng_rangef(rng, 0.9f, 1.1f);
-  w->rec_y += wp[WP_KICK_SIDE] *
-              (GUN_PATTERN[w->idx & 31] + rng_rangef(rng, -0.2f, 0.2f));
-  w->rec_p = f_clamp(w->rec_p, -GUN_REC_CAP, GUN_REC_CAP);
-  w->rec_y = f_clamp(w->rec_y, -GUN_REC_CAP, GUN_REC_CAP);
-  w->punch_v += GUN_PUNCH_SHOT * wp[WP_PUNCH] * GUN_PUNCH_V;
+  // Newton's third law starts the reaction only after this round's direction and
+  // muzzle have been fixed. There is no separate random spray state.
+  gun_recoil_impulse(w, vel, grounded, w->idx, w->cur);
   // The roll's SIGN comes from the pattern step this shot just took, so the view rolls
   // into the direction the muzzle is being pulled.
   {
@@ -343,10 +398,10 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   if (ent == g_local_ent && sh >= 0) {
     recoil_vm_impulse(&g_players[sh].vm, ent, w->idx, w->cur, w->ads_s);
     // Online forward prediction deliberately suppresses ev_push, including the
-    // ent_on_event carry latch which normally starts the eased raise. Reproduce only
-    // that local presentation edge here; the authoritative echo still owns VFX and
-    // the third-person recoil velocity, so neither can be doubled by replay. The T0
-    // shot anchor is event-local; the visible body is deliberately not re-solved.
+    // ent_on_event carry latch which normally starts the eased raise. gun_shoot has
+    // already published that exact physical firing pose above; keep this assignment
+    // as the local prediction latch while the authoritative echo still owns VFX and
+    // third-person recoil velocity, so neither can be doubled by replay.
     if (g_predicting && !g_prediction_replay) {
       anim_t *a = &g_player_anim[sh];
       a->fire_k = 1.0f;
@@ -454,6 +509,7 @@ static void gun_cool(weapon_t *w) {
   for (int i = 0; i < WPN_COUNT; i++)
     if (w->cool[i] > 0) w->cool[i]--;
   if (w->switch_t > 0) w->switch_t--;
+  gun_recoil_step(w);
   // THE VIEW PUNCH STEPS HERE, at the top of the tick, for both shooters — gun_cool is
   // the one hook that already runs before gun_shoot in the player path AND in bot_tick.
   w->punch_v += (-GUN_PUNCH_K * w->punch - GUN_PUNCH_C * w->punch_v) * TICK_DT;
@@ -490,16 +546,12 @@ static void gun_ads(weapon_t *w, int want_ads) {
 }
 
 static void gun_recover(weapon_t *w, int trigger_held) {
-  const float *wp = g_sim_wp[w->cur];
-  // Recovery only once the trigger is off (or the mag ran dry): during a burst
-  // the climb is the shooter's to fight, afterwards the view returns.
-  if (!trigger_held || w->ammo[w->cur] == 0 || w->switch_t > 0) {
-    float a = mv_alpha(wp[WP_RECOVER_MS]);
-    w->rec_p -= w->rec_p * a;
-    w->rec_y -= w->rec_y * a;
-    if (!trigger_held && w->rec_p > -0.05f && w->rec_p < 0.05f) w->idx = 0;
-  }
-  w->bloom *= expf(-3.0f * TICK_DT / 0.4f);   // bursts cool off in ~400 ms
+  // The spring in gun_cool always acts; holding the trigger cannot suspend physics.
+  // This hook owns only heat and pattern re-arm after the complete system is quiet.
+  w->heat *= expf(-3.0f * TICK_DT / 0.4f);
+  if (!trigger_held && fabsf(w->rec_p) < 0.02f && fabsf(w->rec_y) < 0.02f &&
+      fabsf(w->rec_p_v) < 0.20f && fabsf(w->rec_y_v) < 0.20f)
+    w->idx = 0;
   // The punch is NOT stepped here any more — it is a spring and it runs in gun_cool, at
   // the top of the tick, so this tick's impulse survives to the render.
 }
@@ -670,6 +722,17 @@ static void ent_on_event(const event_t *e) {
     // T+0, so the already-solved muzzle/flash pose remains the pose the round left;
     // compression and lift arrive on the following animation ticks.
     recoil_body_impulse(a, e->src, e->i, e->wpn, e->g);
+    // Offline/server/local prediction already applied the gameplay impulse in
+    // gun_shoot. A foreign online figure only receives this event, so reconstruct the
+    // same angular spring edge once; later presentation ticks integrate it.
+    if (g_online && e->src != g_local_ent) {
+      weapon_t *w = ent_weapon(e->src);
+      int h = human_of_ent(e->src);
+      v3 vel = h >= 0 ? g_players[h].vel : g_bots[e->src - 1].vel;
+      int grounded = h >= 0 ? g_players[h].grounded : g_bots[e->src - 1].grounded;
+      gun_recoil_impulse(w, vel, grounded, e->i, e->wpn);
+      if (w->idx <= e->i) w->idx = e->i + 1;
+    }
     // fire_k starts the same eased raise on every viewer; physical recoil remains in
     // the three velocity springs above.
     a->fire_k = 1.0f;
@@ -816,9 +879,9 @@ static void bot_puppet_tick(bot_t *b, int bi) {
   b->wp.ready_want = (unsigned char)(b->pup_ready ? 1 : 0);
   int idle_ok = gun_pose_state(&b->wp, &b->anim, b->vel,
                                  b->grounded, b->sliding);
-  anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
-            b->crouch, 0.0f, b->sliding, b->wp.ads_s, b->pup_lean,
-            b->wp.ready_want, bi + 1, b->wp.cur, idle_ok);  // REAL entity id: hardwired 1, every
+  weapon_anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
+                   b->crouch, 0.0f, b->sliding, b->wp.ads_s, b->pup_lean,
+                   b->wp.ready_want, bi + 1, &b->wp, idle_ok);  // REAL entity id: hardwired 1, every
                                     // puppet != bot 0 pushed EV_STEP/EV_LAND
                                     // with .src = 1 and stepped from the wrong
                                     // body — no tuck, see bot_tick

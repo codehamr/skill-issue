@@ -623,8 +623,8 @@ static float ui_page_dev(float px, float pw, float y, int click, float cx, float
     y += 4;
     ui_section("SPREAD", px, pw, y);
     y += 14;
-    y = ui_wp_row(WP_HIP_SPREAD, px, y, click, cx, cy);
-    y = ui_wp_row(WP_SPREAD, px, y, click, cx, cy);
+    y = ui_wp_row(WP_HIP_KICK, px, y, click, cx, cy);
+    y = ui_wp_row(WP_MOVE_KICK, px, y, click, cx, cy);
 
     y += 4;
     // SWAY rides in HANDLING rather than its own one-row FEEL section: the
@@ -1028,4 +1028,3 @@ static void ui_menu_backdrop(void) {
   ui_begin();
   g_ui_backdrop = 1;
 }
-

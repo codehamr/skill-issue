@@ -267,7 +267,7 @@ static v3 g_vm_hand_p[2];   // trigger wrist, support wrist — published by vm_
 // vm_stage_hands, and read directly by vm_build itself for the gun_build
 // call and the scope-disc block that follow.
 typedef struct {
-  int cur, srcyc;
+  int cur, srcyc, bore_aligned;
   float ads, ready, sight_y, hip, lean, lean_d, sw;
   float kick_back, kick_lift, kick_side, dip;
   gunanim_t ga;
@@ -332,6 +332,10 @@ static vm_pose_t vm_stage_pose(const player_t *p, const vm_t *v, const weapon_t 
   int srcyc = cur == WPN_SR;
 
   ps.ads = ads; ps.ready = f_clamp(ready, 0.0f, 1.0f);
+  // Reload and swap cannot fire. In every other state the rendered barrel is the
+  // gameplay barrel; composition may translate and roll around it, never invent a
+  // second pitch/yaw axis.
+  ps.bore_aligned = w->reload_t == 0 && w->switch_t == 0;
   ps.kick_back = kick_back; ps.kick_lift = kick_lift;
   ps.kick_side = kick_side; ps.dip = dip; ps.cur = cur; ps.sight_y = sight_y;
   ps.ga = ga_; ps.sw = sw; ps.hip = hip; ps.lean = lean; ps.lean_d = lean_d;
@@ -424,6 +428,14 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
                  - jl * 0.055f - hf * 0.040f +
                  (0.090f - lean * 0.10f + lean_d * 0.30f + sl * 0.10f) * hip
                  - kick_side * 1.4f + erg->fp_low_ang.z * low);             // roll
+  if (ps->bore_aligned) {
+    // Preserve the authored roll/cant by projecting its right axis onto the plane
+    // normal to the authoritative bore. This is a pure twist: gz becomes exactly fwd.
+    gx = v3_sub(gx, v3_scale(fwd, v3_dot(gx, fwd)));
+    gx = v3_dot(gx, gx) > 1e-8f ? v3_norm(gx) : rgt;
+    gz = fwd;
+    gy = v3_norm(v3_cross(gx, gz));
+  }
   v3 org = v3_add(eye, v3_add(v3_scale(rgt, px),
            v3_add(v3_scale(upv, py), v3_scale(fwd, pz))));
 

@@ -731,9 +731,9 @@ static void bot_tick(int bi) {
   b->wp.ready_want = (unsigned char)(b->tgt >= 0 || startled || b->alert_t > 0);
   int idle_ok = gun_pose_state(&b->wp, &b->anim, b->vel,
                                  b->grounded, b->sliding);
-  anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
-            b->crouch, 0.0f, b->sliding, b->wp.ads_s, 0.0f,
-            b->wp.ready_want, bi + 1, b->wp.cur, idle_ok);
+  weapon_anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
+                   b->crouch, 0.0f, b->sliding, b->wp.ads_s, 0.0f,
+                   b->wp.ready_want, bi + 1, &b->wp, idle_ok);
   // (`startled` is in there because a bot that turns to a sound with the rifle
   // still slung is the single most "it did not really notice me" frame in the
   // game — the carry state is the only tell the player gets that hearing

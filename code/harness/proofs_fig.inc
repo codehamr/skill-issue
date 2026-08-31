@@ -9363,7 +9363,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
           stage_fail |= idle_ok != GUN_POSE_IDLE || a.fire_k != 1.0f ||
                         tmp.vm.kick_back != 0.0f || a.recoil_back != 0.0f ||
                         tmp.vm.kick_back_v <= 0.0f || a.recoil_back_v <= 0.0f ||
-                        tmp.vm.kick_lift_v <= 0.0f || a.recoil_lift_v <= 0.0f ||
+                        tmp.vm.kick_lift_v != 0.0f || a.recoil_lift_v != 0.0f ||
                         fabsf(tmp.vm.kick_side_v) <= 1e-8f ||
                         fabsf(a.recoil_side_v) <= 1e-8f ||
                         render_ready != 0.0f;

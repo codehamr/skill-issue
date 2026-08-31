@@ -371,11 +371,11 @@ static void cmd_lean(sim_ctx_t *s) {
 static void cmd_wpn(sim_ctx_t *s) {
   const weapon_t *w = &s->p->wp;
   const vm_t *v = &s->p->vm;
-  printf("wpn t=%ld cur=%s ammo=%d spread=%.3f rec=(%.3f %.3f) bloom=%.3f ads=%.3f "
+  printf("wpn t=%ld cur=%s ammo=%d bore=%.3f rec=(%.3f %.3f) heat=%.3f ads=%.3f "
          "reload=%d switch=%d punch=%.3f vm sway=(%.4f %.4f) lag=(%.4f %.4f %.4f) "
          "kick=(%.4f %.3fdeg %.4f) roll=%.4f scope=(%.1f %.1f %.1f)\n",
          s->tick, WPN_DEF[w->cur].prefix, w->ammo[w->cur], (double)weapon_spread(s->p),
-         (double)w->rec_p, (double)w->rec_y, (double)w->bloom,
+         (double)w->rec_p, (double)w->rec_y, (double)w->heat,
          (double)w->ads_s, w->reload_t, w->switch_t, (double)w->punch,
          (double)v->sway_p, (double)v->sway_y,
          (double)v->lag_x, (double)v->lag_y, (double)v->lag_z,
@@ -664,23 +664,22 @@ static void cmd_vmscope(sim_ctx_t *s) {
   // THE SR'S OPTICAL CONTRACT. Unlike vmsight, this measures the projected ocular
   // and the PiP aperture that is composited after geometry. The renderer's own
   // scope_pip_radius() supplies the threshold/alignment result. These eleven rows
-  // were measured from secured 2a6b08c with a temporary observer that called its
-  // production five-argument vm_build; values are in metres / 640x360 virtual pixels.
-  // Keeping the reference here makes the plan's "compare with the before binary"
-  // requirement a hard gate instead of a one-time transcript.
+  // are the secured physical-barrel pass at 640x360 virtual pixels. Keeping the
+  // reference here makes later composition changes deliberate rather than an
+  // accidental return to a viewmodel axis that differs from hitscan.
   typedef struct { float ocular, axis, cx, cy, radius, pip; } scope_before_t;
   static const scope_before_t BEFORE[11] = {
-    {0.222957f, 0.138023f, 516.820923f, 230.674255f, 25.394438f,  0.000000f},
-    {0.219381f, 0.134357f, 514.426331f, 230.044708f, 25.808449f,  0.000000f},
-    {0.209679f, 0.124349f, 507.510193f, 228.229950f, 27.002558f,  0.000000f},
-    {0.195399f, 0.109447f, 496.053955f, 225.234070f, 28.975935f,  0.000000f},
-    {0.178086f, 0.091106f, 479.652740f, 220.963928f, 31.792862f,  0.000000f},
-    {0.159280f, 0.070840f, 457.728638f, 215.283447f, 35.546787f,  0.000000f},
-    {0.140508f, 0.050253f, 429.911743f, 208.110443f, 40.295887f,  0.000000f},
-    {0.123288f, 0.031052f, 396.864471f, 199.624878f, 45.923969f,  0.000000f},
-    {0.109129f, 0.015036f, 361.810181f, 190.654678f, 51.882401f,  1.591349f},
-    {0.099532f, 0.004063f, 332.341888f, 183.131760f, 56.884842f, 56.884842f},
-    {0.095999f, 0.000004f, 320.000000f, 179.984848f, 58.978577f, 58.978577f},
+    {0.226000f, 0.154711f, 519.666000f, 226.785000f, 25.053000f,  0.000000f},
+    {0.222360f, 0.150370f, 517.243000f, 226.208000f, 25.463000f,  0.000000f},
+    {0.212480f, 0.138590f, 510.248000f, 224.546000f, 26.647000f,  0.000000f},
+    {0.197920f, 0.121236f, 498.677000f, 221.804000f, 28.607000f,  0.000000f},
+    {0.180240f, 0.100175f, 482.128000f, 217.894000f, 31.413000f,  0.000000f},
+    {0.161000f, 0.077270f, 460.010000f, 212.688000f, 35.167000f,  0.000000f},
+    {0.141760f, 0.054379f, 431.913000f, 206.096000f, 39.940000f,  0.000000f},
+    {0.124080f, 0.033358f, 398.439000f, 198.267000f, 45.631000f,  0.000000f},
+    {0.109520f, 0.016057f, 362.779000f, 189.946000f, 51.697000f,  0.038000f},
+    {0.099640f, 0.004321f, 332.658000f, 182.929000f, 56.823000f, 56.823000f},
+    {0.096000f, 0.000006f, 320.000000f, 179.983000f, 58.978000f, 58.978000f},
   };
   player_t tmp = *s->p;
   v3 eye = {{0, 0, 0}}, rgt = {{1, 0, 0}}, upv = {{0, 1, 0}}, fwd = {{0, 0, -1}};
@@ -728,8 +727,8 @@ static void cmd_vmscope(sim_ctx_t *s) {
     if (ep > max_base_px) max_base_px = ep;
     int base_ok = em <= 0.00020f && ep <= 0.08f * vk;
     if (!base_ok) bad++;
-    printf("vmscope ads=%.1f eased=%.3f ocular=%.1fmm axis=%.2fmm "
-           "center=(%.1f %.1f) off=%.2f radius=%.2f pip=%.2f base=%s\n",
+    printf("vmscope ads=%.1f eased=%.3f ocular=%.3fmm axis=%.3fmm "
+           "center=(%.3f %.3f) off=%.3f radius=%.3f pip=%.3f base=%s\n",
            (double)tmp.wp.ads_lin, (double)tmp.wp.ads_s,
            (double)(ocular * 1000.0f), (double)(axis_off * 1000.0f),
            (double)g_scope_cx, (double)g_scope_cy, (double)center_off,
@@ -804,7 +803,9 @@ static void cmd_parity(sim_ctx_t *s) {
   weapon_t pw = p->wp, bw = b->wp;
   pw.cur = bw.cur = WPN_AR;
   pw.ads_s = bw.ads_s = 0.0f;
-  pw.bloom = bw.bloom = 0.0f;
+  pw.heat = bw.heat = 0.0f;
+  pw.rec_p = bw.rec_p = pw.rec_y = bw.rec_y = 0.0f;
+  pw.rec_p_v = bw.rec_p_v = pw.rec_y_v = bw.rec_y_v = 0.0f;
   v3 rest = {{0, 0, 0}}, run = {{mv[MV_RUN], 0, 0}};
   int ppart = 0, bpart = 0;
   v3 dn = {{0, -1, 0}};
@@ -833,9 +834,9 @@ static void cmd_parity(sim_ctx_t *s) {
     {"mag",           WPN_DEF[WPN_AR].mag,              WPN_DEF[WPN_AR].mag, 1},
     {"reload_ticks",  WPN_DEF[WPN_AR].reload_ticks,     WPN_DEF[WPN_AR].reload_ticks, 1},
     {"dmg",           WPN_DEF[WPN_AR].dmg,              WPN_DEF[WPN_AR].dmg, 1},
-    {"spread_rest",   gun_spread(&pw, rest, 1),         gun_spread(&bw, rest, 1), 0},
-    {"spread_run",    gun_spread(&pw, run, 1),          gun_spread(&bw, run, 1), 0},
-    {"spread_air",    gun_spread(&pw, run, 0),          gun_spread(&bw, run, 0), 0},
+    {"bore_rest",     gun_spread(&pw, rest, 1),         gun_spread(&bw, rest, 1), 0},
+    {"bore_run",      gun_spread(&pw, run, 1),          gun_spread(&bw, run, 1), 0},
+    {"bore_air",      gun_spread(&pw, run, 0),          gun_spread(&bw, run, 0), 0},
     {"kick_up",       g_cfg.wp[WPN_AR][WP_KICK_UP],     g_cfg.wp[WPN_AR][WP_KICK_UP], 1},
     {"recover_ms",    g_cfg.wp[WPN_AR][WP_RECOVER_MS],  g_cfg.wp[WPN_AR][WP_RECOVER_MS], 1},
     {"eye_stand",     EYE_STAND,                        EYE_STAND, 1},
@@ -1262,7 +1263,9 @@ static void cmd_slidecheck(sim_ctx_t *s) {
     {-0.70710678f, -0.70710678f},
   };
   float min_clear = 9.0f, min_side = 9.0f, max_step = 0.0f, bone_err = 0.0f;
+  float exit_step = 0.0f, exit_side = 0.0f;
   int clear_dir = -1, clear_tick = -1, step_dir = -1, step_tick = -1;
+  int exit_step_dir = -1, exit_step_tick = -1;
   int finite = 1;
   for (int d = 0; d < 8; d++) {
     anim_t a;
@@ -1294,16 +1297,101 @@ static void cmd_slidecheck(sim_ctx_t *s) {
                   !f_is_nonfinite(P->knee[i].z);
       }
     }
+    // Release the raw slide while velocity remains high. This is the actual failure
+    // window: pelvis and feet are still owned by the eased get-up, but the special
+    // collision poles are returning control to ordinary leg IK.
+    for (int tick = 0; tick < 90; tick++) {
+      pos = v3_add(pos, v3_scale(vel, TICK_DT));
+      anim_tick(&a, pos, vel, 0.0f, 0.0f, 1, 0, 0.0f, 0, 0.0f,
+                0.0f, 1, 1, WPN_AR, GUN_POSE_BLOCKED);
+      const pose_t *P = &a.pose;
+      v3 right = {{cosf(a.leg_yaw), 0.0f, sinf(a.leg_yaw)}};
+      if (a.was_slide_pose && a.slide_s < 0.40f)
+        exit_side = fmaxf(exit_side,
+                          v3_dot(v3_sub(P->knee[1], P->knee[0]), right));
+      for (int i = 0; i < 2; i++) {
+        v3 bend = v3_sub(P->knee[i], P->hip[i]);
+        v3 old_bend = v3_sub(a.prev_pose.knee[i], a.prev_pose.hip[i]);
+        float step = v3_len(v3_sub(bend, old_bend));
+        if (step > exit_step) {
+          exit_step = step;
+          exit_step_dir = d;
+          exit_step_tick = tick;
+        }
+        bone_err = fmaxf(bone_err,
+            fabsf(v3_len(v3_sub(P->knee[i], P->hip[i])) - ANIM_THIGH));
+        bone_err = fmaxf(bone_err,
+            fabsf(v3_len(v3_sub(P->ankle[i], P->knee[i])) - ANIM_SHIN));
+        finite &= !f_is_nonfinite(P->knee[i].x) &&
+                  !f_is_nonfinite(P->knee[i].y) &&
+                  !f_is_nonfinite(P->knee[i].z);
+      }
+    }
   }
   int ok = finite && min_clear >= 0.120f && min_side >= 0.090f &&
-           max_step <= 0.080f && bone_err <= 0.007f;
+           max_step <= 0.080f && exit_step <= 0.080f &&
+           exit_side <= 0.480f && bone_err <= 0.007f;
   printf("slidecheck dirs=8 clear=%.1fmm@%d/%d side=%.1fmm "
-         "step=%.1fmm@%d/%d "
+         "step=%.1fmm@%d/%d exit_step=%.1fmm@%d/%d exit_side=%.1fmm "
          "bone=%.3fmm finite=%d %s\n",
          (double)(min_clear * 1000.0f), clear_dir, clear_tick,
          (double)(min_side * 1000.0f), (double)(max_step * 1000.0f),
-         step_dir, step_tick, (double)(bone_err * 1000.0f),
+         step_dir, step_tick, (double)(exit_step * 1000.0f),
+         exit_step_dir, exit_step_tick,
+         (double)(exit_side * 1000.0f), (double)(bone_err * 1000.0f),
          finite, ok ? "ok" : "FAIL");
+  if (!ok) exit(1);
+}
+
+static void armcheck_sample(const anim_t *a, float step[2], float clear[2]) {
+  const pose_t *P = &a->pose;
+  v3 body_right = v3_norm(P->right);
+  v3 body_fwd = {{body_right.z, 0.0f, -body_right.x}};
+  for (int i = 0; i < 2; i++) {
+    v3 bend = v3_sub(P->elb[i], P->sho[i]);
+    v3 old_bend = v3_sub(a->prev_pose.elb[i], a->prev_pose.sho[i]);
+    step[i] = fmaxf(step[i], v3_len(v3_sub(bend, old_bend)));
+    clear[i] = fminf(clear[i],
+        arm_torso_segment_clearance(P->sho[i], P->elb[i], P->wri[i],
+                                    P->chest, body_right, body_fwd));
+  }
+}
+
+static void cmd_armcheck(sim_ctx_t *s) {
+  (void)s;
+  float run_step[2] = {0, 0}, aim_step[2] = {0, 0};
+  float run_clear[2] = {9, 9}, aim_clear[2] = {9, 9};
+  anim_t a;
+  v3 pos = {{0, 5, 0}}, vel = {{0, 0, -5.5f}};
+  anim_reset(&a, pos, 0.0f, WPN_AR);
+  for (int tick = 0; tick < 300; tick++) {
+    pos = v3_add(pos, v3_scale(vel, TICK_DT));
+    anim_tick(&a, pos, vel, 0.0f, 0.0f, 1, 0, 0.0f, 0, 0.0f,
+              0.0f, 1, 1, WPN_AR, GUN_POSE_BLOCKED);
+    if (tick >= 30) armcheck_sample(&a, run_step, run_clear);
+  }
+
+  pos = (v3){{0, 5, 0}};
+  vel = (v3){{0, 0, 0}};
+  anim_reset(&a, pos, 0.0f, WPN_AR);
+  for (int tick = 0; tick < 270; tick++) {
+    float pitch = tick < 90 ? 0.0f
+                : tick < 210 ? DEG2RAD * (-80.0f * (tick - 89) / 120.0f)
+                             : DEG2RAD * -80.0f;
+    anim_tick(&a, pos, vel, 0.0f, pitch, 1, 0, 0.0f, 0, 0.0f,
+              0.0f, 1, 1, WPN_AR, GUN_POSE_BLOCKED);
+    if (tick >= 90) armcheck_sample(&a, aim_step, aim_clear);
+  }
+  int ok = run_step[0] <= 0.025f && run_step[1] <= 0.025f &&
+           aim_step[0] <= 0.025f && aim_step[1] <= 0.025f &&
+           run_clear[0] >= 0.90f && run_clear[1] >= 0.90f &&
+           aim_clear[0] >= 0.90f && aim_clear[1] >= 0.90f;
+  printf("armcheck run_step=%.1f/%.1fmm aim_step=%.1f/%.1fmm "
+         "run_clear=%.3f/%.3f aim_clear=%.3f/%.3f %s\n",
+         (double)(run_step[0] * 1000.0f), (double)(run_step[1] * 1000.0f),
+         (double)(aim_step[0] * 1000.0f), (double)(aim_step[1] * 1000.0f),
+         (double)run_clear[0], (double)run_clear[1],
+         (double)aim_clear[0], (double)aim_clear[1], ok ? "ok" : "FAIL");
   if (!ok) exit(1);
 }
 
@@ -3011,7 +3099,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"vmsight", cmd_vmsight}, {"vmscope", cmd_vmscope}, {"parity", cmd_parity},
   {"rag", cmd_rag}, {"ragsoak", cmd_ragsoak}, {"ragx", cmd_ragx},
   {"figv", cmd_figv}, {"figcheck", cmd_figcheck}, {"kine", cmd_kine},
-  {"slidecheck", cmd_slidecheck},
+  {"slidecheck", cmd_slidecheck}, {"armcheck", cmd_armcheck},
   {"skel", cmd_skel}, {"vmhand", cmd_vmhand}, {"vmorbit", cmd_vmorbit},
   {"vmbore", cmd_vmbore},
   {"hud", cmd_hud}, {"showfps", cmd_showfps}, {"trace", cmd_trace},

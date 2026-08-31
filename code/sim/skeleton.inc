@@ -96,8 +96,11 @@ typedef struct {
 } recoil_pose_t;
 
 static const recoil_pose_t RECOIL_POSE[WPN_COUNT] = {
-  [WPN_AR] = {1.25f, 0.95f, 0.20f, 3.10f, 1.15f, 0.24f, 0.72f},
-  [WPN_SR] = {2.25f, 2.90f, 0.32f, 5.30f, 3.00f, 0.36f, 0.65f},
+  // Angular rise belongs to weapon_t's physical barrel spring. These event-fed
+  // channels retain only stock compression and tiny lateral/cant response, so a
+  // remote body cannot display a second muzzle direction over the authoritative one.
+  [WPN_AR] = {1.25f, 0.00f, 0.20f, 3.10f, 0.00f, 0.24f, 0.72f},
+  [WPN_SR] = {2.25f, 0.00f, 0.32f, 5.30f, 0.00f, 0.36f, 0.65f},
 };
 
 // Solved against the 120 Hz semi-implicit recurrence: back peaks on tick 3 and lift
@@ -429,7 +432,9 @@ typedef struct {
   float   kneel_s, kneel_lin; // idle crouch: firing knee down; fades before gait
   float   slide_t;           // seconds since the slide began (entry envelope)
   float   slide_v;           // eased slide speed factor 0..1.2 (recline depth)
+  float   slide_knee_s;      // collision-safe knee-pole ownership on exit
   int     was_slide;
+  int     was_slide_pose;    // previous eased-pose ownership, for gait handoff
   float   land;              // landing dip impulse, decays
   float   hdown;             // hard-landing hand-to-ground reach, decays slower
   // ...and the IMPULSES those two chase.
@@ -461,6 +466,7 @@ typedef struct {
   float   slide_bk;          // 0 = forward/lateral slide, 1 = full butt-slide
   float   slide_ld;          // 0 = the LEFT leg leads the skid, 1 = the right.
                              // Latched once on entry; it cannot swap mid-slide.
+  v3      slide_knee_pole[2]; // persistent bend planes survive a straight lead leg
   int     was_grounded;
   float   idle_t;            // always-advancing clock for idle breathing
   float   bwd;               // eased 0..1 how much of the travel is backward
@@ -742,7 +748,9 @@ static v3 brace_hand(v3 shoulder, v3 want, v3 wri, float k) {
 static float arm_torso_segment_clearance(v3 shoulder, v3 elbow, v3 wrist,
                                          v3 chest, v3 body_right, v3 body_fwd) {
   const float upper_t[] = {0.30f, 0.48f, 0.66f, 0.84f, 1.0f};
-  const float fore_t[] = {0.12f, 0.28f};
+  // A steep-down support forearm crosses the vest near its wrist, not near its elbow;
+  // sampling only 12/28% certified precisely the wrong half of that segment.
+  const float fore_t[] = {0.12f, 0.28f, 0.45f, 0.62f, 0.78f, 0.92f};
   float best = 9.0f;
   for (int seg = 0; seg < 2; seg++) {
     const float *samples = seg ? fore_t : upper_t;
@@ -789,7 +797,7 @@ static v3 arm_elbow_solve(v3 shoulder, v3 wrist, v3 pole,
     // otherwise select its opposite side and make the joint snap through the torso.
     // Preserve the preceding anatomical bend plane increasingly near full reach.
     float reach = v3_len(v3_sub(wrist, shoulder)) / (ANIM_UARM + ANIM_FARM);
-    float keep = 0.18f + 0.64f * f_smoothstep(0.78f, ANIM_ARM_REACH_K, reach);
+    float keep = 0.34f + 0.52f * f_smoothstep(0.72f, ANIM_ARM_REACH_K, reach);
     if (v3_dot(authored, previous) < -0.10f) keep = fmaxf(keep, 0.86f);
     authored = v3_norm(v3_lerp(authored, previous, keep));
   }
@@ -1290,7 +1298,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // actual two-bone solution circle. Five bounded angular candidates per leg include
   // "stay", so the pair can preserve clearance without ever teleporting to a discrete
   // target or passing through an IK pole singularity.
-  if (a->slide_s > 0.001f) {
+  if (a->slide_s > 0.001f && a->was_slide) {
     v3 authored[2] = {P->knee[0], P->knee[1]};
     v3 target_pole[2][4], target_knee[2][4];
     for (int i = 0; i < 2; i++) {
@@ -1337,7 +1345,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
         }
       }
     int target[2] = {target_l, target_r};
-    static const float TURN[5] = {-0.16f, -0.08f, 0.0f, 0.08f, 0.16f};
+    static const float TURN[5] = {-0.128f, -0.064f, 0.0f, 0.064f, 0.128f};
     v3 local[2][5];
     float target_error[2][5];
     for (int i = 0; i < 2; i++) {
@@ -1376,8 +1384,43 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
         float error = target_error[0][l] + target_error[1][r];
         if (error < best_error) { best_error = error; choose_l = l; choose_r = r; }
       }
-    P->knee[0] = local[0][choose_l];
-    P->knee[1] = local[1][choose_r];
+    // The collision solve owns the live skid completely.
+    int choose[2] = {choose_l, choose_r};
+    for (int i = 0; i < 2; i++) {
+      P->knee[i] = local[i][choose[i]];
+      if (advance_state) {
+        v3 axis = v3_norm(v3_sub(P->ankle[i], P->hip[i]));
+        v3 pole = v3_sub(v3_sub(P->knee[i], P->hip[i]),
+                         v3_scale(axis,
+                             v3_dot(v3_sub(P->knee[i], P->hip[i]), axis)));
+        if (v3_dot(pole, pole) > 1e-7f) a->slide_knee_pole[i] = v3_norm(pole);
+      }
+    }
+  } else if (a->was_slide_pose && a->slide_knee_s > 0.001f) {
+    // During get-up, walk each previous bend plane toward the ordinary authored pole
+    // around its actual hip-to-ankle axis. A normalized linear mix can cross zero when
+    // those poles oppose each other and flip the knee by 61 cm; a signed 0.12-radian
+    // angular step has no singular midpoint and preserves both bone lengths via IK.
+    for (int i = 0; i < 2; i++) {
+      v3 axis = v3_norm(v3_sub(P->ankle[i], P->hip[i]));
+      // Use the latched bend plane, not the previous knee point: at full extension
+      // the knee point sits on the hip-ankle axis and loses all information about
+      // which side it should bend toward.
+      v3 previous = v3_sub(a->slide_knee_pole[i],
+                           v3_scale(axis, v3_dot(a->slide_knee_pole[i], axis)));
+      v3 desired = v3_sub(v3_sub(P->knee[i], P->hip[i]),
+                          v3_scale(axis,
+                              v3_dot(v3_sub(P->knee[i], P->hip[i]), axis)));
+      if (v3_dot(previous, previous) < 1e-7f) previous = desired;
+      if (v3_dot(desired, desired) < 1e-7f) desired = previous;
+      previous = v3_norm(previous);
+      desired = v3_norm(desired);
+      float angle = acosf(f_clamp(v3_dot(previous, desired), -1.0f, 1.0f));
+      float sign = v3_dot(v3_cross(previous, desired), axis) < 0.0f ? -1.0f : 1.0f;
+      v3 pole = v3_rot_axis(previous, axis, sign * fminf(angle, 0.12f));
+      P->knee[i] = ik_solve(P->hip[i], P->ankle[i], ANIM_THIGH, ANIM_SHIN, pole);
+      if (advance_state) a->slide_knee_pole[i] = v3_norm(pole);
+    }
   }
 
   // Arms hold the rifle two-handed on the aim axis; recoil pulls it back.
@@ -1392,7 +1435,11 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // AR uses its standard carriage; the relative idle pose applies only to SR.
   // State changes set ready_s's TARGET; they never bypass its follower. runT then
   // carries either weapon continuously from idle sway into its authored run hold.
-  float ready_pose = idle_ok < GUN_POSE_LOCOMOTION ? 1.0f : a->ready_s;
+  // The AR's normal carriage is the firing axis; lowering it between engagements made
+  // its first hip round leave a visibly down/crossed barrel. The SR keeps its authored
+  // patrol carry, but a fire edge raises it on every viewer before the next solve.
+  float ready_pose = (wpn == WPN_AR || idle_ok < GUN_POSE_LOCOMOTION ||
+                      a->fire_k > 0.01f) ? 1.0f : a->ready_s;
   float rl = 1.0f - ready_pose;
   // Solve the shoulder line once. Stock seating, brace reach and arm IK all consume
   // these exact anchors; three nearby approximations cannot describe one torso.
@@ -1494,7 +1541,9 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // both wrist targets move as one frame; the arm solve below then chooses collision-
   // free elbows instead of letting a vertical rifle pull them through the sternum.
   float aim_down = f_smoothstep(0.20f, 0.92f, -aimd.y);
-  gun_o = v3_add(gun_o, v3_scale(F, 0.205f * aim_down * (1.0f - a->slide_s)));
+  gun_o = v3_add(gun_o,
+                 v3_add(v3_scale(F, 0.285f * aim_down * (1.0f - a->slide_s)),
+                        v3_scale(Rc, -0.070f * aim_down * (1.0f - a->slide_s))));
   // ADS is seated from the stock, not guessed from the grip. The descriptor's butt pin
   // is the shared model point; the target is the high firing-shoulder pocket used with
   // armour, slightly forward on the plate. Move the complete eye/weapon complex by the
@@ -1649,6 +1698,21 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
                                               + 0.50f * a->air_s),
                                  v3_scale(aimd, erg->support_pole.z
                                                 - 0.30f * a->slide_s))));
+    // Preferred human bend planes for the near-vertical singularity. Projecting the
+    // ordinary aim-relative poles around a downward bore can swap hemispheres from a
+    // tiny pitch change; blend both elbows to stable outward/forward hints instead.
+    if (aim_down > 0.001f && a->slide_s < 0.2f) {
+      // The firing elbow belongs below the shoulder pocket, not straight out at
+      // shoulder height. The support elbow stays wider because it must reach across
+      // to the fore-end, but both hints retain a forward component so neither arm can
+      // choose the torso-facing half of the near-vertical IK solution circle.
+      v3 down_hint = i
+          ? v3_norm(v3_add(v3_scale(Rc, 0.72f),
+                           v3_add(v3_scale(F, 0.82f), v3_scale(U, -0.82f))))
+          : v3_norm(v3_add(v3_scale(Rc, -1.18f),
+                           v3_add(v3_scale(F, 0.88f), v3_scale(U, -0.30f))));
+      pole = v3_norm(v3_lerp(pole, down_hint, aim_down));
+    }
     // (airborne both elbows flare up and out — the braced-in-flight look) A WRIST NEVER
     // GETS FURTHER FROM ITS SHOULDER THAN THE ARM CAN REACH, and the guard is set at
     // 96% rather than 100 for the reason this file already records: near full extension
@@ -1733,7 +1797,10 @@ static void foot_ride(afoot_t *f, v3 base, v3 tgt, v3 vel, float yaw, float kf) 
 static void anim_stage_fire_anchor(const anim_t *a, v3 pos, float yaw,
                                    float pitch, int wpn, int src) {
   anim_t shot = *a;
-  skel_solve(&shot, pos, yaw, pitch, wpn, GUN_POSE_IDLE, SKEL_POSE_ONLY);
+  // A shot is a firing pose even if the eased patrol carry was still lowering. The
+  // caller already supplied the physical bore angle; BLOCKED selects the aligned
+  // carriage without advancing any persistent animation state.
+  skel_solve(&shot, pos, yaw, pitch, wpn, GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
   g_fire_anchor_pose = shot.pose;
   g_fire_anchor_src = src;
   g_fire_anchor_tick = g_tick;
@@ -1809,15 +1876,22 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   // before the gait controller starts stepping, so the same input becomes a mobile
   // two-foot crouch without a mode switch or a teleported joint.
   float kneel_speed = f_smoothstep(0.18f, 0.90f, a->spd);
-  float kneel_want = crouch && grounded && !slide ? 1.0f - kneel_speed : 0.0f;
+  float kneel_want = crouch && grounded && !slide && a->slide_s < 0.05f
+                   ? 1.0f - kneel_speed : 0.0f;
   float kneel_hz = kneel_want > a->kneel_lin ? 6.5f : 16.0f;
   a->kneel_lin += (kneel_want - a->kneel_lin) * ease_k(kneel_hz);
   a->kneel_s = smooth01(a->kneel_lin);
   // Slide blend is asymmetric: the drop-in snaps (~60 ms), standing back up
   // out of the skid is deliberately softer.
-  float ksl = ease_k(slide ? 17.0f : 8.0f);
+  float ksl = ease_k(slide ? 17.0f : 5.0f);
   a->slide_lin += ((slide ? 1.0f : 0.0f) - a->slide_lin) * ksl;
   a->slide_s = smooth01(a->slide_lin);
+  // Ownership of the feet follows the POSE out of a slide, not the collider bit.
+  // Handing them to gait on the first non-slide tick starts a run cycle under a pelvis
+  // still 40-60 cm low, which is the photographed bow-legged exit.
+  int slide_pose = slide || a->slide_s > 0.015f;
+  int slide_pose_exit = !slide_pose && a->was_slide_pose;
+  a->was_slide_pose = slide_pose;
   float ks = ease_k(11.0f);
   a->air_lin += ((grounded ? 0.0f : 1.0f) - a->air_lin) * ks;
   a->air_s = smooth01(a->air_lin);
@@ -1910,6 +1984,9 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
 
   int slide_enter = slide && !a->was_slide;
   if (slide_enter) a->slide_t = 0;  // fresh slide: entry envelope
+  if (slide_enter) a->slide_knee_s = 1.0f;
+  else a->slide_knee_s += ((slide ? 1.0f : 0.0f) - a->slide_knee_s) *
+                          ease_k(slide ? 24.0f : 14.0f);
   a->was_slide = slide;
   if (slide) {
     a->slide_t += TICK_DT;
@@ -1988,8 +2065,22 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   else if (fabsf(dyaw) > 0.45f)
     a->leg_yaw += (dyaw - (dyaw > 0 ? 0.28f : -0.28f)) * ease_k(10.0f);
 
-  // Gait phase.
-  int moving = grounded && !slide && a->spd > 0.35f;
+  // Gait phase. When the eased get-up finally releases its feet, begin from one
+  // explicit single swing. Reusing the phase left behind on slide entry can put both
+  // feet inside overlapping swing windows, lifting both boots just as the pelvis
+  // reaches standing height — the photographed bow-legged, floating first stride.
+  if (slide_pose_exit) {
+    // At high speed reach protection can expand the swing window beyond half a
+    // cycle. 0.38 begins with only the lead foot eligible instead of placing both
+    // feet in that overlap on the first post-slide tick.
+    a->phase = 0.38f;
+    a->bob_lag = 0.0f;
+    for (int i = 0; i < 2; i++) {
+      a->foot[i].from = a->foot[i].to = a->foot[i].pos;
+      a->foot[i].t = 1.0f;
+    }
+  }
+  int moving = grounded && !slide_pose && a->spd > 0.35f;
   // One cadence number, shared with the plant-ahead budget and the duty's reach bound
   // (anim_hz).
   float hz = anim_hz(a);
@@ -2037,7 +2128,7 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
       // clamp holding the legs dead straight through the entire jump.
       foot_ride(&a->foot[i], base, tgt, vel, a->leg_yaw, kf);
     }
-  } else if (slide) {
+  } else if (slide_pose) {
     // Slide: one heel-first leg extends along the mirrored travel direction while the
     // other foot stays under the hips, letting its knee become the ground contact.
     // Both feet still skid with the body; only their body-relative targets differ.
@@ -2047,16 +2138,24 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     // newly entered lateral slide that distinction is what keeps the folded knee on
     // its own side of the body.
     float kf = ease_k(22.0f);
-    float syaw = atan2f(pd.x, -pd.z);
+    float foot_slide_k = slide ? 1.0f : a->slide_s;
+    float syaw = a->leg_yaw +
+                 wrap_pi(atan2f(pd.x, -pd.z) - a->leg_yaw) * foot_slide_k;
     for (int i = 0; i < 2; i++) {
       float s = i ? 1.0f : -1.0f;
       float ld = i ? a->slide_ld : 1.0f - a->slide_ld;  // how much THIS leg leads
-      float along = ld * (0.48f + 0.20f * a->slide_v) -
-                    (1.0f - ld) * 0.02f;
+      float slide_along = ld * (0.48f + 0.20f * a->slide_v) -
+                          (1.0f - ld) * 0.14f;
+      // As the pelvis rises, converge both skid contacts into an ordinary staggered
+      // stance while they still ride with the body. Gait receives reachable planted
+      // feet instead of two slide-wide endpoints and may start on the following tick.
+      float stand_along = i ? -0.050f : 0.070f;
+      float along = stand_along + (slide_along - stand_along) * foot_slide_k;
+      float half = 0.14f + (0.19f - 0.14f) * foot_slide_k;
       float footy = ANIM_ANKLE_Y;
-      v3 tgt = {{base.x + pd.x * along + slide_body_right.x * s * 0.19f,
+      v3 tgt = {{base.x + pd.x * along + slide_body_right.x * s * half,
                  base.y + footy,
-                 base.z + pd.z * along + slide_body_right.z * s * 0.19f}};
+                 base.z + pd.z * along + slide_body_right.z * s * half}};
       // Skid HORIZONTALLY only.
       foot_ride(&a->foot[i], base, tgt, (v3){{vel.x, 0.0f, vel.z}}, syaw, kf);
     }
