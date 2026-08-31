@@ -42,6 +42,10 @@ jobs:
       # x86_64-w64-mingw32-gcc name is an update-alternatives symlink.
       - name: Toolchain
         run: |
+          # force-unsafe-io: dpkg's per-file fsync is pure cost in a container
+          # that is discarded after the job — the mingw metapackage alone
+          # unpacks ~700 MB and pays it thousands of times.
+          echo force-unsafe-io > /etc/dpkg/dpkg.cfg.d/ci
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             build-essential git ca-certificates \
@@ -62,7 +66,12 @@ jobs:
           # re-install the same build on every boot.
           V=$(date -u +%Y-%m-%d); C=$(echo ${{ github.sha }} | cut -c1-7)
           echo "$V" > VERSION
-          make all BUILD_VERSION="$V" BUILD_COMMIT="$C"
+          # The two SHIPPED targets only, in parallel — NOT `make all`:
+          # build/game is the in-container harness and nothing in this job
+          # runs it (ci-proofs drives skill-issue-linux, asan-gate builds its
+          # own binary), so building it here is a third full compile for
+          # nobody.
+          make -j build/game.exe build/game-x86_64 BUILD_VERSION="$V" BUILD_COMMIT="$C"
           # game-x86_64, NOT game: the two are the same compile on an x86_64
           # runner, but only the x86_64 target is guaranteed to be one — and the
           # asset name no longer says amd64, so nothing downstream would catch a
@@ -73,20 +82,34 @@ jobs:
           mv build/game.exe    skill-issue.exe
 
       # Warning gate WITHOUT LTO (-flto swallows -Wformat-truncation),
-      # then the self-contained proof gate. The build that ships is proved.
+      # beside the self-contained proof gate. The build that ships is proved.
       - name: Gate
         run: |
-          # -Wshadow BELONGS HERE. The Makefile passes it on every build but with
-          # no -Werror, and this gate had -Werror without it — so nothing in the
-          # tree actually enforced the "-Wall -Wextra -Wshadow clean on both
-          # compilers" contract, and a shadowed local could ship.
-          gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
-          x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
+          # Two independent lanes, joined at the end — ci-proofs is this job's
+          # wall clock (its vmtrig case alone is ~2 min single-threaded), so
+          # the compile gates run BESIDE it, not after it. The step is red if
+          # EITHER lane is: a foreground ci-proofs failure fails the step
+          # directly, the lane's status is re-raised after the join, and its
+          # log is replayed so a lane failure is readable.
+          (
+            set -e
+            # -Wshadow BELONGS HERE. The Makefile passes it on every build but
+            # with no -Werror, and this gate had -Werror without it — so
+            # nothing in the tree actually enforced the "-Wall -Wextra
+            # -Wshadow clean on both compilers" contract, and a shadowed local
+            # could ship.
+            gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
+            x86_64-w64-mingw32-gcc -std=c23 -O2 -Wall -Wextra -Wshadow -Werror -c code/game.c -o /dev/null
+            # Memory-safety gate: the proof battery (incl. netfuzz, the packet
+            # fuzzer) under ASan/UBSan. The Makefile target owns the recipe
+            # and the reasoning; ~1 min compile + ~10 s run.
+            make asan-gate
+          ) >compile-gate.log 2>&1 &
+          LANE=$!
           ./tools/ci-proofs.sh ./skill-issue-linux
-          # Memory-safety gate: the proof battery (incl. netfuzz, the packet
-          # fuzzer) under ASan/UBSan. The Makefile target owns the recipe and
-          # the reasoning; ~1 min compile + ~10 s run.
-          make asan-gate
+          lane_status=0; wait "$LANE" || lane_status=$?
+          cat compile-gate.log
+          exit "$lane_status"
 
       - uses: actions/upload-artifact@v7
         # "skill-issue*", NOT "skill-issue-*": skill-issue.exe has no dash after

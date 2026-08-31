@@ -16,8 +16,11 @@ Names follow `pose_view_detail.png`. The set is intentionally compact:
 
 - `stand_*` and `crouch_*`: neutral exterior views and views down the local body
 - `ads_*`: AR/sniper first person plus standing/crouched exterior alignment
+- `aim_sr_*_seq_*`: slow sniper ready/ADS sweeps through the 88.8-degree pitch limit
+- `run_sr_seq_*`: dense low-ready sniper run start and settled gait
 - `lean_*`: hip/ADS and left/right comparisons from one fixed camera
-- `slide_*`: profile, three-quarter, first-person, and a six-frame get-up sequence
+- `slide_*`: profile, three-quarter, first-person, six-frame get-up, and eight-frame
+  front/back/left/right entry sequences
 - `detail_*`: close hand/weapon views and a lit side view of stock contact
 
 Capture only one area while iterating:

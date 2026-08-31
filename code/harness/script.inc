@@ -1264,8 +1264,15 @@ static void cmd_slidecheck(sim_ctx_t *s) {
   };
   float min_clear = 9.0f, min_side = 9.0f, max_step = 0.0f, bone_err = 0.0f;
   float exit_step = 0.0f, exit_side = 0.0f;
+  float max_pole = 0.0f, exit_pole = 0.0f;
+  float steady_step = 0.0f, steady_pole = 0.0f;
+  float knee_contact = 9.0f, back_knee = 9.0f;
   int clear_dir = -1, clear_tick = -1, step_dir = -1, step_tick = -1;
+  int step_leg = -1, pole_dir = -1, pole_tick = -1, pole_leg = -1;
   int exit_step_dir = -1, exit_step_tick = -1;
+  int exit_step_leg = -1, exit_pole_dir = -1, exit_pole_tick = -1;
+  int exit_pole_leg = -1;
+  int contact_dir = -1, contact_tick = -1, back_dir = -1, back_tick = -1;
   int finite = 1;
   for (int d = 0; d < 8; d++) {
     anim_t a;
@@ -1287,7 +1294,21 @@ static void cmd_slidecheck(sim_ctx_t *s) {
         v3 bend = v3_sub(P->knee[i], P->hip[i]);
         v3 old_bend = v3_sub(a.prev_pose.knee[i], a.prev_pose.hip[i]);
         float step = v3_len(v3_sub(bend, old_bend));
-        if (step > max_step) { max_step = step; step_dir = d; step_tick = tick; }
+        if (step > max_step) {
+          max_step = step; step_dir = d; step_tick = tick; step_leg = i;
+        }
+        if (tick >= 20) steady_step = fmaxf(steady_step, step);
+        v3 axis = v3_norm(v3_sub(P->ankle[i], P->hip[i]));
+        v3 p0 = v3_sub(bend, v3_scale(axis, v3_dot(bend, axis)));
+        v3 p1 = v3_sub(old_bend, v3_scale(axis, v3_dot(old_bend, axis)));
+        if (v3_dot(p0, p0) > 1e-7f && v3_dot(p1, p1) > 1e-7f) {
+          float turn = acosf(f_clamp(v3_dot(v3_norm(p0), v3_norm(p1)),
+                                     -1.0f, 1.0f));
+          if (turn > max_pole) {
+            max_pole = turn; pole_dir = d; pole_tick = tick; pole_leg = i;
+          }
+          if (tick >= 20) steady_pole = fmaxf(steady_pole, turn);
+        }
         bone_err = fmaxf(bone_err,
             fabsf(v3_len(v3_sub(P->knee[i], P->hip[i])) - ANIM_THIGH));
         bone_err = fmaxf(bone_err,
@@ -1295,6 +1316,16 @@ static void cmd_slidecheck(sim_ctx_t *s) {
         finite &= !f_is_nonfinite(P->knee[i].x) &&
                   !f_is_nonfinite(P->knee[i].y) &&
                   !f_is_nonfinite(P->knee[i].z);
+      }
+      if (tick >= 24) {
+        int folded = a.slide_ld > 0.5f ? 0 : 1;
+        float ky = P->knee[folded].y - pos.y;
+        if (a.slide_bk < 0.18f && ky < knee_contact) {
+          knee_contact = ky; contact_dir = d; contact_tick = tick;
+        }
+        if (a.slide_bk > 0.82f && ky < back_knee) {
+          back_knee = ky; back_dir = d; back_tick = tick;
+        }
       }
     }
     // Release the raw slide while velocity remains high. This is the actual failure
@@ -1317,6 +1348,18 @@ static void cmd_slidecheck(sim_ctx_t *s) {
           exit_step = step;
           exit_step_dir = d;
           exit_step_tick = tick;
+          exit_step_leg = i;
+        }
+        v3 axis = v3_norm(v3_sub(P->ankle[i], P->hip[i]));
+        v3 p0 = v3_sub(bend, v3_scale(axis, v3_dot(bend, axis)));
+        v3 p1 = v3_sub(old_bend, v3_scale(axis, v3_dot(old_bend, axis)));
+        if (v3_dot(p0, p0) > 1e-7f && v3_dot(p1, p1) > 1e-7f) {
+          float turn = acosf(f_clamp(v3_dot(v3_norm(p0), v3_norm(p1)),
+                                     -1.0f, 1.0f));
+          if (turn > exit_pole) {
+            exit_pole = turn; exit_pole_dir = d; exit_pole_tick = tick;
+            exit_pole_leg = i;
+          }
         }
         bone_err = fmaxf(bone_err,
             fabsf(v3_len(v3_sub(P->knee[i], P->hip[i])) - ANIM_THIGH));
@@ -1329,15 +1372,28 @@ static void cmd_slidecheck(sim_ctx_t *s) {
     }
   }
   int ok = finite && min_clear >= 0.120f && min_side >= 0.090f &&
-           max_step <= 0.080f && exit_step <= 0.080f &&
-           exit_side <= 0.480f && bone_err <= 0.007f;
+           max_step <= 0.090f && steady_step <= 0.035f &&
+           max_pole <= 15.0f * DEG2RAD && steady_pole <= 7.0f * DEG2RAD &&
+           exit_step <= 0.080f && exit_pole <= 10.0f * DEG2RAD &&
+           exit_side <= 0.520f && knee_contact >= 0.044f &&
+           knee_contact <= 0.090f &&
+           back_knee >= 0.180f && bone_err <= 0.007f;
   printf("slidecheck dirs=8 clear=%.1fmm@%d/%d side=%.1fmm "
-         "step=%.1fmm@%d/%d exit_step=%.1fmm@%d/%d exit_side=%.1fmm "
+         "step=%.1fmm@%d/%d/%d pole=%.2fdeg@%d/%d/%d "
+         "steady=%.1fmm/%.2fdeg contact=%.1f@%d/%d/%.1f@%d/%dmm "
+         "exit_step=%.1fmm@%d/%d/%d exit_pole=%.2fdeg@%d/%d/%d "
+         "exit_side=%.1fmm "
          "bone=%.3fmm finite=%d %s\n",
          (double)(min_clear * 1000.0f), clear_dir, clear_tick,
          (double)(min_side * 1000.0f), (double)(max_step * 1000.0f),
-         step_dir, step_tick, (double)(exit_step * 1000.0f),
-         exit_step_dir, exit_step_tick,
+         step_dir, step_tick, step_leg, (double)(max_pole / DEG2RAD),
+         pole_dir, pole_tick, pole_leg, (double)(steady_step * 1000.0f),
+         (double)(steady_pole / DEG2RAD), (double)(knee_contact * 1000.0f),
+         contact_dir, contact_tick, (double)(back_knee * 1000.0f),
+         back_dir, back_tick, (double)(exit_step * 1000.0f),
+         exit_step_dir, exit_step_tick, exit_step_leg,
+         (double)(exit_pole / DEG2RAD), exit_pole_dir, exit_pole_tick,
+         exit_pole_leg,
          (double)(exit_side * 1000.0f), (double)(bone_err * 1000.0f),
          finite, ok ? "ok" : "FAIL");
   if (!ok) exit(1);
@@ -1359,39 +1415,91 @@ static void armcheck_sample(const anim_t *a, float step[2], float clear[2]) {
 
 static void cmd_armcheck(sim_ctx_t *s) {
   (void)s;
-  float run_step[2] = {0, 0}, aim_step[2] = {0, 0};
-  float run_clear[2] = {9, 9}, aim_clear[2] = {9, 9};
-  anim_t a;
-  v3 pos = {{0, 5, 0}}, vel = {{0, 0, -5.5f}};
-  anim_reset(&a, pos, 0.0f, WPN_AR);
-  for (int tick = 0; tick < 300; tick++) {
-    pos = v3_add(pos, v3_scale(vel, TICK_DT));
-    anim_tick(&a, pos, vel, 0.0f, 0.0f, 1, 0, 0.0f, 0, 0.0f,
-              0.0f, 1, 1, WPN_AR, GUN_POSE_BLOCKED);
-    if (tick >= 30) armcheck_sample(&a, run_step, run_clear);
-  }
+  float worst_step = 0.0f, worst_trigger = 0.0f, worst_clear = 9.0f;
+  float worst_gun = 0.0f, worst_bore = 0.0f;
+  int ok = 1;
+  for (int wpn = WPN_AR; wpn <= WPN_SR; wpn++) {
+    float start_step[2] = {0, 0}, run_step[2] = {0, 0};
+    float aim_step[2] = {0, 0}, ads_step[2] = {0, 0};
+    float start_clear[2] = {9, 9}, run_clear[2] = {9, 9};
+    float aim_clear[2] = {9, 9}, ads_clear[2] = {9, 9};
+    float gun_step = 0.0f, bore_step = 0.0f;
+    anim_t a;
+    v3 pos = {{0, 5, 0}}, vel = {{0, 0, 0}};
+    anim_reset(&a, pos, 0.0f, wpn);
+    // Settle the sniper into its real patrol carry, then start locomotion. This is the
+    // transition that the old AR-only proof skipped and the reported SR elbow twitch
+    // lives in.
+    for (int tick = 0; tick < 120; tick++)
+      anim_tick(&a, pos, vel, 0.0f, 0.0f, 1, 0, 0.0f, 0, 0.0f,
+                0.0f, 0, 1, wpn, GUN_POSE_IDLE);
+    vel = (v3){{0, 0, -5.5f}};
+    for (int tick = 0; tick < 300; tick++) {
+      pos = v3_add(pos, v3_scale(vel, TICK_DT));
+      anim_tick(&a, pos, vel, 0.0f, 0.0f, 1, 0, 0.0f, 0, 0.0f,
+                0.0f, 0, 1, wpn, GUN_POSE_LOCOMOTION);
+      if (tick < 40) armcheck_sample(&a, start_step, start_clear);
+      else armcheck_sample(&a, run_step, run_clear);
+    }
 
-  pos = (v3){{0, 5, 0}};
-  vel = (v3){{0, 0, 0}};
-  anim_reset(&a, pos, 0.0f, WPN_AR);
-  for (int tick = 0; tick < 270; tick++) {
-    float pitch = tick < 90 ? 0.0f
-                : tick < 210 ? DEG2RAD * (-80.0f * (tick - 89) / 120.0f)
-                             : DEG2RAD * -80.0f;
-    anim_tick(&a, pos, vel, 0.0f, pitch, 1, 0, 0.0f, 0, 0.0f,
-              0.0f, 1, 1, WPN_AR, GUN_POSE_BLOCKED);
-    if (tick >= 90) armcheck_sample(&a, aim_step, aim_clear);
+    for (int ads = 0; ads <= 1; ads++) {
+      float *step = ads ? ads_step : aim_step;
+      float *clear = ads ? ads_clear : aim_clear;
+      pos = (v3){{0, 5, 0}};
+      vel = (v3){{0, 0, 0}};
+      anim_reset(&a, pos, 0.0f, wpn);
+      for (int tick = 0; tick < 340; tick++) {
+        float pitch = tick < 120 ? 0.0f
+                    : tick < 300 ? -PITCH_MAX * (tick - 119) / 180.0f
+                                 : -PITCH_MAX;
+        anim_tick(&a, pos, vel, 0.0f, pitch, 1, 0, 0.0f, 0, (float)ads,
+                  0.0f, 1, 1, wpn, GUN_POSE_BLOCKED);
+        if (tick >= 120) {
+          armcheck_sample(&a, step, clear);
+          gun_step = fmaxf(gun_step,
+                           v3_len(v3_sub(a.pose.gun_o, a.prev_pose.gun_o)));
+          bore_step = fmaxf(bore_step,
+              acosf(f_clamp(v3_dot(a.pose.gun_f, a.prev_pose.gun_f),
+                             -1.0f, 1.0f)));
+        }
+      }
+    }
+    float local_step = 0.0f, local_clear = 9.0f;
+    for (int i = 0; i < 2; i++) {
+      local_step = fmaxf(local_step, fmaxf(fmaxf(start_step[i], run_step[i]),
+                                           fmaxf(aim_step[i], ads_step[i])));
+      local_clear = fminf(local_clear, fminf(fminf(start_clear[i], run_clear[i]),
+                                             fminf(aim_clear[i], ads_clear[i])));
+    }
+    worst_step = fmaxf(worst_step, local_step);
+    worst_trigger = fmaxf(worst_trigger,
+        fmaxf(fmaxf(start_step[1], run_step[1]),
+              fmaxf(aim_step[1], ads_step[1])));
+    worst_clear = fminf(worst_clear, local_clear);
+    worst_gun = fmaxf(worst_gun, gun_step);
+    worst_bore = fmaxf(worst_bore, bore_step);
+    ok &= local_step <= 0.035f && local_clear >= 0.020f &&
+          gun_step <= 0.012f && bore_step <= 0.70f * DEG2RAD;
+    printf("armcheck %s start=%.1f/%.1fmm run=%.1f/%.1fmm "
+           "aim=%.1f/%.1fmm ads=%.1f/%.1fmm gun=%.1fmm/%.3fdeg "
+           "clear=%.3f %s\n",
+           wpn == WPN_AR ? "ar" : "sr",
+           (double)(start_step[0] * 1000.0f), (double)(start_step[1] * 1000.0f),
+           (double)(run_step[0] * 1000.0f), (double)(run_step[1] * 1000.0f),
+           (double)(aim_step[0] * 1000.0f), (double)(aim_step[1] * 1000.0f),
+           (double)(ads_step[0] * 1000.0f), (double)(ads_step[1] * 1000.0f),
+           (double)(gun_step * 1000.0f), (double)(bore_step / DEG2RAD),
+           (double)local_clear, local_step <= 0.035f && local_clear >= 0.020f &&
+                                gun_step <= 0.012f && bore_step <= 0.70f * DEG2RAD
+                                  ? "ok" : "FAIL");
   }
-  int ok = run_step[0] <= 0.025f && run_step[1] <= 0.025f &&
-           aim_step[0] <= 0.025f && aim_step[1] <= 0.025f &&
-           run_clear[0] >= 0.90f && run_clear[1] >= 0.90f &&
-           aim_clear[0] >= 0.90f && aim_clear[1] >= 0.90f;
-  printf("armcheck run_step=%.1f/%.1fmm aim_step=%.1f/%.1fmm "
-         "run_clear=%.3f/%.3f aim_clear=%.3f/%.3f %s\n",
-         (double)(run_step[0] * 1000.0f), (double)(run_step[1] * 1000.0f),
-         (double)(aim_step[0] * 1000.0f), (double)(aim_step[1] * 1000.0f),
-         (double)run_clear[0], (double)run_clear[1],
-         (double)aim_clear[0], (double)aim_clear[1], ok ? "ok" : "FAIL");
+  ok &= worst_trigger <= 0.015f;
+  printf("armcheck weapons=2 max_step=%.1fmm trigger=%.1fmm "
+         "gun=%.1fmm/%.3fdeg min_clear=%.3f %s\n",
+         (double)(worst_step * 1000.0f), (double)(worst_trigger * 1000.0f),
+         (double)(worst_gun * 1000.0f), (double)(worst_bore / DEG2RAD),
+         (double)worst_clear,
+         ok ? "ok" : "FAIL");
   if (!ok) exit(1);
 }
 

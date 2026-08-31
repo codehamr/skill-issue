@@ -74,6 +74,17 @@ def exterior(
     )
 
 
+def slow_pitch_to(target: float) -> tuple[str, ...]:
+    """Build one deterministic two-degree/two-tick aim ramp down to target."""
+    commands: list[str] = []
+    pitch = -2.0
+    while pitch > target:
+        commands += (f"puppet pitch {pitch:g}", "wait 2")
+        pitch -= 2.0
+    commands += (f"puppet pitch {target:g}", "wait 2")
+    return tuple(commands)
+
+
 CAPTURES = (
     exterior(
         "standing",
@@ -394,6 +405,64 @@ for frame, ticks in enumerate((145, 152, 159, 166, 176, 190), start=1):
             (-2.65, 1.02, 0.00),
         ),
     )
+
+# The issue reproductions are sequences rather than hero frames. Closely spaced early
+# samples expose a one-tick IK hemisphere change; later samples prove that a stable
+# hold does not start oscillating after the transition has settled.
+for frame, ticks in enumerate((1, 3, 6, 10, 16, 24, 36, 48), start=1):
+    CAPTURES += (
+        exterior(
+            "run",
+            f"run_sr_seq_{frame:02d}_ext_side.png",
+            f"Sniper low-ready run sequence frame {frame}/8 (wait {ticks})",
+            (
+                "weapon sr",
+                "puppet ready 0",
+                "wait 90",
+                "puppet move 0 -1",
+                "puppet speed 5.5",
+                f"wait {ticks}",
+            ),
+            0.90,
+            (-2.65, 1.12, 0.00),
+        ),
+    )
+
+for mode, ads in (("ready", 0), ("ads", 1)):
+    for frame, pitch in enumerate((0.0, -30.0, -50.0, -65.0, -73.0,
+                                    -79.0, -84.0, -88.0, -88.8), start=1):
+        ramp = () if pitch == 0.0 else slow_pitch_to(pitch)
+        CAPTURES += (
+            exterior(
+                "aim",
+                f"aim_sr_{mode}_seq_{frame:02d}_ext_front3q.png",
+                f"Slow sniper {mode} aim-down frame {frame}/9 ({pitch:g} deg)",
+                ("weapon sr", "puppet ready 1", f"puppet ads {ads}", "wait 90")
+                + ramp,
+                0.88,
+                (-1.55, 1.15, -2.15),
+            ),
+        )
+
+for direction, mx, mz in (("front", 0, -1), ("back", 0, 1),
+                           ("left", -1, 0), ("right", 1, 0)):
+    for frame, ticks in enumerate((3, 6, 9, 12, 16, 24, 36, 45), start=1):
+        CAPTURES += (
+            exterior(
+                "slide",
+                f"slide_{direction}_seq_{frame:02d}_ext_front3q.png",
+                f"{direction.title()} slide sequence frame {frame}/8 (wait {ticks})",
+                (
+                    f"puppet move {mx} {mz}",
+                    "puppet speed 7",
+                    "wait 45",
+                    "puppet slide",
+                    f"wait {ticks}",
+                ),
+                0.58,
+                (-1.55, 0.86, -2.15),
+            ),
+        )
 
 
 def sha256(path: Path) -> str:
