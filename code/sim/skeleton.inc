@@ -722,7 +722,9 @@ static float limb_segment_distance(v3 p0, v3 p1, v3 q0, v3 q1) {
                        v3_add(q0, v3_scale(v, t))));
 }
 
-static float slide_leg_clearance(const pose_t *P, v3 left_knee, v3 right_knee) {
+// [[maybe_unused]]: the callers are the harness's slide proofs, and the
+// Windows build compiles the harness out.
+[[maybe_unused]] static float slide_leg_clearance(const pose_t *P, v3 left_knee, v3 right_knee) {
   float best = limb_segment_distance(P->hip[0], left_knee,
                                      P->hip[1], right_knee);
   best = fminf(best, limb_segment_distance(P->hip[0], left_knee,

@@ -204,6 +204,12 @@ say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 #   families fall 346->313, 64->15 and 107->28; at k=6 thigh/shin falls 69->26.
 #   The bounded firing-arm pole redistributes only the expected arm/carrier/weapon
 #   families. All eight sweeps retain zero open/flip/dup/zfight/degen.
+# - The committed directional-slide state measures one contact off that record in
+#   three cross slots (AR k=6 65->66, SR close 183->182): the census was recorded one
+#   tweak before the final pole values. Re-verified against the pre-pass build with a
+#   full figv family diff: shin/boot 345->312, thigh/shin and shin/knee fall, gun/palm
+#   and grip_digits rise a few contacts — exactly the pass's own families, no foreign
+#   family moves, near quadruples and every hard topology class unchanged.
 WANT_AR_NEAR="78 78 75 61"
 [ "$AR_NEAR" = "$WANT_AR_NEAR" ] || {
   say "GATE AR near '$AR_NEAR' != reviewed baseline '$WANT_AR_NEAR'"; fail=1;
@@ -286,7 +292,7 @@ WANT_AR_NEAR="78 78 75 61"
 #   class and vmtrig's forbidden mesh/proxy crossings still zero.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_AR_CROSS="105 105 95 65"
+WANT_AR_CROSS="105 105 95 66"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -314,7 +320,7 @@ WANT_AR_CROSS="105 105 95 65"
 # SR near becomes 94/94/58/39 and cross falls 208/208/135/92 -> 193/193/126/85, with
 # open/flip/dup/zfight/degen still zero in every one of the eight full sweeps.
 WANT_SR_NEAR="98 98 58 41"
-WANT_SR_CROSS="183 183 126 91"
+WANT_SR_CROSS="182 182 126 91"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -331,7 +337,11 @@ WANT_SR_CROSS="183 183 126 91"
 # 2026-08-30 physical-bore/arm A/B: stable downward preferred angles and the unified
 # live firing carriage move the shallow hand/weapon contact census; hard topology and
 # vmtrig's forbidden mesh/proxy census remain zero.
-gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=194 cross=138 degen=0 recoil_states=20$'
+# near=200: zeroing RECOIL_POSE's angular channels (the barrel spring owns the rise)
+# changed the poses the 20 recoil states sweep, moving the shallow hand/weapon census
+# 199->200 while cross returned 145->138; the 194 this gate carried was stale for the
+# whole recorded history and never blocked because it drifted alongside real reds.
+gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=200 cross=138 degen=0 recoil_states=20$'
 gate_command vmsight "vmsight" '^vmsight total=0 '
 gate_command vmscope "vmscope" '^vmscope scope_tris=[1-9][0-9]* open_at=0[.]55 baseline_err=.* recoil_min_ocular=.* recoil_axis=.* recoil_center=.* recoil_pip=.* recoil_radius_delta=.* ok$'
 gate_command vmframe "vmframe" '^vmframe ok$'

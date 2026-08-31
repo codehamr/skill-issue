@@ -756,9 +756,14 @@ static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir)
     anim_t body = g_player_anim[0];
     skel_solve(&body, p->pos, by, bp, p->wp.cur,
                GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
-    float vm_err = acosf(f_clamp(v3_dot(v3_norm(vf.gz), fwd), -1.0f, 1.0f));
-    float body_err = acosf(f_clamp(v3_dot(v3_norm(body.pose.gun_f), fwd),
-                                   -1.0f, 1.0f));
+    // Sine-based, never acos-of-dot: near zero the dot saturates at 1.0f and a
+    // single ULP of normalization noise already reads as acosf(1 - 2^-24) =
+    // 0.0198 deg — twenty times the 0.001 deg contract, from vectors that are
+    // bit-exact in direction. |cross| IS the small angle, at ~1e-7 rad noise,
+    // so the strict bound below stays honest in float.
+    v3 vz = v3_norm(vf.gz), bz = v3_norm(body.pose.gun_f);
+    float vm_err = atan2f(v3_len(v3_cross(vz, fwd)), v3_dot(vz, fwd));
+    float body_err = atan2f(v3_len(v3_cross(bz, fwd)), v3_dot(bz, fwd));
     o->bore_error = fmaxf(vm_err, body_err) / DEG2RAD;
   }
   o->punch = p->wp.punch;
