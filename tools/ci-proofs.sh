@@ -210,7 +210,14 @@ say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 #   full figv family diff: shin/boot 345->312, thigh/shin and shin/knee fall, gun/palm
 #   and grip_digits rise a few contacts — exactly the pass's own families, no foreign
 #   family moves, near quadruples and every hard topology class unchanged.
-WANT_AR_NEAR="78 78 75 61"
+# - 2026-09-01 physical-bore/slide-handoff pass, A/B against the saved pre-change O3
+#   binary with identical seed and fresh config: AR near 78/78/75/61 ->
+#   75/75/75/61 and SR near 98/98/58/41 -> 94/94/58/41. The full 60-tick close-tier
+#   `figv` family diff moves the maximum through the expected pose contacts:
+#   neck/helm_shell -8, carrier/gun +4 for AR, and the shared hand/weapon/arm families
+#   for SR. No mesh primitive changed; all eight sweeps retain zero
+#   open/flip/dup/zfight/degen.
+WANT_AR_NEAR="75 75 75 61"
 [ "$AR_NEAR" = "$WANT_AR_NEAR" ] || {
   say "GATE AR near '$AR_NEAR' != reviewed baseline '$WANT_AR_NEAR'"; fail=1;
 }
@@ -296,7 +303,12 @@ WANT_AR_NEAR="78 78 75 61"
 # hints, band 0.12..0.85) moves the arm/torso contact seams whenever the live
 # bot aims above ~7 deg, so the close tiers' cross census rose 105 -> 113 (SR
 # 182 -> 181). near and every hard topology class are unchanged on all tiers.
-WANT_AR_CROSS="113 113 97 66"
+# 2026-09-01: the same saved-binary A/B above moves AR cross to 112/112/96/67
+# and SR to 180/180/121/95. Close-tier aggregate deltas are confined to the solved
+# weapon/arm chain and recovered gait contacts (gun/farm, torso/gun, carrier/arm,
+# shin/boot/knee and their equipment hosts); these are new POSES of unchanged closed
+# meshes, and vmtrig independently retains zero forbidden hand/weapon crossings.
+WANT_AR_CROSS="112 112 96 67"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -323,9 +335,9 @@ WANT_AR_CROSS="113 113 97 66"
 # The closed-chain follow-up documented in the AR census affects only shared anatomy:
 # SR near becomes 94/94/58/39 and cross falls 208/208/135/92 -> 193/193/126/85, with
 # open/flip/dup/zfight/degen still zero in every one of the eight full sweeps.
-WANT_SR_NEAR="98 98 58 41"
-# 2026-09: 182 -> 181 close-tier, the aim-up working room (see the AR note).
-WANT_SR_CROSS="181 181 126 91"
+WANT_SR_NEAR="94 94 58 41"
+# 2026-09: see the reviewed physical-bore/slide-handoff A/B in the AR notes.
+WANT_SR_CROSS="180 180 121 95"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -375,7 +387,7 @@ grep -Eq '^vmframe fire sr T1 .*ready=0[.]000/0[.][12][0-9][0-9] .* ok$' \
     say "GATE vmframe missing partial T1 fire carry witness"; fail=1;
   }
 gate_command vmtrig "vmtrig" '^vmtrig worst .* ok$'
-gate_command slidecheck "slidecheck" '^slidecheck dirs=8 clear=[0-9]+[.][0-9]mm@[0-7]/[0-9]+ side=[0-9]+[.][0-9]mm step=[0-9]+[.][0-9]mm@[0-7]/[0-9]+/[01] pole=[0-9]+[.][0-9]+deg@[0-7]/[0-9]+/[01] steady=[0-9]+[.][0-9]mm/[0-9]+[.][0-9]+deg contact=[0-9]+[.][0-9]@[0-7]/[0-9]+/[0-9]+[.][0-9]@[0-7]/[0-9]+mm exit_step=[0-9]+[.][0-9]mm@[0-7]/[0-9]+/[01] exit_pole=[0-9]+[.][0-9]+deg@[0-7]/[0-9]+/[01] exit_side=[0-9]+[.][0-9]mm bone=[0-9]+[.][0-9]+mm finite=1 ok$'
+gate_command slidecheck "slidecheck" '^slidecheck dirs=8 clear=[0-9]+[.][0-9]mm@[0-7]/[0-9]+ side=[0-9]+[.][0-9]mm step=[0-9]+[.][0-9]mm@[0-7]/[0-9]+/[01] pole=[0-9]+[.][0-9]+deg@[0-7]/[0-9]+/[01] steady=[0-9]+[.][0-9]mm/[0-9]+[.][0-9]+deg contact=[0-9]+[.][0-9]@[0-7]/[0-9]+/[0-9]+[.][0-9]@[0-7]/[0-9]+mm exit_step=[0-9]+[.][0-9]mm@[0-7]/[0-9]+/[01] exit_pole=[0-9]+[.][0-9]+deg@[0-7]/[0-9]+/[01] exit_side=[0-9]+[.][0-9]mm handoff=[0-9]+[.][.][0-9]+ swing_lag=[0-9]+ bone=[0-9]+[.][0-9]+mm finite=1 ok$'
 gate_command armcheck "armcheck" '^armcheck weapons=2 max_step=[0-9]+[.][0-9]mm trigger=[0-9]+[.][0-9]mm gun=[0-9]+[.][0-9]mm/[0-9]+[.][0-9]+deg min_clear=[0-9]+[.][0-9]+ ok$'
 
 # Do not make field order part of the interface: parse the named witnesses from the

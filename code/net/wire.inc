@@ -442,9 +442,10 @@ static uint32_t net_world_hash(void) {
 }
 
 // Angle validation: absolute angles per tick without checks hand the client two things
-// server authority is supposed to hold. gun_shoot builds the direction as yaw + rec_y
-// and clamp(pitch + rec_p) — recoil is ADDED to the client angle, so a modified client
-// that subtracts the expected recoil has a laser.
+// server authority is supposed to hold. gun_shoot adds the weapon's physical
+// recoil+sway angles to the validated head angles. A modified client that subtracts
+// the expected motion therefore moves its head to compensate; it cannot recover a
+// hidden camera-axis laser because no such ballistic axis exists.
 #define NET_MAX_TURN_PER_TICK 0.6f   // rad/tick (~4100 deg/s): far above human,
                                      // below a spinbot's instant flip
 static void net_validate_angles(float *yaw, float *pitch, float prev_yaw) {

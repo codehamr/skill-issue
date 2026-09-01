@@ -8,10 +8,9 @@
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Weapon — the trigger, swap and reload path for BOTH weapons: fire mode is
-// structural (WPN_DEF.full_auto) and per-weapon feel is g_cfg.wp. Recoil is a
-// pitch/yaw offset that climbs per shot (deterministic pattern + small jitter), applied to
-// BOTH the view and the shot direction, so pulling down really compensates; it recovers
-// exponentially once the trigger is released.
+// structural (WPN_DEF.full_auto) and per-weapon feel is g_cfg.wp. Recoil, look lag,
+// breathing and stride are physical pitch/yaw state of the barrel. Camera, visible gun
+// and shot direction all consume that state; there is no random accuracy cone.
 // ---------------------------------------------------------------------------
 
 // THE keystone call: real entity id, per-human RNG stream, per-human
@@ -60,6 +59,10 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
     w->idx = 0;
   }
   int busy = w->reload_t > 0 || w->switch_t > 0;
+
+  // Step the physical hold before any bore consumer. The wall test, ADS denial and a
+  // same-tick shot must all see the weapon in the pose the hands reached this tick.
+  gun_sway_tick(w, p->vel, p->grounded, p->yaw, p->pitch);
 
   // A walled rifle cannot be shouldered onto the eye line: ADS intent is denied by
   // the same predicate that lowers the carriage and refuses the trigger, so all
@@ -122,7 +125,9 @@ static void vm_tick(player_t *p) {
   v->prev_slide_s = v->slide_s;
   v->prev_gunwall = v->gunwall;
 
-  // Look sway: the gun trails the view's angular velocity.
+  // Local pose follower retained for reload/slide composition and hand inertia. The
+  // fireable barrel's angular sway is authoritative weapon_t state (gun_sway_tick), so
+  // vm_stage_springs never uses this follower to invent another shootable axis.
   float dyaw = p->yaw - v->last_yaw, dpit = p->pitch - v->last_pitch;
   v->last_yaw = p->yaw; v->last_pitch = p->pitch;
   float damp = 1.0f - 0.88f * p->wp.ads_s;  // ADS pins the sight

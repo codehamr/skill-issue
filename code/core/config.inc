@@ -97,13 +97,31 @@ static const param_def_t WP_DEF[WP_COUNT] = {
   [WP_SWAY]       = {"sway",       "SWAY/BOB",   0,   0.0f,    3.0f,  0.1f},
 };
 
-// The AR is a controllable full-auto laser, the sniper a violent single shot.
+// The AR remains controllable, but a sustained burst has real angular momentum:
+// recovery cannot erase one impulse before the next arrives, movement and a loose hip
+// shoulder amplify it, and heat makes the later rounds progressively harder to hold.
+// The sniper is the violent single shot.
 static const float WP_DEFAULTS[WPN_COUNT][WP_COUNT] = {
-  [WPN_AR] = {750, 0.30f, 0.15f, 200, 1.10f, 0.30f, 0.06f, 180, 80, 1.00f, 0.6f},
+  [WPN_AR] = {750, 0.95f, 0.42f, 460, 1.45f, 0.48f, 0.15f, 180, 80, 1.00f, 0.7f},
   // ads_zoom 89 not 100: the scope's PiP pass owns the magnification; the base
   // FOV drop only sells the transition. rpm caps the semi-auto trigger interval
   // at 60 ms; it is not a fire rate (fire mode is structural, in WPN_DEF).
   [WPN_SR] = {1000, 1.80f, 0.20f, 400, 1.35f, 0.50f, 0.10f, 80, 89, 2.20f, 1.0f},
+};
+
+// Exact emitted signature of the pre-physical-bore AR defaults. Config loading uses
+// the whole row to distinguish an untouched install from a user-authored tune: one
+// changed field preserves the entire row.
+static const float WP_AR_DEFAULTS_PRE_PHYSICAL[WP_COUNT] = {
+  750, 0.30f, 0.15f, 200, 1.10f, 0.30f, 0.06f, 180, 80, 1.00f, 0.6f,
+};
+
+// The first physical-bore tune proved axis identity but not a useful full-auto wall
+// trace: its spring reached a sub-degree equilibrium by round four. Recognize that
+// exact emitted row as another untouched default so existing installs receive the
+// visible climb without overwriting any hand-tuned profile.
+static const float WP_AR_DEFAULTS_PRE_WALL_TRACE[WP_COUNT] = {
+  750, 0.52f, 0.28f, 260, 1.30f, 0.48f, 0.10f, 180, 80, 1.00f, 0.7f,
 };
 
 // Structural weapon identity — not sliders: these change WHAT the weapon is.

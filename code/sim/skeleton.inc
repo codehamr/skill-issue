@@ -35,6 +35,10 @@
 // 0.44, DOWN from 0.55.
 #define ANIM_HIP_CR   0.44f   // crouched
 #define ANIM_HIP_SL   0.19f   // sliding: the trail-leg HIP is the contact
+// Once the get-up has passed this blend, ordinary gait owns the contacts again. Waiting
+// for the slide pose to become numerically zero kept both feet body-relative for ~0.7 s:
+// a standing, accelerating figure visibly skated before its first running step.
+#define ANIM_SLIDE_GAIT_HANDOFF 0.25f
 // Arm segments, measured rather than eyeballed.
 #define ANIM_UARM     0.315f
 #define ANIM_FARM     0.265f
@@ -1466,7 +1470,7 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
         a->slide_knee_pole[i] = pole;
       }
     }
-  } else if (a->was_slide_pose && a->slide_knee_s > 0.001f) {
+  } else if (!a->was_slide && a->slide_knee_s > 0.001f) {
     // During get-up, walk each persistent bend plane toward the ordinary authored pole
     // around its actual hip-to-ankle axis. The shared bounded rotation has no singular
     // midpoint and preserves both bone lengths via IK.
@@ -2005,10 +2009,12 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   float ksl = ease_k(slide ? 11.0f : 3.8f);
   a->slide_lin += ((slide ? 1.0f : 0.0f) - a->slide_lin) * ksl;
   a->slide_s = smooth01(a->slide_lin);
-  // Ownership of the feet follows the POSE out of a slide, not the collider bit.
-  // Handing them to gait on the first non-slide tick starts a run cycle under a pelvis
-  // still 40-60 cm low, which is the photographed bow-legged exit.
-  int slide_pose = slide || a->slide_s > 0.015f;
+  // Ownership of the feet follows the get-up far enough to keep the deeply folded pose
+  // collision-safe, then hands off while the body is visibly rising. Waiting until the
+  // blend was almost zero left both ankles riding with the root for ~82 ticks — the
+  // reported post-slide skating. The persistent knee-pole follower below bridges the
+  // remaining pose blend while gait starts its explicit single swing.
+  int slide_pose = slide || a->slide_s > ANIM_SLIDE_GAIT_HANDOFF;
   int slide_pose_exit = !slide_pose && a->was_slide_pose;
   a->was_slide_pose = slide_pose;
   float ks = ease_k(11.0f);

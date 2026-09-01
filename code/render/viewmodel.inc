@@ -351,7 +351,7 @@ static vm_pose_t vm_stage_pose(const player_t *p, const vm_t *v, const weapon_t 
 }
 
 static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alpha,
-                                    v3 eye, v3 rgt, v3 upv, v3 fwd) {
+                                    v3 eye, v3 rgt, v3 upv, v3 fwd, v3 bore) {
   int cur = ps->cur, srcyc = ps->srcyc;
   const gun_pose_desc_t *erg = gun_pose_desc(cur);
   float sight_y = ps->sight_y, ads = ps->ads, dip = ps->dip;
@@ -443,10 +443,15 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
                  + 0.22f * gw);                                             // roll
   if (ps->bore_aligned) {
     // Preserve the authored roll/cant by projecting its right axis onto the plane
-    // normal to the authoritative bore. This is a pure twist: gz becomes exactly fwd.
-    gx = v3_sub(gx, v3_scale(fwd, v3_dot(gx, fwd)));
-    gx = v3_dot(gx, gx) > 1e-8f ? v3_norm(gx) : rgt;
-    gz = fwd;
+    // normal to the authoritative bore. This is a pure twist: translations and stock
+    // compression remain visible, while the mesh axis becomes exactly the gameplay
+    // axis supplied by weapon_t — not the camera's separate head line.
+    bore = v3_norm(bore);
+    gx = v3_sub(gx, v3_scale(bore, v3_dot(gx, bore)));
+    if (v3_dot(gx, gx) <= 1e-8f)
+      gx = v3_sub(rgt, v3_scale(bore, v3_dot(rgt, bore)));
+    gx = v3_norm(gx);
+    gz = bore;
     gy = v3_norm(v3_cross(gx, gz));
   }
   v3 org = v3_add(eye, v3_add(v3_scale(rgt, px),
@@ -467,10 +472,11 @@ static v3 vm_plan_muzzle(const vm_pose_t *ps, const vm_frame_t *fr) {
 
 static vm_build_plan_t vm_plan_make(const player_t *p, float alpha,
                                     v3 eye, v3 rgt, v3 upv, v3 fwd,
-                                    float ready) {
+                                    v3 bore, float ready) {
   vm_build_plan_t plan;
   plan.pose = vm_stage_pose(p, &p->vm, &p->wp, alpha, ready);
-  plan.frame = vm_stage_springs(&plan.pose, &p->vm, alpha, eye, rgt, upv, fwd);
+  plan.frame = vm_stage_springs(&plan.pose, &p->vm, alpha, eye, rgt, upv, fwd,
+                                bore);
   plan.muzzle = vm_plan_muzzle(&plan.pose, &plan.frame);
   return plan;
 }
@@ -773,7 +779,7 @@ static void vm_build_prepared(v3 eye, v3 rgt, v3 upv, v3 fwd,
 #ifndef _WIN32
 static void vm_build(const player_t *p, float alpha, v3 eye, v3 rgt, v3 upv, v3 fwd,
                      float ready) {
-  vm_build_plan_t plan = vm_plan_make(p, alpha, eye, rgt, upv, fwd, ready);
+  vm_build_plan_t plan = vm_plan_make(p, alpha, eye, rgt, upv, fwd, fwd, ready);
   vm_build_prepared(eye, rgt, upv, fwd, &plan);
 }
 #endif

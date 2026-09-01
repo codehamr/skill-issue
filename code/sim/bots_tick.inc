@@ -44,8 +44,8 @@ static void bot_arm_engage(bot_t *b, const bot_skill_t *sk, float tdist,
     // away, and a bot that is pinpoint at 30 m does not read as a person.
     float rng_k = 1.0f + f_clamp(tdist * 0.020f, 0.0f, 0.55f);
     // Fight the recoil, as far as this skill can.
-    float cy = b->wp.rec_y * sk->rec_comp * DEG2RAD;
-    float cp = b->wp.rec_p * sk->rec_comp * DEG2RAD;
+    float cy = (b->wp.rec_y + b->wp.sway_y) * sk->rec_comp * DEG2RAD;
+    float cp = (b->wp.rec_p + b->wp.sway_p) * sk->rec_comp * DEG2RAD;
     want_yaw = atan2f(dx, -dz) + (b->off_y * rng_k + b->fl_y) * DEG2RAD - cy;
     want_pitch = f_clamp(atan2f(dy, hl) + (b->off_p * rng_k + b->fl_p) * DEG2RAD - cp,
                          -1.2f, 1.2f);
@@ -649,6 +649,10 @@ static void bot_tick(int bi) {
   // the half of "stuck at the corner in a loop" that the escape exists to bound.
   if (wx * wx + wz * wz > 0.01f && hs < 0.3f) b->pin++;
   else b->pin = 0;
+
+  // This is the bot's one physical-hold step, after movement and aim have reached their
+  // tick values and before wall/trigger consumers read the barrel.
+  gun_sway_tick(&b->wp, b->vel, b->grounded, b->yaw, b->pitch);
   if (!engaging && b->tgt >= 0 && b->belief != BOT_BELIEF_VISIBLE &&
       b->stuck > 30) {
     bot_search_plan_next(b, sk);

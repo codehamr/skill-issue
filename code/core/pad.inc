@@ -726,6 +726,21 @@ static void config_load_or_create(const char *path, config_t *c) {
   }
   fclose(f);
 
+  // An existing untouched config otherwise pins the old full-auto-laser profile
+  // forever: defaults only fill missing keys. Migrate the exact complete legacy row,
+  // never a partially matching row, so one deliberate user tune protects all of it.
+  int legacy_ar = 1, flat_trace_ar = 1;
+  for (int i = 0; i < WP_COUNT; i++) {
+    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_PHYSICAL[i]) > 0.0001f)
+      legacy_ar = 0;
+    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_WALL_TRACE[i]) > 0.0001f)
+      flat_trace_ar = 0;
+  }
+  if (legacy_ar || flat_trace_ar) {
+    memcpy(c->wp[WPN_AR], WP_DEFAULTS[WPN_AR], sizeof c->wp[WPN_AR]);
+    fprintf(stderr, "config: migrated untouched AR profile to wall-trace defaults\n");
+  }
+
   config_bind_migrate(c, 0);
   config_bind_migrate(c, 1);
 }
@@ -751,4 +766,3 @@ static void exe_dir(char *out, size_t n) {
   if (slash) slash[1] = '\0';
 #endif
 }
-

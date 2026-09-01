@@ -9345,7 +9345,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
                                    tmp.grounded, tmp.sliding);
         float render_ready = vm_render_ready(&tmp, &a, 1.0f);
         vm_build_plan_t plan = vm_plan_make(&tmp, 1.0f, eye, rgt, upv, fwd,
-                                            render_ready);
+                                            fwd, render_ready);
         int stage_fail = 0;
         if (cs->stage == VMTRIG_STAGE_SWAP)
           stage_fail |= idle_ok != GUN_POSE_BLOCKED ||

@@ -752,7 +752,7 @@ static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir)
     v3 upv = v3_norm(v3_cross(rgt, fwd));
     vm_pose_t vp = vm_stage_pose(p, &p->vm, &p->wp, 1.0f, 1.0f);
     vm_frame_t vf = vm_stage_springs(&vp, &p->vm, 1.0f,
-                                      (v3){{0, 0, 0}}, rgt, upv, fwd);
+                                      (v3){{0, 0, 0}}, rgt, upv, fwd, fwd);
     anim_t body = g_player_anim[0];
     skel_solve(&body, p->pos, by, bp, p->wp.cur,
                GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
@@ -922,6 +922,174 @@ static void recoil_print_samples(const recoil_trace_t *tr, const recoil_metric_t
          (double)(s->side * 1000.0f), (double)s->muzzle_deg, (double)s->punch);
 }
 
+typedef struct {
+  int shots;
+  float sway_peak, bore_peak, shot_span;
+  float vm_err, body_err, anchor_err, bore_err, head_err;
+} recoil_auto_t;
+
+#define RECOIL_WALL_SHOTS 20
+
+typedef struct {
+  int shots, early_rises, tail_turns;
+  float x[RECOIL_WALL_SHOTS], y[RECOIL_WALL_SHOTS];
+  float rise_five, rise_peak, horizontal_span, tail_vertical_span;
+} recoil_wall_t;
+
+static float recoil_dir_angle(v3 a, v3 b) {
+  a = v3_norm(a);
+  b = v3_norm(b);
+  return atan2f(v3_len(v3_cross(a, b)), v3_dot(a, b)) / DEG2RAD;
+}
+
+// A held-trigger production loop, including the physical hand follower and both
+// render rigs. Every EV_FIRE is compared against the viewmodel barrel, the current
+// third-person barrel, the immutable fire anchor and the camera's published optical
+// axis. The full-ADS head line must become coaxial as well; hipfire intentionally
+// leaves some arm motion below the eye so the rifle can move without welding the
+// player's head to it.
+static recoil_auto_t recoil_auto_run(int ads) {
+  recoil_auto_t out = {0};
+  int home_save = g_home;
+  int third_save = g_cfg.third_person;
+  int vmorb_save = g_vmorb.on;
+  g_home = 0;
+  g_cfg.third_person = 0;
+  g_vmorb.on = 0;
+
+  recoil_stage(1, WPN_AR, ads);
+  player_t *p = &g_players[0];
+  p->grounded = p->prev_grounded = 1;
+  p->vel = (v3){{g_sim_mv[MV_RUN], 0.0f, 0.0f}};
+  v3 first_dir = {{0, 0, 0}};
+  int have_first = 0;
+
+  // Thirty-six settling ticks establish real stride/breath sway. The first eight also
+  // turn the head, so the hand-lag term is covered independently of recoil.
+  for (int t = -36; t < 120; t++) {
+    int held[IN_COUNT] = {0};
+    held[IN_ADS] = ads;
+    held[IN_FIRE] = t >= 0;
+    if (t >= -36 && t < -28) p->yaw += 0.010f;
+    int ev0 = g_num_events;
+    weapon_tick(p, 0, held);
+    vm_tick(p);
+    for (int i = 0; i < IN_COUNT; i++) p->prev_held[i] = held[i];
+    recoil_present_body(p);
+
+    float bore = gun_spread(&p->wp, p->vel, p->grounded);
+    if (t < 0) out.sway_peak = fmaxf(out.sway_peak, bore);
+    else out.bore_peak = fmaxf(out.bore_peak, bore);
+
+    for (int i = ev0; i < g_num_events; i++) {
+      const event_t *e = &g_events[i];
+      if (e->type != EV_FIRE || e->src != 0) continue;
+      v3 shot = v3_norm(e->b);
+      if (!have_first) { first_dir = shot; have_first = 1; }
+      out.shot_span = fmaxf(out.shot_span,
+                            recoil_dir_angle(first_dir, shot));
+
+      frame_cam_t c = rf_camera(p, 1.0f, NULL);
+      rf_vm_frame_t vmf = rf_vm_prepare(p, 1.0f, &c);
+      v3 head_fwd, head_rgt, head_up;
+      cam_basis(c.yaw, c.pitch, c.roll, &head_fwd, &head_rgt, &head_up);
+      (void)head_rgt;
+      (void)head_up;
+      out.vm_err = fmaxf(out.vm_err,
+                         recoil_dir_angle(shot, vmf.plan.frame.gz));
+      out.body_err = fmaxf(out.body_err,
+                           recoil_dir_angle(shot, g_player_anim[0].pose.gun_f));
+      out.anchor_err = fmaxf(out.anchor_err,
+                             recoil_dir_angle(shot, g_fire_anchor_pose.gun_f));
+      out.bore_err = fmaxf(out.bore_err, recoil_dir_angle(shot, c.bore));
+      out.head_err = fmaxf(out.head_err, recoil_dir_angle(shot, head_fwd));
+      out.shots++;
+    }
+    g_tick++;
+  }
+
+  g_home = home_save;
+  g_cfg.third_person = third_save;
+  g_vmorb.on = vmorb_save;
+  return out;
+}
+
+// A full-auto burst against a virtual plane 18 m in front of the real staged muzzle.
+// Unlike an angular peak, this answers the player's complaint directly: where would
+// each production EV_FIRE punch the same wall? The anchor's moving muzzle participates
+// as it does in play; only the wall is virtual so the proof is independent of map seed.
+static recoil_wall_t recoil_wall_run(int ads) {
+  recoil_wall_t out = {0};
+  recoil_stage(1, WPN_AR, ads);
+  player_t *p = &g_players[0];
+  p->grounded = p->prev_grounded = 1;
+  p->vel = (v3){{0.0f, 0.0f, 0.0f}};
+  float wall_z = 0.0f, first_x = 0.0f, first_y = 0.0f;
+
+  for (int t = -36; t < 240 && out.shots < RECOIL_WALL_SHOTS; t++) {
+    int held[IN_COUNT] = {0};
+    held[IN_ADS] = ads;
+    held[IN_FIRE] = t >= 0;
+    int ev0 = g_num_events;
+    weapon_tick(p, 0, held);
+    vm_tick(p);
+    for (int i = 0; i < IN_COUNT; i++) p->prev_held[i] = held[i];
+    recoil_present_body(p);
+
+    for (int i = ev0; i < g_num_events && out.shots < RECOIL_WALL_SHOTS; i++) {
+      const event_t *e = &g_events[i];
+      if (e->type != EV_FIRE || e->src != 0) continue;
+      v3 muzzle = pose_muzzle(&g_fire_anchor_pose, WPN_AR);
+      v3 dir = v3_norm(e->b);
+      if (out.shots == 0) wall_z = muzzle.z - 18.0f;
+      float ft = (wall_z - muzzle.z) / dir.z;
+      float wx = muzzle.x + dir.x * ft;
+      float wy = muzzle.y + dir.y * ft;
+      if (out.shots == 0) { first_x = wx; first_y = wy; }
+      int si = out.shots++;
+      out.x[si] = wx - first_x;
+      out.y[si] = wy - first_y;
+      if (si > 0 && si <= 5 && out.y[si] > out.y[si - 1] + 0.035f)
+        out.early_rises++;
+    }
+    g_tick++;
+  }
+
+  if (out.shots > 5) out.rise_five = out.y[5];
+  float xmin = 0.0f, xmax = 0.0f;
+  float tail_min = 1e9f, tail_max = -1e9f;
+  int tail_sign = 0;
+  for (int i = 0; i < out.shots; i++) {
+    out.rise_peak = fmaxf(out.rise_peak, out.y[i]);
+    xmin = fminf(xmin, out.x[i]);
+    xmax = fmaxf(xmax, out.x[i]);
+    if (i >= 7) {
+      tail_min = fminf(tail_min, out.y[i]);
+      tail_max = fmaxf(tail_max, out.y[i]);
+    }
+    if (i >= 8) {
+      float dy = out.y[i] - out.y[i - 1];
+      int sign = dy > 0.015f ? 1 : dy < -0.015f ? -1 : 0;
+      if (sign && tail_sign && sign != tail_sign) out.tail_turns++;
+      if (sign) tail_sign = sign;
+    }
+  }
+  out.horizontal_span = xmax - xmin;
+  if (out.shots > 7) out.tail_vertical_span = tail_max - tail_min;
+  return out;
+}
+
+static void recoil_wall_print(const char *name, const recoil_wall_t *w) {
+  printf("recoil wall %s", name);
+  for (int i = 0; i < w->shots; i++)
+    printf(" %d:%+.2f/%+.2fm", i, (double)w->x[i], (double)w->y[i]);
+  printf(" | rise5=%.2fm peak=%.2fm lateral=%.2fm "
+         "tail_band=%.2fm turns=%d early=%d/%d\n",
+         (double)w->rise_five, (double)w->rise_peak,
+         (double)w->horizontal_span, (double)w->tail_vertical_span,
+         w->tail_turns, w->early_rises, 5);
+}
+
 static void recoil_proof(void) {
   recoil_save_globals();
   int ok = 1;
@@ -955,7 +1123,10 @@ static void recoil_proof(void) {
                   m.side <= (wi == WPN_SR ? 0.0041f : 0.0031f) &&
                   m.bore_error < 0.001f &&
                   m.muzzle > (wi == WPN_SR ? 0.8f : 0.12f) &&
-                  m.muzzle < (wi == WPN_SR ? 12.5f : 2.0f);
+                  // The AR wall-trace tune intentionally reaches 4--6 degrees in
+                  // the airborne three-round fixture; the old 2-degree ceiling was
+                  // the same flat equilibrium that let the wall regression pass.
+                  m.muzzle < (wi == WPN_SR ? 12.5f : 6.5f);
       if (!burst) {
         static const float BACK_LO[WPN_COUNT][2] = {
           [WPN_AR] = {0.009f, 0.007f}, [WPN_SR] = {0.018f, 0.010f},
@@ -990,6 +1161,65 @@ static void recoil_proof(void) {
       ok &= case_ok;
     }
   }
+  recoil_auto_t hip = recoil_auto_run(0);
+  recoil_auto_t hip_again = recoil_auto_run(0);
+  recoil_auto_t ads = recoil_auto_run(1);
+  recoil_auto_t ads_again = recoil_auto_run(1);
+  int auto_deterministic = !memcmp(&hip, &hip_again, sizeof hip) &&
+                           !memcmp(&ads, &ads_again, sizeof ads);
+  int auto_axes = hip.vm_err < 0.001f && hip.body_err < 0.001f &&
+                  hip.anchor_err < 0.001f && hip.bore_err < 0.001f &&
+                  ads.vm_err < 0.001f && ads.body_err < 0.001f &&
+                  ads.anchor_err < 0.001f && ads.bore_err < 0.001f &&
+                  ads.head_err < 0.001f;
+  int auto_shape = hip.shots >= 10 && ads.shots == hip.shots &&
+                   hip.sway_peak > 0.05f && ads.sway_peak > 0.01f &&
+                   ads.sway_peak < hip.sway_peak * 0.35f &&
+                   hip.bore_peak > 0.80f && ads.bore_peak > 0.50f &&
+                   hip.shot_span > 0.35f && ads.shot_span > 0.20f &&
+                   hip.head_err > 0.10f;
+  int auto_ok = auto_deterministic && auto_axes && auto_shape;
+  printf("recoil auto hip shots=%d sway=%.3fdeg bore=%.3fdeg span=%.3fdeg "
+         "axis(vm/body/anchor/bore/head)=%.4f/%.4f/%.4f/%.4f/%.4fdeg\n",
+         hip.shots, (double)hip.sway_peak, (double)hip.bore_peak,
+         (double)hip.shot_span, (double)hip.vm_err, (double)hip.body_err,
+         (double)hip.anchor_err, (double)hip.bore_err, (double)hip.head_err);
+  printf("recoil auto ads shots=%d sway=%.3fdeg bore=%.3fdeg span=%.3fdeg "
+         "axis(vm/body/anchor/bore/head)=%.4f/%.4f/%.4f/%.4f/%.4fdeg "
+         "deterministic=%d %s\n",
+         ads.shots, (double)ads.sway_peak, (double)ads.bore_peak,
+         (double)ads.shot_span, (double)ads.vm_err, (double)ads.body_err,
+         (double)ads.anchor_err, (double)ads.bore_err, (double)ads.head_err,
+         auto_deterministic, auto_ok ? "ok" : "FAIL");
+  ok &= auto_ok;
+  recoil_wall_t wall_hip = recoil_wall_run(0);
+  recoil_wall_t wall_hip_again = recoil_wall_run(0);
+  recoil_wall_t wall_ads = recoil_wall_run(1);
+  recoil_wall_t wall_ads_again = recoil_wall_run(1);
+  recoil_wall_print("hip", &wall_hip);
+  recoil_wall_print("ads", &wall_ads);
+  int wall_deterministic = !memcmp(&wall_hip, &wall_hip_again, sizeof wall_hip) &&
+                           !memcmp(&wall_ads, &wall_ads_again, sizeof wall_ads);
+  int wall_shape = wall_hip.shots == RECOIL_WALL_SHOTS &&
+                   wall_ads.shots == RECOIL_WALL_SHOTS &&
+                   wall_hip.early_rises >= 4 && wall_ads.early_rises >= 4 &&
+                   wall_hip.rise_five > 0.90f && wall_ads.rise_five > 0.58f &&
+                   wall_hip.rise_peak > 1.05f && wall_ads.rise_peak > 0.68f &&
+                   wall_hip.rise_peak > wall_ads.rise_peak * 1.25f &&
+                   wall_hip.horizontal_span > 0.28f &&
+                   wall_ads.horizontal_span > 0.18f &&
+                   wall_hip.horizontal_span < 1.20f &&
+                   wall_ads.horizontal_span < 0.85f &&
+                   // No hard-looking cap: after the initial climb, the loaded
+                   // shoulder must reverse through a bounded vertical band.
+                   wall_hip.tail_vertical_span > 0.12f &&
+                   wall_ads.tail_vertical_span > 0.065f &&
+                   wall_hip.tail_vertical_span < 0.38f &&
+                   wall_ads.tail_vertical_span < 0.24f &&
+                   wall_hip.tail_turns >= 2 && wall_ads.tail_turns >= 2;
+  printf("recoil wall deterministic=%d shape=%d %s\n", wall_deterministic,
+         wall_shape, wall_deterministic && wall_shape ? "ok" : "FAIL");
+  ok &= wall_deterministic && wall_shape;
   recoil_restore_globals();
   printf("recoil %s\n", ok ? "ok" : "FAIL");
   if (!ok) exit(1);
@@ -1132,7 +1362,7 @@ static vmframe_diag_t vmframe_emit_basis(float ready, v3 eye,
 
 static vmframe_diag_t vmframe_build_basis(const player_t *p, float alpha, float ready,
                                           v3 eye, v3 rgt, v3 upv, v3 fwd) {
-  vm_build_plan_t plan = vm_plan_make(p, alpha, eye, rgt, upv, fwd, ready);
+  vm_build_plan_t plan = vm_plan_make(p, alpha, eye, rgt, upv, fwd, fwd, ready);
   return vmframe_emit_basis(ready, eye, rgt, upv, fwd, &plan);
 }
 

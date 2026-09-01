@@ -89,6 +89,9 @@ static float ease_k(float rate) { return 1.0f - expf(-rate * TICK_DT); }
 #define GUN_HEAT_CAP     0.6f    // later recoil impulses top out at +60%
 #define GUN_AIR_KICK     1.65f   // an airborne body cannot brace the stock
 #define GUN_REC_CAP      12.0f   // deg: recoil climb hard cap
+#define GUN_GRIP_LOAD_HEAT 0.22f // heat where the shoulder control loop is fully loaded
+#define GUN_GRIP_P_HIP    0.48f  // deg: loose-shoulder correction amplitude
+#define GUN_GRIP_P_ADS    0.27f  // deg: cheek weld braces, but cannot freeze, the rifle
 #define GUN_PUNCH_SHOT   0.4f    // deg of visual punch per shot (x VIEW PUNCH)
 // THE PUNCH IS A SPRING AND THE AUTHORED NUMBER IS ITS PEAK. These constants were
 // solved on the DISCRETE recurrence, not the continuous one, and that is not academic:
@@ -130,6 +133,14 @@ typedef struct {
   // camera, rendered weapon and hitscan all consume the same two angles.
   float rec_p, rec_y, prev_rec_p, prev_rec_y;
   float rec_p_v, rec_y_v;
+  // The other half of the physical barrel: the hands trail a look change and carry
+  // breathing/stride motion. Degrees, like recoil. This belongs to weapon_t rather
+  // than the local-only vm_t because the server must trace the same moving barrel the
+  // shooter sees, and prediction must restore it across rollback.
+  float sway_p, sway_y, prev_sway_p, prev_sway_y;
+  float sway_phase, sway_clock;
+  float sway_last_yaw, sway_last_pitch;
+  unsigned char sway_primed;
   float heat;            // later impulse multiplier, decays between bursts
   // THE DRY CLICK IS LATCHED, NOT EDGE-GATED. It used to be pushed only on a press
   // edge, so on a FULL-AUTO weapon — where prev_held is 1 on every tick of the burst —

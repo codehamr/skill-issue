@@ -258,12 +258,14 @@ static void ent_damage(int ent, int dmg, int part, int src, v3 from, v3 at) {
   }
 }
 
-// The crosshair reports the actual angular distance between the calm aim and the
+// The crosshair reports the actual angular distance between the calm head line and the
 // physical barrel. There is no hidden cone: this value is diagnostic, not sampled.
 static float gun_spread(const weapon_t *w, v3 vel, int grounded) {
   (void)vel;
   (void)grounded;
-  return sqrtf(w->rec_p * w->rec_p + w->rec_y * w->rec_y);
+  float p = w->rec_p + w->sway_p;
+  float y = w->rec_y + w->sway_y;
+  return sqrtf(p * p + y * y);
 }
 
 static float weapon_spread(const player_t *p) {
@@ -292,10 +294,89 @@ static void gun_recoil_step(weapon_t *w) {
   if (w->rec_y < -GUN_REC_CAP) { w->rec_y = -GUN_REC_CAP; if (w->rec_y_v < 0) w->rec_y_v = 0; }
 }
 
+// The hands are an angular mass too. Look-rate lag, breathing and the alternating
+// stride all become one deterministic barrel target; a short follower gives that target
+// weight without introducing a random accuracy cone. A sustained recoil load excites
+// two incommensurate shoulder-control modes: the shooter corrects the rising rifle, but
+// human support cannot hold a mathematically exact spring equilibrium. ADS braces their
+// amplitude rather than deleting them. This is gameplay state: every caller steps it
+// once before asking the wall gate or trigger where the bore is.
+static void gun_sway_tick(weapon_t *w, v3 vel, int grounded,
+                          float yaw, float pitch) {
+  w->prev_sway_p = w->sway_p;
+  w->prev_sway_y = w->sway_y;
+  if (!w->sway_primed) {
+    w->sway_last_yaw = yaw;
+    w->sway_last_pitch = pitch;
+    w->sway_primed = 1;
+  }
+  float dyaw = wrap_pi(yaw - w->sway_last_yaw);
+  float dpitch = pitch - w->sway_last_pitch;
+  w->sway_last_yaw = yaw;
+  w->sway_last_pitch = pitch;
+
+  float hs = sqrtf(vel.x * vel.x + vel.z * vel.z);
+  float run = f_clamp(hs / fmaxf(g_sim_mv[MV_RUN], 0.1f), 0.0f, 1.35f);
+  float move = grounded ? f_clamp(run, 0.0f, 1.0f) : 0.35f;
+  if (move > 0.02f)
+    w->sway_phase += F_TAU * (1.55f + 0.75f * f_clamp(run, 0.0f, 1.0f)) * TICK_DT;
+  w->sway_clock += TICK_DT;
+  if (w->sway_phase >= F_TAU) w->sway_phase -= F_TAU;
+  // Both breathing frequencies complete an integer number of cycles in 100 s
+  // (30 and 47), so this wrap is phase-continuous and keeps long-session sinf input
+  // precise without another pair of clocks.
+  if (w->sway_clock >= 100.0f) w->sway_clock -= 100.0f;
+
+  float sc = g_sim_wp[w->cur][WP_SWAY];
+  float brace = 1.0f - 0.78f * w->ads_s;
+  float look_p = f_clamp(-dpitch / TICK_DT * 0.011f, -0.040f, 0.040f) /
+                 DEG2RAD;
+  float look_y = f_clamp(-dyaw / TICK_DT * 0.014f, -0.050f, 0.050f) /
+                 DEG2RAD;
+  float stride_p = cosf(w->sway_phase * 2.0f) * 0.18f * move;
+  float stride_y = sinf(w->sway_phase) * 0.26f * move;
+  float breath_p = (sinf(w->sway_clock * F_TAU * 0.30f) * 0.70f +
+                    sinf(w->sway_clock * F_TAU * 0.47f) * 0.30f) * 0.11f;
+  float breath_y = sinf(w->sway_clock * F_TAU * 0.30f) * 0.07f;
+  float load = smooth01(f_clamp(w->heat / GUN_GRIP_LOAD_HEAT, 0.0f, 1.0f));
+  float grip_wave = (sinf(w->sway_clock * F_TAU * 1.83f) +
+                     0.48f * sinf(w->sway_clock * F_TAU * 3.17f + 1.10f)) /
+                    1.48f;
+  float grip_amp = GUN_GRIP_P_HIP +
+                   (GUN_GRIP_P_ADS - GUN_GRIP_P_HIP) * w->ads_s;
+  float target_p = (look_p + stride_p + breath_p) * sc * brace +
+                   grip_wave * grip_amp * load;
+  float target_y = (look_y + stride_y + breath_y) * sc * brace;
+  float k = ease_k(13.0f);
+  w->sway_p += (f_clamp(target_p, -3.0f, 3.0f) - w->sway_p) * k;
+  w->sway_y += (f_clamp(target_y, -3.0f, 3.0f) - w->sway_y) * k;
+}
+
 static void gun_bore_angles(const weapon_t *w, float yaw, float pitch,
                             float *bore_yaw, float *bore_pitch) {
-  *bore_yaw = yaw + w->rec_y * DEG2RAD;
-  *bore_pitch = f_clamp(pitch + w->rec_p * DEG2RAD, -PITCH_MAX, PITCH_MAX);
+  *bore_yaw = yaw + (w->rec_y + w->sway_y) * DEG2RAD;
+  *bore_pitch = f_clamp(pitch + (w->rec_p + w->sway_p) * DEG2RAD,
+                        -PITCH_MAX, PITCH_MAX);
+}
+
+// Render interpolation reads the same physical state, never a renderer-side imitation.
+static void gun_bore_angles_lerp(const weapon_t *w, float yaw, float pitch,
+                                 float alpha, float *bore_yaw,
+                                 float *bore_pitch) {
+  float rp = w->prev_rec_p + (w->rec_p - w->prev_rec_p) * alpha;
+  float ry = w->prev_rec_y + (w->rec_y - w->prev_rec_y) * alpha;
+  float sp = w->prev_sway_p + (w->sway_p - w->prev_sway_p) * alpha;
+  float sy = w->prev_sway_y + (w->sway_y - w->prev_sway_y) * alpha;
+  *bore_yaw = yaw + (ry + sy) * DEG2RAD;
+  *bore_pitch = f_clamp(pitch + (rp + sp) * DEG2RAD,
+                        -PITCH_MAX, PITCH_MAX);
+}
+
+static v3 gun_bore_dir_lerp(const weapon_t *w, float yaw, float pitch,
+                            float alpha) {
+  float by, bp;
+  gun_bore_angles_lerp(w, yaw, pitch, alpha, &by, &bp);
+  return (v3){{cosf(bp) * sinf(by), sinf(bp), -cosf(bp) * cosf(by)}};
 }
 
 // THE WALL GATE'S ONE PREDICATE: within the muzzle's own reach along the bore, does
@@ -785,10 +866,15 @@ static void ent_on_event(const event_t *e) {
     // the three velocity springs above.
     a->fire_k = 1.0f;
     // A locally simulated shot already staged the exact barrel before tracing. A
-    // received remote event carries the authoritative ballistic muzzle in a/b/f; its
-    // current interpolated pose is only the flash model and must not feed the final
-    // bore through carry rotation a second time.
+    // received remote event carries the authoritative ballistic direction in b. Re-pose
+    // the visible rifle onto that axis at T+0: snapshot-rate reconstruction of a foreign
+    // sway follower may be a few milliradians away, but the shot and the photographed
+    // barrel are not allowed to disagree.
     if (g_fire_anchor_src != e->src || g_fire_anchor_tick != g_tick) {
+      float by = atan2f(e->b.x, -e->b.z);
+      float bp = asinf(f_clamp(e->b.y, -1.0f, 1.0f));
+      skel_solve(a, ent_pos(e->src), by, bp, e->wpn,
+                 GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
       g_fire_anchor_pose = a->pose;
       g_fire_anchor_src = e->src;
       g_fire_anchor_tick = g_tick;
@@ -925,6 +1011,7 @@ static void bot_puppet_tick(bot_t *b, int bi) {
            b->crouch ? HEIGHT_CROUCH : HEIGHT_STAND);
   arena_clamp(&b->pos);
   b->wp.ready_want = (unsigned char)(b->pup_ready ? 1 : 0);
+  gun_sway_tick(&b->wp, b->vel, b->grounded, b->yaw, b->pitch);
   int idle_ok = gun_pose_state(&b->wp, &b->anim, b->vel,
                                  b->grounded, b->sliding);
   weapon_anim_tick(&b->anim, b->pos,

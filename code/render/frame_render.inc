@@ -15,8 +15,8 @@
 // passes must consume one exact T0/T1 plan; it does not belong in this general camera
 // value.
 typedef struct {
-  v3 eye, feet;
-  float yaw, pitch, roll, fovy, aspect, ads, tp_dist;
+  v3 eye, feet, bore;
+  float yaw, pitch, bore_yaw, bore_pitch, roll, fovy, aspect, ads, tp_dist;
   int cam_free, third;
   mat4 vp;
 } frame_cam_t;
@@ -31,14 +31,19 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
   float leanv = p->prev_lean + (p->lean - p->prev_lean) * alpha;
   eye = v3_add(eye, lean_offset(p->yaw, leanv));
   eye.y -= lean_eye_drop(leanv);
-  // The physical barrel spring moves the rendered view. Pitch punch used to add a
-  // second, cosmetic direction that neither hitscan nor the visible bore shared.
+  // The head and rifle are coupled, not welded. Hipfire lets the arms absorb most of
+  // the physical barrel motion relative to the eye; ADS progressively brings the cheek
+  // onto the stock until the camera, sight line and bore are exactly coaxial. Both
+  // angles still come from the one weapon_t state used by hitscan.
   const weapon_t *w = &p->wp;
-  float rec_p = w->prev_rec_p + (w->rec_p - w->prev_rec_p) * alpha;
-  float rec_y = w->prev_rec_y + (w->rec_y - w->prev_rec_y) * alpha;
   float ads = w->prev_ads_s + (w->ads_s - w->prev_ads_s) * alpha;
-  float yaw = p->yaw + rec_y * DEG2RAD;
-  float pitch = f_clamp(p->pitch + rec_p * DEG2RAD, -PITCH_MAX, PITCH_MAX);
+  float bore_yaw, bore_pitch;
+  gun_bore_angles_lerp(w, p->yaw, p->pitch, alpha, &bore_yaw, &bore_pitch);
+  float follow = 0.30f + 0.70f * ads;
+  float yaw = p->yaw + wrap_pi(bore_yaw - p->yaw) * follow;
+  float pitch = f_clamp(p->pitch + (bore_pitch - p->pitch) * follow,
+                        -PITCH_MAX, PITCH_MAX);
+  v3 bore = gun_bore_dir_lerp(w, p->yaw, p->pitch, alpha);
   // The boot screen owns the camera while it is up.
   cam_override_t home_ov;
   if (home_camera(&home_ov, p, alpha,
@@ -87,6 +92,9 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
   } else if (ov && ov->active) {
     eye = ov->eye; yaw = ov->yaw; pitch = ov->pitch;
   }
+  if (cam_free)
+    bore = (v3){{cosf(pitch) * sinf(yaw), sinf(pitch),
+                 -cosf(pitch) * cosf(yaw)}};
 
   float aspect = (float)R.width / (float)R.height;
   // Slide FOV kick, interpolated like the camera for smooth surges; ADS
@@ -100,7 +108,10 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
   mat4 vp = m4_mul(m4_perspective(fovy, aspect, ZNEAR, ZFAR),
                    m4_look(eye, yaw, pitch, roll));
 
-  return (frame_cam_t){.eye = eye, .feet = feet, .yaw = yaw, .pitch = pitch,
+  return (frame_cam_t){.eye = eye, .feet = feet, .bore = bore,
+                        .yaw = yaw, .pitch = pitch,
+                        .bore_yaw = cam_free ? yaw : bore_yaw,
+                        .bore_pitch = cam_free ? pitch : bore_pitch,
                         .roll = roll, .fovy = fovy, .aspect = aspect,
                         .ads = ads, .tp_dist = tp_dist,
                         .cam_free = cam_free, .third = third, .vp = vp};
@@ -193,7 +204,7 @@ typedef struct { float scope; mat4 svp; int scope_on; } scope_result_t;
 
 static scope_result_t rf_scope_pass(const player_t *p, const frame_cam_t *c) {
   v3 eye = c->eye;
-  float yaw = c->yaw, pitch = c->pitch, roll = c->roll, ads = c->ads;
+  float yaw = c->bore_yaw, pitch = c->bore_pitch, roll = c->roll, ads = c->ads;
   int cam_free = c->cam_free, third = c->third;
   mat4 vp = c->vp;
 
@@ -269,7 +280,9 @@ static rf_vm_frame_t rf_vm_prepare(const player_t *p, float alpha,
   int lh = human_of_ent(g_local_ent);
   const anim_t *a = lh >= 0 && lh < MAX_HUMANS ? &g_player_anim[lh] : NULL;
   float ready = vm_render_ready(p, a, alpha);
-  out.plan = vm_plan_make(p, alpha, c->eye, out.rgt, out.upv, out.fwd, ready);
+  v3 bore = g_vmorb.on ? out.fwd : c->bore;
+  out.plan = vm_plan_make(p, alpha, c->eye, out.rgt, out.upv, out.fwd,
+                          bore, ready);
 
   // Only the ordinary live first-person camera may publish.  Orbit/probe poses still
   // build through the plan above, but can never donate their muzzle to a later tracer.
@@ -484,21 +497,16 @@ static void rf_vm_pass(const player_t *p, const frame_cam_t *c,
       // The same star the world pass gives every other shooter, on the drawn barrel tip
       // in the viewmodel's own projection.
       //
-      // AND THE RED DOT IS NOT IN HERE. It was, for one iteration: an emissive quad on
-      // the aperture plane, which is where a real reflex sight's dot physically is. It
-      // was a SECOND dot. The HUD has drawn the point-of-aim dot at screen centre since
-      // long before this pass (`dot_a`, in the HUD block below), and the two agree only
-      // while the weapon is still — the viewmodel sways cosmetically and the SHOT does
-      // not, because gun_shoot fires along the camera axis. So a dot anchored to the
-      // drawn sight separates from the point of aim exactly when the player is moving,
-      // which is a mark that lies about where the round goes. The honest one is the one
-      // that was already there.
+      // The reflex dot remains HUD-drawn to avoid a duplicate emissive mark. Its full-ADS
+      // centre is honest because the cheek-weld camera follows the physical bore at
+      // ads=1; before that point the fading housing itself shows the remaining parallax.
       scene_reset();
       float mf01 = mfresh ? 1.0f : (float)g_muzzle_t / (float)FLASH_TICKS;
       g_muzzle_fresh = 0;
       float fs = 1.0f - 0.55f * ads;
       float ws = p->wp.cur == WPN_SR ? 0.155f : 0.115f;
-      fx_flash(g_vm_muzzle, fwd, rgt, upv, eye,
+      fx_flash(g_vm_muzzle, vmf->plan.frame.gz, vmf->plan.frame.gx,
+               vmf->plan.frame.gy, eye,
                ws * fs * (0.55f + 0.45f * mf01), mf01,
                (uint32_t)p->wp.idx * 61u + 17u, p->wp.cur);
       fx_pass_begin();

@@ -791,6 +791,7 @@ static void net_cl_present_advance(void) {
     gun_ads(&p->wp, p->wp.ads_want);   // idempotent on the intent it re-publishes
     gun_reload_tick(&p->wp);
     gun_recoil_step(&p->wp);
+    gun_sway_tick(&p->wp, p->vel, p->grounded, p->yaw, p->pitch);
   }
   for (int i = 0; i < g_match.nbots; i++) {
     bot_t *b = &g_bots[i];
@@ -798,6 +799,7 @@ static void net_cl_present_advance(void) {
     gun_ads(&b->wp, b->wp.ads_want);
     gun_reload_tick(&b->wp);
     gun_recoil_step(&b->wp);
+    gun_sway_tick(&b->wp, b->vel, b->grounded, b->yaw, b->pitch);
   }
 }
 
