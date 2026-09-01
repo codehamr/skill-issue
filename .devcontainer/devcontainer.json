@@ -27,7 +27,7 @@
         // Windows host: USERPROFILE = C:\Users\<name>. Mounted read-only and
         // COPIED in postCreate, because a Windows bind reads 0777 in the
         // container and ssh refuses a key that world-readable.
-        "source=${localEnv:USERPROFILE}/.ssh,target=/root/.ssh-host,type=bind,readonly"
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/root/.ssh-host,type=bind,readonly"
     ],
     "runArgs": [
         "--cap-add=SYS_PTRACE",
