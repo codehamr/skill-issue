@@ -609,6 +609,17 @@ static void sdf_rifle(const anim_t *A, pose_t P, kit_t kt, v3 Rc, v3 spine, int 
                                              erg->bolt_wrist, GUN_GIRTH_3P));
       P.wri[1] = v3_lerp(P.wri[1], want, gs.bhand);
     }
+    // The re-stationed wrists get the same reach guard the ordinary solve applied:
+    // skel_solve's ANIM_ARM_REACH_K clamp ran BEFORE this transform, so a moving
+    // reload could put a wrist past UARM+FARM and visibly stretch the forearm.
+    // Clamped here, the weapon-side station gives instead — fig_hand's own clamp
+    // slides the grip out from under the wrist and reports it — never the arm.
+    for (int h = 0; h < 2; h++) {
+      v3 dw = v3_sub(P.wri[h], P.sho[h]);
+      float dl = v3_len(dw);
+      float amax = (ANIM_UARM + ANIM_FARM) * ANIM_ARM_REACH_K;
+      if (dl > amax) P.wri[h] = v3_add(P.sho[h], v3_scale(dw, amax / dl));
+    }
     P.elb[0] = ik_solve(P.sho[0], P.wri[0], ANIM_UARM, ANIM_FARM, pole0);
     P.elb[1] = ik_solve(P.sho[1], P.wri[1], ANIM_UARM, ANIM_FARM, pole1);
   }

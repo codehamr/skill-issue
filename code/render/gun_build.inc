@@ -36,6 +36,15 @@ static const float GUN_MUZ[2][3] = {{0.0f, 0.0225f, 0.494f},     // AR
                                     // that. See the note at the top of the SR branch.
                                     {0.0f, 0.0160f, 0.7820f}};   // SR
 
+// The wall-tuck reach (prototyped beside pose_muzzle): how far ahead of the EYE the
+// bore must be clear for the rifle to be carried up and fired. The 3P muzzle station
+// off the same GUN_MUZ row the tracer uses, plus 0.30 m — the carry anchor's forward
+// seat ahead of the eye plus a hand's width of pad, one authored margin for both
+// weapons. gun_wall_blocked and the gunwall proof are the only consumers.
+static float gun_wall_reach(int wpn) {
+  return GUN_MUZ[wpn][2] * GUN_GIRTH_3P + 0.30f;
+}
+
 // One pure local->world transform for every owner of the barrel tip.  The builder,
 // third-person event pose and mesh-free first-person publish deliberately differ only
 // in scale; none may restate GUNP and silently acquire a different muzzle.

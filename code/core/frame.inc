@@ -383,13 +383,24 @@ static void client_anim_all(void) {
     // snapshot describes it and the carry predicate runs here exactly as
     // player_present_tick runs it on the server.
     if (ent == g_local_ent) p->wp.ready_want = (unsigned char)player_carry_ready(p);
+    // A MIRROR'S EYE IS DERIVED, NOT RECEIVED. Nothing but the respawn edge ever
+    // writes p->eye for a foreign slot (player_spawn never runs for one here), so
+    // the wall predicate below used to measure from ankle height and tucked every
+    // remote rifle behind knee-high cover. Same target and ease as the sim's own
+    // (weapon.inc's eye settle); our own body predicted its eye already.
+    if (ent != g_local_ent) {
+      float eye_tgt = (p->crouched || p->sliding ? EYE_CROUCH : EYE_STAND) -
+                      p->tuck_y;
+      p->eye += (eye_tgt - p->eye) * f_clamp(EYE_LERP_RATE * TICK_DT, 0, 1);
+    }
     // ...AND THE FLASH COUNTS DOWN HERE for the same reason, on the same line
     // player_present_tick runs: nothing else on a client ticks a body's presentation,
     // and the dead branch above already took it through player_present_tick.
     if (p->flash > 0) p->flash--;
     int idle_ok = gun_pose_state(&p->wp, &g_player_anim[h], p->vel,
                                    p->grounded, p->sliding);
-    weapon_anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch,
+    weapon_anim_tick(&g_player_anim[h], p->pos, player_eye_pos(p), p->vel,
+                     p->yaw, p->pitch,
                      p->grounded, p->crouched && !p->sliding, p->tuck_y,
                      p->sliding, p->wp.ads_s, p->lean, p->wp.ready_want,
                      ent_of_human(h), &p->wp, idle_ok);
@@ -423,7 +434,9 @@ static void client_anim_all(void) {
     }
     int idle_ok = gun_pose_state(&bt->wp, &bt->anim, bt->vel,
                                    bt->grounded, bt->sliding);
-    weapon_anim_tick(&bt->anim, bt->pos, bt->vel, bt->yaw, bt->pitch,
+    weapon_anim_tick(&bt->anim, bt->pos,
+                     (v3){{bt->pos.x, bt->pos.y + bot_eye(bt), bt->pos.z}},
+                     bt->vel, bt->yaw, bt->pitch,
                      bt->grounded, bt->crouch, 0.0f, bt->sliding, bt->wp.ads_s,
                      0.0f, bt->wp.ready_want, b + 1, &bt->wp, idle_ok);
   }

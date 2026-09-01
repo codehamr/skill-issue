@@ -326,6 +326,9 @@ typedef struct {
 // Defined with the one shared rifle model later in the translation unit. Combat uses
 // the model's published barrel tip; it must never restate weapon-local muzzle offsets.
 static v3 pose_muzzle(const pose_t *P, int wpn);
+// Also defined at the muzzle table: how far ahead of the EYE the bore must be clear
+// for the weapon to be carried up and fired (the wall-tuck reach).
+static float gun_wall_reach(int wpn);
 
 // TWO EXTENTS, BECAUSE THEY ANSWER TWO QUESTIONS. "How far can this part poke into a
 // wall" and "how high does it hold the body off the floor" are different numbers,
@@ -446,11 +449,18 @@ typedef struct {
   float   brace;             // 0..1 preparation for a landing that is coming
   float   lean_f, lean_r;    // fwd/right acceleration lean (rad)
   float   fire_k;            // shot-triggered eased carry intent; not recoil distance
+  // THE WALL AT THE MUZZLE. weapon_anim_tick publishes the crisp predicate (the one
+  // copy is gun_wall_blocked); the follower eases the carriage tuck the arena sees.
+  // Derivable from state + solids on every viewer, so it never touches the wire.
+  unsigned char gunwall_want;
+  float   gunwall_s;
   // Third-person shoulder response. prev_pose, rather than duplicate prev scalars,
   // interpolates the solved gun and hands for rendering.
   float   recoil_back, recoil_back_v;  // m toward the shoulder
-  float   recoil_lift, recoil_lift_v;  // rad of muzzle rise
-  float   recoil_side, recoil_side_v;  // m, signed in gun-right
+  float   recoil_lift, recoil_lift_v;  // spring only — no pose consumer (see the
+                                       // shoulder-response note in skel_solve)
+  float   recoil_side, recoil_side_v;  // m, signed in gun-right (also rolls the
+                                       // frame about the bore at -1.4 rad/m)
   float   hit_k;             // TAKING a round: body flinch impulse, decays
   float   hit_s;             // ...and what the POSE sees, chasing it: assigned
                              // outright the impulse stepped the chest 42 mm and
@@ -596,6 +606,47 @@ static v3 foot_clamp_m(v3 base, v3 tgt, float margin) {
 }
 
 static v3 foot_clamp_world(v3 base, v3 tgt) { return foot_clamp_m(base, tgt, 0.06f); }
+
+// How far below the collider's plane a foot may reach for its own ground before it
+// simply dangles: past this the leg cannot cover the drop even with the sink
+// solver's hip drop paid in.
+#define ANIM_FOOT_DROP 0.30f
+
+// THE GROUND THIS FOOT STANDS ON, which is not always the collider's floor: a body
+// on a platform edge has one boot over air. Highest solid top under the point that
+// is not above the collider's own plane (a wall beside a boot is not a floor), else
+// the arena plane. Pure over the solids, so every viewer solves the same boot, and
+// exactly base.y wherever the ground is flat — the flat-ground gait is bit-identical
+// by construction.
+// ...but only where the world MODEL explains the collider's own plane: a solid top
+// at base.y under the body's footprint, or the arena floor itself. A pose staged on
+// a synthetic "flat ground" at an arbitrary height (armcheck runs its gait at
+// y = 5) has no such support, and adapting its boots to the real arena far below
+// would turn every staged proof into a permanent dangle. Where support is missing
+// the feet keep the collider's plane, exactly as before this solver existed.
+static int foot_ground_supported(v3 base) {
+  if (base.y < 0.04f) return 1;  // the arena floor
+  for (int i = 0; i < g_num_solids; i++) {
+    const solid_t *s = &g_solids[i];
+    if (fabsf(s->max.y - base.y) > 0.04f) continue;
+    if (base.x < s->min.x - 0.35f || base.x > s->max.x + 0.35f ||
+        base.z < s->min.z - 0.35f || base.z > s->max.z + 0.35f) continue;
+    return 1;
+  }
+  return 0;
+}
+
+static float foot_ground_y(v3 base, float x, float z) {
+  if (!foot_ground_supported(base)) return base.y;
+  float top = 0.0f;
+  for (int i = 0; i < g_num_solids; i++) {
+    const solid_t *s = &g_solids[i];
+    if (x < s->min.x || x > s->max.x || z < s->min.z || z > s->max.z) continue;
+    if (s->max.y > base.y + 0.04f) continue;
+    if (s->max.y > top) top = s->max.y;
+  }
+  return top;
+}
 
 typedef struct {
   v3 p;
@@ -1333,6 +1384,14 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
     // Sliding: the lead foot rides heel-first with the toe well up.
     want += (sld * 0.50f + (1.0f - sld) * (0.06f + 0.42f * a->slide_bk)) *
             a->slide_s;
+    // A PLANTED boot whose own ground is out of reach points its toe: held sole-flat
+    // over a drop it read as levitation at platform corners. Planted only — a swing
+    // foot is above the plane by design and already owns its pitch. Exactly zero on
+    // flat ground (the gap clamp's 60 mm dead band).
+    if (a->foot[i].t >= 1.0f && ground > 0.5f) {
+      float dg = ank.y - ANIM_ANKLE_Y - foot_ground_y(base, ank.x, ank.z);
+      want -= 0.42f * f_clamp((dg - 0.06f) * (1.0f / 0.12f), 0.0f, 1.0f);
+    }
     // Ease, never snap: the foot does not reach its plant at a fixed point of the cycle
     // (measured sp ~0.17 at 2 m/s), so switching from the swing formula to the stance
     // one on contact would jump the pitch by ~11 degrees in one tick.
@@ -1352,10 +1411,14 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
         float d = pitch_f > 0.0f ? -0.086f : 0.194f;  // heel : toe tip
         // ...but a pivot is a CONTACT point, so it only exists while the boot is ON the
         // floor.
-        float con = 1.0f - f_clamp((ank.y - base.y - ANIM_ANKLE_Y) *
+        // The contact plane is THIS boot's own ground (a foot hanging past a curb
+        // pivots on the lower floor it reaches, not on the collider's plane).
+        // foot_ground_y == base.y on flat ground, so the ordinary gait is unchanged.
+        float gfloor = foot_ground_y(base, ank.x, ank.z);
+        float con = 1.0f - f_clamp((ank.y - gfloor - ANIM_ANKLE_Y) *
                                    (1.0f / 0.060f), 0.0f, 1.0f);
         v3 piv = v3_add(ank, v3_scale(footF, d * con));
-        piv.y = ank.y + (base.y - ank.y) * con;
+        piv.y = ank.y + (gfloor - ank.y) * con;
         ank = v3_add(piv, v3_rot_axis(v3_sub(ank, piv), fr, -pitch_f));
         footF = v3_norm(v3_rot_axis(footF, fr, -pitch_f));
       }
@@ -1448,6 +1511,12 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // patrol carry, but a fire edge raises it on every viewer before the next solve.
   float ready_pose = (wpn == WPN_AR || idle_ok < GUN_POSE_LOCOMOTION ||
                       a->fire_k > 0.01f) ? 1.0f : a->ready_s;
+  // A WALL AT THE MUZZLE OWNS THE CARRIAGE, whatever the carry wanted — both weapons,
+  // every state, multiplied AFTER the gates above so a reloading or aiming figure
+  // still tucks against a wall. fire_k overrides it continuously: gun_shoot's wall
+  // gate guarantees no round leaves while walled, so a firing pose is by definition
+  // clear, and the anchor solve zeroes gunwall_s outright for the same reason.
+  ready_pose *= 1.0f - a->gunwall_s * (1.0f - a->fire_k);
   float rl = 1.0f - ready_pose;
   // Solve the shoulder line once. Stock seating, brace reach and arm IK all consume
   // these exact anchors; three nearby approximations cannot describe one torso.
@@ -1552,9 +1621,21 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   // both wrist targets move as one frame; the arm solve below then chooses collision-
   // free elbows instead of letting a vertical rifle pull them through the sternum.
   float aim_down = f_smoothstep(0.20f, 0.92f, -aimd.y);
+  // The up band starts earlier than the down band (0.12 vs 0.20): at +40 deg the
+  // butt is already at the cheek, so the working room has to arrive by then — filmed,
+  // the mid-band was the cramped part while +75 read fine.
+  float aim_up = f_smoothstep(0.12f, 0.85f, aimd.y);
   gun_o = v3_add(gun_o,
                  v3_add(v3_scale(F, 0.285f * aim_down * (1.0f - a->slide_s)),
                         v3_scale(Rc, -0.070f * aim_down * (1.0f - a->slide_s))));
+  // Looking steeply UP needs the same room, on the other side of the face: without
+  // it the near-vertical rifle stood ON the head with both forearms crossed over
+  // the eyes. Forward and out to the strong side — the real technique drops the
+  // stock off the shoulder pocket, so the whole frame also rides down a little.
+  gun_o = v3_add(gun_o,
+                 v3_add(v3_scale(F, 0.300f * aim_up * (1.0f - a->slide_s)),
+                        v3_add(v3_scale(Rc, 0.075f * aim_up * (1.0f - a->slide_s)),
+                               v3_scale(U, -0.060f * aim_up))));
   // ADS is seated from the stock, not guessed from the grip. The descriptor's butt pin
   // is the shared model point; the target is the high firing-shoulder pocket used with
   // armour, slightly forward on the plate. Move the complete eye/weapon complex by the
@@ -1599,17 +1680,17 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
                                v3_scale(Rc, sinf(a->idle_t * 0.92f) * 0.0035f * still)));
   // SHOULDER RESPONSE. fire_k is solely the carry-floor latch. Event-fed springs move
   // one coherent weapon frame, and the wrist/elbow solve makes the arms compress while
-  // the shoulder anchors remain on the torso. Lift follows back; signed side adds only
-  // millimetres and a few tenths of a degree.
+  // the shoulder anchors remain on the torso. The springs TRANSLATE and (below) ROLL
+  // the weapon frame; they never rotate the bore axis: gd stays exactly the caller's
+  // yaw/pitch, i.e. weapon_t's physical barrel spring, so the rendered rifle, the
+  // fire-anchor tracer and the round share one axis BY CONSTRUCTION. A decaying body
+  // spring bending gd was a second muzzle direction over the authoritative one — and
+  // anim_stage_fire_anchor re-solves from this live state, so it deflected round 2..n
+  // of a burst by the presentation beat (recoil_side, authored in metres, was fed to
+  // v3_rot_axis as radians). recoil_lift stays a spring with no pose consumer for the
+  // same reason its table row is 0: angular rise belongs to weapon_t alone.
   {
     v3 gun_r = v3_cross(gd, U);
-    if (v3_dot(gun_r, gun_r) < 1e-6f) gun_r = Rc;
-    else gun_r = v3_norm(gun_r);
-    if (a->recoil_lift != 0.0f)
-      gd = v3_norm(v3_rot_axis(gd, gun_r, a->recoil_lift));
-    if (a->recoil_side != 0.0f)
-      gd = v3_norm(v3_rot_axis(gd, U, a->recoil_side));
-    gun_r = v3_cross(gd, U);
     if (v3_dot(gun_r, gun_r) < 1e-6f) gun_r = Rc;
     else gun_r = v3_norm(gun_r);
     gun_o = v3_add(gun_o, v3_add(v3_scale(gd, -a->recoil_back),
@@ -1724,6 +1805,20 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
                            v3_add(v3_scale(F, 0.88f), v3_scale(U, -0.30f))));
       pole = v3_norm(v3_lerp(pole, down_hint, aim_down));
     }
+    // The same protection AIMING UP — the singularity is symmetric but the old code
+    // only guarded the floor, so a skyward bore left both poles to the projection
+    // lottery. Shooting up, the elbows drop UNDER the raised rifle (firing side
+    // tight to the ribs, support side wider under the fore-end), and the forward
+    // component again forbids the torso-facing hemisphere. armcheck's aim sweep
+    // continues through +PITCH_MAX to hold this.
+    if (aim_up > 0.001f && a->slide_s < 0.2f) {
+      v3 up_hint = i
+          ? v3_norm(v3_add(v3_scale(Rc, 0.85f),
+                           v3_add(v3_scale(F, 0.70f), v3_scale(U, -0.95f))))
+          : v3_norm(v3_add(v3_scale(Rc, -1.05f),
+                           v3_add(v3_scale(F, 0.75f), v3_scale(U, -0.55f))));
+      pole = v3_norm(v3_lerp(pole, up_hint, aim_up));
+    }
     // (airborne both elbows flare up and out — the braced-in-flight look) A WRIST NEVER
     // GETS FURTHER FROM ITS SHOULDER THAN THE ARM CAN REACH, and the guard is set at
     // 96% rather than 100 for the reason this file already records: near full extension
@@ -1753,6 +1848,9 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
   v3 gr = v3_cross(gd, U);
   if (v3_dot(gr, gr) < 1e-6f) gr = Rc;
   P->gun_u = v3_norm(v3_cross(v3_norm(gr), gd));
+  // The side beat also rolls the frame ABOUT the bore (-1.4 rad per metre of side
+  // travel — one tuned number, deliberately reusing the spring). A roll about gd
+  // cannot move the bore axis, so the point-of-aim contract holds by construction.
   if (a->recoil_side != 0.0f)
     P->gun_u = v3_norm(v3_rot_axis(P->gun_u, gd, -1.4f * a->recoil_side));
 
@@ -1810,7 +1908,11 @@ static void anim_stage_fire_anchor(const anim_t *a, v3 pos, float yaw,
   anim_t shot = *a;
   // A shot is a firing pose even if the eased patrol carry was still lowering. The
   // caller already supplied the physical bore angle; BLOCKED selects the aligned
-  // carriage without advancing any persistent animation state.
+  // carriage without advancing any persistent animation state. The wall tuck is
+  // zeroed for the same reason: the ballistic anchor is the ALIGNED rifle, and the
+  // wall gate already refused any shot whose aligned muzzle path is not clear — a
+  // decaying tuck bending the anchor's bore would be a second muzzle direction.
+  shot.gunwall_s = 0.0f;
   skel_solve(&shot, pos, yaw, pitch, wpn, GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
   g_fire_anchor_pose = shot.pose;
   g_fire_anchor_src = src;
@@ -1842,6 +1944,13 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
   {
     float want = (ready || ads > 0.05f || a->fire_k > 0.01f) ? 1.0f : 0.0f;
     a->ready_s += (want - a->ready_s) * ease_k(want > 0.5f ? 20.0f : 4.5f);
+  }
+  // The wall tuck: fast in (a rifle meeting a wall is a contact), slower out
+  // (recovering the carry is a deliberate move). The crisp predicate was published
+  // by weapon_anim_tick; the eased value is what skel_solve's carriage consumes.
+  {
+    float want = a->gunwall_want ? 1.0f : 0.0f;
+    a->gunwall_s += (want - a->gunwall_s) * ease_k(a->gunwall_want ? 14.0f : 7.0f);
   }
 
   // Smoothed motion signals; the raw-vs-smoothed velocity gap drives lean.
@@ -2227,6 +2336,16 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
       if (wp < 0) wp += 1.0f;
       int in_win = moving && wp < duty;
       if (f->t >= 1.0f) {
+        // A PLANTED foot rests on the ground under ITSELF. Vertical only, eased: a
+        // warp onto an edge, or the body drifting until a boot hangs past a curb,
+        // may not step-change the sole. On flat ground want == pos.y exactly, so
+        // this adds a literal zero and the ordinary gait cannot drift.
+        {
+          float gy = foot_ground_y(base, f->pos.x, f->pos.z);
+          float wanty = fmaxf(gy + ANIM_ANKLE_Y,
+                              base.y + ANIM_ANKLE_Y - ANIM_FOOT_DROP);
+          f->pos.y += (wanty - f->pos.y) * ease_k(12.0f);
+        }
         float ddx = f->pos.x - home.x, ddz = f->pos.z - home.z;
         float d = sqrtf(ddx * ddx + ddz * ddz);
         float ye = wrap_pi(a->leg_yaw - f->yaw);
@@ -2287,6 +2406,15 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
           float d2 = s * 0.30f - lat;
           to.x += d2 * rx;
           to.z += d2 * rz;
+        }
+        // THE PLANT LANDS ON ITS OWN GROUND: a step over a curb's edge aims at the
+        // floor actually under the landing point, bounded by what the leg can cover
+        // (ANIM_FOOT_DROP — past that the boot dangles and the sink solver carries
+        // what it can). base.y exactly on flat ground.
+        {
+          float gy = foot_ground_y(base, to.x, to.z);
+          to.y = fmaxf(gy + ANIM_ANKLE_Y,
+                       base.y + ANIM_ANKLE_Y - ANIM_FOOT_DROP);
         }
         f->to = foot_clamp_world(base, to);
         // A committed swing's target may WANDER but never jump: once the foot is a
@@ -2359,7 +2487,11 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
           f->pos.z = f->from.z + (f->to.z - f->from.z) * e;
           f->pos.x += (base.x - f->pos.x) * pull;
           f->pos.z += (base.z - f->pos.z) * pull;
-          f->pos.y = base.y + ANIM_ANKLE_Y + sinf(F_PI * e) * lift;
+          // The arc rides from the lift-off height to the landing height (they can
+          // differ across a curb); on flat ground both equal base.y + ankle and the
+          // old expression falls out exactly.
+          f->pos.y = f->from.y + (f->to.y - f->from.y) * e +
+                     sinf(F_PI * e) * lift;
         }
       }
     }

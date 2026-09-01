@@ -298,15 +298,52 @@ static void gun_bore_angles(const weapon_t *w, float yaw, float pitch,
   *bore_pitch = f_clamp(pitch + w->rec_p * DEG2RAD, -PITCH_MAX, PITCH_MAX);
 }
 
+// THE WALL GATE'S ONE PREDICATE: within the muzzle's own reach along the bore, does
+// the round meet material NO round can cross? Cast from the EYE, deliberately not
+// from the muzzle — a muzzle-anchored probe moves with the tuck it triggers and
+// oscillates; the eye cannot. Penetrable cover does not wall a rifle off: PEN_PATH
+// is the mechanic that answers thin material, and refusing the trigger against a
+// 0.60 m pen wall would silently delete the designed point-blank wallbang — so the
+// verdict is pen_span's, the one copy of "can a round get through this run". (A
+// muzzle that starts INSIDE a pen solid still under-counts that solid's material in
+// the flight loop — pre-existing, bounded by the wall's own thickness.) The floor
+// plane never blocks: a muzzle cannot stand inside the floor, and a solid TOP under
+// a downward bore is the same case when the run below it is passable. The reach
+// errs a hand's width EARLY (gun_wall_reach's pad); with positions on the wire's
+// 1 cm grid the verdict can flip one tick apart on the exact boundary — a silent
+// mispredicted kick healed by the magazine reconcile, accepted. A mid-burst
+// refusal (recoil walks the bore into a jamb) is silent by design: the tuck is the
+// telegraph, a dry click here would claim an empty magazine. Pure state + solids,
+// so server, prediction, replay and every remote viewer agree without a wire bit.
+// Consumers: the trigger/ADS gates (player AND bot), weapon_anim_tick's carriage
+// publish, vm_tick.
+static int gun_wall_blocked(v3 eye, float yaw, float pitch, const weapon_t *w) {
+  float by, bp;
+  gun_bore_angles(w, yaw, pitch, &by, &bp);
+  v3 d = {{cosf(bp) * sinf(by), sinf(bp), -cosf(bp) * cosf(by)}};
+  float reach = gun_wall_reach(w->cur);
+  float entry = reach;
+  for (int i = 0; i < g_num_solids; i++) {
+    v3 n;
+    float t = ray_aabb(eye, d, g_solids[i].min, g_solids[i].max, &n);
+    if (t > 0.0f && t < entry) entry = t;
+  }
+  if (entry >= reach) return 0;
+  return pen_span(v3_add(eye, v3_scale(d, entry)), d) < 0.0f;
+}
+
 // Production figures solve from the same barrel angles as combat. Keeping this at the
 // weapon boundary prevents six player/bot/offline/online callers from each remembering
-// to add recoil, clamp pitch and select the current weapon independently.
-static void weapon_anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
-                             int grounded, int crouch, float tuck, int slide,
-                             float ads, float lean, int ready, int ent,
+// to add recoil, clamp pitch and select the current weapon independently. The eye
+// rides along so the wall predicate is published exactly once per entity per tick,
+// here, where every carriage consumer already meets.
+static void weapon_anim_tick(anim_t *a, v3 base, v3 eye, v3 vel, float yaw,
+                             float pitch, int grounded, int crouch, float tuck,
+                             int slide, float ads, float lean, int ready, int ent,
                              weapon_t *w, int idle_ok) {
   float bore_yaw, bore_pitch;
   gun_bore_angles(w, yaw, pitch, &bore_yaw, &bore_pitch);
+  a->gunwall_want = (unsigned char)gun_wall_blocked(eye, yaw, pitch, w);
   anim_tick(a, base, vel, bore_yaw, bore_pitch, grounded, crouch, tuck, slide,
             ads, lean, ready, ent, w->cur, idle_ok);
 }
@@ -336,6 +373,13 @@ static void gun_recoil_impulse(weapon_t *w, v3 vel, int grounded,
 static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
                       float pitch, v3 vel, int grounded, uint64_t *rng) {
   (void)rng;  // retained in the call contract so prediction snapshots stay compatible
+  // A SHOT MUST NEVER LEAVE A BARREL THE WORLD OWNS. ray_aabb has no entry face for
+  // a ray born inside a box, so a muzzle poked through a wall used to fire into the
+  // space BEHIND it. Refused here, before any state moves — no ammo, no cooldown, no
+  // noise, no event — for whoever pulled the trigger: player, bot, server, replay.
+  // The refusal is always telegraphed: the same predicate lowers the carriage
+  // (gunwall_s) and drops ADS, so a walled rifle visibly is one.
+  if (gun_wall_blocked(o, yaw, pitch, w)) return;
   const wpn_def_t *def = &WPN_DEF[w->cur];
   const float *wp = g_sim_wp[w->cur];
   w->ammo[w->cur]--;
@@ -397,6 +441,10 @@ static void gun_shoot(int ent, weapon_t *w, v3 o, float yaw,
   if (sh >= 0 && !g_prediction_replay) g_players[sh].shots++;
   if (ent == g_local_ent && sh >= 0) {
     recoil_vm_impulse(&g_players[sh].vm, ent, w->idx, w->cur, w->ads_s);
+    // The FP twin of the 3P fire_k override: a fired round owns the frame, and the
+    // gate above just proved the muzzle path clear — a decaying wall tuck may not
+    // keep pointing the rendered barrel away from where live rounds are going.
+    g_players[sh].vm.gunwall = g_players[sh].vm.prev_gunwall = 0.0f;
     // Online forward prediction deliberately suppresses ev_push, including the
     // ent_on_event carry latch which normally starts the eased raise. gun_shoot has
     // already published that exact physical firing pose above; keep this assignment
@@ -879,7 +927,9 @@ static void bot_puppet_tick(bot_t *b, int bi) {
   b->wp.ready_want = (unsigned char)(b->pup_ready ? 1 : 0);
   int idle_ok = gun_pose_state(&b->wp, &b->anim, b->vel,
                                  b->grounded, b->sliding);
-  weapon_anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
+  weapon_anim_tick(&b->anim, b->pos,
+                   (v3){{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}},
+                   b->vel, b->yaw, b->pitch, b->grounded,
                    b->crouch, 0.0f, b->sliding, b->wp.ads_s, b->pup_lean,
                    b->wp.ready_want, bi + 1, &b->wp, idle_ok);  // REAL entity id: hardwired 1, every
                                     // puppet != bot 0 pushed EV_STEP/EV_LAND

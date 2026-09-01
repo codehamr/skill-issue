@@ -777,6 +777,20 @@ static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir)
   o->rng = g_rng_gun[0];
 }
 
+// One real presentation tick for the staged player's third-person body, exactly as
+// player_present_tick drives it. recoil_run and gunwall_proof both run the live
+// anim alongside the weapon loop; one copy keeps their idea of "the real path"
+// from drifting apart.
+static void recoil_present_body(player_t *p) {
+  p->wp.ready_want = (unsigned char)player_carry_ready(p);
+  int idle_ok = gun_pose_state(&p->wp, &g_player_anim[0], p->vel,
+                               p->grounded, p->sliding);
+  weapon_anim_tick(&g_player_anim[0], p->pos, player_eye_pos(p), p->vel,
+                   p->yaw, p->pitch, p->grounded, p->crouched && !p->sliding,
+                   p->tuck_y, p->sliding, p->wp.ads_s, p->lean,
+                   p->wp.ready_want, 0, &p->wp, idle_ok);
+}
+
 static void recoil_fire(recoil_trace_t *tr, int instant_tick) {
   player_t *p = &g_players[0];
   float back = p->vm.kick_back, lift = p->vm.kick_lift, side = p->vm.kick_side;
@@ -829,6 +843,12 @@ static recoil_trace_t recoil_run(int wpn, int ads, int burst,
     gun_recover(&p->wp, held);
     g_tick++;
     vm_tick(p);
+    // The third-person body runs the REAL presentation path alongside, so the bore
+    // gate in recoil_take_sample judges the solved pose the arena would render
+    // mid-burst. A weapon-only loop left the body springs at zero and was blind to
+    // any anim-state term bending the bore (that blindness hid a presentation
+    // spring deflecting round 2..n of a burst).
+    recoil_present_body(p);
     recoil_take_sample(&tr, t, tr.nshot ? &tr.shot[tr.nshot - 1].dir : NULL);
   }
   tr.end_wp = p->wp;
@@ -972,6 +992,77 @@ static void recoil_proof(void) {
   }
   recoil_restore_globals();
   printf("recoil %s\n", ok ? "ok" : "FAIL");
+  if (!ok) exit(1);
+}
+
+// --- The wall gate ------------------------------------------------------------------
+// A shot must never leave a barrel the world owns: gun_shoot refuses when the
+// eye->reach bore segment meets material no round can cross, the carriage tucks
+// (gunwall_s), and the refusal costs no state. Three impenetrable standoffs per
+// weapon prove the reach is per-weapon (0.95 m sits between the AR's and the SR's),
+// that a refused trigger moves neither ammo, cooldown, index nor the event channel,
+// that a clear muzzle still fires, and that the tuck actually depresses the rendered
+// bore. The fourth case is the SAME wall at 0.50 m made penetrable: the gate must
+// stand aside — PEN_PATH owns thin cover, and the point-blank wallbang is a designed
+// mechanic this gate once silently deleted. The synthetic wall rides in the scratch
+// slot past the generated count; both the count AND the slot's contents are
+// restored (at MAX_SOLIDS the clamp overwrites a real solid, and restoring only the
+// count would leave the synthetic wall in the live arena for the rest of the run).
+static void gunwall_proof(void) {
+  recoil_save_globals();
+  int ok = 1;
+  int save_solids = g_num_solids;
+  int slot = save_solids >= MAX_SOLIDS ? MAX_SOLIDS - 1 : save_solids;
+  solid_t save_slot = g_solids[slot];
+  for (int wi = 0; wi < WPN_COUNT; wi++) {
+    static const float D[4] = {0.50f, 0.95f, 2.00f, 0.50f};
+    static const int PEN[4] = {0, 0, 0, 1};
+    for (int di = 0; di < 4; di++) {
+      recoil_stage(1, wi, 0);
+      player_t *p = &g_players[0];
+      v3 eye = player_eye_pos(p);
+      // A wall square to the bore (yaw 0 aims along -z), full height around the eye.
+      g_num_solids = slot;
+      g_solids[g_num_solids++] = (solid_t){
+        .min = {{-3.0f, eye.y - 3.0f, -D[di] - 0.4f}},
+        .max = {{3.0f, eye.y + 3.0f, -D[di]}},
+        .pen = PEN[di]};
+      int want_block = !PEN[di] && D[di] < gun_wall_reach(wi);
+      int blocked = gun_wall_blocked(eye, p->yaw, p->pitch, &p->wp);
+      int ammo0 = p->wp.ammo[wi], ev0 = g_num_events;
+      uint64_t rng0 = g_rng_gun[0];
+      gun_shoot(0, &p->wp, eye, p->yaw, p->pitch, p->vel, p->grounded,
+                &g_rng_gun[0]);
+      int fired = p->wp.ammo[wi] != ammo0;
+      int evs = g_num_events - ev0;
+      int silent = p->wp.ammo[wi] == ammo0 && p->wp.cool[wi] == 0 &&
+                   p->wp.idx == 0 && evs == 0 && g_rng_gun[0] == rng0 &&
+                   p->wp.rec_p == 0.0f && p->wp.rec_y == 0.0f;
+      // The tuck: run the real presentation path and read the carriage. A blocked
+      // rifle must settle tucked with its rendered bore depressed; a clear one must
+      // stay level on the aim axis.
+      for (int t = 0; t < 90; t++) {
+        g_tick++;
+        recoil_present_body(p);
+      }
+      float tuck = g_player_anim[0].gunwall_s;
+      float bore_y = g_player_anim[0].pose.gun_f.y;
+      int case_ok = blocked == want_block &&
+                    (blocked ? !fired && silent && tuck > 0.80f && bore_y < -0.25f
+                             : fired && evs > 0 && tuck < 0.02f &&
+                               fabsf(bore_y) < 0.05f);
+      printf("gunwall %s d=%.2f pen=%d reach=%.2f blocked=%d fired=%d silent=%d "
+             "tuck=%.2f bore_y=%+.2f %s\n",
+             wi == WPN_SR ? "sr" : "ar", (double)D[di], PEN[di],
+             (double)gun_wall_reach(wi), blocked, fired, silent, (double)tuck,
+             (double)bore_y, case_ok ? "ok" : "FAIL");
+      ok &= case_ok;
+    }
+  }
+  g_solids[slot] = save_slot;
+  g_num_solids = save_solids;
+  recoil_restore_globals();
+  printf("gunwall %s\n", ok ? "ok" : "FAIL");
   if (!ok) exit(1);
 }
 

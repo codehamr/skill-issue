@@ -270,6 +270,7 @@ typedef struct {
   int cur, srcyc, bore_aligned;
   float ads, ready, sight_y, hip, lean, lean_d, sw;
   float kick_back, kick_lift, kick_side, dip;
+  float gunwall;   // eased wall tuck: FP twin of the 3P carriage override
   gunanim_t ga;
 } vm_pose_t;
 
@@ -332,10 +333,16 @@ static vm_pose_t vm_stage_pose(const player_t *p, const vm_t *v, const weapon_t 
   int srcyc = cur == WPN_SR;
 
   ps.ads = ads; ps.ready = f_clamp(ready, 0.0f, 1.0f);
-  // Reload and swap cannot fire. In every other state the rendered barrel is the
-  // gameplay barrel; composition may translate and roll around it, never invent a
-  // second pitch/yaw axis.
-  ps.bore_aligned = w->reload_t == 0 && w->switch_t == 0;
+  float gw = VLERP(gunwall);
+  ps.gunwall = gw;
+  // Reload and swap cannot fire, and neither can a walled rifle (gun_shoot's wall
+  // gate). In every other state the rendered barrel is the gameplay barrel;
+  // composition may translate and roll around it, never invent a second pitch/yaw
+  // axis. The wall tuck may: its whole point is showing a barrel that cannot fire.
+  // The tuck terms are all hip-scaled, so in ADS a residual tuck moves nothing and
+  // must NOT unhook the bore lock — the (1 - ads) mirrors the terms it guards.
+  ps.bore_aligned = w->reload_t == 0 && w->switch_t == 0 &&
+                    gw * (1.0f - ads) < 0.001f;
   ps.kick_back = kick_back; ps.kick_lift = kick_lift;
   ps.kick_side = kick_side; ps.dip = dip; ps.cur = cur; ps.sight_y = sight_y;
   ps.ga = ga_; ps.sw = sw; ps.hip = hip; ps.lean = lean; ps.lean_d = lean_d;
@@ -358,6 +365,11 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
   // with weight in it, and past ~2x these values they read as the shooter
   // losing the weapon rather than working it.
   float jl = ps->ga.jolt, hf = ps->ga.heft;
+  // The wall tuck: pull the rifle in and down off the wall, muzzle dipped, a touch
+  // of roll — the FP reading of the 3P lowered carriage. Scaled by hip: ADS is being
+  // denied while walled, so during the ramp-out overlap the sight stays on axis and
+  // the tuck arrives only as the hip pose returns.
+  float gw = ps->gunwall * hip;
 
   // BREATHING: two incommensurate frequencies (0.30 Hz and its 1.57x partner)
   // so the idle never visibly loops, walking with the SIM CLOCK — a breath on
@@ -393,13 +405,13 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
            - dip * 0.5f + rl * 0.084f + rch * (srcyc ? 0.044f : 0.020f)
            - rk * 0.020f + jl * 0.0030f + hf * 0.0045f
            - sw * 0.125f + br_y - sl * 0.020f * hip
-           + erg->fp_low_pos.y * low;
+           + erg->fp_low_pos.y * low - 0.045f * gw;
   // The sniper pulls closer to the eye in ADS so the scope window opens up.
   float pz = 0.30f
            - 0.022f * hip - (cur == WPN_SR ? 0.152f : 0.06f) * ads - kick_back
            + VLERP(lag_z) - sw * 0.03f - rl * 0.020f
            - rch * (srcyc ? 0.062f : 0.030f) + rk * 0.016f
-           - sl * 0.040f * hip + erg->fp_low_pos.z * low;
+           - sl * 0.040f * hip + erg->fp_low_pos.z * low - 0.110f * gw;
 
   v3 gx = rgt, gy = upv, gz = fwd;
   // sw * 0.42, not 0.7: 0.7 rad of muzzle-down put the barrel tip a further 0.32 m
@@ -413,7 +425,7 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
                  + kick_lift
                  + br_p + VLERP(lag_y) * 0.9f * (0.15f + 0.85f * hip)
                  + sl * 0.20f * hip
-                 + erg->fp_low_ang.x * low);                               // pitch
+                 + erg->fp_low_ang.x * low - 0.30f * gw);                  // pitch
   rot2(&gx, &gz, VLERP(sway_y) + rl * 0.10f + jl * 0.016f
                  - rch * (srcyc ? 0.13f : 0.0f)
                  + (-0.075f + lean_d * 0.22f + sl * 0.06f) * hip
@@ -427,7 +439,8 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
   rot2(&gx, &gy, VLERP(roll) + rl * -0.46f + rch * cyroll - rk * 0.16f
                  - jl * 0.055f - hf * 0.040f +
                  (0.090f - lean * 0.10f + lean_d * 0.30f + sl * 0.10f) * hip
-                 - kick_side * 1.4f + erg->fp_low_ang.z * low);             // roll
+                 - kick_side * 1.4f + erg->fp_low_ang.z * low
+                 + 0.22f * gw);                                             // roll
   if (ps->bore_aligned) {
     // Preserve the authored roll/cant by projecting its right axis onto the plane
     // normal to the authoritative bore. This is a pure twist: gz becomes exactly fwd.

@@ -292,7 +292,11 @@ WANT_AR_NEAR="78 78 75 61"
 #   class and vmtrig's forbidden mesh/proxy crossings still zero.
 # zfight/open/flip/dup/degen are 0 on every tier through all of it, and
 # `near` moved only where its own note above says.
-WANT_AR_CROSS="105 105 95 66"
+# 2026-09: the aim-up working room (skel_solve's `aim_up` gun_o push + elbow
+# hints, band 0.12..0.85) moves the arm/torso contact seams whenever the live
+# bot aims above ~7 deg, so the close tiers' cross census rose 105 -> 113 (SR
+# 182 -> 181). near and every hard topology class are unchanged on all tiers.
+WANT_AR_CROSS="113 113 97 66"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -320,7 +324,8 @@ WANT_AR_CROSS="105 105 95 66"
 # SR near becomes 94/94/58/39 and cross falls 208/208/135/92 -> 193/193/126/85, with
 # open/flip/dup/zfight/degen still zero in every one of the eight full sweeps.
 WANT_SR_NEAR="98 98 58 41"
-WANT_SR_CROSS="182 182 126 91"
+# 2026-09: 182 -> 181 close-tier, the aim-up working room (see the AR note).
+WANT_SR_CROSS="181 181 126 91"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -541,6 +546,7 @@ if ! awk '
 fi
 
 gate_command recoil "recoil" '^recoil ok$'
+gate_command gunwall "gunwall" '^gunwall ok$'
 gate_command netrecoil "netrecoil" '^netrecoil cl_pred=.* ok$'
 netrecoil_single_rows="$(grep -Ec '^netrecoil single .* replay_body=1 .* sidefx=1/1 counts=1/1 noise_t=[0-9]+ events=2/0 ok$' \
   "$TMPD/netrecoil.log" || true)"

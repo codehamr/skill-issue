@@ -30,6 +30,7 @@ static void cmd_netfuzz(sim_ctx_t *s)          { (void)s; netfuzz_proof(); }
 static void cmd_netdeath(sim_ctx_t *s)         { (void)s; netdeath_proof(); }
 static void cmd_netclient(sim_ctx_t *s)        { (void)s; netclient_proof(); }
 static void cmd_recoil(sim_ctx_t *s)           { (void)s; recoil_proof(); }
+static void cmd_gunwall(sim_ctx_t *s)          { (void)s; gunwall_proof(); }
 static void cmd_netrecoil(sim_ctx_t *s)        { (void)s; netrecoil_proof(); }
 static void cmd_vmframe(sim_ctx_t *s)           { (void)s; vmframe_proof(); }
 static void cmd_figbury(sim_ctx_t *s)          { (void)s; figbury_proof(); }
@@ -1448,10 +1449,15 @@ static void cmd_armcheck(sim_ctx_t *s) {
       pos = (v3){{0, 5, 0}};
       vel = (v3){{0, 0, 0}};
       anim_reset(&a, pos, 0.0f, wpn);
-      for (int tick = 0; tick < 340; tick++) {
+      // Down to -PITCH_MAX, hold, then the same slow rate up through zero to
+      // +PITCH_MAX and hold — the up half exists because the up-aim elbow hints
+      // (see aim_up in skel_solve) were added after the floor-only sweep shipped.
+      for (int tick = 0; tick < 740; tick++) {
         float pitch = tick < 120 ? 0.0f
                     : tick < 300 ? -PITCH_MAX * (tick - 119) / 180.0f
-                                 : -PITCH_MAX;
+                    : tick < 340 ? -PITCH_MAX
+                    : tick < 700 ? -PITCH_MAX + PITCH_MAX * (tick - 339) / 180.0f
+                                 : PITCH_MAX;
         anim_tick(&a, pos, vel, 0.0f, pitch, 1, 0, 0.0f, 0, (float)ads,
                   0.0f, 1, 1, wpn, GUN_POSE_BLOCKED);
         if (tick >= 120) {
@@ -3220,7 +3226,8 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"nav", cmd_nav}, {"netloop", cmd_netloop}, {"netpack", cmd_netpack}, {"netpredict", cmd_netpredict},
   {"netlagcomp", cmd_netlagcomp}, {"netstall", cmd_netstall}, {"netanim", cmd_netanim}, {"netfill", cmd_netfill},
   {"netcarry", cmd_netcarry}, {"netfigure", cmd_netfigure},
-  {"recoil", cmd_recoil}, {"netrecoil", cmd_netrecoil}, {"vmframe", cmd_vmframe},
+  {"recoil", cmd_recoil}, {"gunwall", cmd_gunwall},
+  {"netrecoil", cmd_netrecoil}, {"vmframe", cmd_vmframe},
   {"netleave", cmd_netleave}, {"tele", cmd_tele}, {"humans", cmd_humans}, {"localent", cmd_localent},
   {"tacstat", cmd_tacstat}, {"netdebug", cmd_netdebug}, {"dev", cmd_dev}, {"bots", cmd_bots},
   {"skill", cmd_skill}, {"fraglimit", cmd_fraglimit}, {"restart", cmd_restart}, {"sfxlog", cmd_sfxlog},

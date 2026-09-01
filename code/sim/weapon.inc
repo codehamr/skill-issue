@@ -61,7 +61,11 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
   }
   int busy = w->reload_t > 0 || w->switch_t > 0;
 
-  gun_ads(w, held[IN_ADS] && !busy);
+  // A walled rifle cannot be shouldered onto the eye line: ADS intent is denied by
+  // the same predicate that lowers the carriage and refuses the trigger, so all
+  // three tell one story (and NEF_ADS carries the denial to every viewer for free).
+  int walled = gun_wall_blocked(player_eye_pos(p), p->yaw, p->pitch, w);
+  gun_ads(w, held[IN_ADS] && !busy && !walled);
 
   gun_reload_tick(w);
   if (held[IN_RELOAD] && !p->prev_held[IN_RELOAD] && !busy &&
@@ -86,7 +90,11 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
   // a held trigger — the case the old press-edge test made unreachable, and the
   // commonest way anybody empties a magazine.
   if (!held[IN_FIRE]) w->dry_done = 0;
-  if (trigger && w->cool[w->cur] == 0 && w->reload_t == 0 && w->switch_t == 0) {
+  // `!walled` here spares the per-attempt refusal inside gun_shoot the dry-click
+  // bookkeeping; gun_shoot's own gate stays the authoritative chokepoint (bots and
+  // every other caller reach it without passing through this trigger).
+  if (trigger && !walled &&
+      w->cool[w->cur] == 0 && w->reload_t == 0 && w->switch_t == 0) {
     if (w->ammo[w->cur] > 0) weapon_fire(p, ent);
     else if (!w->dry_done) {
       ev_push((event_t){.type = EV_DRYFIRE, .src = ent, .a = p->pos});
@@ -112,6 +120,7 @@ static void vm_tick(player_t *p) {
   v->prev_roll = v->roll;
   v->prev_lean_lag = v->lean_lag;
   v->prev_slide_s = v->slide_s;
+  v->prev_gunwall = v->gunwall;
 
   // Look sway: the gun trails the view's angular velocity.
   float dyaw = p->yaw - v->last_yaw, dpit = p->pitch - v->last_pitch;
@@ -170,6 +179,13 @@ static void vm_tick(player_t *p) {
   float st = p->sliding ? 1.0f : 0.0f;
   v->slide_s += (st - v->slide_s) *
                 f_clamp((p->sliding ? 14.0f : 6.0f) * TICK_DT, 0, 1);
+
+  // The wall tuck's FP half, chasing the same crisp predicate the carriage and the
+  // trigger gate read, through the same ease_k kernel at the same 14/7 rates as the
+  // body's gunwall_s follower — first and third person may not disagree about a wall.
+  int walled = gun_wall_blocked(player_eye_pos(p), p->yaw, p->pitch, &p->wp);
+  v->gunwall += ((walled ? 1.0f : 0.0f) - v->gunwall) *
+                ease_k(walled ? 14.0f : 7.0f);
 
   // Roll: slide tilt plus a strafe hint.
   float roll_t = (p->sliding ? 0.09f : 0.0f);
@@ -442,7 +458,8 @@ static void player_present_tick(player_t *p, int ent) {
     p->wp.ready_want = (unsigned char)player_carry_ready(p);
     int idle_ok = gun_pose_state(&p->wp, &g_player_anim[h], p->vel,
                                    p->grounded, p->sliding);
-    weapon_anim_tick(&g_player_anim[h], p->pos, p->vel, p->yaw, p->pitch,
+    weapon_anim_tick(&g_player_anim[h], p->pos, player_eye_pos(p), p->vel,
+                     p->yaw, p->pitch,
                      p->grounded, p->crouched && !p->sliding, p->tuck_y,
                      p->sliding, p->wp.ads_s, p->lean, p->wp.ready_want, ent,
                      &p->wp, idle_ok);

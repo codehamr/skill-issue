@@ -185,6 +185,8 @@ typedef struct {
                                                    // bolted to the helmet
   float slide_s, prev_slide_s;                     // eased slide 0..1: the FP
                                                    // tuck-and-cant pose blend
+  float gunwall, prev_gunwall;                     // eased wall tuck 0..1: the FP
+                                                   // half of anim_t.gunwall_s
   float last_yaw, last_pitch;
   float last_eye;                                  // for the crouch/stand settle
   v3    last_vel;

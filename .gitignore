@@ -1,12 +1,6 @@
 build/
 .worktrees/
 screenshots/
-!screenshots/
-screenshots/*
-!screenshots/debug/
-screenshots/debug/*
-!screenshots/debug/capture.py
-!screenshots/debug/README.md
 .superpowers/
 .agents/
 .claude

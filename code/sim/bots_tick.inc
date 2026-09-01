@@ -695,6 +695,16 @@ static void bot_tick(int bi) {
                 b->pause_t == 0 && !b->sliding && b->wp.switch_t == 0 &&
                 diff > -aim_gate && diff < aim_gate &&
                 pdiff > -aim_gate * 1.2f && pdiff < aim_gate * 1.2f;
+  // A walled rifle answers the bot exactly as it answers the player: dead trigger,
+  // ADS denied. Gated here and not only by gun_shoot's silent return, because that
+  // return neither drains ammo nor sets cool — a covered bot re-fired every tick
+  // forever, and each attempt zeroed `stare`, blinding the very diagnostic built
+  // to catch that stall. Gated BEFORE the stare bookkeeping, a walled bot counts
+  // as staring and tacstat reports it.
+  int walled = (trigger || engaging) &&
+               gun_wall_blocked((v3){{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}},
+                                b->yaw, b->pitch, &b->wp);
+  trigger = trigger && !walled;
   // THE STARE, counted because it is the one failure a player reports in words and no
   // other number here can see: the bot can shoot, has someone to shoot at, and the
   // trigger never comes. tacstat reports the longest run.
@@ -720,7 +730,7 @@ static void bot_tick(int bi) {
   // weapon for a distant target, which buys it the tuned base spread and costs it the
   // same aimed-walk slow.
   int want_ads = engaging && b->wp.reload_t == 0 && b->wp.switch_t == 0 &&
-                 !b->sliding && tdist > 9.0f;
+                 !b->sliding && !walled && tdist > 9.0f;
   // ...and the PUPPET can ask for it directly.
   gun_ads(&b->wp, want_ads);
   // Recoil recovers the same way it does for the player: only once the trigger
@@ -731,7 +741,9 @@ static void bot_tick(int bi) {
   b->wp.ready_want = (unsigned char)(b->tgt >= 0 || startled || b->alert_t > 0);
   int idle_ok = gun_pose_state(&b->wp, &b->anim, b->vel,
                                  b->grounded, b->sliding);
-  weapon_anim_tick(&b->anim, b->pos, b->vel, b->yaw, b->pitch, b->grounded,
+  weapon_anim_tick(&b->anim, b->pos,
+                   (v3){{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}},
+                   b->vel, b->yaw, b->pitch, b->grounded,
                    b->crouch, 0.0f, b->sliding, b->wp.ads_s, 0.0f,
                    b->wp.ready_want, bi + 1, &b->wp, idle_ok);
   // (`startled` is in there because a bot that turns to a sound with the rifle
