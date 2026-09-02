@@ -409,6 +409,11 @@ static float ui_page_settings(float px, float pw, float y, int click, float cx, 
   if (ui_cycle("ANTI-ALIAS", MSAA_OPTS, 4, &mi, px, pw, y, click, cx, cy))
     g_cfg.msaa = mi ? 1 << mi : 0;
   y += 15;
+  // Read per frame by rf_ao_pass / rf_ssr_pass; nothing to rebuild.
+  ui_toggle("AMBIENT OCCLUSION", &g_cfg.ssao, px, pw, y, click, cx, cy);
+  y += 15;
+  ui_toggle("REFLECTIONS", &g_cfg.ssr, px, pw, y, click, cx, cy);
+  y += 15;
 
   if (ui_toggle("VSYNC", &g_cfg.vsync, px, pw, y, click, cx, cy))
     platform_vsync_changed();
@@ -833,7 +838,8 @@ static void blur_update(void) {
   glGenFramebuffers(2, R.blur_fbo);
   for (int i = 0; i < 2; i++) {
     glBindTexture(GL_TEXTURE_2D, R.blur_tex[i]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, bw, bh, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    // RGBA: the alpha is the scene's bloom weight, blitted down with the colour.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -852,31 +858,132 @@ static void blur_update(void) {
   glBindTexture(GL_TEXTURE_2D, R.font_tex);
 }
 
-// Resolve the multisampled scene into the present buffer — ONCE PER FRAME, and
-// the latch is what makes that true. Three callers want a resolved frame (the
-// glare chain, the frosted menu backdrop, and the end of render_frame) and
-// before the latch each of them paid for its own: an 8x resolve of 1280x720 is
-// the single most expensive blit in the frame, and running it twice cost 12 ms
-// on the llvmpipe proxy for a second copy of a picture that had not changed.
+// One colour or depth texture of the screen-space kind: no mips, clamped, and
+// the filter the caller asks for (depth and normals are read NEAREST — a
+// bilinear depth is a surface that exists nowhere).
+static GLuint post_tex(GLenum ifmt, GLenum fmt, GLenum type, int w, int h,
+                       GLenum filter) {
+  GLuint t;
+  glGenTextures(1, &t);
+  glBindTexture(GL_TEXTURE_2D, t);
+  glTexImage2D(GL_TEXTURE_2D, 0, (GLint)ifmt, w, h, 0, fmt, type, NULL);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (GLint)filter);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (GLint)filter);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  return t;
+}
+
+// The scene target, the prepass target and the AO pair — lazily rebuilt on a
+// size change like the MSAA target and the blur chain above. The scene and
+// the prepass SHARE the depth texture: the prepass fills it, the AO reads it,
+// and the lit pass (MSAA off) overwrites it with the same values. Half the
+// frame's resolution for the AO, floored so a tiny window still has a target.
+static void post_update(void) {
+  if (R.scene_fbo && R.scene_w == R.width && R.scene_h == R.height) return;
+  if (R.scene_fbo) {
+    glDeleteFramebuffers(1, &R.scene_fbo);
+    glDeleteFramebuffers(1, &R.pre_fbo);
+    glDeleteFramebuffers(2, R.ao_fbo);
+    glDeleteFramebuffers(4, R.bloom_fbo);
+    glDeleteFramebuffers(1, &R.pic_fbo);
+    glDeleteFramebuffers(1, &R.ssr_fbo);
+    GLuint t[7] = {R.scene_tex, R.depth_tex, R.nrm_tex, R.ao_tex[0], R.ao_tex[1],
+                   R.pic_tex, R.ssr_tex};
+    glDeleteTextures(7, t);
+    glDeleteTextures(4, R.bloom_tex);
+    R.scene_fbo = 0;
+  }
+  R.scene_w = R.width;
+  R.scene_h = R.height;
+  R.ao_w = R.width / 2 > 8 ? R.width / 2 : 8;
+  R.ao_h = R.height / 2 > 8 ? R.height / 2 : 8;
+  R.scene_tex = post_tex(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, R.width, R.height, GL_LINEAR);
+  R.depth_tex = post_tex(GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_FLOAT,
+                         R.width, R.height, GL_NEAREST);
+  R.nrm_tex = post_tex(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, R.width, R.height, GL_NEAREST);
+  for (int i = 0; i < 2; i++)
+    R.ao_tex[i] = post_tex(GL_RG16F, GL_RG, GL_HALF_FLOAT, R.ao_w, R.ao_h, GL_LINEAR);
+  R.pic_tex = post_tex(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, R.width, R.height, GL_LINEAR);
+  // The march runs at the AO's half resolution: a film of water blurs what it
+  // mirrors anyway, and the apply pass reads it bilinearly at full size.
+  R.ssr_tex = post_tex(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, R.ao_w, R.ao_h, GL_LINEAR);
+  for (int i = 0; i < 4; i++) {
+    R.bloom_w[i] = R.width >> (2 + i) > 4 ? R.width >> (2 + i) : 4;
+    R.bloom_h[i] = R.height >> (2 + i) > 4 ? R.height >> (2 + i) : 4;
+    R.bloom_tex[i] = post_tex(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE,
+                              R.bloom_w[i], R.bloom_h[i], GL_LINEAR);
+  }
+  glGenFramebuffers(1, &R.scene_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, R.scene_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, R.scene_tex, 0);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, R.depth_tex, 0);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    fatal("scene framebuffer incomplete");
+  glGenFramebuffers(1, &R.pre_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, R.pre_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, R.nrm_tex, 0);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, R.depth_tex, 0);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    fatal("prepass framebuffer incomplete");
+  glGenFramebuffers(2, R.ao_fbo);
+  for (int i = 0; i < 2; i++) {
+    glBindFramebuffer(GL_FRAMEBUFFER, R.ao_fbo[i]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, R.ao_tex[i], 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+      fatal("ao framebuffer incomplete");
+  }
+  { GLuint fb[2]; GLuint tx[2] = {R.pic_tex, R.ssr_tex};
+    glGenFramebuffers(2, fb);
+    R.pic_fbo = fb[0]; R.ssr_fbo = fb[1];
+    for (int i = 0; i < 2; i++) {
+      glBindFramebuffer(GL_FRAMEBUFFER, fb[i]);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tx[i], 0);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        fatal("reflection framebuffer incomplete");
+    } }
+  glGenFramebuffers(4, R.bloom_fbo);
+  for (int i = 0; i < 4; i++) {
+    glBindFramebuffer(GL_FRAMEBUFFER, R.bloom_fbo[i]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, R.bloom_tex[i], 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+      fatal("bloom framebuffer incomplete");
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
+  glBindTexture(GL_TEXTURE_2D, R.font_tex);
+}
+
+// Finish the picture into the SCENE target — ONCE PER FRAME, and the latch is
+// what makes that true. With MSAA on this is the resolve blit (an 8x resolve
+// of 1280x720 is the single most expensive blit in the frame, and running it
+// twice cost 12 ms on the llvmpipe proxy for a second copy of a picture that
+// had not changed); with it off the picture was drawn into the scene target
+// directly and there is nothing to copy. Three callers want a finished frame
+// (the composite, the frosted menu backdrop, and the end of render_frame).
 //
-// The consequence is the rule below it: once the frame is resolved, EVERYTHING
-// after it is drawn into the present buffer instead of the multisample one.
-// Nothing after the resolve is geometry — the glare composite is a fullscreen
-// triangle and the HUD is SDF text that carries its own antialiasing — so
-// there is nothing left for MSAA to do but be copied again.
+// The consequence is the rule below it: once the frame is finished, EVERYTHING
+// after it is drawn into the PRESENT buffer. Nothing after this point is
+// geometry — the composite is a fullscreen triangle that reads the scene
+// target and the HUD is SDF text that carries its own antialiasing — so there
+// is nothing left for MSAA to do but be copied again.
 static void msaa_resolve(void) {
-  if (!R.msaa_fbo || R.frame_resolved) return;
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, R.msaa_fbo);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.present_fbo);
-  glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.width, R.height,
-                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  if (R.frame_resolved) return;
+  if (R.msaa_fbo) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, R.msaa_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.scene_fbo);
+    glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.width, R.height,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  }
   R.frame_resolved = 1;
 }
 
 // Where the frame is being built RIGHT NOW. One predicate, so a pass that draws
-// after the resolve cannot land on the buffer that is no longer being presented.
+// after the resolve cannot land on the buffer that is no longer being presented:
+// the multisample target or the scene target while the picture is being made,
+// the present buffer once it is finished.
 static GLuint frame_fbo(void) {
-  return R.frame_resolved || !R.msaa_fbo ? R.present_fbo : R.msaa_fbo;
+  if (R.frame_resolved) return R.present_fbo;
+  return R.msaa_fbo ? R.msaa_fbo : R.scene_fbo;
 }
 
 // A render target is an FBO AND its viewport; binding one without the other is how a
@@ -897,8 +1004,17 @@ static void rt_bind(GLuint fbo, int w, int h) {
 // and forth, then ONE additive full-res draw. Nothing here allocates.
 static void glare_pass(float yaw, float pitch, float roll, float fovy, float aspect) {
   blur_update();
-  if (!R.blur_fbo[0] || !R.blur_fbo[1]) return;   // no chain: no glare, not a broken frame
-  msaa_resolve();   // the glare reads a RESOLVED frame; also final-safe
+  msaa_resolve();   // the glare reads a FINISHED frame; also final-safe
+  if (!R.blur_fbo[0] || !R.blur_fbo[1]) {
+    // No chain: no glare, but the picture still has to reach the present
+    // buffer — a plain copy is the composite with everything off.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, R.scene_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.present_fbo);
+    glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.width, R.height,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
+    return;
+  }
   // WHERE THE SUN IS ON SCREEN. The sun is a direction, not a point, so it
   // projects through the camera basis rather than through the view matrix — and
   // it has to be behind nothing: with the sun behind the camera the march would
@@ -925,7 +1041,7 @@ static void glare_pass(float yaw, float pitch, float roll, float fovy, float asp
     // theme does not get a dusty theme's beams.
     rays *= (0.55f + 0.95f * (1.0f - g_sun.dir.y)) * (0.55f + 1.15f * atmo_haze());
   }
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, R.present_fbo);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, R.scene_fbo);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.blur_fbo[0]);
   glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.blur_w, R.blur_h,
                     GL_COLOR_BUFFER_BIT, GL_LINEAR);
@@ -933,26 +1049,46 @@ static void glare_pass(float yaw, float pitch, float roll, float fovy, float asp
   glDisable(GL_DEPTH_TEST);
   glBindVertexArray(R.vao_sky);   // attribute-less fullscreen triangle
   glViewport(0, 0, R.blur_w, R.blur_h);
+  // THE BLOOM CHAIN, from the quarter-res copy: four 13-tap downsamples (the
+  // first one weighted by the scene's own bloom alpha and Karis-averaged), then
+  // three 9-tap tent upsamples ADDED back up the chain, so the finest level
+  // ends up carrying all four octaves of halo.
+  glUseProgram(R.prog_bdown);
+  glUniform1i(R.u_bd_tex, 0);
+  for (int i = 0; i < 4; i++) {
+    int sw = i ? R.bloom_w[i - 1] : R.blur_w, shh = i ? R.bloom_h[i - 1] : R.blur_h;
+    rt_bind(R.bloom_fbo[i], R.bloom_w[i], R.bloom_h[i]);
+    glBindTexture(GL_TEXTURE_2D, i ? R.bloom_tex[i - 1] : R.blur_tex[0]);
+    glUniform2f(R.u_bd_px, 1.0f / (float)sw, 1.0f / (float)shh);
+    glUniform1f(R.u_bd_first, i ? 0.0f : 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  }
+  glUseProgram(R.prog_bup);
+  glUniform1i(R.u_bu_tex, 0);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE);
+  for (int i = 2; i >= 0; i--) {
+    rt_bind(R.bloom_fbo[i], R.bloom_w[i], R.bloom_h[i]);
+    glBindTexture(GL_TEXTURE_2D, R.bloom_tex[i + 1]);
+    glUniform2f(R.u_bu_px, 1.0f / (float)R.bloom_w[i + 1], 1.0f / (float)R.bloom_h[i + 1]);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  }
+  glDisable(GL_BLEND);
+  // The shafts: the march through the bloom-weighted picture, quarter res.
+  glViewport(0, 0, R.blur_w, R.blur_h);
   glUseProgram(R.prog_glare);
   glUniform1i(R.u_gl_tex, 0);
+  glUniform1i(R.u_gl_scene, 1);
+  glUniform1i(R.u_gl_bloom, 3);
   glUniform1f(R.u_gl_mode, 0.0f);
   glUniform3f(R.u_gl_sun, sx * 0.5f + 0.5f, sy * 0.5f + 0.5f, rays);
-  // THE KNEE IS ABOVE SUNLIT GROUND, ON PURPOSE. Lit sand reads about 0.73 in
-  // display and half the frame is lit sand; a knee under it blooms the floor,
-  // which is how a bloom pass turns into a fog pass. 0.78..0.97 leaves the
-  // ground alone and takes the disc, the sky within a few degrees of it, the
-  // water's specular, the mica glitter, tracers and the muzzle flash. It was
-  // 0.72..0.94 and that reached into the aureole, which is already near the
-  // tonemap's shoulder: adding a blurred copy of it turned twenty degrees of
-  // sky into one flat clipped mass with the sun somewhere inside.
   glUniform2f(R.u_gl_knee, 0.78f, 0.97f);
-  glUniform3f(R.u_gl_gain, 1.0f, 0.85f, 0.0f);
+  glUniform3f(R.u_gl_gain, 0.0f, 0.85f, 0.0f);   // shafts only; the bloom has its chain
   glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1]);
   glBindTexture(GL_TEXTURE_2D, R.blur_tex[0]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  // Two growing dual-Kawase taps. They soften the shafts as much as they spread
-  // the bloom, which is why the two share a chain: a ten-tap march at quarter
-  // res is banded, and this is the filter that was already here to fix that.
+  // Two growing dual-Kawase taps: a ten-tap march at quarter res is banded,
+  // and this is the filter that was already here to fix that.
   glUseProgram(R.prog_blur);
   glUniform1i(R.u_blur_tex, 0);
   int src = 1;
@@ -964,22 +1100,32 @@ static void glare_pass(float yaw, float pitch, float roll, float fovy, float asp
     glDrawArrays(GL_TRIANGLES, 0, 3);
     src = 1 - src;
   }
+  // The composite: the scene target on unit 1, the glare on unit 0, the
+  // present buffer as the target. No blending — see the branch in GLARE_FS.
   rt_bind(frame_fbo(), R.width, R.height);
-  glEnable(GL_BLEND);
-  // ONE/SRC_ALPHA: the colour channels add, the alpha channel multiplies. See
-  // the composite branch in GLARE_FS.
-  glBlendFunc(GL_ONE, GL_SRC_ALPHA);
   glUseProgram(R.prog_glare);
-  glUniform1f(R.u_gl_mode, 1.0f);
-  glUniform3f(R.u_gl_gain, 0.0f, 0.0f, 0.56f);
+  glUniform1f(R.u_gl_mode, g_dbg_view == 1 ? 2.0f : g_dbg_view == 2 ? 3.0f
+                         : g_dbg_view == 3 ? 4.0f : 1.0f);
+  // x = the bloom's weight in the composite: four accumulated octaves of a
+  // weight that is already a fraction of the colour, so a third of it is a
+  // visible halo on the sun, the water and a tracer and nothing on a wall.
+  glUniform3f(R.u_gl_gain, 0.30f, 0.0f, 0.56f);
   // The seed walks with the sim tick, so it is deterministic per tick and yet
   // never still in play. 8 ticks is 15 Hz of grain, which is about where film
   // sits: at 120 it strobes, at 1 it is dirt on the lens.
-  glUniform4f(R.u_gl_grade, 0.34f, 0.045f, (float)((g_tick / 8) % 733) * 7.13f,
+  glUniform4f(R.u_gl_grade, 0.20f, 0.045f, (float)((g_tick / 8) % 733) * 7.13f,
               (float)R.width / (float)R.height);
+  // FXAA only where there is no multisample target to do the job.
+  glUniform3f(R.u_gl_aa, R.msaa_fbo ? 0.0f : 1.0f,
+              1.0f / (float)R.width, 1.0f / (float)R.height);
+  gl_active_texture(GL_TEXTURE3);
+  glBindTexture(GL_TEXTURE_2D, R.bloom_tex[0]);
+  gl_active_texture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, g_dbg_view == 1 ? R.ao_tex[0]
+                             : g_dbg_view == 2 ? R.bloom_tex[0] : R.scene_tex);
+  gl_active_texture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
   glBindTexture(GL_TEXTURE_2D, R.font_tex);
 }

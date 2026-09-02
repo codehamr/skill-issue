@@ -327,6 +327,8 @@ typedef struct {
   int   fps_cap;             // frame limiter, 0 = off
   int   show_fps;
   int   msaa;                // MSAA samples: 0 (off), 2, 4 or 8
+  int   ssao;                // screen-space ambient occlusion, 1 = on
+  int   ssr;                 // screen-space reflections in standing water, 1 = on
   // Written by the GAME tab's slider on the main thread, read by audio_mix on the
   // audio thread. Atomic member, not a mirrored global with three publish sites.
   _Atomic float vol;         // master volume 0..1
@@ -388,6 +390,7 @@ static config_t config_defaults(void) {
   // panel without vsync's latency; msaa 8 because flat facets and long straight
   // silhouettes are what MSAA is cheap on and what crawls without it.
   config_t c = {.sense = 1.0f, .ads_sense = 1.0f, .fov = 100.0f, .vsync = 0, .fps_cap = 120, .show_fps = 1, .msaa = 8,
+                .ssao = 1, .ssr = 1,
                 // sp_diff 2 = HARD. The bot count came down to 1, so difficulty
                 // is what carries the challenge now — see SP_BOTS_DEF.
                 .vol = VOL_DEF.def, .sp_bots = (int)SP_BOTS_DEF.def, .sp_diff = 2,
@@ -432,10 +435,12 @@ static void config_emit(FILE *f, const config_t *c) {
     "fps_cap %d\n"
     "show_fps %d\n"
     "msaa %d\n"
+    "ssao %d\n"
+    "ssr %d\n"
     "third_person %d\n"
     "devmode %d\n",
     (double)c->sense, (double)c->ads_sense, (double)c->fov, c->vsync, c->fps_cap,
-    c->show_fps, c->msaa,
+    c->show_fps, c->msaa, c->ssao, c->ssr,
     c->third_person, c->devmode);
   fprintf(f, "%s %.2f\n", VOL_DEF.key, (double)c->vol);
   fprintf(f, "sp_bots %d\nsp_difficulty %d\nsp_fraglimit %d\nplayer_name %s\n",
@@ -611,6 +616,8 @@ static void config_load_or_create(const char *path, config_t *c) {
     // hand-edited `vsync -1` means "on" today and a clamp would make it "off".
     else if (!strcmp(key, "vsync"))    c->vsync    = parse_long(val, c->vsync) ? 1 : 0;
     else if (!strcmp(key, "msaa"))     c->msaa     = msaa_snap(parse_long(val, c->msaa));
+    else if (!strcmp(key, "ssao"))     c->ssao     = parse_long(val, c->ssao) ? 1 : 0;
+    else if (!strcmp(key, "ssr"))      c->ssr      = parse_long(val, c->ssr) ? 1 : 0;
     else if (!strcmp(key, "fps_cap"))  c->fps_cap  = parse_int(val, c->fps_cap, 0, 1000);
     else if (!strcmp(key, "show_fps")) c->show_fps = parse_long(val, c->show_fps) ? 1 : 0;
     else if (!strcmp(key, "third_person")) {

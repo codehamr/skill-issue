@@ -11,8 +11,9 @@
 // ---------------------------------------------------------------------------
 // GL 3.3 core loader — only what we use beyond the GL 1.1 headers.
 // Pointer names match the spec names; nothing here collides with the 1.1
-// prototypes in either platform's GL/gl.h (glActiveTexture is avoided: we
-// only ever use texture unit 0, which is active by default).
+// prototypes in either platform's GL/gl.h. glActiveTexture is the one
+// exception (Mesa's gl.h declares it) and is loaded as gl_active_texture
+// below; units 0..3 are in use — see the renderer's texture-unit contract.
 // ---------------------------------------------------------------------------
 
 #ifdef _WIN32  // Linux Mesa gl.h pulls in glext.h which already has these
@@ -50,6 +51,36 @@ typedef struct __GLsync *GLsync;
 #define GL_COMPARE_REF_TO_TEXTURE 0x884E
 #define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT    0x00000001
+// The screen-space passes (prepass normals, SSAO, the composite) read two
+// textures at once, so a second unit exists after all. The enums are guarded:
+// Mesa's gl.h already carries the GL 1.3 set, MinGW's does not.
+#ifndef GL_TEXTURE0
+  #define GL_TEXTURE0           0x84C0
+#endif
+#ifndef GL_TEXTURE1
+  #define GL_TEXTURE1           0x84C1
+#endif
+#ifndef GL_TEXTURE2
+  #define GL_TEXTURE2           0x84C2
+#endif
+#ifndef GL_TEXTURE3
+  #define GL_TEXTURE3           0x84C3
+#endif
+#ifndef GL_RG
+  #define GL_RG                 0x8227
+#endif
+#ifndef GL_TIME_ELAPSED
+  #define GL_TIME_ELAPSED       0x88BF
+#endif
+#ifndef GL_QUERY_RESULT
+  #define GL_QUERY_RESULT       0x8866
+#endif
+#ifndef GL_RG16F
+  #define GL_RG16F              0x822F
+#endif
+#ifndef GL_HALF_FLOAT
+  #define GL_HALF_FLOAT         0x140B
+#endif
 
 #define GL_FUNC_LIST(X) \
   X(GLuint, glCreateShader, (GLenum)) \
@@ -90,6 +121,14 @@ typedef struct __GLsync *GLsync;
   X(void,   glDeleteRenderbuffers, (GLsizei, const GLuint *)) \
   X(void,   glRenderbufferStorageMultisample, (GLenum, GLsizei, GLenum, GLsizei, GLsizei)) \
   X(void,   glBlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
+  X(void,   glGenSamplers, (GLsizei, GLuint *)) \
+  X(void,   glBindSampler, (GLuint, GLuint)) \
+  X(void,   glSamplerParameteri, (GLuint, GLenum, GLint)) \
+  X(void,   glBlendFuncSeparate, (GLenum, GLenum, GLenum, GLenum)) \
+  X(void,   glGenQueries, (GLsizei, GLuint *)) \
+  X(void,   glBeginQuery, (GLenum, GLuint)) \
+  X(void,   glEndQuery, (GLenum)) \
+  X(void,   glGetQueryObjectui64v, (GLuint, GLenum, GLuint64 *)) \
   X(GLsync, glFenceSync, (GLenum, GLbitfield)) \
   X(GLenum, glClientWaitSync, (GLsync, GLbitfield, GLuint64)) \
   X(void,   glDeleteSync, (GLsync))
@@ -100,11 +139,20 @@ GL_FUNC_LIST(X)
 
 typedef void *(*gl_loader_fn)(const char *);
 
+// glActiveTexture is GL 1.3 and Mesa's gl.h DECLARES it, so a pointer under the
+// spec name would collide with that prototype on Linux; it is loaded under its
+// own name instead. Two units are used: 0 (everything that was here before)
+// and 1 (the AO texture under the world pass, the scene under the composite).
+typedef void (APIENTRY *pfn_gl_active_texture)(GLenum);
+static pfn_gl_active_texture gl_active_texture;
+
 static void gl_load_functions(gl_loader_fn load) {
 #define X(ret, name, args) name = (pfn_##name)load(#name); \
   if (!name) fatal("GL 3.3 function missing: " #name);
   GL_FUNC_LIST(X)
 #undef X
+  gl_active_texture = (pfn_gl_active_texture)load("glActiveTexture");
+  if (!gl_active_texture) fatal("GL 3.3 function missing: glActiveTexture");
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +226,37 @@ static mat4 m4_mul(mat4 a, mat4 b) {
       for (int k = 0; k < 4; k++) s += a.m[k * 4 + r] * b.m[c * 4 + k];
       o.m[c * 4 + r] = s;
     }
+  return o;
+}
+
+// General 4x4 inverse (cofactors), for the screen-space passes' unprojection:
+// world = inverse(VP) * ndc. Column-major like everything else here. A
+// singular matrix returns the identity rather than NaNs — the AO then reads a
+// flat world, which is a dull frame, not a corrupted one.
+static mat4 m4_inverse(const mat4 *a) {
+  const float *m = a->m;
+  float inv[16];
+  inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+  inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+  inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+  inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+  inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+  inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+  inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+  inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+  inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+  inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+  inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+  inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+  inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+  inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+  inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+  inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+  float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+  mat4 o = {0};
+  if (fabsf(det) < 1.0e-20f) { o.m[0] = o.m[5] = o.m[10] = o.m[15] = 1.0f; return o; }
+  float id = 1.0f / det;
+  for (int i = 0; i < 16; i++) o.m[i] = inv[i] * id;
   return o;
 }
 

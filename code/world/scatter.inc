@@ -889,8 +889,53 @@ static void renderer_init(int width, int height) {
   R.u_screen = glGetUniformLocation(R.prog_hud, "uScreen");
   R.u_tex = glGetUniformLocation(R.prog_hud, "uTex");
   R.u_img = glGetUniformLocation(R.prog_hud, "uImg");
+  R.prog_pre = gl_program(PRE_VS, PRE_FS);
+  R.u_pre_vp = glGetUniformLocation(R.prog_pre, "uVP");
+  R.u_pre_pool = glGetUniformLocation(R.prog_pre, "uPoolLevel");
+  R.prog_ssr = gl_program(BLUR_VS, SSR_FS);
+  R.u_ssr_depth = glGetUniformLocation(R.prog_ssr, "uDepth");
+  R.u_ssr_nrm   = glGetUniformLocation(R.prog_ssr, "uNrm");
+  R.u_ssr_pic   = glGetUniformLocation(R.prog_ssr, "uPic");
+  R.u_ssr_invvp = glGetUniformLocation(R.prog_ssr, "uInvVP");
+  R.u_ssr_vp    = glGetUniformLocation(R.prog_ssr, "uVP");
+  R.u_ssr_eye   = glGetUniformLocation(R.prog_ssr, "uEye");
+  R.u_ssr_z     = glGetUniformLocation(R.prog_ssr, "uZ");
+  R.prog_ssr_apply = gl_program(BLUR_VS, SSR_APPLY_FS);
+  R.u_sa_ssr   = glGetUniformLocation(R.prog_ssr_apply, "uSsr");
+  R.u_sa_nrm   = glGetUniformLocation(R.prog_ssr_apply, "uNrm");
+  R.u_sa_depth = glGetUniformLocation(R.prog_ssr_apply, "uDepth");
+  R.u_sa_invvp = glGetUniformLocation(R.prog_ssr_apply, "uInvVP");
+  R.u_sa_eye   = glGetUniformLocation(R.prog_ssr_apply, "uEye");
+  R.u_sa_px    = glGetUniformLocation(R.prog_ssr_apply, "uSsrPx");
+  R.u_ao = glGetUniformLocation(R.prog_world, "uAo");
+  R.u_aop = glGetUniformLocation(R.prog_world, "uAoP");
+  R.u_predepth = glGetUniformLocation(R.prog_world, "uPreDepth");
+  R.u_skycut = glGetUniformLocation(R.prog_world, "uSkyCut");
+  R.prog_ssao = gl_program(BLUR_VS, SSAO_FS);
+  R.u_ao_depth = glGetUniformLocation(R.prog_ssao, "uDepth");
+  R.u_ao_nrm   = glGetUniformLocation(R.prog_ssao, "uNrm");
+  R.u_ao_invvp = glGetUniformLocation(R.prog_ssao, "uInvVP");
+  R.u_ao_eye   = glGetUniformLocation(R.prog_ssao, "uEye");
+  R.u_ao_scr   = glGetUniformLocation(R.prog_ssao, "uScr");
+  R.u_ao_z     = glGetUniformLocation(R.prog_ssao, "uZ");
+  R.u_ao_i     = glGetUniformLocation(R.prog_ssao, "uAoI");
+  R.prog_aoblur = gl_program(BLUR_VS, AOBLUR_FS);
+  R.u_aob_tex = glGetUniformLocation(R.prog_aoblur, "uTex");
+  R.u_aob_px  = glGetUniformLocation(R.prog_aoblur, "uPix");
   R.prog_blur = gl_program(BLUR_VS, BLUR_FS);
   R.prog_glare = gl_program(BLUR_VS, GLARE_FS);   // same fullscreen triangle
+  R.u_gl_scene = glGetUniformLocation(R.prog_glare, "uScene");
+  R.u_gl_bloom = glGetUniformLocation(R.prog_glare, "uBloom");
+  R.u_gl_aa = glGetUniformLocation(R.prog_glare, "uAA");
+  R.prog_bdown = gl_program(BLUR_VS, BLOOM_DOWN_FS);
+  R.u_bd_tex   = glGetUniformLocation(R.prog_bdown, "uTex");
+  R.u_bd_px    = glGetUniformLocation(R.prog_bdown, "uPix");
+  R.u_bd_first = glGetUniformLocation(R.prog_bdown, "uFirst");
+  R.prog_bup   = gl_program(BLUR_VS, BLOOM_UP_FS);
+  R.u_bu_tex   = glGetUniformLocation(R.prog_bup, "uTex");
+  R.u_bu_px    = glGetUniformLocation(R.prog_bup, "uPix");
+  R.u_smraw  = glGetUniformLocation(R.prog_world, "uSmRaw");
+  R.u_smpcss = glGetUniformLocation(R.prog_world, "uSmPcss");
   R.u_gl_tex  = glGetUniformLocation(R.prog_glare, "uTex");
   R.u_gl_sun  = glGetUniformLocation(R.prog_glare, "uSunUV");
   R.u_gl_knee = glGetUniformLocation(R.prog_glare, "uKnee");
@@ -906,6 +951,7 @@ static void renderer_init(int width, int height) {
   R.u_sky_wind = glGetUniformLocation(R.prog_sky, "uWindD");
   R.u_sky_cov = glGetUniformLocation(R.prog_sky, "uCov");
   R.u_sky_sunxz = glGetUniformLocation(R.prog_sky, "uSunXZ");
+  R.u_sky_ridge = glGetUniformLocation(R.prog_sky, "uRidge");
   R.rig_sky = rig_locs(R.prog_sky);
   glGenVertexArrays(1, &R.vao_sky);  // attribute-less: verts from gl_VertexID
 
@@ -977,6 +1023,20 @@ static void renderer_init(int width, int height) {
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
     R.sm_fbo = 0;   // unshadowed game rather than no game
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  // The same map on unit 2 through a sampler object with the compare OFF: the
+  // PCSS blocker search wants depths, not verdicts. A sampler object's state
+  // overrides the texture's own, so one texture serves both readers. Unit 2
+  // belongs to this binding for the life of the program; nothing else uses it.
+  glGenSamplers(1, &R.sm_raw_sampler);
+  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_COMPARE_MODE, 0 /* GL_NONE */);
+  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+  gl_active_texture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
+  glBindSampler(2, R.sm_raw_sampler);
+  gl_active_texture(GL_TEXTURE0);
 
   // Scope target: the magnified view is rendered here once per frame while the sniper
   // is shouldered, then shown as a disc inside the ocular.
@@ -1006,7 +1066,7 @@ static void renderer_init(int width, int height) {
   glViewport(0, 0, width, height);
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_CULL_FACE);
-  glClearColor(0.71f, 0.73f, 0.75f, 1.0f);  // ~= tonemap(sky_env) at the horizon
+  glClearColor(0.71f, 0.73f, 0.75f, 0.0f);  // ~= tonemap(sky_env) at the horizon
 }
 
 static int glyph_index(char ch) {

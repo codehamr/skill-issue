@@ -846,6 +846,8 @@ static void sky_pass(float yaw, float pitch, float roll, float fovy, float aspec
   { v3 sxz = v3_norm((v3){{g_sun.dir.x, 0.0f, g_sun.dir.z}});
     glUniform2f(R.u_sky_sunxz, sxz.x, sxz.z); }
   glUniform1f(R.u_sky_cov, g_sun.cloud);
+  { float dk; v3 rp = ridge_params(&dk);
+    glUniform4f(R.u_sky_ridge, rp.x, rp.y, rp.z, dk); }
   glUniform3f(R.u_sky_fwd, sf.x, sf.y, sf.z);
   glUniform3f(R.u_sky_right, sr.x, sr.y, sr.z);
   glUniform3f(R.u_sky_up, su.x, su.y, su.z);

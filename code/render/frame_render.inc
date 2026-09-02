@@ -7,6 +7,25 @@
 // the one predicate for where the frame is being built right now.
 // =============================================================================
 
+// PER-PASS GPU TIMERS for the harness's `benchpass`: one GL_TIME_ELAPSED
+// query per pass, armed only while benching (rf_mark is a no-op otherwise),
+// so the frame's pass order below doubles as its cost table. On llvmpipe the
+// "GPU" is the rasterizer threads, which is the proxy this repo tunes on.
+#define RF_PASSES 12
+static const char *const RF_PASS_NAME[RF_PASSES] = {
+  "build", "shadow", "prepass", "ao", "world+sky", "figures", "ssr", "scope",
+  "glow", "dust", "viewmodel", "post+hud"};
+static int    g_rf_bench;
+static GLuint g_rf_q[RF_PASSES];
+static int    g_rf_cur = -1;
+static void rf_mark(int idx) {
+  if (!g_rf_bench) return;
+  if (!g_rf_q[0]) glGenQueries(RF_PASSES, g_rf_q);
+  if (g_rf_cur >= 0) glEndQuery(GL_TIME_ELAPSED);
+  g_rf_cur = idx;
+  if (idx >= 0) glBeginQuery(GL_TIME_ELAPSED, g_rf_q[idx]);
+}
+
 // The camera pass: everything that turns (player, alpha, override) into one
 // frame's eye/basis/projection. Field list is exactly the locals that cross
 // into a later pass or into render_frame's own inter-pass glue: `feet` crosses into
@@ -142,8 +161,142 @@ static void rf_shadow_pass(void) {
   glBindVertexArray(R.vao_world);
   glDrawArrays(GL_TRIANGLES, 0, R.world_cast_verts);
   scene_draw_cast();   // the same buffer minus the FP body — casters only
-  rt_bind(R.msaa_fbo ? R.msaa_fbo : R.present_fbo, R.width, R.height);
+  rt_bind(frame_fbo(), R.width, R.height);
   glBindTexture(GL_TEXTURE_2D, R.sm_tex);   // stays bound for every lit pass
+}
+
+// THE GEOMETRY PREPASS: the solids, the floor and the figures once more, into
+// the prepass target (depth + world normal), single-sample whatever the MSAA
+// setting. Decor is left out on purpose — a grass blade is not an occluder, it
+// is a texel of noise the AO would smear under every figure standing in it —
+// and so is everything drawn later with its own depth clear (the viewmodel).
+// Reads no state the lit pass does not: same VBOs, same camera, same cull.
+static void rf_pre_pass(const frame_cam_t *c) {
+  rt_bind(R.pre_fbo, R.width, R.height);
+  glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glEnable(GL_DEPTH_TEST);
+  glEnable(GL_CULL_FACE);
+  glDisable(GL_BLEND);
+  glUseProgram(R.prog_pre);
+  glUniformMatrix4fv(R.u_pre_vp, 1, GL_FALSE, c->vp.m);
+  glUniform1f(R.u_pre_pool, surf_params().z);
+  glBindVertexArray(R.vao_world);
+  { int n = R.world_cast_verts + GROUND_VERTS;
+    if (n > R.world_verts) n = R.world_verts;
+    glDrawArrays(GL_TRIANGLES, 0, n); }
+  scene_draw_vp(&c->vp);
+  glClearColor(0.71f, 0.73f, 0.75f, 0.0f);   // the lit pass's own clear, restored
+}
+
+// SCREEN-SPACE AMBIENT OCCLUSION over the prepass, half resolution: the
+// estimator, then one depth-aware blur pass per axis, leaving the result on
+// texture unit 1 for the lit passes. Everything here is a fullscreen triangle
+// with the depth test off; nothing writes depth. The projected-radius scale is
+// the half-res target's height over the vertical tangent, so the same world
+// radius lands in the same number of texels at any window size.
+static void rf_ao_pass(const frame_cam_t *c) {
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_BLEND);
+  glBindVertexArray(R.vao_sky);
+  rt_bind(R.ao_fbo[0], R.ao_w, R.ao_h);
+  glUseProgram(R.prog_ssao);
+  glUniform1i(R.u_ao_depth, 0);
+  glUniform1i(R.u_ao_nrm, 1);
+  { mat4 inv = m4_inverse(&c->vp);
+    glUniformMatrix4fv(R.u_ao_invvp, 1, GL_FALSE, inv.m); }
+  glUniform3f(R.u_ao_eye, c->eye.x, c->eye.y, c->eye.z);
+  glUniform4f(R.u_ao_scr, (float)R.ao_w, (float)R.ao_h,
+              1.0f / (float)R.ao_w, 1.0f / (float)R.ao_h);
+  // 0.45 m: a crate's foot and the hand's width of floor under a wall, not a
+  // grime band up a third of the wall — and a wall half a metre behind a
+  // figure no longer greys its whole body. Intensity 2.0: a right-angle
+  // corner reads about half-dark at the seam and clean by the radius.
+  glUniform4f(R.u_ao_z, ZNEAR, ZFAR,
+              (float)R.ao_h * 0.5f / tanf(c->fovy * 0.5f), 0.45f);
+  glUniform1f(R.u_ao_i, 2.0f);
+  gl_active_texture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, R.nrm_tex);
+  gl_active_texture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, R.depth_tex);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glUseProgram(R.prog_aoblur);
+  glUniform1i(R.u_aob_tex, 0);
+  for (int i = 0; i < 2; i++) {
+    rt_bind(R.ao_fbo[1 - i], R.ao_w, R.ao_h);
+    glBindTexture(GL_TEXTURE_2D, R.ao_tex[i]);
+    glUniform2f(R.u_aob_px, i == 0 ? 1.0f / (float)R.ao_w : 0.0f,
+                i == 0 ? 0.0f : 1.0f / (float)R.ao_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  }
+  // The blurred result (ao_tex[0], two passes: 0 -> 1 -> 0) stays on unit 1
+  // for every lit pass of this frame; unit 0 goes back to the shadow map.
+  gl_active_texture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, R.ao_tex[0]);
+  gl_active_texture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
+  glEnable(GL_DEPTH_TEST);
+  rt_bind(frame_fbo(), R.width, R.height);
+}
+
+// SCREEN-SPACE REFLECTIONS in the standing water, after the opaque passes
+// and before anything that glows: the opaque picture is copied out (the
+// multisample target resolves into it, a plain target blits), the march
+// reads it, and the apply pass blends the hits into the frame target under
+// the water's Fresnel. Nothing here happens on a dry arena — the water level
+// is the gate — and the copy is the whole cost on a wet one with MSAA on.
+// Dst alpha is kept: it is the bloom weight the lit pass wrote. The march
+// itself is half resolution (the AO's target size); the apply pass is full.
+static void rf_ssr_pass(const frame_cam_t *c) {
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, frame_fbo());
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.pic_fbo);
+  glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.width, R.height,
+                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_BLEND);
+  glBindVertexArray(R.vao_sky);
+  rt_bind(R.ssr_fbo, R.ao_w, R.ao_h);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(R.prog_ssr);
+  glUniform1i(R.u_ssr_depth, 0);
+  glUniform1i(R.u_ssr_nrm, 1);
+  glUniform1i(R.u_ssr_pic, 3);
+  { mat4 inv = m4_inverse(&c->vp);
+    glUniformMatrix4fv(R.u_ssr_invvp, 1, GL_FALSE, inv.m);
+    glUniformMatrix4fv(R.u_ssr_vp, 1, GL_FALSE, c->vp.m);
+    glUniform3f(R.u_ssr_eye, c->eye.x, c->eye.y, c->eye.z);
+    glUniform2f(R.u_ssr_z, ZNEAR, ZFAR);
+    gl_active_texture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, R.pic_tex);
+    gl_active_texture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, R.nrm_tex);
+    gl_active_texture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, R.depth_tex);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    rt_bind(frame_fbo(), R.width, R.height);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glUseProgram(R.prog_ssr_apply);
+    glUniform1i(R.u_sa_ssr, 0);
+    glUniform1i(R.u_sa_nrm, 1);
+    glUniform1i(R.u_sa_depth, 3);
+    glUniformMatrix4fv(R.u_sa_invvp, 1, GL_FALSE, inv.m);
+    glUniform3f(R.u_sa_eye, c->eye.x, c->eye.y, c->eye.z);
+    glUniform2f(R.u_sa_px, 1.0f / (float)R.ao_w, 1.0f / (float)R.ao_h);
+    gl_active_texture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, R.depth_tex);
+    gl_active_texture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, R.ssr_tex);
+    glDrawArrays(GL_TRIANGLES, 0, 3); }
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+  // The lit passes that follow (scope, viewmodel) expect the shadow map on
+  // unit 0 and the occlusion on unit 1.
+  gl_active_texture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, R.ao_tex[0]);
+  gl_active_texture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
+  glUseProgram(R.prog_world);
 }
 
 // World + sky. `shadow_on` is threaded as a plain second parameter rather than
@@ -172,6 +325,9 @@ static void rf_world_pass(const frame_cam_t *c, int shadow_on) {
   glUniform1i(R.u_sm, 0);
   glUniform1f(R.u_shadow, shadow_on ? 1.0f : 0.0f);
   glUniform1f(R.u_vm, 0.0f);
+  glUniform1i(R.u_ao, 1);
+  glUniform4f(R.u_aop, (float)R.ao_w, (float)R.ao_h, g_cfg.ssao ? 1.0f : 0.0f, 0.0f);
+  glUniform1f(R.u_skycut, 0.0f);
   // The world's own muzzle light.
   g_world_muz_c = 0.0f;
   for (int i = 0; i < MAX_FLASHES; i++)
@@ -189,6 +345,16 @@ static void rf_world_pass(const frame_cam_t *c, int shadow_on) {
   }
   glUniform2f(R.u_smstep, 1.0f / SHADOW_TEX, 1.0f / SHADOW_TEX);
   glUniform1f(R.u_smtexel, 2.0f * g_sun.sh_half / SHADOW_TEX);
+  // The penumbra: the light-space depth runs 0..1 over (sh_depth - 0.5) metres
+  // (m4_ortho's near is 0.5), so a depth difference times that is metres of
+  // caster-to-receiver gap, times the sun's tangent is metres of penumbra,
+  // over the texel is texels. The sun is drawn at 1.5x its 0.53 degrees: the
+  // dust aureole around it is part of the source as far as a shadow is
+  // concerned. The bias is two texels of world in the same units.
+  { float texel_m = 2.0f * g_sun.sh_half / SHADOW_TEX;
+    float rng = g_sun.sh_depth - 0.5f;
+    glUniform1i(R.u_smraw, 2);
+    glUniform2f(R.u_smpcss, rng * 0.0139f / texel_m, 2.0f * texel_m / rng); }
   glUniformMatrix4fv(R.u_lightvp, 1, GL_FALSE, R.light_vp.m);
   glBindVertexArray(R.vao_world);
   glDrawArrays(GL_TRIANGLES, 0, R.world_verts);
@@ -226,6 +392,9 @@ static scope_result_t rf_scope_pass(const player_t *p, const frame_cam_t *c) {
     glUseProgram(R.prog_world);
     glUniformMatrix4fv(R.u_vp, 1, GL_FALSE, svp.m);
     glUniform1f(R.u_detail, 1.0f);
+    // The occlusion was measured through the main lens; the scope's is another
+    // screen, so it goes without.
+    glUniform4f(R.u_aop, (float)R.ao_w, (float)R.ao_h, 0.0f, 0.0f);
     glBindVertexArray(R.vao_world);
     glDrawArrays(GL_TRIANGLES, 0, R.world_verts);
     sky_pass(yaw, pitch, roll, szoom, 1.0f);
@@ -239,8 +408,9 @@ static scope_result_t rf_scope_pass(const player_t *p, const frame_cam_t *c) {
       if (g_scene_cast_floats >= 0) g_scene_floats = g_scene_cast_floats;
       scene_draw_vp(&svp);
       g_scene_floats = fl_save; }
-    rt_bind(R.msaa_fbo ? R.msaa_fbo : R.present_fbo, R.width, R.height);
+    rt_bind(frame_fbo(), R.width, R.height);
     glUniformMatrix4fv(R.u_vp, 1, GL_FALSE, vp.m);
+    glUniform4f(R.u_aop, (float)R.ao_w, (float)R.ao_h, g_cfg.ssao ? 1.0f : 0.0f, 0.0f);
   }
   return (scope_result_t){.scope = scope, .svp = svp, .scope_on = scope_on};
 }
@@ -348,7 +518,7 @@ static void rf_glow_pass(const player_t *p, float alpha, const frame_cam_t *c,
       rt_bind(R.scope_fbo, R.scope_size, R.scope_size);
       glUniformMatrix4fv(R.u_vp, 1, GL_FALSE, svp.m);
       scene_draw_vp(&svp);
-      rt_bind(R.msaa_fbo ? R.msaa_fbo : R.present_fbo, R.width, R.height);
+      rt_bind(frame_fbo(), R.width, R.height);
       glUniformMatrix4fv(R.u_vp, 1, GL_FALSE, vp.m);
     }
     fx_pass_end();
@@ -370,9 +540,16 @@ static void rf_dust_pass(const frame_cam_t *c) {
     scene_reset();
     fx_dust(eye);
     if (g_scene_floats) {
+      // The prepass depth on unit 3 for the sky test — see uSkyCut in WORLD_FS.
+      gl_active_texture(GL_TEXTURE3);
+      glBindTexture(GL_TEXTURE_2D, R.depth_tex);
+      gl_active_texture(GL_TEXTURE0);
+      glUniform1i(R.u_predepth, 3);
+      glUniform1f(R.u_skycut, 1.0f);
       fx_pass_begin();
       scene_draw_vp(&vp);
       fx_pass_end();
+      glUniform1f(R.u_skycut, 0.0f);
     }
   }
 }
@@ -895,8 +1072,9 @@ static void render_frame(const player_t *p, float alpha, int fps,
                          const cam_override_t *ov) {
   if (g_world_dirty) { world_upload(); g_world_dirty = 0; }
   msaa_update();
+  post_update();
   R.frame_resolved = 0;
-  glBindFramebuffer(GL_FRAMEBUFFER, R.msaa_fbo ? R.msaa_fbo : R.present_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, frame_fbo());
 
   frame_cam_t cam = rf_camera(p, alpha, ov);
   v3 eye = cam.eye;
@@ -909,6 +1087,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
   // Everything that casts is built BEFORE anything is drawn: the shadow pass draws the
   // same two VBOs the colour passes do, so the caster list cannot drift from the
   // visible geometry.
+  rf_mark(0);
   g_cam_eye = eye;
   g_cam_frustum = frustum_of(&vp);
   g_cam_cull = 1;
@@ -923,34 +1102,65 @@ static void render_frame(const player_t *p, float alpha, int fps,
   // Sun shadows. One ortho map over the whole arena, centred on it, far enough
   // back along the sun that nothing in the level is behind the near plane.
   int shadow_on = R.sm_fbo != 0;
+  rf_mark(1);
   if (shadow_on) rf_shadow_pass();
 
+  // The screen-space half: geometry first, then what the screen can say about
+  // it, before a single lit pixel is decided.
+  rf_mark(2);
+  rf_pre_pass(&cam);
+  rf_mark(3);
+  if (g_cfg.ssao) {
+    rf_ao_pass(&cam);
+  } else {
+    // Unit 1 still carries the (stale) AO texture: the lit passes declare the
+    // sampler whether or not they read it, and a unit that flips format
+    // between a frame's draws costs llvmpipe a shader variant per flip
+    // (measured: the world pass at 103 ms against 60 with the occlusion ON).
+    gl_active_texture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, R.ao_tex[0]);
+    gl_active_texture(GL_TEXTURE0);
+    rt_bind(frame_fbo(), R.width, R.height);
+  }
+
+  rf_mark(4);
   rf_world_pass(&cam, shadow_on);
 
   // Dynamic scene: figures and round impact marks (solid), then the additive
   // light pass — tracers and sparks are glow, not geometry: depth-tested but not
   // depth-written, blended ONE/ONE.
+  rf_mark(5);
   scene_draw_vp(&vp);
 
+  rf_mark(6);
+  if (g_cfg.ssr && surf_params().z > 0.0f) rf_ssr_pass(&cam);
+
+  rf_mark(7);
   scope_result_t sr = rf_scope_pass(p, &cam);
 
+  rf_mark(8);
   rf_vm_frame_t vmf;
   rf_glow_pass(p, alpha, &cam, sr.scope_on, &sr.svp, &vmf);
 
+  rf_mark(9);
   rf_dust_pass(&cam);
 
+  rf_mark(10);
   rf_vm_pass(p, &cam, &vmf);
 
   // The picture is finished here; everything after this line is interface.
+  rf_mark(11);
   glare_pass(yaw, pitch, roll, fovy, aspect);
 
   rf_hud_pass(p, &cam, fps, sr.scope);
+  rf_mark(-1);
 
   // Leave the present FBO bound on both targets so glReadPixels/SwapBuffers
-  // see it. glare_pass has normally resolved already, in which case this is the
-  // latch's no-op and the HUD above was drawn straight into the present buffer.
+  // see it. glare_pass has normally finished the frame already, in which case
+  // this is the latch's no-op and the HUD above was drawn straight into the
+  // present buffer.
   msaa_resolve();
-  if (R.msaa_fbo) glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
 }
 
 #define DEFAULT_SEED 1337u

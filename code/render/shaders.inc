@@ -63,6 +63,14 @@
   "  return mix(mix(vhash2(i), vhash2(i + vec2(1.0, 0.0)), f.x),\n" \
   "             mix(vhash2(i + vec2(0.0, 1.0)), vhash2(i + vec2(1.0, 1.0)), f.x), f.y);\n" \
   "}\n" \
+  /* THE STANDING WATER, as one function with two readers: the lit floor
+     (which shades the film) and the geometry prepass (which flags it for the
+     reflection pass). One height field, one threshold, so the pixels the
+     reflection lands on are exactly the pixels drawn as water. */ \
+  "float pool_mask(vec2 P, float level){\n" \
+  "  float hgt = vnoise2(P * 0.155) * 0.64 + vnoise2(P * 0.41) * 0.36;\n" \
+  "  return smoothstep(-0.045, 0.045, level - hgt);\n" \
+  "}\n" \
   /* THE LIGHT RIG, and every one of these is now map state rather than a
      constant. NEVER near-overhead: a sun at 62 degrees lights three
      90-degrees-apart faces of the same box to within a few percent of each
@@ -123,7 +131,7 @@
      four values: measured at 6 ms/frame on the llvmpipe proxy, i.e. more than
      the entire glare chain, for arithmetic that cannot change within a draw.
      rig_upload folds them once instead. */ \
-  "uniform vec3 uHaze, uHazeS, uAmbD, uAmbU, uBounce;\n" \
+  "uniform vec3 uHaze, uHazeS, uAmbD, uAmbU, uBounce, uBounceS, uAmbS, uSunH;\n" \
   "vec3 haze_rad(float mu){\n" \
   "  float k = 0.792;\n" \
   "  float den = 1.0 - k * mu;\n" \
@@ -326,16 +334,68 @@
   "  vec3 F = mix(F0, f90, fv2 * fv2 * fv);\n" \
   "  return (diff + D * Vis * F) * NoL * rad;\n" \
   "}\n" \
+  /* THE LOOK: x selects the curve (0 = the ACES fit, 1 = AgX), y is a contrast
+     about display mid-grey, z a saturation about luminance, both applied in
+     DISPLAY space after the curve so a change of curve and a change of grade
+     stay two separate decisions. The harness `look` command drives all of
+     them at runtime; the defaults are what ships. */ \
+  "uniform vec4 uLook;\n" \
+  /* AgX (Sobotka; the minimal fit by Wrensch): a log2 encode over 16.5 stops,
+     a sixth-order sigmoid, and the inset/outset matrices that keep a saturated
+     highlight desaturating toward white instead of skewing hue — the thing the
+     ACES fit does to a sunset (orange to yellow) and to the landmark reds. The
+     output is display-encoded already; the sqrt below is skipped for it. */ \
+  "vec3 agx_curve(vec3 x){\n" \
+  "  vec3 x2 = x * x, x4 = x2 * x2;\n" \
+  "  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x\n" \
+  "       + 0.4298 * x2 + 0.1191 * x - 0.00232;\n" \
+  "}\n" \
+  "vec3 agx(vec3 v){\n" \
+  "  const mat3 M = mat3(0.842479062253094, 0.0423282422610123, 0.0423756549057051,\n" \
+  "                      0.0784335999999992, 0.878468636469772, 0.0784336,\n" \
+  "                      0.0792237451477643, 0.0791661274605434, 0.879142973793104);\n" \
+  "  const mat3 Mi = mat3(1.19687900512017, -0.0528968517574562, -0.0529716355144438,\n" \
+  "                       -0.0980208811401368, 1.15190312990417, -0.0980434501171241,\n" \
+  "                       -0.0990297440797205, -0.0989611768448433, 1.15107367264116);\n" \
+  "  v = M * v;\n" \
+  "  v = clamp(log2(max(v, 1.0e-10)), -12.47393, 4.026069);\n" \
+  "  v = (v + 12.47393) * (1.0 / 16.5);\n" \
+  "  v = agx_curve(v);\n" \
+  "  return clamp(Mi * v, 0.0, 1.0);\n" \
+  "}\n" \
   "vec3 tonemap(vec3 x){\n" \
   "  x *= EXPOSURE;\n" \
-  "  x = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);\n" \
-  "  x = sqrt(clamp(x, 0.0, 1.0));\n" \
+  "  if (uLook.x > 0.5) {\n" \
+  "    x = agx(x);\n" \
+  "  } else {\n" \
+  "    x = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);\n" \
+  "    x = sqrt(clamp(x, 0.0, 1.0));\n" \
+  "  }\n" \
+  "  float lm = dot(x, vec3(0.2126, 0.7152, 0.0722));\n" \
+  "  x = mix(vec3(lm), x, uLook.z);\n" \
+  "  x = clamp(0.5 + (x - 0.5) * uLook.y, 0.0, 1.0);\n" \
   /* Half an LSB of interleaved-gradient noise. A smooth sky quantised to 8 bits
      shows about eighty hard Mach bands ten pixels apart; dither turns the step
      into grain the eye integrates away, and it costs three instructions. */ \
   "  float dth = fract(52.9829189 * fract(dot(gl_FragCoord.xy,\n" \
   "                                          vec2(0.06711056, 0.00583715))));\n" \
   "  return x + (dth - 0.5) * 0.0039216;\n" \
+  "}\n" \
+  /* THE BLOOM IS DECIDED BEFORE THE TONEMAP, and it rides in the alpha channel.
+     The picture is display-referred by the time the glare chain reads it, so a
+     knee on the displayed luminance cannot tell a sunlit wall at 0.8 from a
+     sun disc at 26: both clip to about the same white. This is the scene
+     luminance (after exposure, before the curve) in stops over the point where
+     the curve starts to shoulder (1.2), mapped to [0,1] over three stops — wide
+     enough that the sun's aureole counts, so a noon sun blinds the way the
+     old display-knee bloom made it, with a real falloff instead of a clipped
+     blob. The chain
+     multiplies the colour by it, so what spills is what was actually bright,
+     in its own colour. An RGBA8 target carries it, MSAA resolves it, nothing
+     else in the frame reads the alpha. */ \
+  "float bloom_w(vec3 c){\n" \
+  "  float l = dot(c, vec3(0.2126, 0.7152, 0.0722)) * EXPOSURE;\n" \
+  "  return clamp(log2(max(l, 1.0e-4) * (1.0 / 1.2)) * (1.0 / 3.0), 0.0, 1.0);\n" \
   "}\n"
 
 static const char *WORLD_VS =
@@ -366,6 +426,145 @@ static const char *DEPTH_FS =
   "#version 330 core\n"
   "void main(){}\n";
 
+// THE GEOMETRY PREPASS: depth plus the world-space normal of what is solid,
+// drawn once per frame into single-sample textures BEFORE the lit pass, so the
+// screen-space passes (SSAO today) have a picture of the geometry to read
+// while the colour is still being decided. It is its own pass and not a second
+// attachment on the lit target on purpose: the lit target may be multisampled
+// and a screen-space pass wants one depth per pixel, not eight.
+static const char *PRE_VS =
+  "#version 330 core\n"
+  "layout(location=0) in vec3 aPos;\n"
+  "layout(location=1) in vec3 aNrm;\n"
+  "uniform mat4 uVP;\n"
+  "out vec3 vNrm; out vec3 vWorld;\n"
+  "void main(){ vNrm = aNrm; vWorld = aPos; gl_Position = uVP * vec4(aPos, 1.0); }\n";
+// ...and the alpha is the standing-water mask on the floor (pool_mask, the
+// same function the lit floor shades with), so the reflection pass knows
+// which pixels are a film of water without a second guess at the noise.
+static const char *PRE_FS =
+  "#version 330 core\n"
+  GLSL_ENV
+  "in vec3 vNrm; in vec3 vWorld; out vec4 oNrm;\n"
+  "uniform float uPoolLevel;\n"
+  "void main(){\n"
+  "  float pool = 0.0;\n"
+  "  if (uPoolLevel > 0.0 && vNrm.y > 0.95 && vWorld.y < 0.05)\n"
+  "    pool = pool_mask(vWorld.xz, uPoolLevel);\n"
+  "  oNrm = vec4(normalize(vNrm) * 0.5 + 0.5, pool);\n"
+  "}\n";
+
+// SCREEN-SPACE REFLECTIONS, for the standing water only. A pool is a mirror
+// lying on the floor, and until now it mirrored the sky alone: a wall a metre
+// behind it, a figure standing in it, the landmark box — none of them were in
+// the film. This marches the reflected ray through the prepass depth (24
+// steps of a third of a metre, then four halvings onto the hit) and reads the
+// finished opaque picture where it lands. Everything else about the water —
+// its Fresnel, its diffuse, its sky where no hit lands — is still the lit
+// floor's; this pass only replaces the sky in the film where something else
+// actually stands. Full resolution, but a pixel that is not water leaves in
+// three instructions, so on a dry arena the pass is a clear and a quad.
+// The hit is faded toward the screen's edges (what leaves the frame cannot
+// be reflected) and by the ray's own length (a long march is a guess).
+static const char *SSR_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uDepth;\n"   // unit 0: prepass depth
+  "uniform sampler2D uNrm;\n"     // unit 1: prepass normal + pool mask
+  "uniform sampler2D uPic;\n"     // unit 3: the opaque picture
+  "uniform mat4 uInvVP, uVP;\n"
+  "uniform vec3 uEye;\n"
+  "uniform vec2 uZ;\n"            // near, far
+  "float lin_z(float d){\n"
+  "  float z = d * 2.0 - 1.0;\n"
+  "  return 2.0 * uZ.x * uZ.y / (uZ.y + uZ.x - z * (uZ.y - uZ.x));\n"
+  "}\n"
+  "vec3 world_at(vec2 uv, float d){\n"
+  "  vec4 p = uInvVP * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);\n"
+  "  return p.xyz / p.w;\n"
+  "}\n"
+  // Screen position AND view depth of a world point, in one projection.
+  "vec3 to_screen(vec3 w){\n"
+  "  vec4 c = uVP * vec4(w, 1.0);\n"
+  "  return vec3(c.xy / c.w * 0.5 + 0.5, c.w);\n"
+  "}\n"
+  "void main(){\n"
+  "  float pool = texture(uNrm, vUV).a;\n"
+  "  if (pool < 0.02) { oCol = vec4(0.0); return; }\n"
+  "  float d0 = texture(uDepth, vUV).r;\n"
+  "  vec3 P = world_at(vUV, d0);\n"
+  "  vec3 V = normalize(uEye - P);\n"
+  "  vec3 R = reflect(-V, vec3(0.0, 1.0, 0.0));\n"
+  "  if (R.y < 0.02) { oCol = vec4(0.0); return; }\n"
+  // A per-pixel start offset (the same interleaved-gradient noise as every
+  // other screen-space term) turns the step banding into fine grain.
+  "  float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy,\n"
+  "                                          vec2(0.06711056, 0.00583715))));\n"
+  "  float step = 0.34;\n"
+  "  float t = step * (0.3 + 0.7 * ign);\n"
+  "  float t_prev = 0.0;\n"
+  "  bool hit = false;\n"
+  "  vec3 sp = vec3(0.0);\n"
+  "  for (int i = 0; i < 24; i++) {\n"
+  "    vec3 w = P + R * t;\n"
+  "    sp = to_screen(w);\n"
+  "    if (sp.x < 0.0 || sp.x > 1.0 || sp.y < 0.0 || sp.y > 1.0) break;\n"
+  "    float zs = lin_z(texture(uDepth, sp.xy).r);\n"
+  "    float dz = sp.z - zs;\n"
+  "    if (dz > 0.0 && dz < 0.9 + 0.04 * t) { hit = true; break; }\n"
+  "    t_prev = t;\n"
+  "    t += step * (1.0 + 0.06 * float(i));\n"
+  "  }\n"
+  "  if (!hit) { oCol = vec4(0.0); return; }\n"
+  // Four halvings between the last miss and the hit sharpen the edge.
+  "  float lo = t_prev, hi = t;\n"
+  "  for (int i = 0; i < 4; i++) {\n"
+  "    float mid = 0.5 * (lo + hi);\n"
+  "    vec3 sm = to_screen(P + R * mid);\n"
+  "    float zs = lin_z(texture(uDepth, sm.xy).r);\n"
+  "    if (sm.z - zs > 0.0) { hi = mid; sp = sm; } else lo = mid;\n"
+  "  }\n"
+  "  vec2 e = abs(sp.xy - 0.5) * 2.0;\n"
+  "  float edge = 1.0 - smoothstep(0.75, 1.0, max(e.x, e.y));\n"
+  "  float len = 1.0 - smoothstep(10.0, 18.0, hi);\n"
+  "  vec3 c = texture(uPic, sp.xy).rgb;\n"
+  "  oCol = vec4(c, edge * len);\n"
+  "}\n";
+
+// ...and the film's Fresnel decides how much of the hit replaces the sky:
+// 0.02 straight down, all of it at grazing — the same 1.33 water the lit
+// floor uses. The pool mask and the hit confidence multiply in.
+static const char *SSR_APPLY_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uSsr;\n"     // unit 0: the reflection (rgb, confidence)
+  "uniform sampler2D uNrm;\n"     // unit 1: prepass normal + pool mask
+  "uniform sampler2D uDepth;\n"   // unit 2: prepass depth
+  "uniform mat4 uInvVP;\n"
+  "uniform vec3 uEye;\n"
+  "uniform vec2 uSsrPx;\n"        // one texel of the half-res march
+  "void main(){\n"
+  // Four bilinear taps a half texel out: a 3x3 tent over the march, which
+  // takes the odd/even hit pattern a jittered march leaves on a thin
+  // reflected figure and turns it into the soft image a film of water gives.
+  "  vec4 r = (texture(uSsr, vUV + uSsrPx * vec2(-0.5, -0.5))\n"
+  "          + texture(uSsr, vUV + uSsrPx * vec2( 0.5, -0.5))\n"
+  "          + texture(uSsr, vUV + uSsrPx * vec2(-0.5,  0.5))\n"
+  "          + texture(uSsr, vUV + uSsrPx * vec2( 0.5,  0.5))) * 0.25;\n"
+  "  float pool = texture(uNrm, vUV).a;\n"
+  "  if (r.a * pool < 0.005) discard;\n"
+  "  vec4 p = uInvVP * vec4(vUV * 2.0 - 1.0, texture(uDepth, vUV).r * 2.0 - 1.0, 1.0);\n"
+  "  vec3 V = normalize(uEye - p.xyz / p.w);\n"
+  "  float f = 1.0 - max(V.y, 0.0); f *= f; f *= f * (1.0 - max(V.y, 0.0));\n"
+  // 1.8x the Fresnel, and the reason is what the mix replaces: the pixel
+  // under it already carries the film's own SKY reflection at this same
+  // Fresnel, and a hit should stand in for that sky, not sit at half strength
+  // on top of it. Display-referred mixing on both sides; the factor is what
+  // makes a wall in a puddle read as a wall in a puddle.
+  "  float F = clamp((0.02 + 0.98 * f) * 1.8, 0.0, 1.0);\n"
+  "  oCol = vec4(r.rgb, F * r.a * pool);\n"
+  "}\n";
+
 // One metal/dielectric BRDF for everything solid: GGX specular + Smith visibility, F0
 // from metalness, and — the term that actually sells metal — an environment reflection
 // sampled from the same sky the player can see.
@@ -389,6 +588,20 @@ static const char *WORLD_FS =
   "uniform vec4 uSurf;\n"
   "uniform vec2 uSmStep;\n"               // one shadow texel in UV
   "uniform sampler2DShadow uSm;\n"
+  "uniform sampler2D uSmRaw;\n"           // the same map, no compare: blocker depths
+  // x = penumbra texels per unit of light-space depth difference (the sun's
+  // angular size over the texel, folded in C); y = the blocker bias in depth
+  // units (two texels of world, so a surface is never its own blocker).
+  "uniform vec2 uSmPcss;\n"
+  // SCREEN-SPACE OCCLUSION, half resolution: r = the obscurance, g = the distance
+  // from the eye of the surface it was measured on. uAoP.xy is the texture's size
+  // in texels, .z its switch — 0 for the scope picture (a different lens, so a
+  // different screen) and for the viewmodel (drawn after its own depth clear, so
+  // the buffer under it is the wall behind the rifle).
+  "uniform sampler2D uAo;\n"
+  "uniform vec4 uAoP;\n"
+  "uniform sampler2D uPreDepth;\n"   // unit 3, bound by the dust pass only
+  "uniform float uSkyCut;\n"
   "out vec4 oCol;\n"
   // 4x4 taps of a hardware-compared shadow map: each tap is itself bilinear, so sixteen
   // of them at half-texel spacing give a penumbra about three texels wide — enough that
@@ -410,20 +623,120 @@ static const char *WORLD_FS =
   "  f = f * f * (3.0 - 2.0 * f);\n"
   "  return mix(vhash1(i), vhash1(i + 1.0), f);\n"
   "}\n"
+  // THE SUN HAS A SIZE, AND THE SHADOW SHOWS IT. Percentage-closer soft shadows:
+  // a blocker search on the raw depth (unit 2, the same texture without the
+  // compare) finds how far in front of this surface the caster is, the sun's
+  // angular size turns that distance into a penumbra width, and a Vogel disc
+  // of hardware-compared taps at that width filters it. A wall's shadow is a
+  // razor at its foot and a hand's width soft twenty metres out, which is what
+  // a low sun across an arena actually draws — the old 4x4 grid was three
+  // texels wide everywhere.
+  // The disc is rotated per pixel by interleaved-gradient noise (the same
+  // construction the tonemap dither and the AO use: a pure function of the
+  // fragment coordinate, so a screenshot cannot depend on the frame before it).
+  // THE CAP IS WHAT KEEPS THE PENUMBRA CLEAN. Twenty-four bilinear taps cover
+  // a disc of about five and a half texels completely; at eight they cover
+  // half of it and every wide penumbra is grain (measured: 7.1 levels of
+  // neighbour difference against 2.1 on flat sand), at ten it was stipple on
+  // the entry screen's wall shadow. 5.5 texels is eight centimetres of
+  // penumbra — the far end of a long wall shadow is softer than that in
+  // life, but a soft edge that does not crawl beats a wide one that does.
+  "vec2 vogel(int i, int n, float phi){\n"
+  "  float r = sqrt((float(i) + 0.5) / float(n));\n"
+  "  float t = 2.3999632 * float(i) + phi;\n"
+  "  return r * vec2(cos(t), sin(t));\n"
+  "}\n"
   "float sun_shadow(){\n"
   "  if (uShadow < 0.5) return 1.0;\n"
   "  vec3 p = vLit.xyz / vLit.w;\n"
   "  if (p.z >= 1.0) return 1.0;\n"
   "  p = p * 0.5 + 0.5;\n"
+  // Hash noise for the disc's rotation, not interleaved-gradient: a sparse
+  // disc under IGN leaves IGN's diagonal lattice in every wide penumbra,
+  // which read as a screen door on the entry screen's wall shadow. Hash
+  // noise leaves grain, and grain is what the composite already adds.
+  "  vec3 hq = fract(vec3(gl_FragCoord.xy, gl_FragCoord.x + 7.3) * 0.1031);\n"
+  "  hq += dot(hq, hq.yzx + 33.33);\n"
+  "  float phi = 6.2831853 * fract((hq.x + hq.y) * hq.z);\n"
+  // THE WIDE TEST FIRST. Twelve compared taps over the widest penumbra the
+  // filter can draw: all lit or all shadowed means this pixel is further from
+  // any edge than the penumbra can reach, and that is the answer — most of
+  // the floor, most of every wall. Only a pixel inside that band pays for the
+  // blocker search and the second, fitted disc. 12 taps common, 32 on the
+  // edge, against the 16 flat taps this replaced.
   "  float s = 0.0;\n"
-  "  for (int y = -1; y <= 2; y++)\n"
-  "    for (int x = -1; x <= 2; x++)\n"
-  "      s += texture(uSm, vec3(p.xy + vec2(float(x) - 0.5, float(y) - 0.5)\n"
-  "                                    * uSmStep, p.z));\n"
-  "  return s * 0.0625;\n"
+  "  for (int i = 0; i < 12; i++)\n"
+  "    s += texture(uSm, vec3(p.xy + vogel(i, 12, phi) * uSmStep * 12.0, p.z));\n"
+  "  if (s < 0.5) return 0.0;\n"
+  "  if (s > 11.5) return 1.0;\n"
+  // Blocker search: the centre plus eight raw depths over the same width, and
+  // THE NEAREST BLOCKER DECIDES, not the average. A floor pixel a hand behind
+  // a wall's foot is, in light space, a hand from the LIT floor in front of
+  // that wall — the only thing between them is the wall's own lit face. The
+  // average blocker there is the wall's top, three metres up, which asks for
+  // the widest penumbra and so mixes the lit floor into the umbra: a bright
+  // seam along every base. The nearest blocker is the lit face a few
+  // centimetres up, which asks for a hard contact — the truth. Far out on
+  // the floor every blocker is the top and the two agree.
+  "  float bmax = -1.0, bn = 0.0;\n"
+  "  { float d = texture(uSmRaw, p.xy).r;\n"
+  "    if (d < p.z - uSmPcss.y) { bmax = max(bmax, d); bn += 1.0; } }\n"
+  // The search pattern is NOT rotated per pixel: with a rotating pattern the
+  // nearest blocker each pixel finds is a different one, the fitted width
+  // jumps with it, and the penumbra is noise however many compares the disc
+  // below spends (measured 6.9 levels of neighbour difference, unchanged
+  // from 24 taps at half the width). A fixed pattern finds the same blocker
+  // for neighbouring pixels, so the width varies smoothly across the edge.
+  "  for (int i = 0; i < 8; i++) {\n"
+  "    float d = texture(uSmRaw, p.xy + vogel(i, 8, 0.0) * uSmStep * 10.0).r;\n"
+  "    if (d < p.z - uSmPcss.y) { bmax = max(bmax, d); bn += 1.0; }\n"
+  "  }\n"
+  "  if (bn < 0.5) return 1.0;\n"
+  "  float pen = clamp((p.z - bmax) * uSmPcss.x, 1.0, 5.5);\n"
+  "  s = 0.0;\n"
+  "  for (int i = 0; i < 24; i++)\n"
+  "    s += texture(uSm, vec3(p.xy + vogel(i, 24, phi) * uSmStep * pen, p.z));\n"
+  "  return s * (1.0 / 24.0);\n"
+  "}\n"
+  // DEPTH-AWARE UPSAMPLE of the half-res occlusion: the four texels under this
+  // pixel, bilinear weights scaled by how close each one's surface is to THIS
+  // surface. A plain bilinear read of a half-res AO paints a dark halo of the
+  // crate's contact onto the wall three metres behind it; weighting by the
+  // distance stored beside the AO keeps the two surfaces' occlusion apart. If
+  // no texel agrees (a one-pixel sliver), the nearest one wins rather than
+  // averaging strangers.
+  "float ao_screen(float d){\n"
+  "  vec2 h = gl_FragCoord.xy * 0.5 - 0.5;\n"
+  "  vec2 i0 = floor(h), f = h - i0;\n"
+  "  ivec2 mx = ivec2(uAoP.xy) - 1;\n"
+  "  float acc = 0.0, ws = 0.0, near_ao = 1.0, near_w = -1.0;\n"
+  "  for (int j = 0; j < 2; j++)\n"
+  "    for (int i = 0; i < 2; i++) {\n"
+  "      ivec2 c = clamp(ivec2(i0) + ivec2(i, j), ivec2(0), mx);\n"
+  "      vec2 t = texelFetch(uAo, c, 0).rg;\n"
+  "      float wb = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);\n"
+  "      float w = wb / (1.0 + 80.0 * abs(t.g - d) / max(d, 0.2));\n"
+  "      acc += t.r * w; ws += w;\n"
+  "      if (wb > near_w) { near_w = wb; near_ao = t.r; }\n"
+  "    }\n"
+  "  return ws > 1.0e-3 ? acc / ws : near_ao;\n"
   "}\n"
   "void main(){\n"
-  "  if (uEmis > 0.5) { oCol = vec4(vCol, 1.0); return; }\n"
+  // A glow's bloom weight comes from its own brightness: a tracer core and a
+  // muzzle star spill, a dust mote (dim by construction) does not.
+  // A mote against the SKY is a speck on the lens: the dust pass (and only
+  // it, uSkyCut) asks the prepass depth under this pixel and fades the mote
+  // out where nothing but sky is behind it. The prepass is single-sample, so
+  // a mote on a wall's silhouette edge may flicker by one pixel; the motes
+  // are a pixel and a half wide, nobody will see it.
+  "  if (uEmis > 0.5) {\n"
+  "    float gl = dot(vCol, vec3(0.2126, 0.7152, 0.0722));\n"
+  "    float keep = 1.0;\n"
+  "    if (uSkyCut > 0.5 &&\n"
+  "        texelFetch(uPreDepth, ivec2(gl_FragCoord.xy), 0).r >= 0.99999) keep = 0.15;\n"
+  "    oCol = vec4(vCol * keep, smoothstep(0.45, 1.1, gl) * 0.6 * keep);\n"
+  "    return;\n"
+  "  }\n"
   "  vec3 n = normalize(vNrm);\n"
   "  vec3 alb = vCol * vCol;\n"                 // authored display -> linear
   "  vec3 dv = vWorld - uEye;\n"
@@ -452,6 +765,18 @@ static const char *WORLD_FS =
   // ...and the metalness is its MAGNITUDE: the sign is the tool direction. See
   // mat_lathe. Nothing outside gun_build writes a negative, so the world is unchanged.
   "  float metal = abs(vMat.y), ao = vMat.z;\n"
+  // TWO OCCLUSIONS, ONE READER EACH. `ao` is the authored ramp a vertex carries
+  // (a crate's foot, a figure's crease) and it goes on partly applying to the
+  // sun — a crease is a little darker in a beam. `aos` is what the screen
+  // measured this frame — the metre of floor under a wall, the ground under a
+  // boot, the corner two walls make — and it is INDIRECT light only: the sun
+  // does not care that a wall stands a metre away, and the shadow map already
+  // says when it does. So the screen term joins the vertex term in `aoi` for
+  // the ambient, the environment, the sheen and the bounce, and stays out of
+  // `sh`. The branch is uniform-valued per draw.
+  "  float aos = 1.0;\n"
+  "  if (uAoP.z > 0.5 && uVm < 0.5) aos = ao_screen(d);\n"
+  "  float aoi = ao * aos;\n"
   // --- WEAPON MICRO-STRUCTURE, IN THE WEAPON'S OWN FRAME --------------------
   // One roughness and one albedo per PART makes a receiver flat a single unbroken sweep
   // of highlight however good the BRDF over it is, which is most of why the rifle read
@@ -576,8 +901,9 @@ static const char *WORLD_FS =
   // pattern — exactly where the footprint is largest anyway, so the two fades
   // agree about direction and only disagree about which artefact they prevent.
 
-  // 9 mm on a 12.5 cm wavelength, i.e. a 14-degree lee face.
-  "      float amp = 0.0090 * uSurf.x * vis * (0.62 + 0.50 * rv);\n"
+  // 7 mm on a 12.5 cm wavelength, i.e. an 11-degree lee face: 9 mm read as
+  // corduroy under a raking sun once the shadows went soft around it.
+  "      float amp = 0.0072 * uSurf.x * vis * (0.62 + 0.50 * rv);\n"
   "      vec2 gr = wd * (dh * amp / lam);\n"
   "      n = normalize(n - vec3(gr.x, 0.0, gr.y));\n"
   // The albedo term is deliberately weak.
@@ -634,7 +960,20 @@ static const char *WORLD_FS =
   // One height field, TWO thresholds.
   "    if (uSurf.z > 0.0) {\n"
   "      float hgt = vnoise2(P * 0.155) * 0.64 + vnoise2(P * 0.41) * 0.36;\n"
-  "      float pool = smoothstep(-0.045, 0.045, uSurf.z - hgt);\n"
+  "      float pool = pool_mask(P, uSurf.z);\n"
+  // THE FLOOR BETWEEN THE POOLS IS DAMP, and it did not read as anything: a
+  // 0.86-rough concrete with a few dark pools in it is a dry floor with
+  // stains. Wet stone is a broad glossy reflection of the sky at grazing
+  // angles — the far half of the floor takes the horizon's brightness —
+  // and a darker albedo close up. Patchy, from a broad noise, so the
+  // sheen has drying edges rather than a uniform varnish; the water level
+  // scales it, so DRAINED is dampest only where the pools were.
+  "      float dmpn = vnoise2(P * 0.07 + vec2(7.3, 2.1)) * 0.6\n"
+  "                 + vnoise2(P * 0.23 - vec2(1.7, 5.9)) * 0.4;\n"
+  "      float dampf = (0.55 + 0.45 * smoothstep(0.30, 0.72, dmpn))\n"
+  "                  * clamp(uSurf.z * 2.6, 0.0, 1.0);\n"
+  "      rough = mix(rough, 0.28, dampf * (1.0 - pool));\n"
+  "      alb *= mix(1.0, 0.70, dampf);\n"
   // The halo is WIDER than the film by a real margin.
   "      float damp = smoothstep(-0.13, 0.13, uSurf.z + 0.125 - hgt);\n"
   // 0.72, NOT 0.32, and the first number was a misread of the source it came from.
@@ -689,8 +1028,16 @@ static const char *WORLD_FS =
   "  float NoV = max(dot(n, V), 1e-4);\n"
   // Diffuse irradiance: the same sky, smoothed to a hemisphere lobe. Sun-facing AO is
   // only partly applied — a crease is dark in ambient light, not in a direct beam.
-  "  vec3 amb = mix(uAmbD, uAmbU, n.y * 0.5 + 0.5);\n"
-  "  vec3 irr = amb * ao;\n"
+  // ...AND THE SKY IS NOT THE SAME ALL ROUND. The quarter of the sky the sun
+  // is in is where the haze is bright (haze_rad's forward lobe), so a face
+  // turned toward the sun's azimuth stands in more skylight than one turned
+  // away — even in a wall's shadow. Without this the two shadowed faces of a
+  // box are one value and the box is a flat cut-out; with it the shadow side
+  // has a warm and a cool face, which is what makes it a box. uAmbS is the
+  // sun colour through the dust, folded in C; the horizontal normal picks it.
+  "  vec3 amb = mix(uAmbD, uAmbU, n.y * 0.5 + 0.5)\n"
+  "           + uAmbS * max(dot(n, uSunH), 0.0);\n"
+  "  vec3 irr = amb * aoi;\n"
   // THE ENVIRONMENT TERM *IS* THE METAL — a metal has no diffuse, so with only a sun
   // lobe it is black everywhere the highlight is not — and on the weapon it was closed
   // with a fudge: a Schlick rim against max(1-rough, F0), times a flat (1 - 0.62*rough)
@@ -726,10 +1073,24 @@ static const char *WORLD_FS =
   // lit() with SUN_COL * sh (and lit returns vec3(0) before it touches its radiance
   // argument when dot(n, SUN_DIR) <= 0), the glint term, and the puddle term — both
   // guarded.
+  // ...AND AN EIGHTH OF THE SCREEN TERM REACHES THE SUN. Not physics — the shadow
+  // map already says where the sun does not land — but the map's 1.2 cm texel
+  // and its normal offset lose exactly the last centimetres of a contact, and
+  // this is the cheapest way to hand them back: a crate's foot in full sun
+  // shows a darker seam, a boot on the ground stands rather than floats.
   "  float sh = 0.0;\n"
-  "  if (dot(n, SUN_DIR) > 0.0 || glint > 0.0 || wet > 0.0)\n"
-  "    sh = mix(0.45, 1.0, ao) * sun_shadow();\n"
-  "  vec3 env = env_gloss(reflect(-V, n), rough) * mix(1.0, ao, 0.75);\n"
+  "  bool fig = uDetail < 0.5 && uVm < 0.5;\n"
+  "  if (dot(n, SUN_DIR) > 0.0 || glint > 0.0 || wet > 0.0 || fig)\n"
+  "    sh = mix(0.45, 1.0, ao) * mix(1.0, aos, 0.12) * sun_shadow();\n"
+  // ...AND THE REFLECTION IS OCCLUDED HARDER THAN THE DIFFUSE. Lagarde's
+  // specular-occlusion fit: a smooth surface seen at grazing angle reflects the
+  // narrow cone of sky it can actually see, and in a corner that cone is
+  // blocked before the diffuse hemisphere is. One pow, only when the screen
+  // measured anything.
+  "  float so = 1.0;\n"
+  "  if (aos < 0.999)\n"
+  "    so = clamp(pow(NoV + aos, exp2(-16.0 * rough - 1.0)) - 1.0 + aos, 0.0, 1.0);\n"
+  "  vec3 env = env_gloss(reflect(-V, n), rough) * mix(1.0, ao, 0.75) * so;\n"
   // INSIDE THE FILM, THE SUN DISC IS SUPPRESSED. env_gloss hands a 0.05-rough surface a
   // lobe about seven hundred wide, i.e. a near-delta reflection of a near-delta sun:
   // one pixel of pure white that no filter in the frame can average, sliding across the
@@ -741,18 +1102,41 @@ static const char *WORLD_FS =
   // ...AND IT IS SCALED BY THE SUN TERM, which is a sky-VISIBILITY proxy and not a
   // fudge: a film of water a hand's width from a three-metre wall has half its
   // hemisphere behind that wall, so it cannot reflect a whole sky.
-  "    env = mix(env, wenv * mix(1.0, ao, 0.75) * mix(0.45, 1.0, sh), wet);\n"
+  "    env = mix(env, wenv * mix(1.0, aoi, 0.75) * mix(0.45, 1.0, sh), wet);\n"
   "  }\n"
 
   // Grazing-angle sheen.
   "  vec3 sheen = diff * rough * rough * pow(1.0 - NoV, 4.0) * 0.85 * amb;\n"
+  // A SKY RIM ON THE FIGURES ONLY (the scene draw: no world detail, not the
+  // viewmodel). Independent of the albedo, because the cloth is dark and a
+  // rim that is diff-scaled is no rim: a body against a wall in its own colour
+  // needs its edge lit by the sky behind it to read as a body. Kept small —
+  // the silhouettes are the art direction and this may only draw their edge.
+  // ...and the SUN'S rim when it stands behind the figure: cloth and hair
+  // scatter light through their edge, which is why a backlit soldier is a
+  // dark shape with a burning outline and not a black hole. Shadowed like
+  // any other sun term (sh is evaluated for every figure pixel).
+  "  if (fig) {\n"
+  "    float rf = 1.0 - NoV; rf *= rf; rf *= rf;\n"
+  "    sheen += amb * rf * 0.45 * (1.0 - metal);\n"
+  "    float back = max(dot(-V, SUN_DIR), 0.0);\n"
+  "    sheen += SUN_COL * sh * (rf * (1.0 - NoV)) * back * back * 0.30 * (1.0 - metal);\n"
+  "  }\n"
   // Bounce off the floor: down-facing surfaces near the ground pick up warm light
   // reflected off it.
   "  float bnc = 0.0;\n"
   "  if (n.y < 0.0) bnc = -n.y * exp(-max(vWorld.y, 0.0) * 0.85);\n"
   // ...AND SIDEWAYS, which is what the down-facing version was missing.
   "  float bncs = (1.0 - abs(n.y)) * exp(-max(vWorld.y, 0.0) * 2.2);\n"
-  "  vec3 bounce = diff * (bnc + bncs * 0.55) * uBounce;\n"
+  // ...AND THE SUN OFF THE FLOOR. uBounce is the sky's ground colour, which is
+  // what a shadowed floor gives back; a SUNLIT floor gives back the sun times
+  // its own albedo, and half of a wall's hemisphere is floor. Without it the
+  // face of a box turned from the sun was the darkest thing in the frame at
+  // noon, and a figure's back a cut-out. Fades with height like the rest —
+  // a cap 4 m up sees less floor than a boot does.
+  "  vec3 bounce = diff * ((bnc + bncs * 0.55) * uBounce\n"
+  "              + (1.0 - abs(n.y)) * exp(-max(vWorld.y, 0.0) * 0.30) * uBounceS)\n"
+  "              * mix(1.0, aos, 0.6);\n"
   // THE TERNARY IS PARENTHESISED, and the reason is a bug this file has now paid for
   // twice in two forms: written as `col = c ? a : b;` followed by the four continuation
   // lines, the SEMICOLON ended the statement and turned `+ diff * irr + env * Fe +
@@ -765,7 +1149,7 @@ static const char *WORLD_FS =
   "     : lit(n, V, SUN_DIR, diff, F0, f90, rough, SUN_COL * sh))\n"
   "           + diff * irr\n"
   "           + env * Fe\n"
-  "           + sheen * mix(0.55, 1.0, ao) + bounce;\n"
+  "           + sheen * mix(0.55, 1.0, aoi) + bounce;\n"
   // The glitter rides in AS A LIGHT, after the shadow term and scaled by it: a
   // spark in a wall's shadow is a spark with no sun on it, and adding this
   // before `sh` was the difference between mica and fairy lights.
@@ -834,7 +1218,7 @@ static const char *WORLD_FS =
   // rig driven by `cam` never draws one.
   "  if (od > 0.002)\n"
   "    col = mix(col, sky_env(-V, 0.0), 1.0 - exp(-od));\n"
-  "  oCol = vec4(tonemap(col), 1.0);\n"
+  "  oCol = vec4(tonemap(col), bloom_w(col));\n"
   "}\n";
 
 // Sky: fullscreen triangle at depth 1.0 drawn after the world (LEQUAL passes only where
@@ -874,10 +1258,39 @@ static const char *SKY_FS =
   "  vec2 q = q0 + vec2(w, -w * 0.6) * 1.15;\n"
   "  return vnoise2(q) * 0.62 + vnoise2(q * 2.31) * 0.38;\n"
   "}\n"
+  // THE LAND BEYOND THE WALL. The arena used to end at its perimeter with
+  // nothing behind it but gradient: a box on a plane in a void. This is a
+  // ridge line a few kilometres out — a height field of the HEADING, so it is
+  // periodic by construction (the lookup runs on the unit circle, never on an
+  // angle that wraps) — in two layers, the far one paler than the near one,
+  // both nearly the colour of the haze they stand in. It hides the sun disc
+  // when the sun is behind it, which the aureole then sits over, and that is
+  // the whole reason a sunset looks like a place. uRidge is theme state
+  // (ridge_params): dunes, hills or mesas.
+  "uniform vec4 uRidge;\n"
+  "float ridge_h(vec2 hd, float k, float seed){\n"
+  "  float n = vnoise2(hd * k + seed) * 0.62 + vnoise2(hd * k * 2.7 + seed * 1.7) * 0.38;\n"
+  "  float r = 1.0 - abs(n * 2.0 - 1.0);\n"   // ridged: sharp crests
+  "  return mix(n, r * r, uRidge.z);\n"
+  "}\n"
   "void main(){\n"
   "  vec3 dir = normalize(uFwd + uRight * (vNdc.x * uTan.x) + uUp * (vNdc.y * uTan.y));\n"
   "  vec3 c = sky_env(dir, 1.0);\n"
   "  float up = dir.y;\n"
+  "  if (up < 0.12 && uRidge.y > 0.0) {\n"
+  "    vec2 hd = normalize(dir.xz);\n"
+  "    float e = max(fwidth(up), 1.0e-5);\n"
+  // The haze this land stands in: the sky at the horizon in this heading,
+  // disc off (the disc is what the ridge hides). Two layers: the far one is
+  // the haze barely darkened, the near one darker and lower.
+  "    vec3 hz = sky_env(vec3(hd.x, 0.02, hd.y), 0.0);\n"
+  "    float hf = uRidge.x + uRidge.y * 1.35 * ridge_h(hd, 2.1, 3.7);\n"
+  "    float mf = smoothstep(hf + e, hf - e, up);\n"
+  "    c = mix(c, hz * (1.0 - uRidge.w * 0.45), mf);\n"
+  "    float hn = uRidge.x * 0.5 + uRidge.y * ridge_h(hd, 3.3, 11.9);\n"
+  "    float mn = smoothstep(hn + e, hn - e, up);\n"
+  "    c = mix(c, hz * (1.0 - uRidge.w), mn);\n"
+  "  }\n"
   // 0.012, not 0.03: at a low sun the interesting deck is exactly the part
   // lying ON the horizon, and the old cut-in threw that band away and started
   // the clouds a hand's width above the one place they had to be.
@@ -908,12 +1321,19 @@ static const char *SKY_FS =
   // a bright fringe only where the deck is thin — and only toward the sun,
   // which is the whole reason a backlit cloud has a burning edge and a
   // front-lit one does not.
+  // ...AND THE RIM IS A RIM, NOT A RING. At 2.6 the edge term outshone the
+  // body it belonged to whenever the sun stood behind the deck, so every
+  // band toward a low sun drew as a bright loop around a dark hole — the
+  // "doughnuts" of the sunset frames. Half of that energy now goes into the
+  // body as forward scatter (a thin cloud in front of the sun glows through),
+  // the rest stays on the edge, and a band reads as a lit band.
   "      float s2 = max(dot(dir, SUN_DIR), 0.0);\n"
-  "      cl += SUN_COL * (dens * (1.0 - dens)) * 2.6 * pow(s2, 6.0);\n"
+  "      float fwd = pow(s2, 6.0);\n"
+  "      cl += SUN_COL * fwd * (dens * (1.0 - dens) * 1.1 + dens * 0.55);\n"
   "      c = mix(c, cl, dens * 0.86);\n"
   "    }\n"
   "  }\n"
-  "  oCol = vec4(tonemap(c), 1.0);\n"
+  "  oCol = vec4(tonemap(c), bloom_w(c));\n"
   "}\n";
 
 // Frosted-glass menu backdrop: an attribute-less fullscreen triangle and one
@@ -936,17 +1356,154 @@ static const char *BLUR_FS =
   "  c += texture(uTex, vUV - vec2(uPix.x, -uPix.y)).rgb;\n"
   "  oCol = vec4(c * 0.125, 1.0); }\n";   // exact, and three fdiv fewer
 
-// GLARE — the bloom and the light shafts, and they are ONE chain because they are
-// one phenomenon: bright things in front of a dusty atmosphere spill, and the
-// spill runs along the line to the sun when there is anything between. Building
-// them separately would mean two bright-passes, two quarter-res targets and two
-// composites for a result that is added together anyway.
-//
-// Everything here runs at quarter resolution, so ten taps cost 0.6 of a full-res
-// tap. That is the entire budget: no HDR buffer, no extra attachment, no depth
-// read — the input is the frame that was going to be presented regardless, pulled
-// down through the SAME blit and the SAME dual-Kawase ping-pong the frosted menu
-// backdrop already owned.
+// SCREEN-SPACE AMBIENT OBSCURANCE, McGuire's estimator (SAO, 2012), at half
+// resolution over the prepass. Twelve samples on a golden-angle spiral whose
+// radius is a WORLD radius projected — so a crate's foot is occluded the same
+// amount from across the arena as from a metre away — rotated per pixel by
+// interleaved-gradient noise on the fragment coordinate: deterministic per
+// pixel, no history, no temporal term (a harness screenshot must not depend on
+// the frame before it). Positions come back through the inverse view-projection
+// rather than through a view-space reconstruction: the normals are stored in
+// WORLD space, the estimator is a dot product and a distance, and one matrix
+// per sample at a quarter of the pixels is cheaper than getting a second frame
+// of reference right.
+// Each sample's weight is (r^2 - |v|^2)^3 * max(0, v.n - bias) / (|v|^2 + eps):
+// the cube is a smooth cutoff at the radius (no ring where samples stop
+// counting), the dot is "how much of my hemisphere does this point cover", the
+// division is the falloff. The bias grows with view depth because the depth
+// buffer's own quantization does: without it a flat wall twenty metres off
+// shades itself.
+// .g carries the surface's distance from the eye so the blur and the world
+// pass's upsample can tell which surface an occlusion value belongs to. The
+// sky writes 1.0 at a distance nothing else reaches.
+static const char *SSAO_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uDepth;\n"
+  "uniform sampler2D uNrm;\n"
+  "uniform mat4 uInvVP;\n"
+  "uniform vec3 uEye;\n"
+  "uniform vec4 uScr;\n"   // xy = this target's size, zw = 1 / size
+  "uniform vec4 uZ;\n"     // x near, y far, z = texels per metre at 1 m, w = radius (m)
+  "uniform float uAoI;\n"  // intensity
+  "float lin_z(float d){\n"
+  "  float z = d * 2.0 - 1.0;\n"
+  "  return 2.0 * uZ.x * uZ.y / (uZ.y + uZ.x - z * (uZ.y - uZ.x));\n"
+  "}\n"
+  "vec3 world_at(vec2 uv, float d){\n"
+  "  vec4 p = uInvVP * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);\n"
+  "  return p.xyz / p.w;\n"
+  "}\n"
+  "void main(){\n"
+  "  float d0 = texture(uDepth, vUV).r;\n"
+  "  if (d0 >= 0.99999) { oCol = vec4(1.0, 1.0e4, 0.0, 1.0); return; }\n"
+  "  vec3 P = world_at(vUV, d0);\n"
+  "  float z0 = lin_z(d0);\n"
+  "  vec3 n = normalize(texture(uNrm, vUV).rgb * 2.0 - 1.0);\n"
+  "  float rpx = clamp(uZ.z * uZ.w / z0, 1.5, 80.0);\n"
+  "  float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy,\n"
+  "                                          vec2(0.06711056, 0.00583715))));\n"
+  "  float rr = uZ.w * uZ.w;\n"
+  "  float bias = 0.015 + 0.004 * z0;\n"
+  "  float occ = 0.0;\n"
+  "  for (int i = 0; i < 12; i++) {\n"
+  "    float a = (float(i) + 0.5) * (1.0 / 12.0);\n"
+  "    float ang = float(i) * 2.3999632 + ign * 6.2831853;\n"
+  "    vec2 suv = vUV + vec2(cos(ang), sin(ang)) * (sqrt(a) * rpx) * uScr.zw;\n"
+  "    float d = texture(uDepth, suv).r;\n"
+  "    if (d >= 0.99999) continue;\n"
+  "    vec3 v = world_at(suv, d) - P;\n"
+  "    float vv = dot(v, v);\n"
+  "    float f = max(rr - vv, 0.0);\n"
+  "    occ += f * f * f * max(0.0, dot(v, n) - bias) / (vv + 0.02);\n"
+  "  }\n"
+  "  float ao = max(0.0, 1.0 - occ * uAoI * (5.0 / 12.0) / (rr * rr * rr));\n"
+  "  oCol = vec4(ao, length(P - uEye), 0.0, 1.0);\n"
+  "}\n";
+
+// One axis of the depth-aware blur over the AO target (run twice, x then y).
+// Nine taps, Gaussian-ish; a tap only counts if it was measured on a surface
+// at about this one's distance, so a crate's contact shadow does not bleed
+// onto the wall behind it and the sky (distance 1e4) never averages into
+// anything. The width is what removes the sampler's per-pixel rotation
+// pattern: at half resolution nine taps span a hand's width of screen.
+static const char *AOBLUR_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uTex; uniform vec2 uPix;\n"
+  "void main(){\n"
+  "  vec2 c = texture(uTex, vUV).rg;\n"
+  "  float acc = c.r, ws = 1.0;\n"
+  "  for (int i = 1; i <= 4; i++) {\n"
+  "    float k = i == 1 ? 0.88 : (i == 2 ? 0.62 : (i == 3 ? 0.35 : 0.15));\n"
+  "    vec2 a = texture(uTex, vUV + uPix * float(i)).rg;\n"
+  "    vec2 b = texture(uTex, vUV - uPix * float(i)).rg;\n"
+  "    float wa = k / (1.0 + 120.0 * abs(a.g - c.g) / c.g);\n"
+  "    float wb = k / (1.0 + 120.0 * abs(b.g - c.g) / c.g);\n"
+  "    acc += a.r * wa + b.r * wb; ws += wa + wb;\n"
+  "  }\n"
+  "  oCol = vec4(acc / ws, c.g, 0.0, 1.0);\n"
+  "}\n";
+
+// THE BLOOM CHAIN — progressive, the Call of Duty: Advanced Warfare
+// construction (Jimenez 2014): a 13-tap downsample from each level to the
+// next (four levels from a quarter of the frame down to a thirty-second),
+// then a 9-tap tent upsample added back up the chain. One wide Gaussian-ish
+// halo built from four octaves, so a sun disc gets a tight core AND a wide
+// glow, and a tracer a soft streak rather than a square smudge. The two
+// Kawase taps this replaced were one scale and pulsed on small bright things.
+// The source is scene.rgb * scene.a — the bloom weight the lit passes wrote
+// (bloom_w) — so what spills is decided by scene luminance, not by display
+// luminance.
+// The first level takes the KARIS AVERAGE: each of the four 2x2 quadrants is
+// weighted by 1/(1+luma), so one blazing pixel (a specular pinprick, a tracer
+// end) cannot own the whole level and flicker as the camera moves.
+static const char *BLOOM_DOWN_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uTex; uniform vec2 uPix;\n"   // uPix = one SOURCE texel
+  "uniform float uFirst;\n"                        // 1 = apply alpha weight + Karis
+  "vec3 T(vec2 o){\n"
+  "  vec4 s = texture(uTex, vUV + o * uPix);\n"
+  "  return uFirst > 0.5 ? s.rgb * s.a : s.rgb;\n"
+  "}\n"
+  "float kw(vec3 c){ return 1.0 / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }\n"
+  "void main(){\n"
+  "  vec3 a = T(vec2(-2.0, 2.0)), b = T(vec2(0.0, 2.0)), c = T(vec2(2.0, 2.0));\n"
+  "  vec3 d = T(vec2(-2.0, 0.0)), e = T(vec2(0.0, 0.0)), f = T(vec2(2.0, 0.0));\n"
+  "  vec3 g = T(vec2(-2.0, -2.0)), h = T(vec2(0.0, -2.0)), i = T(vec2(2.0, -2.0));\n"
+  "  vec3 j = T(vec2(-1.0, 1.0)), k = T(vec2(1.0, 1.0));\n"
+  "  vec3 l = T(vec2(-1.0, -1.0)), m = T(vec2(1.0, -1.0));\n"
+  "  vec3 o;\n"
+  "  if (uFirst > 0.5) {\n"
+  "    vec3 g0 = (a + b + d + e) * 0.25, g1 = (b + c + e + f) * 0.25;\n"
+  "    vec3 g2 = (d + e + g + h) * 0.25, g3 = (e + f + h + i) * 0.25;\n"
+  "    vec3 g4 = (j + k + l + m) * 0.25;\n"
+  "    float w0 = kw(g0), w1 = kw(g1), w2 = kw(g2), w3 = kw(g3), w4 = kw(g4);\n"
+  "    o = (g4 * w4 * 0.5 + (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3) * 0.125)\n"
+  "      / (w4 * 0.5 + (w0 + w1 + w2 + w3) * 0.125);\n"
+  "  } else {\n"
+  "    o = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625\n"
+  "      + (j + k + l + m) * 0.125;\n"
+  "  }\n"
+  "  oCol = vec4(o, 1.0);\n"
+  "}\n";
+static const char *BLOOM_UP_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uTex; uniform vec2 uPix;\n"   // uPix = one SOURCE texel
+  "vec3 T(vec2 o){ return texture(uTex, vUV + o * uPix).rgb; }\n"
+  "void main(){\n"
+  "  vec3 o = T(vec2(0.0)) * 4.0\n"
+  "         + (T(vec2(-1.0, 0.0)) + T(vec2(1.0, 0.0)) + T(vec2(0.0, -1.0)) + T(vec2(0.0, 1.0))) * 2.0\n"
+  "         + T(vec2(-1.0, -1.0)) + T(vec2(1.0, -1.0)) + T(vec2(-1.0, 1.0)) + T(vec2(1.0, 1.0));\n"
+  "  oCol = vec4(o * (1.0 / 16.0), 1.0);\n"
+  "}\n";
+
+// GLARE — the light shafts and the composite. The shafts are a march toward
+// the sun through the bright pass at quarter resolution, softened by the two
+// dual-Kawase taps the frosted menu backdrop already owned; the bloom is the
+// chain above, and the composite adds both to the scene.
 //
 // THE OCCLUSION IS FREE AND EXACT. A shaft is a march toward the sun through the
 // bright-pass, so a wall between this pixel and the sun contributes nothing and
@@ -956,26 +1513,54 @@ static const char *GLARE_FS =
   "#version 330 core\n"
   "in vec2 vUV; out vec4 oCol;\n"
   "uniform sampler2D uTex;\n"
+  "uniform sampler2D uScene;\n" // the finished picture (unit 1), composite only
+  "uniform sampler2D uBloom;\n" // the bloom chain's finest level (unit 2)
   "uniform vec3 uSunUV;\n"   // xy = the sun's place on screen, z = shaft strength
-  "uniform vec2 uKnee;\n"    // luminance knee: what counts as bright
+  "uniform vec2 uKnee;\n"    // luminance knee: what counts as bright (shafts)
   "uniform vec3 uGain;\n"    // x bloom, y shafts, z composite
   "uniform vec4 uGrade;\n"   // vignette, grain, grain seed, aspect
   "uniform float uMode;\n"   // 0 = build the glare, 1 = add it back
+  "uniform vec3 uAA;\n"      // x = 1: FXAA the scene read (MSAA off); yz = one scene texel
   "const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);\n"
+  // FXAA (Lottes, the nine-tap console form) on the finished picture when
+  // the multisample target is off: the flat facets and long straight
+  // silhouettes of this world are exactly what crawls without it. Runs
+  // inside the composite so the frame still costs one full-screen pass.
+  "vec3 fxaa(vec2 uv){\n"
+  "  vec2 px = uAA.yz;\n"
+  "  vec3 nw = texture(uScene, uv + vec2(-1.0, -1.0) * px).rgb;\n"
+  "  vec3 ne = texture(uScene, uv + vec2( 1.0, -1.0) * px).rgb;\n"
+  "  vec3 sw = texture(uScene, uv + vec2(-1.0,  1.0) * px).rgb;\n"
+  "  vec3 se = texture(uScene, uv + vec2( 1.0,  1.0) * px).rgb;\n"
+  "  vec3 m  = texture(uScene, uv).rgb;\n"
+  "  float lnw = dot(nw, LUMA), lne = dot(ne, LUMA), lsw = dot(sw, LUMA);\n"
+  "  float lse = dot(se, LUMA), lm = dot(m, LUMA);\n"
+  "  float lmin = min(lm, min(min(lnw, lne), min(lsw, lse)));\n"
+  "  float lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));\n"
+  "  if (lmax - lmin < max(0.03, lmax * 0.125)) return m;\n"
+  "  vec2 dir = vec2(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));\n"
+  "  float red = max((lnw + lne + lsw + lse) * 0.03125, 0.0078125);\n"
+  "  float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + red);\n"
+  "  dir = clamp(dir * rcp, vec2(-8.0), vec2(8.0)) * px;\n"
+  "  vec3 a = 0.5 * (texture(uScene, uv + dir * (1.0 / 3.0 - 0.5)).rgb\n"
+  "                + texture(uScene, uv + dir * (2.0 / 3.0 - 0.5)).rgb);\n"
+  "  vec3 b = a * 0.5 + 0.25 * (texture(uScene, uv - dir * 0.5).rgb\n"
+  "                           + texture(uScene, uv + dir * 0.5).rgb);\n"
+  "  float lb = dot(b, LUMA);\n"
+  "  return (lb < lmin || lb > lmax) ? a : b;\n"
+  "}\n"
   "void main(){\n"
   // --- THE COMPOSITE, AND IT IS ALSO THE GRADE ---------------------------
-  // ONE PASS DOES BOTH, and the blend mode is why. Under ONE/SRC_ALPHA the
-  // result is src.rgb + dst.rgb * src.a: the colour channels carry everything
-  // that ADDS light (the bloom, the shafts, the grain's bright half, the edge
-  // tint) and the alpha channel carries everything that MULTIPLIES it (the
-  // vignette, the grain's dark half). A grade written the obvious way needs a
-  // second full-res pass to multiply by, or the frame in a texture to read
-  // back; this needs neither.
-  //
-  // The consequence is a real constraint and it is worth stating: a blend
-  // factor is clamped to [0,1] against a fixed-point target, so the alpha half
-  // can only ever DARKEN. That is why the grain is split across both channels
-  // rather than written as one signed term.
+  // The finished picture lives in a texture now (the scene target), so this is
+  // a plain full-screen pass that READS it and writes the present buffer: the
+  // glare adds, the vignette and the grain's dark half multiply, and none of
+  // it has to be smuggled through a blend equation. The arithmetic is exactly
+  // the old ONE/SRC_ALPHA composite's — base * mul + add — so a frame with the
+  // screen-space terms off is the frame this pass used to blend.
+  // Mode 2: the harness's `dbgview ao` — the occlusion buffer as the picture.
+  "  if (uMode > 3.5) { oCol = vec4(vec3(texture(uScene, vUV).a), 1.0); return; }\n"
+  "  if (uMode > 2.5) { oCol = vec4(texture(uScene, vUV).rgb * 2.0, 1.0); return; }\n"
+  "  if (uMode > 1.5) { oCol = vec4(vec3(texture(uScene, vUV).r), 1.0); return; }\n"
   "  if (uMode > 0.5) {\n"
   "    vec2 q = (vUV - 0.5) * vec2(uGrade.w, 1.0);\n"
   "    float r2 = dot(q, q) * 1.30;\n"
@@ -985,17 +1570,27 @@ static const char *GLARE_FS =
   // moves with the render clock would make every harness screenshot depend on
   // how many frames preceded it, which is the same trap the menu caret's lack
   // of a blink documents.
-  "    float g = fract(52.9829189 * fract(dot(gl_FragCoord.xy + uGrade.z,\n"
-  "                                           vec2(0.06711056, 0.00583715))));\n"
+  // Hash noise, not interleaved-gradient: IGN's diagonal lattice is exactly
+  // the structure a grain must not have, and at 2x it read as a screen door
+  // over every flat face. Three fract-multiplies, no cell structure.
+  "    vec3 gq = fract(vec3(gl_FragCoord.xy + uGrade.z, gl_FragCoord.x) * 0.1031);\n"
+  "    gq += dot(gq, gq.yzx + 33.33);\n"
+  "    float g = fract((gq.x + gq.y) * gq.z);\n"
   "    float gn = (g - 0.5) * uGrade.y;\n"
-  "    float vig = 1.0 - uGrade.x * r2 * r2;\n"
+  // The vignette starts outside the middle third and never takes more than a
+  // fifth: it was r2^2 at 0.34 and took 40-60% off the corners, which read as
+  // a lens hood on every mood and was most of why the frames looked grey.
+  "    float vig = 1.0 - uGrade.x * smoothstep(0.35, 1.6, r2);\n"
   // The edges go cool as well as dark. A vignette that only darkens reads as a
   // lens fault; one that also loses a little warmth reads as the falloff of a
   // real lens, and it costs an add.
   "    vec3 add = texture(uTex, vUV).rgb * uGain.z\n"
+  "             + texture(uBloom, vUV).rgb * uGain.x\n"
   "             + max(gn, 0.0) * 0.42\n"
   "             + vec3(-0.008, -0.002, 0.010) * r2;\n"
-  "    oCol = vec4(add, clamp(vig * (1.0 + min(gn, 0.0)), 0.0, 1.0));\n"
+  "    float mul = clamp(vig * (1.0 + min(gn, 0.0)), 0.0, 1.0);\n"
+  "    vec3 base = uAA.x > 0.5 ? fxaa(vUV) : texture(uScene, vUV).rgb;\n"
+  "    oCol = vec4(base * mul + add, 1.0);\n"
   "    return;\n"
   "  }\n"
   // A LUMINANCE KNEE, NOT A SUBTRACTION. Subtracting a threshold from each
@@ -1003,16 +1598,18 @@ static const char *GLARE_FS =
   // out orange-red — and the one thing this pass must not do is recolour the
   // sunset it is there to sell. Scaling by a smoothstep on the luminance keeps
   // the colour and only decides how much of it spills.
-  "  vec3 s0 = texture(uTex, vUV).rgb;\n"
-  "  vec3 core = s0 * smoothstep(uKnee.x, uKnee.y, dot(s0, LUMA));\n"
+  // The bright pass is the scene's own bloom weight (alpha, see bloom_w) —
+  // the display knee it replaced could not tell a sunlit wall from the sun.
+  "  vec4 s0 = texture(uTex, vUV);\n"
+  "  vec3 core = s0.rgb * s0.a;\n"
   "  vec3 acc = vec3(0.0);\n"
   "  if (uSunUV.z > 0.0) {\n"
   "    vec2 d = (uSunUV.xy - vUV) * (0.85 / 10.0);\n"
   "    vec2 uv = vUV;\n"
   "    float w = 1.0;\n"
   "    for (int i = 0; i < 10; i++) {\n"
-  "      vec3 s = texture(uTex, uv).rgb;\n"
-  "      acc += s * smoothstep(uKnee.x, uKnee.y, dot(s, LUMA)) * w;\n"
+  "      vec4 s = texture(uTex, uv);\n"
+  "      acc += s.rgb * s.a * w;\n"
   "      w *= 0.90;\n"
   "      uv += d;\n"
   "    }\n"

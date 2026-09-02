@@ -258,6 +258,8 @@ static void font_bake(uint8_t *atlas) {
 
 static float g_scope_r, g_scope_cx, g_scope_cy;  // scope disc, derived per frame
 static int g_hud_visible = 1;  // harness capture switch; menus remain visible
+// The harness's debug picture: 0 = the frame, 1 = the AO buffer (`dbgview`).
+static int g_dbg_view = 0;
 // One map over the whole 48 m arena: 4096 px gives ~1.3 cm texels, which is fine
 // enough that a figure self-shadows its own arms.
 #define SHADOW_TEX    4096
@@ -291,8 +293,17 @@ static float scope_pip_radius(float scope, float vw, float vh) {
 // light to the rig cannot be half-wired.
 typedef struct {
   GLint sun, suncol, skytop, skyhor, skygnd, expo, disc, atmo, haze, hazes;
-  GLint ambd, ambu, bounce, vmfill, vmrim;
+  GLint ambd, ambu, bounce, vmfill, vmrim, ambs, sunh, look, bounces;
 } lightloc_t;
+
+// THE LOOK, one vec4 for every program that tonemaps: curve (0 ACES, 1 AgX),
+// contrast, saturation, spare. The harness `look` command overrides it for
+// A/B frames; these are the shipped values.
+// ACES stays the curve: AgX was measured flatter on this palette (the sunset
+// went grey, the landmark reds dulled) even with the same grade on top. The
+// grade is a touch of contrast about mid-grey and a touch of saturation —
+// what the old vignette's darkening had been standing in for.
+static float g_look[4] = {0.0f, 1.03f, 1.10f, 0.0f};
 
 typedef struct {
   int    width, height;
@@ -314,7 +325,7 @@ typedef struct {
   GLuint scope_fbo, scope_tex, scope_depth;  // picture-in-picture scope target
   int    scope_size;
   GLint  u_sky_fwd, u_sky_right, u_sky_up, u_sky_tan, u_sky_wind, u_sky_cov;
-  GLint  u_sky_sunxz;
+  GLint  u_sky_sunxz, u_sky_ridge;
   GLuint vao_world, vbo_world, vao_hud, vbo_hud, vao_sky, font_tex;
   GLuint vao_scene, vbo_scene;   // per-frame dynamic 3D batch (bot, VFX, gun)
   int    world_verts;
@@ -332,7 +343,42 @@ typedef struct {
   GLint  u_blur_tex, u_blur_px;
   GLuint prog_glare;                // bloom + light shafts (see glare_pass)
   GLint  u_gl_tex, u_gl_sun, u_gl_knee, u_gl_gain, u_gl_mode, u_gl_grade;
+  GLint  u_gl_scene;                // the composite's read of the scene target
   int    blur_w, blur_h;            // size the blur chain was built for
+  // THE SCENE TARGET: where the picture is built when MSAA is off, and where the
+  // multisample target resolves to when it is on. Its colour is what the
+  // composite reads; its depth is the PREPASS's (pre_fbo shares the texture),
+  // so the two FBOs are one depth seen twice. scene_fbo == 0 never happens
+  // past renderer_init — an RGBA8 + depth24 target is universal on GL 3.3.
+  GLuint scene_fbo, scene_tex, depth_tex;
+  GLuint pre_fbo, nrm_tex;          // geometry prepass: world-space normals + depth
+  GLuint prog_pre;                  // the prepass program (PRE_VS/PRE_FS)
+  GLint  u_pre_vp;
+  // Screen-space ambient occlusion, half resolution, ping-pong for the blur.
+  GLuint ao_fbo[2], ao_tex[2];
+  int    ao_w, ao_h, scene_w, scene_h;
+  GLuint prog_ssao, prog_aoblur;
+  GLint  u_ao_depth, u_ao_nrm, u_ao_invvp, u_ao_eye, u_ao_scr, u_ao_z, u_ao_i;
+  GLint  u_aob_tex, u_aob_px;
+  GLint  u_ao, u_aop;               // the world pass's read of the AO texture
+  GLint  u_predepth, u_skycut;      // the dust pass's sky test
+  GLint  u_gl_aa;                   // the composite's FXAA switch + texel
+  // The shadow map seen WITHOUT the compare (unit 2, a sampler object over the
+  // same texture) for the PCSS blocker search, and the penumbra constants.
+  GLuint sm_raw_sampler;
+  GLint  u_smraw, u_smpcss;
+  // The bloom chain: four levels from a quarter of the frame down.
+  GLuint bloom_fbo[4], bloom_tex[4];
+  int    bloom_w[4], bloom_h[4];
+  GLuint prog_bdown, prog_bup;
+  GLint  u_bd_tex, u_bd_px, u_bd_first, u_bu_tex, u_bu_px, u_gl_bloom;
+  // Screen-space reflections for the standing water: the opaque picture
+  // copied out (pic_tex), the march's result (ssr_tex), and the two programs.
+  GLuint pic_fbo, pic_tex, ssr_fbo, ssr_tex;
+  GLuint prog_ssr, prog_ssr_apply;
+  GLint  u_pre_pool;
+  GLint  u_ssr_depth, u_ssr_nrm, u_ssr_pic, u_ssr_invvp, u_ssr_vp, u_ssr_eye, u_ssr_z;
+  GLint  u_sa_ssr, u_sa_nrm, u_sa_depth, u_sa_invvp, u_sa_eye, u_sa_px;
 } renderer_t;
 
 static renderer_t R;
@@ -368,6 +414,10 @@ static lightloc_t rig_locs(GLuint p) {
     .bounce = glGetUniformLocation(p, "uBounce"),
     .vmfill = glGetUniformLocation(p, "VM_FILL"),
     .vmrim  = glGetUniformLocation(p, "VM_RIM"),
+    .ambs   = glGetUniformLocation(p, "uAmbS"),
+    .sunh   = glGetUniformLocation(p, "uSunH"),
+    .look   = glGetUniformLocation(p, "uLook"),
+    .bounces = glGetUniformLocation(p, "uBounceS"),
   };
 }
 
@@ -406,6 +456,20 @@ static void rig_upload(const lightloc_t *L) {
     glUniform3f(L->ambu, up.x * 0.40f, up.y * 0.40f, up.z * 0.40f); }
   glUniform3f(L->bounce, S->sky_gnd.x * 1.35f, S->sky_gnd.y * 1.35f,
                          S->sky_gnd.z * 1.35f);
+  // The sun-side skylight: the sun through the dust, a twentieth of it, on
+  // faces turned toward its azimuth (see the ambient in WORLD_FS).
+  { v3 sh = v3_norm((v3){{S->dir.x, 0.0f, S->dir.z}});
+    glUniform3f(L->sunh, sh.x, sh.y, sh.z);
+    glUniform3f(L->ambs, at.x * S->col.x * 0.05f, at.y * S->col.y * 0.05f,
+                         at.z * S->col.z * 0.05f); }
+  glUniform4f(L->look, g_look[0], g_look[1], g_look[2], g_look[3]);
+  // The sun off the floor: the floor's linear albedo times the sun's
+  // irradiance on it (sin of the elevation), a third of the half-hemisphere
+  // a wall would see if every metre of that floor were lit.
+  { v3 g = g_theme.ground;
+    float k = 0.30f * fmaxf(S->dir.y, 0.0f);
+    glUniform3f(L->bounces, g.x * g.x * S->col.x * k, g.y * g.y * S->col.y * k,
+                            g.z * g.z * S->col.z * k); }
   // The viewmodel's fill and rim: sky hue and sun hue, both re-normalized to a
   // fixed DISPLAY strength (see VM_FILL's comment). The 1.22 / 1.35 reproduce
   // the two constants this replaced to within 3% at a midday sun, so a weapon

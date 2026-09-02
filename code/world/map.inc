@@ -653,6 +653,26 @@ static float atmo_haze(void) {
   }
 }
 
+// THE HORIZON BEYOND THE WALL, per theme: x = the ridge line's base elevation
+// (sin of the angle above the horizon), y = its amplitude, z = its shape
+// (0 = rounded dunes, 1 = ridged rock), w = how dark the near silhouette is
+// against the haze (0 = the haze itself). Drawn by SKY_FS only — like the
+// cloud deck it lives in the sky pass and nowhere else, so no wall and no
+// reflection ever sees it; it is scenery, not environment.
+//   SAND  low rounded dunes, warm and nearly lost in the dust
+//   SLATE soft hills under the mist, barely there
+//   QUARTZ a mesa line: flat tops, sharp shoulders, the darkest of the three
+static v3 ridge_params(float *dark) {
+  switch (g_theme.surf) {
+  // The elevations are what clears a 2.75 m perimeter wall seen from eye
+  // height at 24 m (about 3.2 degrees): below that the land is behind the
+  // wall from everywhere on the floor and exists only for the overview.
+  case SURF_SAND: *dark = 0.26f; return (v3){{0.032f, 0.062f, 0.15f}};
+  case SURF_WET:  *dark = 0.20f; return (v3){{0.028f, 0.064f, 0.35f}};
+  default:        *dark = 0.30f; return (v3){{0.034f, 0.095f, 0.85f}};
+  }
+}
+
 // Ripple strength / glitter strength / standing-water level, per treatment.
 static v3 surf_params(void) {
   switch (g_theme.surf) {

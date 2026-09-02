@@ -313,9 +313,9 @@ static void cmd_updcheck(sim_ctx_t *s) {
 
 static void cmd_cfg(sim_ctx_t *s) {
   (void)s;
-  printf("cfg sense=%.2f ads_sense=%.2f fov=%d vsync=%d fps_cap=%d show_fps=%d msaa=%d binds=",
+  printf("cfg sense=%.2f ads_sense=%.2f fov=%d vsync=%d fps_cap=%d show_fps=%d msaa=%d ssao=%d ssr=%d binds=",
          (double)g_cfg.sense, (double)g_cfg.ads_sense, (int)g_cfg.fov, g_cfg.vsync,
-         g_cfg.fps_cap, g_cfg.show_fps, g_cfg.msaa);
+         g_cfg.fps_cap, g_cfg.show_fps, g_cfg.msaa, g_cfg.ssao, g_cfg.ssr);
   for (int i = 0; i < IN_COUNT; i++) printf("%s%s", i ? "," : "", g_cfg.bind[i]);
   printf(" padbinds=");
   for (int i = 0; i < IN_COUNT; i++) printf("%s%s", i ? "," : "", g_cfg.padbind[i]);
@@ -1700,9 +1700,81 @@ static void cmd_showfps(sim_ctx_t *s) {
   g_cfg.show_fps = next_on_off("showfps");
 }
 
+// `dbgview ao|off`: the composite shows a screen-space buffer instead of the
+// picture, so a pass can be judged on its own output rather than through
+// the lighting it feeds.
+static void cmd_dbgview(sim_ctx_t *s) {
+  (void)s;
+  const char *a = next_tok();
+  g_dbg_view = !strcmp(a, "ao") ? 1 : !strcmp(a, "bloom") ? 2
+             : !strcmp(a, "alpha") ? 3 : 0;
+}
+
+// `grade CURVE CONTRAST SAT`: the display look for A/B frames (CURVE 0 = the
+// ACES fit, 1 = AgX). Every tonemapping program reads it through rig_upload.
+static void cmd_grade(sim_ctx_t *s) {
+  (void)s;
+  g_look[0] = next_f();
+  g_look[1] = next_f();
+  g_look[2] = next_f();
+}
+
 static void cmd_trace(sim_ctx_t *s) {
   long n = next_n();
   while (n-- > 0) { sim_advance(s); sim_print(s); }
+}
+
+// `bench N`: the render cost of the CURRENT view — N frames of render_frame
+// back to back, glFinish'd, wall-clock ms per frame. No sim ticks, so the
+// number is the renderer's alone; the harness's llvmpipe makes it a proxy
+// for fragment cost, not a frame rate.
+static void cmd_bench(sim_ctx_t *s) {
+  long n = next_n();
+  if (n < 1) n = 1;
+  render_frame(s->p, 1.0f, 120, &s->cam);   // warm: programs, targets, uploads
+  glFinish();
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (long i = 0; i < n; i++) render_frame(s->p, 1.0f, 120, &s->cam);
+  glFinish();
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double ms = ((double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+               (double)(t1.tv_nsec - t0.tv_nsec) * 1e-6) / (double)n;
+  printf("bench frames=%ld ms/frame=%.2f\n", n, ms);
+}
+
+// `benchpass N`: `bench` broken down by pass — N frames, the per-pass GPU
+// timers averaged, plus the wall clock of the whole frame for the CPU side
+// (scene_build, vm_build, the HUD batch) that no GPU timer sees.
+static void cmd_benchpass(sim_ctx_t *s) {
+  long n = next_n();
+  if (n < 1) n = 1;
+  render_frame(s->p, 1.0f, 120, &s->cam);
+  glFinish();
+  double acc[RF_PASSES] = {0};
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  g_rf_bench = 1;
+  for (long i = 0; i < n; i++) {
+    render_frame(s->p, 1.0f, 120, &s->cam);
+    glFinish();
+    for (int k = 0; k < RF_PASSES; k++) {
+      GLuint64 ns = 0;
+      glGetQueryObjectui64v(g_rf_q[k], GL_QUERY_RESULT, &ns);
+      acc[k] += (double)ns * 1e-6;
+    }
+  }
+  g_rf_bench = 0;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double wall = ((double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                 (double)(t1.tv_nsec - t0.tv_nsec) * 1e-6) / (double)n;
+  double sum = 0.0;
+  printf("benchpass frames=%ld wall=%.2f ms/frame\n", n, wall);
+  for (int k = 0; k < RF_PASSES; k++) {
+    printf("  %-10s %7.2f ms\n", RF_PASS_NAME[k], acc[k] / (double)n);
+    sum += acc[k] / (double)n;
+  }
+  printf("  %-10s %7.2f ms\n", "gpu-sum", sum);
 }
 
 static void cmd_shot(sim_ctx_t *s) {
@@ -3239,7 +3311,9 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"skel", cmd_skel}, {"vmhand", cmd_vmhand}, {"vmorbit", cmd_vmorbit},
   {"vmbore", cmd_vmbore},
   {"hud", cmd_hud}, {"showfps", cmd_showfps}, {"trace", cmd_trace},
-  {"shot", cmd_shot}, {"capture", cmd_capture}, {"cam", cmd_cam},
+  {"shot", cmd_shot}, {"capture", cmd_capture}, {"cam", cmd_cam}, {"bench", cmd_bench},
+  {"benchpass", cmd_benchpass},
+  {"dbgview", cmd_dbgview}, {"grade", cmd_grade},
   {"camaim", cmd_camaim}, {"cambot", cmd_cambot}, {"camorbit", cmd_camorbit},
   {"homeui", cmd_homeui}, {"home", cmd_home}, {"menu", cmd_menu},
   {"cursor", cmd_cursor}, {"mdown", cmd_mdown},
