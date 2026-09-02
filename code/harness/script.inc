@@ -31,6 +31,7 @@ static void cmd_netdeath(sim_ctx_t *s)         { (void)s; netdeath_proof(); }
 static void cmd_netclient(sim_ctx_t *s)        { (void)s; netclient_proof(); }
 static void cmd_recoil(sim_ctx_t *s)           { (void)s; recoil_proof(); }
 static void cmd_gunwall(sim_ctx_t *s)          { (void)s; gunwall_proof(); }
+static void cmd_boresight(sim_ctx_t *s)        { (void)s; boresight_proof(); }
 static void cmd_netrecoil(sim_ctx_t *s)        { (void)s; netrecoil_proof(); }
 static void cmd_vmframe(sim_ctx_t *s)           { (void)s; vmframe_proof(); }
 static void cmd_figbury(sim_ctx_t *s)          { (void)s; figbury_proof(); }
@@ -313,9 +314,14 @@ static void cmd_updcheck(sim_ctx_t *s) {
 
 static void cmd_cfg(sim_ctx_t *s) {
   (void)s;
-  printf("cfg sense=%.2f ads_sense=%.2f fov=%d vsync=%d fps_cap=%d show_fps=%d msaa=%d ssao=%d ssr=%d binds=",
-         (double)g_cfg.sense, (double)g_cfg.ads_sense, (int)g_cfg.fov, g_cfg.vsync,
-         g_cfg.fps_cap, g_cfg.show_fps, g_cfg.msaa, g_cfg.ssao, g_cfg.ssr);
+  printf("cfg sense=%.2f ads_sense=%.2f fov=%d recoil_view=%.2f vsync=%d fps_cap=%d "
+         "show_fps=%d msaa=%d ssao=%d ssr=%d fullscreen=%d shadows=%d bloom=%d "
+         "dust=%d grain=%d brightness=%.2f binds=",
+         (double)g_cfg.sense, (double)g_cfg.ads_sense, (int)g_cfg.fov,
+         (double)g_cfg.recoil_view, g_cfg.vsync,
+         g_cfg.fps_cap, g_cfg.show_fps, g_cfg.msaa, g_cfg.ssao, g_cfg.ssr,
+         g_cfg.fullscreen, g_cfg.shadows, g_cfg.bloom, g_cfg.dust, g_cfg.grain,
+         (double)g_cfg.brightness);
   for (int i = 0; i < IN_COUNT; i++) printf("%s%s", i ? "," : "", g_cfg.bind[i]);
   printf(" padbinds=");
   for (int i = 0; i < IN_COUNT; i++) printf("%s%s", i ? "," : "", g_cfg.padbind[i]);
@@ -327,7 +333,7 @@ static void cmd_cfg(sim_ctx_t *s) {
   for (int w = 0; w < WPN_COUNT; w++)
     for (int i = 0; i < WP_COUNT; i++) {
       char key[32];
-      wp_key(key, sizeof key, w, i);
+      wp_key(key, sizeof key, w, WP_DEF[i].key);
       printf(" %s=%.2f", key, (double)g_cfg.wp[w][i]);
     }
   printf("\npad");
@@ -375,7 +381,8 @@ static void cmd_wpn(sim_ctx_t *s) {
   printf("wpn t=%ld cur=%s ammo=%d bore=%.3f rec=(%.3f %.3f) heat=%.3f ads=%.3f "
          "reload=%d switch=%d punch=%.3f vm sway=(%.4f %.4f) lag=(%.4f %.4f %.4f) "
          "kick=(%.4f %.3fdeg %.4f) roll=%.4f scope=(%.1f %.1f %.1f)\n",
-         s->tick, WPN_DEF[w->cur].prefix, w->ammo[w->cur], (double)weapon_spread(s->p),
+         s->tick, WPN_DEF[w->cur].prefix, w->ammo[w->cur],
+         (double)gun_bore_offset(w),
          (double)w->rec_p, (double)w->rec_y, (double)w->heat,
          (double)w->ads_s, w->reload_t, w->switch_t, (double)w->punch,
          (double)v->sway_p, (double)v->sway_y,
@@ -806,7 +813,6 @@ static void cmd_parity(sim_ctx_t *s) {
   pw.ads_s = bw.ads_s = 0.0f;
   pw.heat = bw.heat = 0.0f;
   pw.rec_p = bw.rec_p = pw.rec_y = bw.rec_y = 0.0f;
-  pw.rec_p_v = bw.rec_p_v = pw.rec_y_v = bw.rec_y_v = 0.0f;
   // Compare the shared calm-bore contract, not whichever unrelated breathing phase
   // the live player and bot happened to occupy before `parity` was invoked.
   pw.sway_p = bw.sway_p = pw.sway_y = bw.sway_y = 0.0f;
@@ -838,9 +844,12 @@ static void cmd_parity(sim_ctx_t *s) {
     {"mag",           WPN_DEF[WPN_AR].mag,              WPN_DEF[WPN_AR].mag, 1},
     {"reload_ticks",  WPN_DEF[WPN_AR].reload_ticks,     WPN_DEF[WPN_AR].reload_ticks, 1},
     {"dmg",           WPN_DEF[WPN_AR].dmg,              WPN_DEF[WPN_AR].dmg, 1},
-    {"bore_rest",     gun_spread(&pw, rest, 1),         gun_spread(&bw, rest, 1), 0},
-    {"bore_run",      gun_spread(&pw, run, 1),          gun_spread(&bw, run, 1), 0},
-    {"bore_air",      gun_spread(&pw, run, 0),          gun_spread(&bw, run, 0), 0},
+    // The spread cone at three stances, from a calm normalized weapon: standing,
+    // at run speed, and the same run speed with both feet off the ground. One
+    // gun_shoot draws from one gun_spread, so a bot's inaccuracy is the player's.
+    {"cone_rest",     gun_spread(&pw, rest, 1),         gun_spread(&bw, rest, 1), 0},
+    {"cone_run",      gun_spread(&pw, run, 1),          gun_spread(&bw, run, 1), 0},
+    {"cone_air",      gun_spread(&pw, run, 0),          gun_spread(&bw, run, 0), 0},
     {"kick_up",       g_cfg.wp[WPN_AR][WP_KICK_UP],     g_cfg.wp[WPN_AR][WP_KICK_UP], 1},
     {"recover_ms",    g_cfg.wp[WPN_AR][WP_RECOVER_MS],  g_cfg.wp[WPN_AR][WP_RECOVER_MS], 1},
     {"eye_stand",     EYE_STAND,                        EYE_STAND, 1},
@@ -1712,6 +1721,8 @@ static void cmd_dbgview(sim_ctx_t *s) {
 
 // `grade CURVE CONTRAST SAT`: the display look for A/B frames (CURVE 0 = the
 // ACES fit, 1 = AgX). Every tonemapping program reads it through rig_upload.
+// THREE, not four: uLook.w is the player's brightness and comes from the config
+// key, so a graded A/B frame still renders at the exposure that is configured.
 static void cmd_grade(sim_ctx_t *s) {
   (void)s;
   g_look[0] = next_f();
@@ -3322,7 +3333,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"nav", cmd_nav}, {"netloop", cmd_netloop}, {"netpack", cmd_netpack}, {"netpredict", cmd_netpredict},
   {"netlagcomp", cmd_netlagcomp}, {"netstall", cmd_netstall}, {"netanim", cmd_netanim}, {"netfill", cmd_netfill},
   {"netcarry", cmd_netcarry}, {"netfigure", cmd_netfigure},
-  {"recoil", cmd_recoil}, {"gunwall", cmd_gunwall},
+  {"recoil", cmd_recoil}, {"gunwall", cmd_gunwall}, {"boresight", cmd_boresight},
   {"netrecoil", cmd_netrecoil}, {"vmframe", cmd_vmframe},
   {"netleave", cmd_netleave}, {"tele", cmd_tele}, {"humans", cmd_humans}, {"localent", cmd_localent},
   {"tacstat", cmd_tacstat}, {"netdebug", cmd_netdebug}, {"dev", cmd_dev}, {"bots", cmd_bots},

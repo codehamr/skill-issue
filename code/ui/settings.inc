@@ -191,15 +191,19 @@ static int g_ui_control;  // CONTROLS page: 0 keyboard/mouse, 1 gamepad
 static int g_ui_tab;      // legacy uistat field; mirrors the page enum
 static int g_ui_pad_sub;  // CONTROLS/GAMEPAD: 0 sticks+aim, 1 buttons
 static int g_ui_dev_sub;  // DEV page: 0 movement, 1 weapon, 2 assist
+static int g_ui_set_sub;  // SETTINGS page: 0 game, 1 video
 
 // Swallow currently-held pad buttons until they are released — the pad analogue of
 // WM_MOUSEACTIVATE's MA_ACTIVATEANDEAT and the 150 ms refocus click swallow.
 static void pad_eat_held(void);
 
 // Defined by each platform backend: react to menu open/close (cursor
-// clip/visibility, input reset) and to a vsync toggle.
+// clip/visibility, input reset), to a vsync toggle and to a fullscreen toggle.
+// The row writes g_cfg first and calls the hook after, so a backend reads the
+// new value rather than being handed it.
 static void platform_menu_changed(void);
 static void platform_vsync_changed(void);
+static void platform_fullscreen_changed(void);
 
 static int g_ui_name_edit;  // Settings page: the name field is capturing keys
 
@@ -413,7 +417,10 @@ static const char *pad_disp(const char *tok) {
 
 enum { DRAG_SENSE = 1, DRAG_FOV, DRAG_CAP, DRAG_VOL, DRAG_BOTS, DRAG_FRAG,
        DRAG_ADS_SENSE,  // 7, the one id left before the MV block starts
-       DRAG_MV0 = 8, DRAG_WP0 = 32, DRAG_PAD0 = 56 };  // +i = tuning slider i
+       DRAG_MV0 = 8, DRAG_WP0 = 32, DRAG_PAD0 = 56,  // +i = tuning slider i
+       // The first id past the last block, derived so widening PAD_DEF cannot
+       // collide with it the way a hand-written 63 would.
+       DRAG_BRIGHT = DRAG_PAD0 + PAD_COUNT };
 
 // Register one interactive row (layout order) and draw the focus ring when the pad
 // drives the menu.

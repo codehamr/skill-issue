@@ -151,7 +151,15 @@ static EGLDisplay g_egl_dpy = EGL_NO_DISPLAY;
 static EGLSurface g_egl_surf = EGL_NO_SURFACE;
 static EGLContext g_egl_ctx = EGL_NO_CONTEXT;
 
-static int   g_running = 1, g_active, g_mapped, g_grabbed, g_fullscreen = 1;
+static int   g_running = 1, g_active, g_mapped, g_grabbed;
+// Not initialised here on purpose: the only reader is native_main and everything
+// below it, and linux_main writes this from the config (or --windowed) on the way
+// in. A default spelled twice is a default that can disagree with itself.
+static int   g_fullscreen;
+// The --w/--h size this session asked for. Going fullscreen replaces the window's size
+// with the display's, so this is the only record of what to return to on the way out;
+// native_main fills it before that substitution happens.
+static int   g_win_w, g_win_h;
 // ^C / `kill` quit through the SAME teardown as the window close: the frame loop maps
 // this flag onto g_running, so the net goodbye and the config write both still run.
 // The dedicated server's srv_sig/g_srv_stop is a different path — this is play-mode.
@@ -995,6 +1003,30 @@ static void platform_menu_changed(void) {
 static void platform_vsync_changed(void) {
   if (!g_headless && g_egl_dpy != EGL_NO_DISPLAY)
     eglSwapInterval(g_egl_dpy, g_cfg.vsync ? 1 : 0);
+}
+
+// A MAPPED window's state belongs to the window manager, so the switch is a request,
+// not a property write: the EWMH ClientMessage to the ROOT window that nat_window's
+// property is the pre-map form of. The WM sizes us up on the way in; on the way out
+// it only restores the geometry we had before, which for a session that started
+// fullscreen IS the display, so the --w/--h size is asked for explicitly.
+// ConfigureNotify carries whatever arrives back into R.width/height.
+static void platform_fullscreen_changed(void) {
+  if (g_headless || !g_xdpy || !g_xwin) return;
+  g_fullscreen = g_cfg.fullscreen ? 1 : 0;
+  XEvent ev = {0};
+  ev.type = ClientMessage;
+  ev.xclient.window = g_xwin;
+  ev.xclient.message_type = A_NET_WM_STATE;
+  ev.xclient.format = 32;
+  ev.xclient.data.l[0] = g_fullscreen;            // 1 = add the state, 0 = remove it
+  ev.xclient.data.l[1] = (long)A_NET_WM_FULLSCREEN;
+  ev.xclient.data.l[2] = 0;                       // no second state
+  ev.xclient.data.l[3] = 1;                       // source: a normal application
+  XSendEvent(g_xdpy, g_xroot, False,
+             SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+  if (!g_fullscreen) XResizeWindow(g_xdpy, g_xwin, (unsigned)g_win_w, (unsigned)g_win_h);
+  XFlush(g_xdpy);
 }
 
 // --- window + context ------------------------------------------------------

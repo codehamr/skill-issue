@@ -94,6 +94,48 @@ static void platform_vsync_changed(void) {
   if (g_swap_interval) g_swap_interval(g_cfg.vsync);
 }
 
+// The window has two shapes and this is the one body that measures either, so the
+// bring-up below and the FULLSCREEN row ask the same question and get the same
+// answer. Borderless fullscreen: a plain popup at desktop resolution. Windowed: a
+// 1280x720 CLIENT rect centred on the primary monitor — AdjustWindowRect measures the
+// frame at the SYSTEM dpi, so on a per-monitor-dpi desktop the frame can land a few
+// pixels off centre; the renderer follows the client size WM_SIZE reports, so that
+// costs window edge and never a wrong viewport.
+static void win_mode_rect(RECT *r, DWORD *style) {
+  int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+  *style = g_cfg.fullscreen ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+  if (g_cfg.fullscreen) {
+    // ONE PIXEL past the desktop, popup only: a top-level window that matches the
+    // desktop exactly is the shape the compositor promotes to exclusive fullscreen,
+    // and this window wants to stay a composited borderless one (alt-tab, overlays,
+    // no mode switch). The extra row is off-screen and costs nothing to draw.
+    SetRect(r, 0, 0, sw, sh + 1);
+    return;
+  }
+  SetRect(r, 0, 0, 1280, 720);
+  AdjustWindowRect(r, *style, FALSE);
+  OffsetRect(r, (sw - (r->right - r->left)) / 2 - r->left,
+                (sh - (r->bottom - r->top)) / 2 - r->top);
+  // A frame wider or taller than the desktop centres to a negative origin, which
+  // hides the title bar the player needs to move the window. Clamp, don't centre.
+  if (r->left < 0) OffsetRect(r, -r->left, 0);
+  if (r->top < 0) OffsetRect(r, 0, -r->top);
+}
+
+// The live window is restyled and re-measured in place, no destroy, no mode switch:
+// the style word decides popup vs framed and win_mode_rect measures the shape that
+// goes with it. WM_SIZE carries the client size that comes out into R and the viewport.
+static void platform_fullscreen_changed(void) {
+  RECT r;
+  DWORD style;
+  win_mode_rect(&r, &style);
+  // Shown stays shown: visibility lives in the same style word we are overwriting.
+  style |= (DWORD)(GetWindowLongPtrA(g_hwnd, GWL_STYLE) & WS_VISIBLE);
+  SetWindowLongPtrA(g_hwnd, GWL_STYLE, (LONG_PTR)style);
+  SetWindowPos(g_hwnd, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
+               SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 // --- Gamepad via XInput + DirectInput8 -------------------------------------
 // Two adapters, tried in that order; both feed the shared mappers and neither writes
 // g_pad on a failed read, so stale state cannot linger.
@@ -654,17 +696,35 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       win_input_clear();
     }
     return 0;
+  case WM_SIZE:
+    // The one place the renderer learns the window's size, in both shapes: the popup
+    // follows the desktop, a windowed session follows the frame the player drags.
+    // SIZE_MINIMIZED reports 0x0 and means "not on screen", never a new target.
+    if (wp != SIZE_MINIMIZED) {
+      int w = LOWORD(lp), h = HIWORD(lp);
+      if (w > 0 && h > 0 && (w != R.width || h != R.height)) {
+        R.width = w;
+        R.height = h;
+        // CreateWindow itself sends a WM_SIZE, so the first one lands before there is
+        // a context to set a viewport on; app_start re-states the size after it.
+        if (wglGetCurrentContext()) glViewport(0, 0, w, h);
+        // The clip rect is the WINDOW rect, so it is stale the moment that moves.
+        if (g_active && !g_menu_open) win_clip_cursor();
+      }
+    }
+    return 0;
   case WM_DISPLAYCHANGE: {
     // Desktop resolution changed while running: keep the borderless popup matched to
-    // the desktop, or the "fullscreen" illusion breaks.
-    int w = LOWORD(lp), h = HIWORD(lp) + 1;
-    if (w > 0 && h > 0 && (w != R.width || h != R.height)) {
+    // the desktop, or the "fullscreen" illusion breaks. A windowed session keeps the
+    // size the player chose; WM_SIZE carries whatever this moves into R. Re-fit through
+    // win_mode_rect rather than lp's own width/height, so the popup's one extra row is
+    // spelled once, not repeated at this second caller.
+    RECT r;
+    DWORD style;
+    win_mode_rect(&r, &style);
+    int w = r.right - r.left, h = r.bottom - r.top;
+    if (g_cfg.fullscreen && w > 0 && h > 0 && (w != R.width || h != R.height))
       SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-      R.width = w;
-      R.height = h;
-      glViewport(0, 0, w, h);
-      if (g_active) win_clip_cursor();
-    }
     return 0;
   }
   case WM_SETCURSOR:
@@ -893,10 +953,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
   };
   RegisterClassA(&wc);
 
-  // Borderless fullscreen: a plain popup at desktop resolution.
-  int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN) + 1;
-  g_hwnd = CreateWindowExA(0, wc.lpszClassName, "skill-issue", WS_POPUP,
-                           0, 0, sw, sh, NULL, NULL, inst, NULL);
+  // The shape the config asks for, measured by the one body that measures both.
+  RECT wr;
+  DWORD style;
+  win_mode_rect(&wr, &style);
+  g_hwnd = CreateWindowExA(0, wc.lpszClassName, "skill-issue", style,
+                           wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
+                           NULL, NULL, inst, NULL);
   // The Linux twin fatals on eight bring-up steps and this one on none. Only this
   // guard changes an OUTCOME rather than a message: without a window GetDC(NULL)
   // hands back the SCREEN dc, so bring-up can succeed, WM_ACTIVATE never arrives,
@@ -941,7 +1004,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
   LARGE_INTEGER seed_qpc;
   QueryPerformanceCounter(&seed_qpc);
   player_t *player_s = &g_players[0];   // human 0 IS the local player
-  app_start(player_s, sw, sh,
+  RECT cli;   // the CLIENT rect, not the window's: windowed, a frame stands between them
+  GetClientRect(g_hwnd, &cli);
+  app_start(player_s, cli.right, cli.bottom,
             (uint32_t)seed_qpc.QuadPart ^
             ((uint32_t)(seed_qpc.QuadPart >> 32) * 2654435761u) ^
             GetCurrentProcessId());

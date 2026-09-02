@@ -62,9 +62,11 @@ static int los_clear(v3 o, v3 tp);
 // needs the cover/search helpers that are defined between the two.
 static void bot_flank_release(bot_t *b);
 
-// EV_FIRE: a = impact/end point, b = shot dir, f = hit distance, i = shot index, k = 0
-// none / 1 solid / 2 body / 3 head, g = ads blend (the tracer's muzzle offset collapses
-// onto the view axis while aiming).
+// EV_FIRE: a = impact/end point, b = shot dir, f = the round's travel FROM THE EYE
+// (the shooter's, not the muzzle's — a − b·f reconstructs the eye, and the rifle's
+// muzzle is a presentation offset off it), i = shot index, k = 0 none / 1 solid /
+// 2 body / 3 head, g = ads blend (the tracer's muzzle offset collapses onto the view
+// axis while aiming).
 typedef struct {
   ev_type_t type; v3 a, b; float f, g, pen; int i, k, wpn, src, dst;
 } event_t;

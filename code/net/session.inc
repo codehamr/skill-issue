@@ -773,7 +773,12 @@ static void net_cl_apply_ent(const net_ent_t *e) {
 //   the RELOAD CLOCK, started by EV_RELOAD in ent_on_event and counted down here on
 //     the same gun_reload_tick the shooter ran — without the countdown reload_t would
 //     be stamped once and never move, i.e. a magazine change that begins and never
-//     ends.
+//     ends;
+//   the BARREL, following the recoil target each shot echo set (gun_recoil_step, whose
+//     rec_hold releases the crown a round interval after the last echo — a viewer has
+//     no trigger to watch). Heat is NOT advanced here and must not be: its readers are
+//     the grip correction and the round's cone, both of which belong to the process
+//     that simulates the shooter, and the visual kick asks the round's index instead.
 //
 // FOREIGN ONLY, both of them: our own body is predicted, and re-running either clock
 // on top of prediction would double it.

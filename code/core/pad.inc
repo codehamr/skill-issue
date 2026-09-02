@@ -323,12 +323,28 @@ typedef struct {
   // Plain multiplier on the same ADS ramp; 1.00 is the identity everywhere.
   float ads_sense;           // mouse ADS sensitivity multiplier, 1 = unchanged
   float fov;                 // horizontal FOV in degrees
+  // How much of the recoil offset the CAMERA follows, 0..1. At 1 the reticle is
+  // always the next round's line and the climb is fought with the mouse; below it
+  // the crosshair lies about the barrel by the remainder. No menu row on purpose:
+  // it is the aim contract, not a taste setting, and the sway follow is separate.
+  float recoil_view;
   int   vsync;
   int   fps_cap;             // frame limiter, 0 = off
   int   show_fps;
   int   msaa;                // MSAA samples: 0 (off), 2, 4 or 8
   int   ssao;                // screen-space ambient occlusion, 1 = on
   int   ssr;                 // screen-space reflections in standing water, 1 = on
+  int   fullscreen;          // borderless fullscreen, 1 = on
+  // THREE STATES, NOT A FLAG: the shadow map's resolution IS the setting, so
+  // "low" is a real quality step and not a half-disabled pass. 0 off, 1 low,
+  // 2 high — shadow_tex_size() is the one reader of the distinction.
+  int   shadows;
+  int   bloom;               // glow: the bloom chain AND the sun shafts, one switch
+  int   dust;                // airborne motes
+  int   grain;               // film grain AND the vignette it belongs to
+  // Exposure multiplier applied BEFORE the tonemap curve (uLook.w), so it is a
+  // real exposure and not a lift on the displayed picture: 1 is the shipped look.
+  float brightness;
   // Written by the GAME tab's slider on the main thread, read by audio_mix on the
   // audio thread. Atomic member, not a mirrored global with three publish sites.
   _Atomic float vol;         // master volume 0..1
@@ -369,8 +385,20 @@ static const float (*g_sim_wp)[WP_COUNT] = g_cfg.wp;
 
 // Q/E are the lean keys, so the weapon TOGGLE moved to x; an existing `bind_swap q` is
 // moved by the migration pass below.
-static void wp_key(char *out, size_t n, int w, int i) {
-  snprintf(out, n, "%s_%s", WPN_DEF[w].prefix, WP_DEF[i].key);
+static void wp_key(char *out, size_t n, int w, const char *name) {
+  snprintf(out, n, "%s_%s", WPN_DEF[w].prefix, name);
+}
+
+// THE TWO SPELLINGS ONE WEAPON PARAMETER ANSWERS TO, in one predicate: the
+// "<prefix>_<name>" form config_write emits, and the pre-sniper single-weapon
+// "wp_<name>", which maps onto the AR so a config tuned before there was a second
+// weapon keeps its feel. Both live here so no caller can teach the parser a spelling
+// the emitter does not know.
+static int wp_key_match(const char *key, int w, const char *name) {
+  char full[32];
+  wp_key(full, sizeof full, w, name);
+  return !strcmp(key, full) ||
+         (w == WPN_AR && !strncmp(key, "wp_", 3) && !strcmp(key + 3, name));
 }
 
 // Valid MSAA sample counts are 0/2/4/8; anything else snaps to the next lower.
@@ -388,9 +416,16 @@ static char name_glyph(char c) {
 static config_t config_defaults(void) {
   // fov 100 is the genre's PC default; vsync 0 + fps_cap 120 matches the handheld
   // panel without vsync's latency; msaa 8 because flat facets and long straight
-  // silhouettes are what MSAA is cheap on and what crawls without it.
-  config_t c = {.sense = 1.0f, .ads_sense = 1.0f, .fov = 100.0f, .vsync = 0, .fps_cap = 120, .show_fps = 1, .msaa = 8,
+  // silhouettes are what MSAA is cheap on and what crawls without it. recoil_view 1
+  // is the open value: the camera carries the whole climb, so the reticle never lies.
+  config_t c = {.sense = 1.0f, .ads_sense = 1.0f, .fov = 100.0f, .recoil_view = 1.0f,
+                .vsync = 0, .fps_cap = 120, .show_fps = 1, .msaa = 8,
                 .ssao = 1, .ssr = 1,
+                // The graphics defaults ARE the top quality preset, deliberately:
+                // an untouched install renders exactly the picture it rendered
+                // before these keys existed, byte for byte.
+                .fullscreen = 1, .shadows = 2, .bloom = 1, .dust = 1, .grain = 1,
+                .brightness = 1.0f,
                 // sp_diff 2 = HARD. The bot count came down to 1, so difficulty
                 // is what carries the challenge now — see SP_BOTS_DEF.
                 .vol = VOL_DEF.def, .sp_bots = (int)SP_BOTS_DEF.def, .sp_diff = 2,
@@ -431,16 +466,25 @@ static void config_emit(FILE *f, const config_t *c) {
     "sense %.3f\n"
     "ads_sense %.3f\n"
     "fov %.0f\n"
+    "recoil_view %.2f\n"
     "vsync %d\n"
     "fps_cap %d\n"
     "show_fps %d\n"
     "msaa %d\n"
     "ssao %d\n"
     "ssr %d\n"
+    "fullscreen %d\n"
+    "shadows %d\n"
+    "bloom %d\n"
+    "dust %d\n"
+    "grain %d\n"
+    "brightness %.2f\n"
     "third_person %d\n"
     "devmode %d\n",
-    (double)c->sense, (double)c->ads_sense, (double)c->fov, c->vsync, c->fps_cap,
+    (double)c->sense, (double)c->ads_sense, (double)c->fov, (double)c->recoil_view,
+    c->vsync, c->fps_cap,
     c->show_fps, c->msaa, c->ssao, c->ssr,
+    c->fullscreen, c->shadows, c->bloom, c->dust, c->grain, (double)c->brightness,
     c->third_person, c->devmode);
   fprintf(f, "%s %.2f\n", VOL_DEF.key, (double)c->vol);
   fprintf(f, "sp_bots %d\nsp_difficulty %d\nsp_fraglimit %d\nplayer_name %s\n",
@@ -456,7 +500,7 @@ static void config_emit(FILE *f, const config_t *c) {
   for (int w = 0; w < WPN_COUNT; w++)
     for (int i = 0; i < WP_COUNT; i++) {
       char key[32];
-      wp_key(key, sizeof key, w, i);
+      wp_key(key, sizeof key, w, WP_DEF[i].key);
       fprintf(f, "%s %.2f\n", key, (double)c->wp[w][i]);
     }
   for (int i = 0; i < PAD_COUNT; i++)
@@ -505,9 +549,13 @@ static void config_write(const char *path, const config_t *c) {
 // Windows), keeps the previous value on garbage rather than clamping nonsense.
 static float parse_float(const char *s, float prev, float lo, float hi) {
   // buf is DELIBERATELY not val's width: 11 chars is the historical numeric
-  // budget, which pins every float key's parse across the val widening.
+  // budget, which pins every float key's parse across the val widening. The
+  // precision spells that truncation out rather than letting snprintf perform it
+  // silently, and it is derived from sizeof so it cannot drift from the buffer.
+  // A val that long is a number no key wants: what survives still goes through
+  // strtof and the f_clamp below, so the worst case is a clamped bound.
   char buf[12];
-  snprintf(buf, sizeof buf, "%s", s);
+  snprintf(buf, sizeof buf, "%.*s", (int)(sizeof buf - 1), s);
   for (char *q = buf; *q; q++)
     if (*q == ',') *q = '.';
   char *end;
@@ -571,6 +619,25 @@ static void config_bind_migrate(config_t *c, int pad) {
   }
 }
 
+// DID THIS LINE NAME A WEAPON PARAMETER? Two vocabularies, one column and one clamp:
+// WP_DEF's live names, and the superseded ones in WP_LEGACY_KEY, which are parsed and
+// never emitted because the untouched-install migration below reads a WHOLE profile
+// and a key it cannot place is a row it cannot recognise.
+static int config_wp_key(config_t *c, const char *key, const char *val) {
+  for (int w = 0; w < WPN_COUNT; w++) {
+    int i = -1;
+    for (int k = 0; k < WP_COUNT && i < 0; k++)
+      if (wp_key_match(key, w, WP_DEF[k].key)) i = k;
+    for (unsigned li = 0;
+         li < sizeof WP_LEGACY_KEY / sizeof *WP_LEGACY_KEY && i < 0; li++)
+      if (wp_key_match(key, w, WP_LEGACY_KEY[li].key)) i = WP_LEGACY_KEY[li].idx;
+    if (i < 0) continue;
+    c->wp[w][i] = parse_float(val, c->wp[w][i], WP_DEF[i].lo, WP_DEF[i].hi);
+    return 1;
+  }
+  return 0;
+}
+
 static void config_load_or_create(const char *path, config_t *c) {
   *c = config_defaults();
   FILE *f = fopen(path, "r");
@@ -612,12 +679,30 @@ static void config_load_or_create(const char *path, config_t *c) {
     // ask for more than the menu offers, and the menu must not rewrite it.
     else if (!strcmp(key, "ads_sense")) c->ads_sense = parse_float(val, c->ads_sense, 0.01f, 10.0f);
     else if (!strcmp(key, "fov"))   c->fov   = parse_float(val, c->fov, 50.0f, 130.0f);
+    // 0 = the camera ignores the climb entirely, 1 = it carries all of it. Clamped to
+    // that range: past 1 the view would outrun the barrel it is supposed to be on.
+    else if (!strcmp(key, "recoil_view"))
+      c->recoil_view = parse_float(val, c->recoil_view, 0.0f, 1.0f);
     // The 0/1 flags stay on `? 1 : 0` rather than a parse_int(0, 1) clamp: a
     // hand-edited `vsync -1` means "on" today and a clamp would make it "off".
     else if (!strcmp(key, "vsync"))    c->vsync    = parse_long(val, c->vsync) ? 1 : 0;
     else if (!strcmp(key, "msaa"))     c->msaa     = msaa_snap(parse_long(val, c->msaa));
     else if (!strcmp(key, "ssao"))     c->ssao     = parse_long(val, c->ssao) ? 1 : 0;
     else if (!strcmp(key, "ssr"))      c->ssr      = parse_long(val, c->ssr) ? 1 : 0;
+    else if (!strcmp(key, "fullscreen"))
+      c->fullscreen = parse_long(val, c->fullscreen) ? 1 : 0;
+    else if (!strcmp(key, "bloom"))    c->bloom    = parse_long(val, c->bloom) ? 1 : 0;
+    else if (!strcmp(key, "dust"))     c->dust     = parse_long(val, c->dust) ? 1 : 0;
+    else if (!strcmp(key, "grain"))    c->grain    = parse_long(val, c->grain) ? 1 : 0;
+    // The one graphics key that CLAMPS instead of taking `? 1 : 0`: it is a
+    // three-state cycle, and "shadows 7" has no reading as "on" the way a flag's
+    // stray -1 does — it is a number out of range, so it snaps into range.
+    else if (!strcmp(key, "shadows"))  c->shadows  = parse_int(val, c->shadows, 0, 2);
+    // Half to one-and-a-half of the shipped exposure, which is the slider's own
+    // range: past either end the picture is a black frame or a white one, and
+    // neither is a setting a hand-edited file should be able to reach.
+    else if (!strcmp(key, "brightness"))
+      c->brightness = parse_float(val, c->brightness, 0.5f, 1.5f);
     else if (!strcmp(key, "fps_cap"))  c->fps_cap  = parse_int(val, c->fps_cap, 0, 1000);
     else if (!strcmp(key, "show_fps")) c->show_fps = parse_long(val, c->show_fps) ? 1 : 0;
     else if (!strcmp(key, "third_person")) {
@@ -677,18 +762,7 @@ static void config_load_or_create(const char *path, config_t *c) {
           c->mv[i] = parse_float(val, c->mv[i], MV_DEF[i].lo, MV_DEF[i].hi);
           hit = 1;
         }
-      for (int w = 0; w < WPN_COUNT && !hit; w++)
-        for (int i = 0; i < WP_COUNT && !hit; i++) {
-          char full[32];
-          wp_key(full, sizeof full, w, i);
-          // "wp_<key>" is the pre-sniper single-weapon form: map it to the AR
-          // so existing tuned configs keep their feel.
-          if (!strcmp(key, full) ||
-              (w == WPN_AR && !strncmp(key, "wp_", 3) && !strcmp(key + 3, WP_DEF[i].key))) {
-            c->wp[w][i] = parse_float(val, c->wp[w][i], WP_DEF[i].lo, WP_DEF[i].hi);
-            hit = 1;
-          }
-        }
+      if (!hit) hit = config_wp_key(c, key, val);
       for (int i = 0; i < PAD_COUNT && !hit; i++)
         if (!strcmp(key, PAD_DEF[i].key)) {
           c->pad[i] = parse_float(val, c->pad[i], PAD_DEF[i].lo, PAD_DEF[i].hi);
@@ -733,19 +807,31 @@ static void config_load_or_create(const char *path, config_t *c) {
   }
   fclose(f);
 
-  // An existing untouched config otherwise pins the old full-auto-laser profile
-  // forever: defaults only fill missing keys. Migrate the exact complete legacy row,
-  // never a partially matching row, so one deliberate user tune protects all of it.
-  int legacy_ar = 1, flat_trace_ar = 1;
+  // An existing untouched config otherwise pins a superseded weapon profile forever:
+  // defaults only fill missing keys. Migrate an exact complete legacy row, never a
+  // partially matching one, so one deliberate user tune protects all of it. Each
+  // weapon is judged on its own row, and every superseded row a shipped build ever
+  // wrote stays listed — a player who skipped a version arrives from the older one.
+  int legacy_ar = 1, flat_trace_ar = 1, spring_ar = 1, placed_ar = 1, spring_sr = 1;
   for (int i = 0; i < WP_COUNT; i++) {
     if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_PHYSICAL[i]) > 0.0001f)
       legacy_ar = 0;
     if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_WALL_TRACE[i]) > 0.0001f)
       flat_trace_ar = 0;
+    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_PATTERN[i]) > 0.0001f)
+      spring_ar = 0;
+    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_FOLLOWER[i]) > 0.0001f)
+      placed_ar = 0;
+    if (fabsf(c->wp[WPN_SR][i] - WP_SR_DEFAULTS_PRE_PATTERN[i]) > 0.0001f)
+      spring_sr = 0;
   }
-  if (legacy_ar || flat_trace_ar) {
+  if (legacy_ar || flat_trace_ar || spring_ar || placed_ar) {
     memcpy(c->wp[WPN_AR], WP_DEFAULTS[WPN_AR], sizeof c->wp[WPN_AR]);
-    fprintf(stderr, "config: migrated untouched AR profile to wall-trace defaults\n");
+    fprintf(stderr, "config: migrated untouched AR profile to follower defaults\n");
+  }
+  if (spring_sr) {
+    memcpy(c->wp[WPN_SR], WP_DEFAULTS[WPN_SR], sizeof c->wp[WPN_SR]);
+    fprintf(stderr, "config: migrated untouched SR profile to pattern defaults\n");
   }
 
   config_bind_migrate(c, 0);

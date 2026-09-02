@@ -1,6 +1,6 @@
 // =============================================================================
 // harness/analysis.inc  —  WAV analysis, usage(), the script token reader,
-// sim_ctx_t, sim_advance.
+// gun_bore_offset, sim_ctx_t, sim_advance.
 // Proof: --help. One TU: included once by game.c, in definition order —
 // moving a definition out is a semantic change.
 // Contract: `./build/game --help` IS the command reference — never copy it
@@ -233,7 +233,8 @@ static void usage(void) {
        "                     --skill 0|1|2 --fraglimit N and\n"
        "                     --ticks N (exit after N ticks; 0 = run forever)\n"
        "                     --net-debug (verbose: trims/skips, one line each)\n"
-       "  --windowed         play in a window rather than borderless fullscreen\n"
+       "  --windowed         play in a window for this run (overrides the config's\n"
+       "                     FULLSCREEN row)\n"
        "  --w N --h N        window size when playing / framebuffer size for the\n"
        "                     harness (default 1280x720; fullscreen uses the display)\n"
        "  --seed N           map seed (harness default 1337; a played session is\n"
@@ -344,9 +345,17 @@ static void usage(void) {
        "  gunwall            the wall gate: three standoffs x both weapons — a\n"
        "                     walled muzzle refuses the trigger silently and\n"
        "                     tucks the carriage; a clear one fires (hard gate)\n"
+       "  boresight          the reticle contract: AR/SR x hip/ADS x level+tilted aim\n"
+       "                     x 4.5/10.5/18.5 m against a synthetic face — impact minus\n"
+       "                     the analytic eye-ray intersection on it must be inside 1 cm\n"
+       "                     for an aimed round (cone 0) and inside HIP SPREAD's own\n"
+       "                     angle over the path from the hip (hard gate)\n"
        "  recoil             AR/SR hip+ADS, single+burst: T0/1/2/4/8/16/settle,\n"
-       "                     muzzle axis, camera punch, shot direction, deterministic\n"
-       "                     curve and gameplay/RNG isolation (hard gate)\n"
+       "                     muzzle axis, camera punch, shot direction reproduced from\n"
+       "                     the trigger-time bore and the round's own two spread draws,\n"
+       "                     deterministic curve and gameplay isolation; plus the auto,\n"
+       "                     slide (fired vs sim bore under a committed slide) and wall\n"
+       "                     fixtures (hard gate)\n"
        "  vmtrig             hard hand contract over FP/3P Hip/ADS, reload\n"
        "                     15/35/55/75/90, SR bolt, recoil peaks, Low-Ready\n"
        "                     and death: guard/blade, actual allowed bite and\n"
@@ -466,6 +475,18 @@ static void usage(void) {
        (int)NET_TELE_DT_MAX);   // same reason as the slider ranges above: a
                                 // hardcoded "0..90" in the help is the copy
                                 // nobody greps when the boundary moves
+}
+
+// HOW FAR OFF THE CALM AIM THE BARREL ITSELF IS, in degrees: the magnitude of exactly
+// the two terms gun_bore_angles adds, the recoil place and the sway wander. It is a
+// measurement and lives here because only measurements ask it — the sim never needs
+// the magnitude, only the angles — and one copy of it keeps `wpn`'s column and the
+// recoil rows from developing separate opinions about where the rifle is pointing.
+// Deliberately NOT gun_spread: that is the cone the STANCE opens around this axis.
+static float gun_bore_offset(const weapon_t *w) {
+  float p = w->rec_p + w->sway_p;
+  float y = w->rec_y + w->sway_y;
+  return sqrtf(p * p + y * y);
 }
 
 typedef struct {

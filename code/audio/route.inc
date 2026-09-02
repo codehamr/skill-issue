@@ -192,7 +192,8 @@ static void audio_on_event(const event_t *e) {
                  lvl * rng_rangef(&g_rng_audio, 0.92f, 1.0f), rate, 0.0f, 0.0f);
       break;
     }
-    // Someone else's.
+    // Someone else's, placed where the round started — the shooter's eye, close
+    // enough to the rifle that no ear could name the difference.
     v3 o = v3_add(e->a, v3_scale(e->b, -e->f));
     float dist, pan = audio_place(o, &dist);
     float fmix = f_clamp((dist - 12.0f) / 14.0f, 0.0f, 1.0f);
@@ -370,10 +371,13 @@ static void audio_shot_world(const event_t *e) {
   // EXCLUDE ONLY ROUNDS THAT HIT THE LISTENER. The old guard rejected `k == 2 || k ==
   // 3`, i.e.
   if (e->src != g_local_ent && e->dst != g_local_ent) {
-    // A round that went past you.
-    v3 muzzle = v3_sub(e->a, v3_scale(e->b, e->f));
+    // A round that went past you. The segment is the ballistic one: it begins at the
+    // SHOOTER'S EYE, where the round was traced from, not at the rifle's barrel tip —
+    // half a metre of it lies behind a shoulder nobody stands next to, and the 0.5 m
+    // end margins below already refuse a crack from inside the shooter.
+    v3 start = v3_sub(e->a, v3_scale(e->b, e->f));
     v3 ax = v3_norm(e->b);
-    v3 d = v3_sub(g_listen, muzzle);
+    v3 d = v3_sub(g_listen, start);
     float t = v3_dot(d, ax);
     v3 perp = v3_sub(d, v3_scale(ax, t));
     float miss = sqrtf(v3_dot(perp, perp));

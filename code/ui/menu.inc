@@ -6,9 +6,19 @@
 // RESET rows cannot cross-confirm each other; ui_arm_take is the one
 // chokepoint, and nav_move clears it. QUIT and LEAVE MATCH are NOT on that
 // list — both are one press, each argued at its own tile in ui/settings.inc.
+// SETTINGS splits GAME | VIDEO behind the CONTROLS sub-select, and the VIDEO
+// page's PRESET is DERIVED from the seven graphics keys rather than stored:
+// GFX_PRESET's HIGH row IS config_defaults' picture, cycling writes the whole
+// group, and CUSTOM is a reading the row can never write.
+// uistat cannot name the settings sub-page: it sees it only as the focus-row
+// count (8 on GAME, 15 on VIDEO), so a row added to either page moves that
+// number and the proof's expectation moves with it.
 // =============================================================================
 static float ui_page_binds_kb (float px, float pw, float y, int click, float cx, float cy);
-static float ui_page_settings (float px, float pw, float y, int click, float cx, float cy);
+static float ui_page_settings_game (float px, float pw, float y, int click,
+                                    float cx, float cy);
+static float ui_page_settings_video(float px, float pw, float y, int click,
+                                    float cx, float cy);
 static float ui_page_binds_pad(float px, float pw, float y, int click, float cx, float cy);
 static float ui_page_match    (float px, float pw, float y, int click, float cx, float cy);
 static float ui_page_dev      (float px, float pw, float y, int click, float cx, float cy);
@@ -99,7 +109,7 @@ static void ui_menu(void) {
   // Self-sizing across FRAMES now, not within one: a rounded panel cannot be bottom-
   // patched the way the old flat quad was (ui_rect_bottom rewrote three vertices;
   // ui_panel is a hundred).
-  static float ph_page[UI_PAGE_COUNT] = {276, 177, 319, 344, 344};
+  static float ph_page[UI_PAGE_COUNT] = {276, 177, 344, 344, 344};
   ui_page_t drawn_page = g_ui_page;
   float pw = 340, px = g_ui_vw * 0.5f - pw * 0.5f;
   float ph = ph_page[drawn_page];
@@ -140,10 +150,21 @@ static void ui_menu(void) {
     static const char *const CONTROL[2] = {"KEYBOARD + MOUSE", "GAMEPAD"};
     ui_subsel(CONTROL, 2, &g_ui_control, px, pw, y, click, cx, cy);
     y += 18;
+  } else if (drawn_page == UI_PAGE_SETTINGS) {
+    // The CONTROLS sub-select, on the one other page that had outgrown a single
+    // list: WHO IS PLAYING AND HOW IT FEELS on one side, WHAT THE PICTURE COSTS on
+    // the other. Same widget, same 18 px, so the split reads as page grammar the
+    // player already learned rather than as a second invention.
+    static const char *const SETSUB[2] = {"GAME", "VIDEO"};
+    ui_subsel(SETSUB, 2, &g_ui_set_sub, px, pw, y, click, cx, cy);
+    y += 18;
   }
   if      (drawn_page == UI_PAGE_CONTROLS && g_ui_control == 0)
                                            y = ui_page_binds_kb (px, pw, y, click, cx, cy);
-  else if (drawn_page == UI_PAGE_SETTINGS) y = ui_page_settings (px, pw, y, click, cx, cy);
+  else if (drawn_page == UI_PAGE_SETTINGS && g_ui_set_sub == 0)
+                                       y = ui_page_settings_game (px, pw, y, click, cx, cy);
+  else if (drawn_page == UI_PAGE_SETTINGS)
+                                       y = ui_page_settings_video(px, pw, y, click, cx, cy);
   else if (drawn_page == UI_PAGE_CONTROLS) y = ui_page_binds_pad(px, pw, y, click, cx, cy);
   else if (drawn_page == UI_PAGE_MATCH)    y = ui_page_match    (px, pw, y, click, cx, cy);
   else if (drawn_page == UI_PAGE_DEV)      y = ui_page_dev      (px, pw, y, click, cx, cy);
@@ -315,8 +336,33 @@ static float ui_page_binds_kb(float px, float pw, float y, int click, float cx, 
   return y;
 }
 
-static float ui_page_settings(float px, float pw, float y, int click, float cx, float cy) {
-  char buf[16];
+// The graphics group as ONE choice. The seven keys below are what a picture costs;
+// LOW/MEDIUM/HIGH name three points on that curve so a player who does not want to
+// learn what "screen-space reflections" are can still trade fidelity for frames.
+// HIGH IS config_defaults' OWN PICTURE — an untouched install reads HIGH and renders
+// exactly what it always rendered; if these two ever disagree, config_defaults wins
+// and this table is the defect.
+typedef struct { int msaa, shadows, ssao, ssr, bloom, dust, grain; } gfx_preset_t;
+static const gfx_preset_t GFX_PRESET[3] = {
+  {0, 1, 0, 0, 0, 0, 0},   // LOW
+  {2, 1, 1, 0, 1, 1, 0},   // MEDIUM
+  {8, 2, 1, 1, 1, 1, 1},   // HIGH
+};
+
+// DERIVED, NEVER STORED: the seven keys are the truth and the row's label is a
+// reading of them, so a hand-edited config.cfg or a single row moved on this very
+// page is answered on the next frame by CUSTOM instead of by a stale name. There is
+// no `preset` config key for the same reason — it could only ever disagree.
+static int gfx_preset_index(void) {
+  for (int i = 0; i < 3; i++) { const gfx_preset_t *g = &GFX_PRESET[i];
+    if (g_cfg.msaa == g->msaa && g_cfg.shadows == g->shadows && g_cfg.ssao == g->ssao &&
+        g_cfg.ssr == g->ssr && g_cfg.bloom == g->bloom && g_cfg.dust == g->dust &&
+        g_cfg.grain == g->grain) return i; }
+  return 3;
+}
+
+static float ui_page_settings_game(float px, float pw, float y, int click,
+                                   float cx, float cy) {
   // IDENTITY FIRST. The name field used to sit on the Singleplayer page, which is where
   // a MATCH is configured — but the name is not match property: it is who you are, it
   // persists across sessions, and online it is what every other player reads on the
@@ -362,12 +408,44 @@ static float ui_page_settings(float px, float pw, float y, int click, float cx, 
     y = ui_param_row(&ad, &g_cfg.ads_sense, DRAG_ADS_SENSE, px, y, click, cx, cy); }
 
   y += 4;
-  ui_section("GRAPHICS", px, pw, y);
+  ui_section("AUDIO", px, pw, y);
   y += 14;
-  // Step 1 selects "%.0f", which prints identically to the old "%d",(int) for the
-  // integral values roundf leaves behind.
-  { param_def_t fd = {"", "FOV", 100.0f, 60.0f, 120.0f, 1.0f};
-    y = ui_param_row(&fd, &g_cfg.fov, DRAG_FOV, px, y, click, cx, cy); }
+  {
+    float pct = g_cfg.vol * 100.0f;
+    param_def_t vd = VOL_DEF;
+    vd.label = "VOLUME";
+    vd.lo = 0; vd.hi = 100; vd.step = 5;
+    y = ui_param_row(&vd, &pct, DRAG_VOL, px, y, click, cx, cy);
+    g_cfg.vol = pct * 0.01f;
+  }
+
+  y += 4;
+  // NOT graphics quality, which is why these two did not follow the rest of the old
+  // GRAPHICS section onto VIDEO: neither costs a frame or changes how the picture is
+  // built. One is a HUD element and the other is where the camera stands — both are
+  // "how I want to play", the question this side of the sub-select answers.
+  ui_section("VIEW", px, pw, y);
+  y += 14;
+  ui_toggle("SHOW FPS", &g_cfg.show_fps, px, pw, y, click, cx, cy);
+  y += 15;
+  ui_toggle("3RD PERSON", &g_cfg.third_person, px, pw, y, click, cx, cy);
+  y += 15;
+  return y;
+}
+
+static float ui_page_settings_video(float px, float pw, float y, int click,
+                                    float cx, float cy) {
+  char buf[16];
+  ui_section("DISPLAY", px, pw, y);
+  y += 14;
+  // How the frame is presented and framed, not what it costs to draw: none of
+  // these four rides the preset's curve, so none of them belongs under QUALITY.
+  if (ui_toggle("FULLSCREEN", &g_cfg.fullscreen, px, pw, y, click, cx, cy))
+    platform_fullscreen_changed();
+  y += 15;
+  if (ui_toggle("VSYNC", &g_cfg.vsync, px, pw, y, click, cx, cy))
+    platform_vsync_changed();
+  y += 15;
 
   // FPS cap: 30..500 in steps of 10; the right end of the track means OFF.
   // Not a param row (the OFF sentinel), so it registers its focus row itself.
@@ -403,36 +481,69 @@ static float ui_page_settings(float px, float pw, float y, int click, float cx, 
   ui_text(buf, px + 324 - ui_text_width(buf, 1), y + 3, 1, C_DIM, 1);
   y += 15;
 
+  // Step 1 selects "%.0f", which prints identically to the old "%d",(int) for the
+  // integral values roundf leaves behind.
+  { param_def_t fd = {"", "FOV", 100.0f, 60.0f, 120.0f, 1.0f};
+    y = ui_param_row(&fd, &g_cfg.fov, DRAG_FOV, px, y, click, cx, cy); }
+
+  y += 4;
+  ui_section("QUALITY", px, pw, y);
+  y += 14;
+  {
+    // CUSTOM IS A READING, NEVER A WRITING. It is offered as a fourth option only
+    // while it is the truth, so the cycle can never park on a state it cannot
+    // produce and LEFT from LOW still reaches HIGH. Forward off CUSTOM lands on
+    // LOW — (3 + 1) % 4. The chip is measured over the options actually OFFERED,
+    // so it grows a couple of px while CUSTOM is one of them and shrinks back when
+    // the state matches a preset again — the typeface is proportional (only the
+    // digits are tabular), so equal glyph counts prove nothing.
+    static const char *const PRESET_OPTS[4] = {"LOW", "MEDIUM", "HIGH", "CUSTOM"};
+    int pi = gfx_preset_index();
+    if (ui_cycle("PRESET", PRESET_OPTS, pi == 3 ? 4 : 3, &pi,
+                 px, pw, y, click, cx, cy)) {
+      const gfx_preset_t *g = &GFX_PRESET[pi];
+      g_cfg.msaa = g->msaa; g_cfg.shadows = g->shadows; g_cfg.ssao = g->ssao;
+      g_cfg.ssr  = g->ssr;  g_cfg.bloom   = g->bloom;   g_cfg.dust = g->dust;
+      g_cfg.grain = g->grain;
+    }
+    y += 15;
+  }
   // MSAA applies on the next frame via the lazy rebuild in msaa_update.
   static const char *const MSAA_OPTS[] = {"OFF", "2X", "4X", "8X"};
   int mi = g_cfg.msaa >= 8 ? 3 : g_cfg.msaa >= 4 ? 2 : g_cfg.msaa >= 2 ? 1 : 0;
   if (ui_cycle("ANTI-ALIAS", MSAA_OPTS, 4, &mi, px, pw, y, click, cx, cy))
     g_cfg.msaa = mi ? 1 << mi : 0;
   y += 15;
+  // Three states, not a flag: the map's SIZE is the middle rung, so the row writes
+  // g_cfg.shadows directly and shadow_update rebuilds the map on the next frame.
+  static const char *const SHADOW_OPTS[3] = {"OFF", "LOW", "HIGH"};
+  ui_cycle("SHADOWS", SHADOW_OPTS, 3, &g_cfg.shadows, px, pw, y, click, cx, cy);
+  y += 15;
   // Read per frame by rf_ao_pass / rf_ssr_pass; nothing to rebuild.
   ui_toggle("AMBIENT OCCLUSION", &g_cfg.ssao, px, pw, y, click, cx, cy);
   y += 15;
   ui_toggle("REFLECTIONS", &g_cfg.ssr, px, pw, y, click, cx, cy);
   y += 15;
-
-  if (ui_toggle("VSYNC", &g_cfg.vsync, px, pw, y, click, cx, cy))
-    platform_vsync_changed();
+  // One switch over the whole glare pass — the bloom chain AND the sun shafts it
+  // composites with. They are one look; two rows would let a player build a picture
+  // nobody designed.
+  ui_toggle("GLOW", &g_cfg.bloom, px, pw, y, click, cx, cy);
   y += 15;
-  ui_toggle("SHOW FPS", &g_cfg.show_fps, px, pw, y, click, cx, cy);
+  ui_toggle("DUST", &g_cfg.dust, px, pw, y, click, cx, cy);
   y += 15;
-  ui_toggle("3RD PERSON", &g_cfg.third_person, px, pw, y, click, cx, cy);
+  // Grain and the vignette it belongs to, likewise: the vignette exists to carry
+  // the grain's edge, so it leaves with it.
+  ui_toggle("FILM GRAIN", &g_cfg.grain, px, pw, y, click, cx, cy);
   y += 15;
-
-  y += 4;
-  ui_section("AUDIO", px, pw, y);
-  y += 14;
   {
-    float pct = g_cfg.vol * 100.0f;
-    param_def_t vd = VOL_DEF;
-    vd.label = "VOLUME";
-    vd.lo = 0; vd.hi = 100; vd.step = 5;
-    y = ui_param_row(&vd, &pct, DRAG_VOL, px, y, click, cx, cy);
-    g_cfg.vol = pct * 0.01f;
+    // Stored 0.5..1.5, shown 50..150 % — VOLUME's pattern. WRITTEN BACK ONLY WHEN
+    // THE ROW MOVED: 100 * 0.01f is not 1.0f in float, so an unconditional assign
+    // would walk brightness a little further from its default every frame the page
+    // is merely drawn.
+    float pct0 = g_cfg.brightness * 100.0f, pct = pct0;
+    param_def_t bd = {"", "BRIGHTNESS", 100.0f, 50.0f, 150.0f, 5.0f};
+    y = ui_param_row(&bd, &pct, DRAG_BRIGHT, px, y, click, cx, cy);
+    if (pct != pct0) g_cfg.brightness = pct * 0.01f;
   }
   return y;
 }
@@ -628,8 +739,8 @@ static float ui_page_dev(float px, float pw, float y, int click, float cx, float
     y += 4;
     ui_section("SPREAD", px, pw, y);
     y += 14;
-    y = ui_wp_row(WP_HIP_KICK, px, y, click, cx, cy);
-    y = ui_wp_row(WP_MOVE_KICK, px, y, click, cx, cy);
+    y = ui_wp_row(WP_HIP_SPREAD, px, y, click, cx, cy);
+    y = ui_wp_row(WP_MOVE_SPREAD, px, y, click, cx, cy);
 
     y += 4;
     // SWAY rides in HANDLING rather than its own one-row FEEL section: the
@@ -993,15 +1104,80 @@ static void rt_bind(GLuint fbo, int w, int h) {
   glViewport(0, 0, w, h);
 }
 
-// The whole glare chain, and it is the last thing that happens to the PICTURE
-// before the HUD is drawn on top of it. Order is load-bearing in both directions:
-// after the viewmodel, so a muzzle flash and the weapon's own highlights spill
-// like everything else; before the HUD, because a bloomed ammo counter is a
-// smeared ammo counter.
+// EVERYTHING THE GLOW SETTING OWNS: the quarter-res copy, the four-octave bloom
+// chain and the sun shafts, in one function so the setting is one branch and not
+// six. It hands the composite nothing: the finished shafts are always in
+// blur_tex[1], because the Kawase taps are an EVEN number and the ping-pong ends
+// back in the half the shafts pass wrote.
 //
-// The chain reuses the frosted menu's ping-pong pair rather than owning targets:
-// present -> blur[0] (the blit), bright+shafts -> blur[1], two Kawase taps back
-// and forth, then ONE additive full-res draw. Nothing here allocates.
+// It reuses the frosted menu's ping-pong pair rather than owning targets:
+// scene -> blur[0] (the blit), bright+shafts -> blur[1], two Kawase taps back
+// and forth. Nothing here allocates.
+static void glare_chain(float sx, float sy, float rays) {
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, R.scene_fbo);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.blur_fbo[0]);
+  glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.blur_w, R.blur_h,
+                    GL_COLOR_BUFFER_BIT, GL_LINEAR);
+  glViewport(0, 0, R.blur_w, R.blur_h);
+  // THE BLOOM CHAIN, from the quarter-res copy: four 13-tap downsamples (the
+  // first one weighted by the scene's own bloom alpha and Karis-averaged), then
+  // three 9-tap tent upsamples ADDED back up the chain, so the finest level
+  // ends up carrying all four octaves of halo.
+  glUseProgram(R.prog_bdown);
+  glUniform1i(R.u_bd_tex, 0);
+  for (int i = 0; i < 4; i++) {
+    int sw = i ? R.bloom_w[i - 1] : R.blur_w, shh = i ? R.bloom_h[i - 1] : R.blur_h;
+    rt_bind(R.bloom_fbo[i], R.bloom_w[i], R.bloom_h[i]);
+    glBindTexture(GL_TEXTURE_2D, i ? R.bloom_tex[i - 1] : R.blur_tex[0]);
+    glUniform2f(R.u_bd_px, 1.0f / (float)sw, 1.0f / (float)shh);
+    glUniform1f(R.u_bd_first, i ? 0.0f : 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  }
+  glUseProgram(R.prog_bup);
+  glUniform1i(R.u_bu_tex, 0);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE);
+  for (int i = 2; i >= 0; i--) {
+    rt_bind(R.bloom_fbo[i], R.bloom_w[i], R.bloom_h[i]);
+    glBindTexture(GL_TEXTURE_2D, R.bloom_tex[i + 1]);
+    glUniform2f(R.u_bu_px, 1.0f / (float)R.bloom_w[i + 1], 1.0f / (float)R.bloom_h[i + 1]);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+  }
+  glDisable(GL_BLEND);
+  // The shafts: the march through the bloom-weighted picture, quarter res.
+  glViewport(0, 0, R.blur_w, R.blur_h);
+  glUseProgram(R.prog_glare);
+  glUniform1i(R.u_gl_tex, 0);   // mode 0 reads this one and no other
+  glUniform1f(R.u_gl_mode, 0.0f);
+  glUniform3f(R.u_gl_sun, sx * 0.5f + 0.5f, sy * 0.5f + 0.5f, rays);
+  glUniform2f(R.u_gl_knee, 0.78f, 0.97f);
+  glUniform3f(R.u_gl_gain, 0.0f, 0.85f, 0.0f);   // shafts only; the bloom has its chain
+  glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1]);
+  glBindTexture(GL_TEXTURE_2D, R.blur_tex[0]);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  // Two growing dual-Kawase taps: a ten-tap march at quarter res is banded,
+  // and this is the filter that was already here to fix that.
+  glUseProgram(R.prog_blur);
+  glUniform1i(R.u_blur_tex, 0);
+  int src = 1;
+  for (int i = 0; i < 2; i++) {
+    glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1 - src]);
+    glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
+    glUniform2f(R.u_blur_px, (float)(i + 1) / (float)R.blur_w,
+                (float)(i + 1) / (float)R.blur_h);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    src = 1 - src;
+  }
+}
+
+// The glare and the composite, and it is the last thing that happens to the
+// PICTURE before the HUD is drawn on top of it. Order is load-bearing in both
+// directions: after the viewmodel, so a muzzle flash and the weapon's own
+// highlights spill like everything else; before the HUD, because a bloomed ammo
+// counter is a smeared ammo counter.
+//
+// The glare itself is glare_chain and is optional; the ONE full-screen composite
+// draw below is not — it is how the scene target reaches the present buffer.
 static void glare_pass(float yaw, float pitch, float roll, float fovy, float aspect) {
   blur_update();
   msaa_resolve();   // the glare reads a FINISHED frame; also final-safe
@@ -1041,80 +1217,45 @@ static void glare_pass(float yaw, float pitch, float roll, float fovy, float asp
     // theme does not get a dusty theme's beams.
     rays *= (0.55f + 0.95f * (1.0f - g_sun.dir.y)) * (0.55f + 1.15f * atmo_haze());
   }
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, R.scene_fbo);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.blur_fbo[0]);
-  glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.blur_w, R.blur_h,
-                    GL_COLOR_BUFFER_BIT, GL_LINEAR);
+  // The state both halves want: the chain and the composite are full-screen
+  // triangles that neither blend nor test depth.
   glDisable(GL_BLEND);
   glDisable(GL_DEPTH_TEST);
   glBindVertexArray(R.vao_sky);   // attribute-less fullscreen triangle
-  glViewport(0, 0, R.blur_w, R.blur_h);
-  // THE BLOOM CHAIN, from the quarter-res copy: four 13-tap downsamples (the
-  // first one weighted by the scene's own bloom alpha and Karis-averaged), then
-  // three 9-tap tent upsamples ADDED back up the chain, so the finest level
-  // ends up carrying all four octaves of halo.
-  glUseProgram(R.prog_bdown);
-  glUniform1i(R.u_bd_tex, 0);
-  for (int i = 0; i < 4; i++) {
-    int sw = i ? R.bloom_w[i - 1] : R.blur_w, shh = i ? R.bloom_h[i - 1] : R.blur_h;
-    rt_bind(R.bloom_fbo[i], R.bloom_w[i], R.bloom_h[i]);
-    glBindTexture(GL_TEXTURE_2D, i ? R.bloom_tex[i - 1] : R.blur_tex[0]);
-    glUniform2f(R.u_bd_px, 1.0f / (float)sw, 1.0f / (float)shh);
-    glUniform1f(R.u_bd_first, i ? 0.0f : 1.0f);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-  }
-  glUseProgram(R.prog_bup);
-  glUniform1i(R.u_bu_tex, 0);
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_ONE, GL_ONE);
-  for (int i = 2; i >= 0; i--) {
-    rt_bind(R.bloom_fbo[i], R.bloom_w[i], R.bloom_h[i]);
-    glBindTexture(GL_TEXTURE_2D, R.bloom_tex[i + 1]);
-    glUniform2f(R.u_bu_px, 1.0f / (float)R.bloom_w[i + 1], 1.0f / (float)R.bloom_h[i + 1]);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-  }
-  glDisable(GL_BLEND);
-  // The shafts: the march through the bloom-weighted picture, quarter res.
-  glViewport(0, 0, R.blur_w, R.blur_h);
-  glUseProgram(R.prog_glare);
-  glUniform1i(R.u_gl_tex, 0);
-  glUniform1i(R.u_gl_scene, 1);
-  glUniform1i(R.u_gl_bloom, 3);
-  glUniform1f(R.u_gl_mode, 0.0f);
-  glUniform3f(R.u_gl_sun, sx * 0.5f + 0.5f, sy * 0.5f + 0.5f, rays);
-  glUniform2f(R.u_gl_knee, 0.78f, 0.97f);
-  glUniform3f(R.u_gl_gain, 0.0f, 0.85f, 0.0f);   // shafts only; the bloom has its chain
-  glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1]);
-  glBindTexture(GL_TEXTURE_2D, R.blur_tex[0]);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
-  // Two growing dual-Kawase taps: a ten-tap march at quarter res is banded,
-  // and this is the filter that was already here to fix that.
-  glUseProgram(R.prog_blur);
-  glUniform1i(R.u_blur_tex, 0);
-  int src = 1;
-  for (int i = 0; i < 2; i++) {
-    glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1 - src]);
-    glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
-    glUniform2f(R.u_blur_px, (float)(i + 1) / (float)R.blur_w,
-                (float)(i + 1) / (float)R.blur_h);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    src = 1 - src;
-  }
+  // GLOW OFF: neither the chain nor the shafts run — those two passes are the
+  // whole setting — but the composite is not optional. It is the pass that gets
+  // the picture from the scene target into the present buffer, and it is also
+  // the grade, the FXAA and the grain, so it runs with both glare gains at zero
+  // and the reads behind them gated in GLARE_FS.
+  if (g_cfg.bloom) glare_chain(sx, sy, rays);
   // The composite: the scene target on unit 1, the glare on unit 0, the
   // present buffer as the target. No blending — see the branch in GLARE_FS.
   rt_bind(frame_fbo(), R.width, R.height);
   glUseProgram(R.prog_glare);
+  // THE UNIT ASSIGNMENT BELONGS TO THE PASS THAT READS, and this pass runs on
+  // every frame while the chain above does not: declared anywhere but here,
+  // uScene is unset on a frame with GLOW off.
+  glUniform1i(R.u_gl_tex, 0);
+  glUniform1i(R.u_gl_scene, 1);
+  glUniform1i(R.u_gl_bloom, 3);
   glUniform1f(R.u_gl_mode, g_dbg_view == 1 ? 2.0f : g_dbg_view == 2 ? 3.0f
                          : g_dbg_view == 3 ? 4.0f : 1.0f);
   // x = the bloom's weight in the composite: four accumulated octaves of a
   // weight that is already a fraction of the colour, so a third of it is a
   // visible halo on the sun, the water and a tracer and nothing on a wall.
-  glUniform3f(R.u_gl_gain, 0.30f, 0.0f, 0.56f);
+  // The two settings scale the shipped numbers rather than choosing between two
+  // sets of them, so there is still one copy of each: GLOW off zeroes both glare
+  // gains (and GLARE_FS then skips the reads), FILM GRAIN off zeroes the grain
+  // AND the vignette it belongs to.
+  { float glow = g_cfg.bloom ? 1.0f : 0.0f;
+    glUniform3f(R.u_gl_gain, 0.30f * glow, 0.0f, 0.56f * glow); }
   // The seed walks with the sim tick, so it is deterministic per tick and yet
   // never still in play. 8 ticks is 15 Hz of grain, which is about where film
   // sits: at 120 it strobes, at 1 it is dirt on the lens.
-  glUniform4f(R.u_gl_grade, 0.20f, 0.045f, (float)((g_tick / 8) % 733) * 7.13f,
-              (float)R.width / (float)R.height);
+  { float film = g_cfg.grain ? 1.0f : 0.0f;
+    glUniform4f(R.u_gl_grade, 0.20f * film, 0.045f * film,
+                (float)((g_tick / 8) % 733) * 7.13f,
+                (float)R.width / (float)R.height); }
   // FXAA only where there is no multisample target to do the job.
   glUniform3f(R.u_gl_aa, R.msaa_fbo ? 0.0f : 1.0f,
               1.0f / (float)R.width, 1.0f / (float)R.height);
@@ -1124,7 +1265,10 @@ static void glare_pass(float yaw, float pitch, float roll, float fovy, float asp
   glBindTexture(GL_TEXTURE_2D, g_dbg_view == 1 ? R.ao_tex[0]
                              : g_dbg_view == 2 ? R.bloom_tex[0] : R.scene_tex);
   gl_active_texture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, R.blur_tex[src]);
+  // blur_tex[1] is where the shafts finish: the Kawase pair is an even number of
+  // taps, so the ping-pong lands back in the half the shafts pass wrote. With
+  // GLOW off nothing wrote it this frame and uGain.z is 0, so it is not read.
+  glBindTexture(GL_TEXTURE_2D, R.blur_tex[1]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   glEnable(GL_DEPTH_TEST);
   glBindTexture(GL_TEXTURE_2D, R.font_tex);

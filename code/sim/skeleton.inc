@@ -136,9 +136,7 @@ static uint32_t recoil_hash(int src, int shot, int wpn) {
 
 static float recoil_side_sample(int src, int shot, int wpn) {
   uint32_t h = recoil_hash(src, shot, wpn);
-  float p = GUN_PATTERN[(uint32_t)shot & 31u];
-  float sign = p > 0.001f ? 1.0f : p < -0.001f ? -1.0f
-                                                   : (h & 1u) ? 1.0f : -1.0f;
+  float sign = gun_pattern_sign(wpn, shot, (int)(h & 1u));
   float amp = 0.85f + (float)((h >> 8) & 255u) * (0.30f / 255.0f);
   return sign * amp;
 }
@@ -147,12 +145,29 @@ static float recoil_brace(const recoil_pose_t *r, float ads) {
   return 1.0f + (r->ads_k - 1.0f) * f_clamp(ads, 0.0f, 1.0f);
 }
 
+// A SHOULDER ALREADY ABSORBING A BURST ABSORBS THE NEXT ROUND BETTER, and the round's
+// own NUMBER is what says how braced it is: the round that opens a burst throws its
+// whole authored impulse (shot 0 is 1.0 by construction — the tap and the sniper's
+// single shot are never taxed), and the crown's rounds throw exactly half of it from
+// round ten on. The index rather than the accumulated heat, because every viewer
+// already has it — the shooter as w->idx, a watcher as the fire event's own e->i — so
+// the damping is identical on every screen without a byte of wire or a second clock.
+// PRESENTATION ONLY: this scales stock compression, lateral response and the view's
+// roll. THE AXIS IS NEVER TOUCHED — where the barrel points is the pattern's alone.
+static float recoil_kick_damp(int shot) {
+  // Clamped BOTH ways: the index reaching here off a fire event is the wire's int16 and
+  // hostile, so the damp is bounded to [0.5, 1] whatever arrives.
+  float s = fminf(fmaxf((float)shot, 0.0f) / 10.0f, 1.0f);
+  return 1.0f - 0.5f * s;
+}
+
 // The local view and the event-fed body deliberately share the same source values,
-// bracing rule and stateless side sample. Proofs call these two entry points too, so
-// they can exercise production impulses without copying presentation constants.
+// bracing rule, burst damping and stateless side sample. Proofs call these two entry
+// points too, so they can exercise production impulses without copying presentation
+// constants.
 static void recoil_vm_impulse(vm_t *vm, int src, int shot, int wpn, float ads) {
   const recoil_pose_t *rp = recoil_pose(wpn);
-  float brace = recoil_brace(rp, ads);
+  float brace = recoil_brace(rp, ads) * recoil_kick_damp(shot);
   float side = recoil_side_sample(src, shot, wpn);
   vm->kick_back_v += rp->vm_back_v * brace;
   vm->kick_lift_v += rp->vm_lift_v * brace;
@@ -543,7 +558,7 @@ static long g_fire_anchor_tick = -1;
 
 static void recoil_body_impulse(anim_t *a, int src, int shot, int wpn, float ads) {
   const recoil_pose_t *rp = recoil_pose(wpn);
-  float brace = recoil_brace(rp, ads);
+  float brace = recoil_brace(rp, ads) * recoil_kick_damp(shot);
   float side = recoil_side_sample(src, shot, wpn);
   a->recoil_back_v += rp->body_back_v * brace;
   a->recoil_lift_v += rp->body_lift_v * brace;
@@ -1566,15 +1581,24 @@ static void skel_solve(anim_t *a, v3 base, float yaw, float pitch,
     v3 b1 = v3_rot_axis(v3_rot_axis(b0, gr0, -down), U, yin);
     carry_pin = v3_sub(b0, b1);
   }
-  // A SLIDE IS A ONE-HANDED CARRY, MUZZLE UP. The support hand is already on the ground
-  // behind the hip — that contact is most of what sells a slide, and it is what leaves
-  // the weapon in one hand — but the weapon itself kept the low-ready angle, so it lay
-  // along a reclined belly and vanished: filmed from the tracking camera the figure was
-  // a crouched mass with no rifle anywhere in it.
-  if (a->slide_s > 0.001f) {
+  // A SLIDE IS A ONE-HANDED CARRY, MUZZLE UP — while it is only a carry. The support
+  // hand is already on the ground behind the hip — that contact is most of what sells a
+  // slide, and it is what leaves the weapon in one hand — but the weapon itself kept the
+  // low-ready angle, so it lay along a reclined belly and vanished: filmed from the
+  // tracking camera the figure was a crouched mass with no rifle anywhere in it.
+  // A ROUND RAISES IT LIKE EVERY OTHER CARRY. fire_k is the floor, saturating on the same
+  // 0.01 latch the low-ready reads above so both carries let go over one window, and the
+  // anchor solve below zeroes it outright: the rifle a tracer leaves points where the sim
+  // sent the round. Raw fire_k cannot be that floor — it is decayed once more before this
+  // solve, leaving 8.2 deg of muzzle over the round that just left, and at 750 rpm it
+  // sits at 0.26 between two rounds, i.e. 48 deg of swing inside every burst. Past the
+  // latch the floor ramps rather than steps, so the carry comes back instead of snapping.
+  float fire_up = f_clamp(a->fire_k / 0.01f, 0.0f, 1.0f);
+  float slide_tilt = 1.15f * a->slide_s * (1.0f - fire_up);
+  if (slide_tilt > 0.001f) {
     v3 gr1 = v3_cross(gd, U);
     gr1 = v3_dot(gr1, gr1) > 1e-6f ? v3_norm(gr1) : Rc;
-    gd = v3_norm(v3_rot_axis(gd, gr1, 1.15f * a->slide_s));
+    gd = v3_norm(v3_rot_axis(gd, gr1, slide_tilt));
   }
   // Sliding, the torso reclines and its belly swings forward into the space the rifle
   // occupies, so the hold is pushed out and up while the recline lasts. Crouching
@@ -1917,6 +1941,9 @@ static void anim_stage_fire_anchor(const anim_t *a, v3 pos, float yaw,
   // wall gate already refused any shot whose aligned muzzle path is not clear — a
   // decaying tuck bending the anchor's bore would be a second muzzle direction.
   shot.gunwall_s = 0.0f;
+  // Same reason, the slide's muzzle-up carry: the anchor is the aligned rifle, so the
+  // carry floor is taken at full rather than wherever the decaying latch stood.
+  shot.fire_k = 1.0f;
   skel_solve(&shot, pos, yaw, pitch, wpn, GUN_POSE_BLOCKED, SKEL_POSE_ONLY);
   g_fire_anchor_pose = shot.pose;
   g_fire_anchor_src = src;

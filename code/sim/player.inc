@@ -86,12 +86,32 @@ static float ease_k(float rate) { return 1.0f - expf(-rate * TICK_DT); }
 // Weapon behavior constants shared by every weapon — per-weapon structure is
 // in WPN_DEF, per-weapon feel in g_cfg.wp.
 #define GUN_SWITCH_TICKS 36      // 0.3 s weapon raise on swap
-#define GUN_HEAT_CAP     0.6f    // later recoil impulses top out at +60%
-#define GUN_AIR_KICK     1.65f   // an airborne body cannot brace the stock
-#define GUN_REC_CAP      12.0f   // deg: recoil climb hard cap
+// HEAT IS A BURST'S PRICE ON THE SHOOTER AND ON THE ROUND: gun_shoot adds a weapon's
+// HEAT/SHOT per round up to this ceiling and gun_recover bleeds it between bursts. Two
+// readers: the shoulder's grip correction below (gun_sway_tick), fully loaded — and
+// stopped growing — at a quarter of it, and gun_spread's cone, which takes the raw
+// accumulation straight into the round's spread in degrees. Both belong to the process
+// that simulates the shooter; the burst's VISUAL fade is the round's index, not this
+// (recoil_kick_damp, sim/skeleton.inc).
+#define GUN_HEAT_CAP     0.6f    // ceiling on a burst's accumulated heat
 #define GUN_GRIP_LOAD_HEAT 0.22f // heat where the shoulder control loop is fully loaded
 #define GUN_GRIP_P_HIP    0.48f  // deg: loose-shoulder correction amplitude
 #define GUN_GRIP_P_ADS    0.27f  // deg: cheek weld braces, but cannot freeze, the rifle
+// THE CONE IS WHAT A STANCE COSTS THE ROUND, and only a stance: standing, grounded,
+// aimed and cold it is exactly zero, so the first ADS round lands on the dot. Airborne
+// is one flat penalty because nothing about a jump is aimable, and heat is the burst's
+// own price, paid on top of the pattern's climb rather than instead of it. The two
+// per-weapon halves (HIP SPREAD, MOVE SPREAD) are config keys; these two are not,
+// because there is no weapon whose jump or whose barrel heat is a different sport.
+#define GUN_AIR_SPREAD   2.5f    // deg of cone while both feet are off the ground
+#define GUN_HEAT_SPREAD  0.6f    // deg of cone per unit of accumulated heat
+// THE SHOULDER'S OWN TIME CONSTANT: how fast the barrel reaches a pattern row it has
+// just been given. Fast enough that a round leaves along ~87% of the row the previous
+// one set at 750 rpm, slow enough that the biggest authored step arrives as a fifth of
+// a degree in the tick of the shot instead of the whole of it. The way BACK is not
+// this number — that is RECOVERY, which the player tunes.
+#define GUN_REC_RISE_TAU 0.040f  // s to 63% of a newly set pattern row
+#define GUN_REC_HOLD_PAD 4       // ticks of slack the standing target keeps past a round
 #define GUN_PUNCH_SHOT   0.4f    // deg of visual punch per shot (x VIEW PUNCH)
 // THE PUNCH IS A SPRING AND THE AUTHORED NUMBER IS ITS PEAK. These constants were
 // solved on the DISCRETE recurrence, not the continuous one, and that is not academic:
@@ -109,14 +129,59 @@ static float ease_k(float rate) { return 1.0f - expf(-rate * TICK_DT); }
 #define GUN_ROLL_K       0.85f   // deg of roll per deg of punch
 #define DEG2RAD          0.017453293f
 
-// Deterministic horizontal drift per shot index (x KICK SIDE): right pull
-// first, a long left sweep, back right — learnable like a CS pattern.
-static const float GUN_PATTERN[32] = {
-   0.00f,  0.05f, -0.10f,  0.15f,  0.30f,  0.45f,  0.55f,  0.40f,
-   0.20f, -0.10f, -0.35f, -0.55f, -0.70f, -0.60f, -0.40f, -0.15f,
-   0.10f,  0.35f,  0.55f,  0.70f,  0.60f,  0.35f,  0.05f, -0.25f,
-  -0.50f, -0.65f, -0.55f, -0.30f,  0.00f,  0.30f,  0.50f,  0.60f,
+// ABSOLUTE per-round bore offsets {yaw, pitch}, normalized to the climb's authored
+// 1.0: round n of a burst asks for base aim + kick_side*yaw, base aim + kick_up*pitch.
+// Not a spring and not a place either — the shot writes this row as the shoulder's
+// TARGET and the barrel follows it (gun_recoil_set / gun_recoil_step, sim/combat.inc),
+// so the offset a round actually leaves along is the follower's position, a fraction
+// of the previous row. Rounds 0-2 are tight (tap and burst fire are precise), 3-9
+// climb, and 10+ CREEP: the crown keeps rising about a hundredth and a half per round
+// instead of sitting on a ceiling, so a magazine ends about a quarter above the
+// authored top and the player who wants the last ten rounds keeps paying for them.
+// Learnable like a Counter-Strike pattern, and controlled the same way: pull down.
+static const float GUN_PATTERN[WPN_COUNT][32][2] = {
+  [WPN_AR] = {
+    { 0.00f, 0.00f}, { 0.03f, 0.05f}, {-0.06f, 0.12f}, { 0.10f, 0.22f},
+    { 0.22f, 0.33f}, { 0.33f, 0.45f}, { 0.42f, 0.56f}, { 0.32f, 0.67f},
+    { 0.15f, 0.76f}, {-0.08f, 0.84f}, {-0.35f, 0.93f}, {-0.60f, 0.95f},
+    {-0.85f, 0.96f}, {-1.00f, 0.98f}, {-0.95f, 0.99f}, {-0.75f, 1.01f},
+    {-0.45f, 1.02f}, {-0.10f, 1.04f}, { 0.25f, 1.05f}, { 0.55f, 1.07f},
+    { 0.78f, 1.08f}, { 0.88f, 1.10f}, { 0.80f, 1.11f}, { 0.58f, 1.13f},
+    { 0.28f, 1.14f}, {-0.05f, 1.16f}, {-0.38f, 1.17f}, {-0.62f, 1.19f},
+    {-0.70f, 1.20f}, {-0.58f, 1.22f}, {-0.35f, 1.23f}, {-0.10f, 1.25f},
+  },
+  [WPN_SR] = {  // the bolt outlasts recovery: every round is round 0 unless spammed
+    { 0.15f, 1.00f}, { 0.25f, 1.00f}, {-0.20f, 1.00f}, { 0.10f, 1.00f},
+    { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f},
+    { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f},
+    { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f},
+    { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f},
+    { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f},
+    { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f},
+    { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f}, { 0.15f, 1.00f},
+  },
 };
+
+// ONE bounds rule for a weapon id, because the echo path carries one off the wire and
+// it reaches BOTH the pattern table and the tuning row beside it. Every reader of
+// either asks here first; nobody spells the comparison a second time.
+static int wpn_clamp(int wpn) { return wpn < 0 || wpn >= WPN_COUNT ? WPN_AR : wpn; }
+
+// ...and the shot index is a wire quantity too, so the row it selects wraps rather
+// than trusts. The shot's own set, the roll sign and the presentation side sample all
+// come through here.
+static const float *gun_pattern(int wpn, int shot) {
+  return GUN_PATTERN[wpn_clamp(wpn)][(uint32_t)shot & 31u];
+}
+
+// The pattern step's SIGN, and the ONE spelling of its tie-break: a step authored at
+// the table's zero pulls the muzzle nowhere, so it has no side to roll or throw
+// toward and the caller's own coin decides. Both the view roll and the presentation
+// side sample read the sign of the same yaw column, and they may not disagree.
+static float gun_pattern_sign(int wpn, int shot, int tie) {
+  float p = gun_pattern(wpn, shot)[0];
+  return p > 0.001f ? 1.0f : p < -0.001f ? -1.0f : (tie ? 1.0f : -1.0f);
+}
 
 typedef struct {
   int   cur;             // WPN_AR / WPN_SR — which weapon is in the hands
@@ -124,15 +189,22 @@ typedef struct {
   // PER WEAPON, like ammo: the cooldown is the weapon's mechanism cycling (the SR's 1.2
   // s bolt), not the shooter's readiness.
   int   cool[WPN_COUNT]; // ticks until that weapon can fire again
-  int   idx;             // spray pattern index, resets once recoil recovered
+  int   idx;             // spray pattern index: the round's number in the burst
+  int   trig_off;        // ticks the trigger has been released, re-arms idx
   int   reload_t;        // ticks of reload remaining, 0 = not reloading
   int   reload_tac;      // ...and whether it started with a round still up
   int   switch_t;        // ticks of weapon raise remaining after a swap
   float prev_switch;     // last tick's raise fraction, for interpolation
-  // Angular spring state of the physical barrel. The values are degrees and deg/s;
-  // camera, rendered weapon and hitscan all consume the same two angles.
+  // Angular offset of the physical barrel from the calm aim line, in degrees; camera,
+  // rendered weapon and hitscan all consume the same two angles. THE PATTERN IS THE
+  // TARGET AND THE BARREL IS THE FOLLOWER: the shot writes rec_tp/rec_ty (the row's
+  // degrees) and gun_recoil_step walks rec_p/rec_y toward them every tick, so the
+  // offset is continuous and there is still no velocity to carry — a shoulder, not a
+  // spring. rec_hold is how many ticks the target stands without another round behind
+  // it; it is what releases the crown for a viewer who only ever sees the echoes.
   float rec_p, rec_y, prev_rec_p, prev_rec_y;
-  float rec_p_v, rec_y_v;
+  float rec_tp, rec_ty;
+  int   rec_hold;
   // The other half of the physical barrel: the hands trail a look change and carry
   // breathing/stride motion. Degrees, like recoil. This belongs to weapon_t rather
   // than the local-only vm_t because the server must trace the same moving barrel the
@@ -141,7 +213,7 @@ typedef struct {
   float sway_phase, sway_clock;
   float sway_last_yaw, sway_last_pitch;
   unsigned char sway_primed;
-  float heat;            // later impulse multiplier, decays between bursts
+  float heat;            // burst's price on grip correction AND round spread, decays between bursts
   // THE DRY CLICK IS LATCHED, NOT EDGE-GATED. It used to be pushed only on a press
   // edge, so on a FULL-AUTO weapon — where prev_held is 1 on every tick of the burst —
   // the branch was unreachable and the single commonest way to run out of ammo made no

@@ -402,13 +402,21 @@ static void mark_stamp(v3 at, v3 n, int solid) {
 
 static void vfx_ev_fire(const event_t *e) {
     if (e->src == g_local_ent) g_vfx_wpn = e->wpn;   // the hitmarker's arming delay
+    // THE ROUND STARTS AT THE EYE, THE PICTURE STARTS AT THE BARREL. `a - b*f` inverts
+    // the ballistic segment back to the shooter's EYE, so the rifle's tip has to come
+    // from the pose the shot was anchored on — ev_push runs ent_on_event, which
+    // re-solves that anchor for a foreign shot, BEFORE this handler. Where no anchor
+    // belongs to this shot the eye stands in: a tracer from the collar reads as a
+    // tracer, one from nowhere does not. Brass, streak and flash then share the one
+    // barrel frame, as they must.
+    v3 md = v3_norm(e->b);
+    v3 muz = (g_fire_anchor_src == e->src && g_fire_anchor_tick == g_tick)
+                 ? pose_muzzle(&g_fire_anchor_pose, e->wpn)
+                 : v3_sub(e->a, v3_scale(md, e->f));
     if (e->src == g_local_ent) {
-      // The muzzle is `a - b*f`, exactly as the fly-by crack reconstructs it —
-      // one expression, no new geometry query. `right` is the shot direction
-      // crossed with world up, which is where a port faces on a level rifle and
-      // is close enough on a pitched one that nobody could name the error.
-      v3 md = v3_norm(e->b);
-      v3 mz = v3_sub(e->a, v3_scale(md, e->f));
+      // `right` is the shot direction crossed with world up, which is where a port
+      // faces on a level rifle and is close enough on a pitched one that nobody
+      // could name the error.
       v3 rt = v3_cross(md, (v3){{0, 1, 0}});
       float rl = v3_len(rt);
       rt = rl > 1e-4f ? v3_scale(rt, 1.0f / rl) : (v3){{1, 0, 0}};
@@ -418,10 +426,10 @@ static void vfx_ev_fire(const event_t *e) {
           v3 v = v3_add(v3_scale(rt, BRASS_OUT * skid_r(&bh, 0.80f, 1.25f)),
                 v3_add(v3_scale((v3){{0, 1, 0}}, BRASS_UP * skid_r(&bh, 0.75f, 1.30f)),
                        v3_scale(md, BRASS_FWD * skid_r(&bh, -0.4f, 1.0f))));
-          // Move back from the reconstructed barrel tip to the receiver port. Muzzle,
-          // case and tracer now share the event's one physical barrel frame.
+          // Move back from the barrel tip to the receiver port. Muzzle, case and
+          // tracer share the one physical barrel frame.
           g_parts[i] = (particle_t){
-              .pos = v3_add(mz, v3_add(v3_scale(rt, 0.135f),
+              .pos = v3_add(muz, v3_add(v3_scale(rt, 0.135f),
                             v3_add(v3_scale(md, BRASS_PORT_F),
                                    (v3){{0, -0.155f, 0}}))),
               .vel = v, .y0 = skid_r(&bh, 0.0f, F_TAU),   // tumble phase
@@ -430,12 +438,10 @@ static void vfx_ev_fire(const event_t *e) {
           break;
         }
     }
-    // The streak reuses the ballistic segment exactly. EV_FIRE's `a` is its endpoint,
-    // `b` its unit bore and `f` its travel from the staged model muzzle, so this inverse
-    // is the same barrel tip combat traced from even after a remote pose has advanced.
+    // The streak ENDS on the ballistic segment's own endpoint (`a`) and starts on the
+    // barrel above, so it reads as the round's path while still leaving the weapon
+    // the viewer can see — even after a remote pose has advanced.
     if (e->src < 0) return;
-    v3 shot_dir = v3_norm(e->b);
-    v3 muz = v3_sub(e->a, v3_scale(shot_dir, e->f));
     // The pool cannot overflow at the default tune (fire cooldown 10 ticks >
     // the 8-tick life caps concurrency at one per shooter), but a DEV rpm
     // near the 1000 cap makes consecutive shots overlap — and the PLAYER's

@@ -182,7 +182,7 @@ int main(int argc, char **argv) {
   int w = 1280, h = 720;
   uint32_t seed = DEFAULT_SEED;
   char *script = NULL;
-  int print_cfg = 0, have_seed = 0;
+  int print_cfg = 0, have_seed = 0, windowed_arg = 0;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -205,7 +205,7 @@ int main(int argc, char **argv) {
     else if (arg && !strcmp(a, "--w")) w = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--h")) h = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--seed")) { seed = (uint32_t)strtoul(argv[++i], NULL, 10); have_seed = 1; }
-    else if (!strcmp(a, "--windowed")) g_fullscreen = 0;
+    else if (!strcmp(a, "--windowed")) windowed_arg = 1;
     else if (arg && !strcmp(a, "--config")) snprintf(g_cfg_path, sizeof g_cfg_path, "%s", argv[++i]);
     else if (arg && !strcmp(a, "--do")) script = strdup(argv[++i]);
     else if (arg && !strcmp(a, "--script")) {
@@ -258,6 +258,9 @@ int main(int argc, char **argv) {
     // --seed asked for a specific one (which is worth keeping in native mode —
     // "play the arena that test reproduced" is a real thing to want).
     if (!have_seed) seed = seed_from_clock();
+    // The window's mode is the config's FULLSCREEN row; --windowed overrides it for
+    // THIS run only — an argv flag is not a preference and is never written back.
+    g_fullscreen = windowed_arg ? 0 : g_cfg.fullscreen;
     g_boot_connect = g_connect_host;   // native_main kicks the join after start
     return native_main(w, h, seed);
   }

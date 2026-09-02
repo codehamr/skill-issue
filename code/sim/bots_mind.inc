@@ -395,11 +395,20 @@ typedef enum {
   BOT_BELIEF_SEARCH_SWEEP
 } bot_belief_state_t;
 
+// The recoil column is a ladder that stays well under 1, and that is the contract:
+// the pattern is ABSOLUTE, so a bot subtracting all of it would trace the barrel's
+// exact inverse and hold a whole spray on one point. The rungs are set by what a
+// seeded minute at 4 bots measures — HARD 0.40 lands the tier near 29 kills at a 19%
+// hit rate over 48 such minutes; near-full compensation runs a quarter hotter on kills
+// and a fifth on hit rate (+26% / +22% measured), which is a machine holding the
+// pattern down. EASY and NORMAL barely answer this knob at all (their aim error
+// dominates it), so their rungs exist to keep the ladder strictly increasing, which
+// is the whole of what a difficulty row promises.
 static const bot_skill_t BOT_SKILL[3] = {
   //  react  err0  err1  settle turn  reco  burst   pause      mem hold search tac
   { 480, 9.0f, 4.2f, 1300, 3.5f, 0.20f, 2, 4,  550, 950, 360, 42, 216, 0.25f },
-  { 300, 6.5f, 2.6f,  950, 5.5f, 0.60f, 3, 6,  380, 700, 540, 60, 312, 0.60f },
-  { 180, 4.0f, 0.7f,  700, 8.5f, 0.92f, 4, 8,  240, 480, 720, 78, 432, 1.00f },
+  { 300, 6.5f, 2.6f,  950, 5.5f, 0.30f, 3, 6,  380, 700, 540, 60, 312, 0.60f },
+  { 180, 4.0f, 0.7f,  700, 8.5f, 0.40f, 4, 8,  240, 480, 720, 78, 432, 1.00f },
 };
 
 struct bot_t {

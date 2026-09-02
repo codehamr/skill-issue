@@ -50,18 +50,30 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
   float leanv = p->prev_lean + (p->lean - p->prev_lean) * alpha;
   eye = v3_add(eye, lean_offset(p->yaw, leanv));
   eye.y -= lean_eye_drop(leanv);
-  // The head and rifle are coupled, not welded. Hipfire lets the arms absorb most of
-  // the physical barrel motion relative to the eye; ADS progressively brings the cheek
-  // onto the stock until the camera, sight line and bore are exactly coaxial. Both
-  // angles still come from the one weapon_t state used by hitscan.
+  // The head and rifle are coupled by TWO follows, because the barrel's two offsets
+  // are two different things to the player. The camera follows RECOIL by recoil_view
+  // (1.0 = the reticle is always the next round's line, in hip as in ADS; the climb is
+  // fought with the mouse and the recovery brings the view back down by whatever was
+  // not compensated). It follows SWAY partially: hipfire lets the arms absorb
+  // breathing and stride, ADS brings the cheek onto the stock until camera, sight line
+  // and bore are coaxial. Both offsets are read from the one weapon_t state hitscan
+  // uses — nothing here can move a round.
   const weapon_t *w = &p->wp;
   float ads = w->prev_ads_s + (w->ads_s - w->prev_ads_s) * alpha;
+  float fr = g_cfg.recoil_view, fs = 0.30f + 0.70f * ads;
+  // The two channels of gun_bore_angles_lerp's own interpolation, taken apart because
+  // only the camera weights them differently; the bore below still asks that function.
+  float rp = w->prev_rec_p + (w->rec_p - w->prev_rec_p) * alpha;
+  float ry = w->prev_rec_y + (w->rec_y - w->prev_rec_y) * alpha;
+  float sp = w->prev_sway_p + (w->sway_p - w->prev_sway_p) * alpha;
+  float sy = w->prev_sway_y + (w->sway_y - w->prev_sway_y) * alpha;
+  float yaw = p->yaw + (ry * fr + sy * fs) * DEG2RAD;
+  float pitch = f_clamp(p->pitch + (rp * fr + sp * fs) * DEG2RAD,
+                        -PITCH_MAX, PITCH_MAX);
+  // The optics and the viewmodel ride the WHOLE barrel, followed or not: the scope
+  // picture is what the rifle sees, and the rendered weapon is where the rifle is.
   float bore_yaw, bore_pitch;
   gun_bore_angles_lerp(w, p->yaw, p->pitch, alpha, &bore_yaw, &bore_pitch);
-  float follow = 0.30f + 0.70f * ads;
-  float yaw = p->yaw + wrap_pi(bore_yaw - p->yaw) * follow;
-  float pitch = f_clamp(p->pitch + (bore_pitch - p->pitch) * follow,
-                        -PITCH_MAX, PITCH_MAX);
   v3 bore = gun_bore_dir_lerp(w, p->yaw, p->pitch, alpha);
   // The boot screen owns the camera while it is up.
   cam_override_t home_ov;
@@ -150,7 +162,7 @@ static void rf_shadow_pass(void) {
   R.light_vp = m4_mul(m4_ortho(g_sun.sh_half, g_sun.sh_half, 0.5f, g_sun.sh_depth),
                       m4_look_dir(lc, ld));
   glBindFramebuffer(GL_FRAMEBUFFER, R.sm_fbo);
-  glViewport(0, 0, SHADOW_TEX, SHADOW_TEX);
+  glViewport(0, 0, R.sm_built, R.sm_built);
   glClear(GL_DEPTH_BUFFER_BIT);
   glEnable(GL_DEPTH_TEST);
   // Front faces cast: with back faces the ground's own shadow floats a texel above
@@ -343,15 +355,19 @@ static void rf_world_pass(const frame_cam_t *c, int shadow_on) {
   } else {
     glUniform3f(R.u_muzc, 0.0f, 0.0f, 0.0f);
   }
-  glUniform2f(R.u_smstep, 1.0f / SHADOW_TEX, 1.0f / SHADOW_TEX);
-  glUniform1f(R.u_smtexel, 2.0f * g_sun.sh_half / SHADOW_TEX);
+  // The map's size is asked, never assumed: at LOW the same penumbra is half as
+  // many texels wide, and a filter stepping in the other map's texels is a
+  // shadow filtered for a map that is not on the card.
+  { float sm = (float)R.sm_built;
+    glUniform2f(R.u_smstep, 1.0f / sm, 1.0f / sm);
+    glUniform1f(R.u_smtexel, 2.0f * g_sun.sh_half / sm); }
   // The penumbra: the light-space depth runs 0..1 over (sh_depth - 0.5) metres
   // (m4_ortho's near is 0.5), so a depth difference times that is metres of
   // caster-to-receiver gap, times the sun's tangent is metres of penumbra,
   // over the texel is texels. The sun is drawn at 1.5x its 0.53 degrees: the
   // dust aureole around it is part of the source as far as a shadow is
   // concerned. The bias is two texels of world in the same units.
-  { float texel_m = 2.0f * g_sun.sh_half / SHADOW_TEX;
+  { float texel_m = 2.0f * g_sun.sh_half / (float)R.sm_built;
     float rng = g_sun.sh_depth - 0.5f;
     glUniform1i(R.u_smraw, 2);
     glUniform2f(R.u_smpcss, rng * 0.0139f / texel_m, 2.0f * texel_m / rng); }
@@ -536,7 +552,10 @@ static void rf_dust_pass(const frame_cam_t *c) {
   int third = c->third;
   mat4 vp = c->vp;
 
-  if (!third) {
+  // DUST OFF is decided before the motes are built, not after: the pass costs a
+  // scene batch and a full blend over the frame, and its whole result is the
+  // motes themselves.
+  if (!third && g_cfg.dust) {
     scene_reset();
     fx_dust(eye);
     if (g_scene_floats) {
@@ -794,8 +813,9 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
   if (!g_menu_open && !cam_free && !g_vmorb.on) {
     float ccx = g_ui_vw * 0.5f, ccy = g_ui_vh * 0.5f;
     int in_play = p->alive && !g_match.over;
-    // Crosshair: the gap mirrors the live barrel displacement. At rest the first round
-    // is exact; recoil opens it only as the visible barrel moves.
+    // Crosshair: the gap IS the spread cone the stance opens. At rest and aimed it is
+    // exactly the base gap, because the round is exact; hip carry, movement, air and
+    // heat open it. Recoil is not in it — that is on screen already as the view.
     float ch_hide = p->wp.cur == WPN_SR ? 0.02f : 0.95f;
     if ((ads < ch_hide || third) && in_play) {  // 3rd person: crosshair even in ADS
       // 2.5x on the honest cone projection — pure readability — plus the HIT KICK, so
@@ -1073,6 +1093,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
   if (g_world_dirty) { world_upload(); g_world_dirty = 0; }
   msaa_update();
   post_update();
+  shadow_update();
   R.frame_resolved = 0;
   glBindFramebuffer(GL_FRAMEBUFFER, frame_fbo());
 
@@ -1101,9 +1122,17 @@ static void render_frame(const player_t *p, float alpha, int fps,
 
   // Sun shadows. One ortho map over the whole arena, centred on it, far enough
   // back along the sun that nothing in the level is behind the near plane.
-  int shadow_on = R.sm_fbo != 0;
+  int shadow_on = R.sm_fbo != 0 && g_cfg.shadows;
   rf_mark(1);
   if (shadow_on) rf_shadow_pass();
+  else {
+    // SHADOWS OFF SKIPS THE PASS, NEVER THE BINDING. Unit 0 belongs to the
+    // shadow map for every lit pass of this frame (unit 2 to its raw twin), and
+    // a unit holding a texture of another type under a declared sampler2DShadow
+    // is undefined — so the map stays bound and the shader simply is not asked
+    // for the read (uShadow 0, the gate at the top of sun_shadow).
+    glBindTexture(GL_TEXTURE_2D, R.sm_tex);
+  }
 
   // The screen-space half: geometry first, then what the screen can say about
   // it, before a single lit pixel is decided.

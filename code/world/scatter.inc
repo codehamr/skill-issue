@@ -1001,42 +1001,9 @@ static void renderer_init(int width, int height) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-  // Sun shadow map.
-  glGenTextures(1, &R.sm_tex);
-  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, SHADOW_TEX, SHADOW_TEX, 0,
-               GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
-  {  // border = "nothing in front of the light", so outside the map is fully lit
-    const float lit[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, lit);
-  }
-  glGenFramebuffers(1, &R.sm_fbo);
-  glBindFramebuffer(GL_FRAMEBUFFER, R.sm_fbo);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, R.sm_tex, 0);
-  glDrawBuffer(GL_NONE);
-  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-    R.sm_fbo = 0;   // unshadowed game rather than no game
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  // The same map on unit 2 through a sampler object with the compare OFF: the
-  // PCSS blocker search wants depths, not verdicts. A sampler object's state
-  // overrides the texture's own, so one texture serves both readers. Unit 2
-  // belongs to this binding for the life of the program; nothing else uses it.
-  glGenSamplers(1, &R.sm_raw_sampler);
-  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_COMPARE_MODE, 0 /* GL_NONE */);
-  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
-  glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-  gl_active_texture(GL_TEXTURE2);
-  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
-  glBindSampler(2, R.sm_raw_sampler);
-  gl_active_texture(GL_TEXTURE0);
+  // Sun shadow map. Built by the one builder, which the frame also calls: the
+  // SHADOWS setting decides the size and this is a rebuild like any other.
+  shadow_update();
 
   // Scope target: the magnified view is rendered here once per frame while the sniper
   // is shouldered, then shown as a disc inside the ocular.

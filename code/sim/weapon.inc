@@ -9,8 +9,10 @@
 // ---------------------------------------------------------------------------
 // Weapon — the trigger, swap and reload path for BOTH weapons: fire mode is
 // structural (WPN_DEF.full_auto) and per-weapon feel is g_cfg.wp. Recoil, look lag,
-// breathing and stride are physical pitch/yaw state of the barrel. Camera, visible gun
-// and shot direction all consume that state; there is no random accuracy cone.
+// breathing and stride are physical pitch/yaw state of the barrel; the camera, the
+// visible gun and the shot direction all consume that state. What the shooter's
+// STANCE costs is separate and lives in gun_spread's cone, drawn per round inside
+// gun_shoot and stored nowhere.
 // ---------------------------------------------------------------------------
 
 // THE keystone call: real entity id, per-human RNG stream, per-human

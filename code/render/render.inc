@@ -4,7 +4,9 @@
 // Proof: budget, shot battery. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // Contract: rig_upload is the ONE writer that hands the sun/light rig to
-// BOTH shader programs. A world/scene vertex is VERT_FLOATS (12) —
+// BOTH shader programs; shadow_update is the ONE builder of the sun shadow
+// map, and shadow_tex_size the ONE answer to how wide it is.
+// A world/scene vertex is VERT_FLOATS (12) —
 // deliberately not widened for the surface/material work.
 // =============================================================================
 // ---------------------------------------------------------------------------
@@ -261,8 +263,17 @@ static int g_hud_visible = 1;  // harness capture switch; menus remain visible
 // The harness's debug picture: 0 = the frame, 1 = the AO buffer (`dbgview`).
 static int g_dbg_view = 0;
 // One map over the whole 48 m arena: 4096 px gives ~1.3 cm texels, which is fine
-// enough that a figure self-shadows its own arms.
-#define SHADOW_TEX    4096
+// enough that a figure self-shadows its own arms. HIGH is that map; LOW halves the
+// side, so a quarter of the fill and a texel a figure's fingers no longer resolve
+// on — a real quality step, which is why SHADOWS is a three-state cycle and not a
+// flag. EVERY reader asks this function: the viewport, the texel the PCSS penumbra
+// is measured in and the texture itself are one number, and a second copy would be
+// a shadow filtered for a map that is not the one on the card.
+#define SHADOW_TEX_HIGH 4096
+#define SHADOW_TEX_LOW  2048
+static int shadow_tex_size(void) {
+  return g_cfg.shadows == 2 ? SHADOW_TEX_HIGH : SHADOW_TEX_LOW;
+}
 // The light-space box is no longer a constant: it is fitted to the elevation by
 // sun_set (g_sun.sh_half / sh_depth / sh_centre), because a fixed 31 m half was
 // the tight fit for ONE sun angle and this arena no longer has one.
@@ -296,14 +307,17 @@ typedef struct {
   GLint ambd, ambu, bounce, vmfill, vmrim, ambs, sunh, look, bounces;
 } lightloc_t;
 
-// THE LOOK, one vec4 for every program that tonemaps: curve (0 ACES, 1 AgX),
-// contrast, saturation, spare. The harness `look` command overrides it for
-// A/B frames; these are the shipped values.
+// THE LOOK, three of the four components of the vec4 every tonemapping program
+// reads: curve (0 ACES, 1 AgX), contrast, saturation. The fourth is BRIGHTNESS
+// and it is NOT mirrored here — rig_upload reads g_cfg.brightness straight into
+// uLook.w, so the config key stays the one copy of the player's exposure and a
+// graded A/B frame still renders at the exposure that is configured. The harness
+// `grade` command overrides these three; they are the shipped values.
 // ACES stays the curve: AgX was measured flatter on this palette (the sunset
 // went grey, the landmark reds dulled) even with the same grade on top. The
 // grade is a touch of contrast about mid-grey and a touch of saturation —
 // what the old vignette's darkening had been standing in for.
-static float g_look[4] = {0.0f, 1.03f, 1.10f, 0.0f};
+static float g_look[3] = {0.0f, 1.03f, 1.10f};
 
 typedef struct {
   int    width, height;
@@ -321,6 +335,7 @@ typedef struct {
   // writer, so the two cannot drift however many uniforms the rig grows.
   lightloc_t rig_world, rig_sky;
   GLuint sm_fbo, sm_tex;             // sun shadow map (depth only)
+  int    sm_built;                   // side of the map on the card, 0 = none yet
   mat4   light_vp;
   GLuint scope_fbo, scope_tex, scope_depth;  // picture-in-picture scope target
   int    scope_size;
@@ -382,6 +397,64 @@ typedef struct {
 } renderer_t;
 
 static renderer_t R;
+
+// THE SUN SHADOW MAP, built here and nowhere else — the renderer's init calls this
+// for the first build and the frame calls it again, so the SHADOWS setting takes
+// effect on the next frame with no platform hook (the msaa_update idiom: remember
+// the size that was built, delete and recreate when it moves).
+// The map is kept even with shadows OFF, at the low size: units 0 and 2 belong to
+// it for the life of the program, and a unit holding no texture under a declared
+// sampler2DShadow is undefined. Shadows off skips the PASS and the READ (uShadow),
+// never the binding — so only the texture's FORMAT matters there, never its
+// contents: sun_shadow returns before it samples, and clearing a map nothing
+// reads would be a full-size fill bought for nothing.
+static void shadow_update(void) {
+  int want = shadow_tex_size();
+  if (R.sm_built == want) return;
+  if (R.sm_fbo) { glDeleteFramebuffers(1, &R.sm_fbo); R.sm_fbo = 0; }
+  if (R.sm_tex) { glDeleteTextures(1, &R.sm_tex); R.sm_tex = 0; }
+  R.sm_built = want;
+  glGenTextures(1, &R.sm_tex);
+  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, want, want, 0,
+               GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+  {  // border = "nothing in front of the light", so outside the map is fully lit
+    const float lit[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, lit);
+  }
+  glGenFramebuffers(1, &R.sm_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, R.sm_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, R.sm_tex, 0);
+  glDrawBuffer(GL_NONE);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    R.sm_fbo = 0;   // unshadowed game rather than no game
+  glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
+  // The same map on unit 2 through a sampler object with the compare OFF: the
+  // PCSS blocker search wants depths, not verdicts. A sampler object's state
+  // overrides the texture's own, so one texture serves both readers. Unit 2
+  // belongs to this binding for the life of the program; nothing else uses it.
+  // The sampler outlives every rebuild — it is state of the UNIT — but the
+  // texture under it is new each time, so the bind is repeated here.
+  if (!R.sm_raw_sampler) {
+    glGenSamplers(1, &R.sm_raw_sampler);
+    glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_COMPARE_MODE, 0 /* GL_NONE */);
+    glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glSamplerParameteri(R.sm_raw_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+  }
+  gl_active_texture(GL_TEXTURE2);
+  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
+  glBindSampler(2, R.sm_raw_sampler);
+  gl_active_texture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, R.sm_tex);   // unit 0's lit-pass binding
+}
 
 static GLuint gl_compile(GLenum type, const char *src) {
   GLuint sh = glCreateShader(type);
@@ -462,7 +535,9 @@ static void rig_upload(const lightloc_t *L) {
     glUniform3f(L->sunh, sh.x, sh.y, sh.z);
     glUniform3f(L->ambs, at.x * S->col.x * 0.05f, at.y * S->col.y * 0.05f,
                          at.z * S->col.z * 0.05f); }
-  glUniform4f(L->look, g_look[0], g_look[1], g_look[2], g_look[3]);
+  // w = the exposure multiplier, applied before the curve in tonemap(). Read
+  // from the config at the upload, not threaded: the key is the only copy.
+  glUniform4f(L->look, g_look[0], g_look[1], g_look[2], g_cfg.brightness);
   // The sun off the floor: the floor's linear albedo times the sun's
   // irradiance on it (sin of the elevation), a third of the half-hemisphere
   // a wall would see if every metre of that floor were lit.

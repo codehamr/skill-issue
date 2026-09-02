@@ -363,8 +363,13 @@
   "  v = agx_curve(v);\n" \
   "  return clamp(Mi * v, 0.0, 1.0);\n" \
   "}\n" \
+  /* BRIGHTNESS IS AN EXPOSURE, NOT A LIFT. uLook.w multiplies the scene here,
+     before the curve and before the bloom weight is read off it, so turning it
+     down darkens the way stopping a lens down does — the highlights roll back
+     into the shoulder — instead of crushing a picture that has already been
+     tonemapped and clipped. 1.0 is the shipped exposure. */ \
   "vec3 tonemap(vec3 x){\n" \
-  "  x *= EXPOSURE;\n" \
+  "  x *= EXPOSURE * uLook.w;\n" \
   "  if (uLook.x > 0.5) {\n" \
   "    x = agx(x);\n" \
   "  } else {\n" \
@@ -389,12 +394,14 @@
      the curve starts to shoulder (1.2), mapped to [0,1] over three stops — wide
      enough that the sun's aureole counts, so a noon sun blinds the way the
      old display-knee bloom made it, with a real falloff instead of a clipped
-     blob. The chain
+     blob. The exposure it measures is the SAME exposure tonemap() applies,
+     uLook.w included: a picture stopped down a third must spill a third less,
+     or the halo survives the frame it belongs to. The chain
      multiplies the colour by it, so what spills is what was actually bright,
      in its own colour. An RGBA8 target carries it, MSAA resolves it, nothing
      else in the frame reads the alpha. */ \
   "float bloom_w(vec3 c){\n" \
-  "  float l = dot(c, vec3(0.2126, 0.7152, 0.0722)) * EXPOSURE;\n" \
+  "  float l = dot(c, vec3(0.2126, 0.7152, 0.0722)) * EXPOSURE * uLook.w;\n" \
   "  return clamp(log2(max(l, 1.0e-4) * (1.0 / 1.2)) * (1.0 / 3.0), 0.0, 1.0);\n" \
   "}\n"
 
@@ -575,7 +582,10 @@ static const char *WORLD_FS =
   "uniform vec3 uEye;\n"
   "uniform float uDetail;\n"
   "uniform float uEmis;\n"
-  "uniform float uShadow;\n"              // 0 = no shadow map bound
+  // 0 = no shadow map to read: either the FBO never came up, or SHADOWS is off.
+  // The map and its raw twin stay bound on units 0 and 2 either way — this
+  // uniform says the read is not asked for, never that the binding is gone.
+  "uniform float uShadow;\n"
   "uniform float uVm;\n"                  // 1 = viewmodel: add the hero rig
   "uniform vec3 uMuzC;\n"                 // muzzle-flash radiance (0 = no shot)
   "uniform vec3 uMuzL;\n"                 // direction from the gun to the flash
@@ -647,6 +657,10 @@ static const char *WORLD_FS =
   "  return r * vec2(cos(t), sin(t));\n"
   "}\n"
   "float sun_shadow(){\n"
+  // FULLY LIT, and it is the first line of the function on purpose: with no map
+  // to read, twelve compared taps of a texture nothing wrote would paint the
+  // arena black. Everything below is a per-pixel term whose result is unreadable
+  // here, so none of it runs.
   "  if (uShadow < 0.5) return 1.0;\n"
   "  vec3 p = vLit.xyz / vLit.w;\n"
   "  if (p.z >= 1.0) return 1.0;\n"
@@ -1583,11 +1597,17 @@ static const char *GLARE_FS =
   "    float vig = 1.0 - uGrade.x * smoothstep(0.35, 1.6, r2);\n"
   // The edges go cool as well as dark. A vignette that only darkens reads as a
   // lens fault; one that also loses a little warmth reads as the falloff of a
-  // real lens, and it costs an add.
-  "    vec3 add = texture(uTex, vUV).rgb * uGain.z\n"
-  "             + texture(uBloom, vUV).rgb * uGain.x\n"
+  // real lens, and it costs an add. FILM GRAIN OFF zeroes uGrade.x, and this
+  // switch turns the cool edge off with it: the tint is the vignette's other
+  // half, and a corner that is blue but not dark is that same lens fault. One
+  // step, so the shipped look multiplies by exactly one.
+  "    float vigk = step(1e-6, uGrade.x);\n"
+  // GLOW OFF zeroes both gains and the two glare targets hold last frame's
+  // picture — an unreadable result, so the fetches are not made.
+  "    vec3 add = (uGain.z > 0.0 ? texture(uTex, vUV).rgb * uGain.z : vec3(0.0))\n"
+  "             + (uGain.x > 0.0 ? texture(uBloom, vUV).rgb * uGain.x : vec3(0.0))\n"
   "             + max(gn, 0.0) * 0.42\n"
-  "             + vec3(-0.008, -0.002, 0.010) * r2;\n"
+  "             + vec3(-0.008, -0.002, 0.010) * r2 * vigk;\n"
   "    float mul = clamp(vig * (1.0 + min(gn, 0.0)), 0.0, 1.0);\n"
   "    vec3 base = uAA.x > 0.5 ? fxaa(vUV) : texture(uScene, vUV).rgb;\n"
   "    oCol = vec4(base * mul + add, 1.0);\n"

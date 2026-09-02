@@ -14,13 +14,17 @@
 #             documented fresh-config baselines (the WANT_NEAR / WANT_CROSS
 #             lines below are the single authority — the config is part of the
 #             number, so the script writes fresh defaults itself)
+#   boresight: the round lands on the eye line — AR/SR x hip/ADS x level and tilted
+#              aim x three ranges, impact against the analytic eye-ray intersection
 #   parity  : no MISMATCH in the shared-code rows
 #   budget  : scene/event/world/UI drops = 0 at 20 bots hard (nothing silently
 #             dropped a triangle, event, arena decoration or interface vertex)
 #   vmframe : the solved 3P SR low-ready axis matches its production descriptor,
 #             uses a monotone ready_s raise/lower transition, keeps spatial action
-#             gates exact, and proves fire T0 uses the exact live barrel/tracer axis
-#             while the visible arms raise only partially at T1 (including prediction)
+#             gates exact, and proves fire T0 anchors the tracer on the live barrel
+#             along the sim bore, with the ballistic segment inverting back onto the
+#             shooter's eye, while the visible arms raise only partially at T1
+#             (including prediction)
 #   slidecheck: eight-direction thigh/shin clearance, anatomical ordering, bounded
 #             bend-plane travel, front/side knee-pad vs back-foot contact roles and
 #             bone-length residual
@@ -308,7 +312,16 @@ WANT_AR_NEAR="75 75 75 61"
 # weapon/arm chain and recovered gait contacts (gun/farm, torso/gun, carrier/arm,
 # shin/boot/knee and their equipment hosts); these are new POSES of unchanged closed
 # meshes, and vmtrig independently retains zero forbidden hand/weapon crossings.
-WANT_AR_CROSS="112 112 96 67"
+# 2026-09-02 bot recoil-compensation retune (BOT_SKILL rec_comp, HARD 0.92 -> 0.40):
+# figcheck's subject is the LIVE hard bot, so this census tracks that difficulty row —
+# on an unchanged binary the same sweep reads cross 95 at EASY and 92 at NORMAL against
+# 112 at HARD, so the tier spread dwarfs this move. AR cross goes 112/112/96/67 ->
+# 114/114/96/65 with near unchanged. The 60-tick close-tier `figv` aggregate moves a few
+# contacts inside the SAME families (shin/boot 340 -> 336, torso/gun 68 -> 64, carrier/gun
+# 41 -> 46, thigh/knee 82 -> 85); AR totals 4586 -> 4583 CROSS and 4268 -> 4270 near. No
+# family enters or leaves but the rarest (neck/neck out, shingle_strap/farm in, one contact
+# each), and all five hard topology classes stay zero on all four tiers.
+WANT_AR_CROSS="114 114 96 65"
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -335,9 +348,12 @@ WANT_AR_CROSS="112 112 96 67"
 # The closed-chain follow-up documented in the AR census affects only shared anatomy:
 # SR near becomes 94/94/58/39 and cross falls 208/208/135/92 -> 193/193/126/85, with
 # open/flip/dup/zfight/degen still zero in every one of the eight full sweeps.
-WANT_SR_NEAR="94 94 58 41"
+# 2026-09-02 rec_comp retune (the AR census above carries the review): the same pose
+# sample takes SR near's k=6 tier 41 -> 40 and SR cross 180/180/121/95 -> 181/181/122/95,
+# with SR aggregates 8681 -> 8705 CROSS and 5427 -> 5425 near inside the existing families.
+WANT_SR_NEAR="94 94 58 40"
 # 2026-09: see the reviewed physical-bore/slide-handoff A/B in the AR notes.
-WANT_SR_CROSS="180 180 121 95"
+WANT_SR_CROSS="181 181 122 95"
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -358,7 +374,14 @@ WANT_SR_CROSS="180 180 121 95"
 # changed the poses the 20 recoil states sweep, moving the shallow hand/weapon census
 # 199->200 while cross returned 145->138; the 194 this gate carried was stale for the
 # whole recorded history and never blocked because it drifted alongside real reds.
-gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=200 cross=138 degen=0 recoil_states=20$'
+# 2026-09-02 near=198, worst [sr ads=1.0 side_neg] -> [sr ads=1.0 idle]: the visual
+# kick is damped by the ROUND'S INDEX now (recoil_kick_damp, sim/skeleton.inc), and the
+# recoil states this fixture sweeps are staged deep in a burst, so their impulses are
+# smaller and two shallow hand/weapon pairs fall out of the census. Isolated by
+# ablation — with the damp forced to 1.0 the line reads near=200 side_neg again, bit
+# for bit — and nothing topological moved: tris, cross and all five zero invariants
+# (open/flip/dup/zfight/degen) are unchanged.
+gate_command vmcheck "vmcheck" '^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=198 cross=138 degen=0 recoil_states=20$'
 gate_command vmsight "vmsight" '^vmsight total=0 '
 gate_command vmscope "vmscope" '^vmscope scope_tris=[1-9][0-9]* open_at=0[.]55 baseline_err=.* recoil_min_ocular=.* recoil_axis=.* recoil_center=.* recoil_pip=.* recoil_radius_delta=.* ok$'
 gate_command vmframe "vmframe" '^vmframe ok$'
@@ -378,7 +401,7 @@ grep -Eq '^vmframe reset_transition ready=1[.]000 pose=0[.]000mm lower=\(0[.][0-
   "$TMPD/vmframe.log" || {
     say "GATE vmframe missing reset-to-idle transition witness"; fail=1;
   }
-grep -Eq '^vmframe fire sr T0 .*anchor=0[.]00[0-9]mm visible_hold=0[.][0-9]+mm bore=0[.]0000mrad ballistic=0[.]00[0-9]mm .* stale=1$' \
+grep -Eq '^vmframe fire sr T0 .*anchor=0[.]00[0-9]mm visible_hold=0[.][0-9]+mm bore=0[.]0000mrad ballistic_eye=0[.]00[0-9]mm .* stale=1$' \
   "$TMPD/vmframe.log" || {
     say "GATE vmframe missing exact live-barrel/tracer T0 witness"; fail=1;
   }
@@ -559,6 +582,7 @@ fi
 
 gate_command recoil "recoil" '^recoil ok$'
 gate_command gunwall "gunwall" '^gunwall ok$'
+gate_command boresight "boresight" '^boresight ok$'
 gate_command netrecoil "netrecoil" '^netrecoil cl_pred=.* ok$'
 netrecoil_single_rows="$(grep -Ec '^netrecoil single .* replay_body=1 .* sidefx=1/1 counts=1/1 noise_t=[0-9]+ events=2/0 ok$' \
   "$TMPD/netrecoil.log" || true)"

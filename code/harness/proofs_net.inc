@@ -338,6 +338,13 @@ static netfigure_fire_t netfigure_fire_case(int ent, int wpn) {
   int staged = g_fire_anchor_src == ent && g_fire_anchor_tick == g_tick;
   v3 event_muz0 = staged ? pose_muzzle(&g_fire_anchor_pose, wpn) : muz0;
   v3 tracer = ti >= 0 ? g_tracers[ti].a : event_muz0;
+  // AN IDENTITY, AND THE BRANCH IS THE POINT: vfx_ev_fire starts the tracer ON the
+  // anchor muzzle, so this can only be zero or a metre. For a FOREIGN shot the anchor
+  // exists at all because ent_on_event re-solved it before vfx_on_event ran; miss that
+  // ordering and the fallback starts the streak at the authored event origin instead
+  // and this reads the gap. The LIVE measurement is toward0 below — the same tracer
+  // against the muzzle the live pose holds a presentation tick later, which no
+  // assignment ties together.
   float anchor0 = v3_len(v3_sub(tracer, event_muz0));
   float visible0 = v3_len(v3_sub(muz0, muz_slung));
   float axis0 = staged ? netfigure_pose_bore_off(&g_fire_anchor_pose,
@@ -505,11 +512,12 @@ static void netfigure_proof(void) {
 // VM edge, EV_FIRE creates the body edge, and rollback must reproduce (not duplicate)
 // the former. None of the measurements below restates an impulse: shots enter through
 // gun_shoot and the body-only check enters through the encoded EV_FIRE echo.
-#define RECOIL_PROOF_TICKS 80
+#define RECOIL_PROOF_TICKS 120
 #define RECOIL_PROOF_SHOTS 3
 
 typedef struct {
   float back, lift, side, muzzle_deg, bore_error, punch, punch_roll;
+  float rec_p, rec_y;
   float shot_yaw, shot_pitch;
   int ammo, idx;
   uint64_t rng;
@@ -518,6 +526,15 @@ typedef struct {
 typedef struct {
   int tick;
   v3 dir;
+  // The offset the round LEFT along, read before gun_shoot: the pattern is set at the
+  // shot, so the weapon standing after it is one round ahead of the trajectory.
+  float bore_p, bore_y;
+  // The trigger-time cone and the angles this round HAD to leave along, reproduced in
+  // recoil_fire from the weapon and the RNG state gun_shoot was handed. rng_two is
+  // that reproduction landing on the state the shot left behind, i.e. exactly two
+  // draws, which is the wire contract as much as the ballistic one.
+  float cone, want_y, want_p;
+  int rng_two;
   weapon_t wp;
   uint64_t rng;
 } recoil_shot_t;
@@ -731,10 +748,30 @@ static void recoil_stage(int local_presentation, int wpn, int ads) {
   g_rng_gun[0] = rng_gun_seed(1337u, 0);
 }
 
-// Angular change of the authoritative barrel from calm aim. The viewmodel is aligned
-// to this same axis, so the gameplay state is the stable, render-independent measure.
+// A CALM WEAPON TABLE FOR A FIXTURE MEASURING SOMETHING ELSE: the named columns are
+// zeroed in a copy and g_sim_wp is pointed at it, so a reading is the standing geometry
+// rather than a lottery on whichever breath phase or cone draw the run landed on. Two
+// invariants ride along. The pointer is part of the recoil_save/restore set, so the
+// arena gets its own table back when the proof ends; and a fixture is left pointing at
+// THIS static until its next recoil_stage re-points it at g_cfg.wp, which is why the
+// table outlives the call. Pass a negative column to zero only one.
+static void recoil_wp_zero(int col_a, int col_b) {
+  static float wp[WPN_COUNT][WP_COUNT];
+  memcpy(wp, g_cfg.wp, sizeof wp);
+  for (int i = 0; i < WPN_COUNT; i++) {
+    if (col_a >= 0) wp[i][col_a] = 0.0f;
+    if (col_b >= 0) wp[i][col_b] = 0.0f;
+  }
+  g_sim_wp = wp;
+}
+
+// Angular change of the authoritative barrel from calm aim, which is the recoil place
+// plus the sway wander and deliberately NOT the spread cone: what these rows grade is
+// where the RIFLE is pointing, and the cone is the separate price the stance puts on
+// the round. The viewmodel is aligned to this same axis, so the gameplay state is the
+// stable, render-independent measure.
 static float recoil_muzzle_delta(const player_t *p) {
-  return gun_spread(&p->wp, p->vel, p->grounded);
+  return gun_bore_offset(&p->wp);
 }
 
 static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir) {
@@ -747,7 +784,7 @@ static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir)
   {
     float by, bp;
     gun_bore_angles(&p->wp, p->yaw, p->pitch, &by, &bp);
-    v3 fwd = {{cosf(bp) * sinf(by), sinf(bp), -cosf(bp) * cosf(by)}};
+    v3 fwd = bore_axis(by, bp);
     v3 rgt = v3_norm(v3_cross(fwd, (v3){{0, 1, 0}}));
     v3 upv = v3_norm(v3_cross(rgt, fwd));
     vm_pose_t vp = vm_stage_pose(p, &p->vm, &p->wp, 1.0f, 1.0f);
@@ -768,6 +805,8 @@ static void recoil_take_sample(recoil_trace_t *tr, int tick, const v3 *last_dir)
   }
   o->punch = p->wp.punch;
   o->punch_roll = p->wp.punch_roll;
+  o->rec_p = p->wp.rec_p;
+  o->rec_y = p->wp.rec_y;
   if (last_dir) {
     o->shot_yaw = atan2f(last_dir->x, -last_dir->z) / DEG2RAD;
     o->shot_pitch = asinf(f_clamp(last_dir->y, -1.0f, 1.0f)) / DEG2RAD;
@@ -794,6 +833,18 @@ static void recoil_present_body(player_t *p) {
 static void recoil_fire(recoil_trace_t *tr, int instant_tick) {
   player_t *p = &g_players[0];
   float back = p->vm.kick_back, lift = p->vm.kick_lift, side = p->vm.kick_side;
+  float bore_p = p->wp.rec_p, bore_y = p->wp.rec_y;
+  // THE BARREL, THE CONE AND THE STREAM AS THE TRIGGER FOUND THEM. Reproducing the
+  // dispersion here — the same two rng_rangef draws, in order, from the same state —
+  // is what keeps the row below an IDENTITY instead of a tolerance around a cone: the
+  // round has to leave along the trigger-time bore displaced by exactly the offset its
+  // own two draws asked for. That the replay lands on the state the shot left behind
+  // is the draw COUNT, which is a wire contract (a shot that draws a different number
+  // of values predicts on the client and replays on the server out of step).
+  float trg_yaw, trg_pitch;
+  gun_bore_angles(&p->wp, p->yaw, p->pitch, &trg_yaw, &trg_pitch);
+  float cone = gun_spread(&p->wp, p->vel, p->grounded);
+  uint64_t replay = g_rng_gun[0];
   int ev0 = g_num_events;
   gun_shoot(0, &p->wp, player_eye_pos(p), p->yaw, p->pitch,
             p->vel, p->grounded, &g_rng_gun[0]);
@@ -811,6 +862,17 @@ static void recoil_fire(recoil_trace_t *tr, int instant_tick) {
   recoil_shot_t *s = &tr->shot[tr->nshot++];
   s->tick = instant_tick;
   s->dir = fire->b;
+  s->bore_p = bore_p;
+  s->bore_y = bore_y;
+  s->cone = cone;
+  {
+    float cu = rng_rangef(&replay, 0.0f, 1.0f);
+    float cv = rng_rangef(&replay, 0.0f, 1.0f);
+    float r = cone * sqrtf(cu) * DEG2RAD, th = cv * F_TAU;
+    s->want_y = (trg_yaw + r * cosf(th)) / DEG2RAD;
+    s->want_p = f_clamp(trg_pitch + r * sinf(th), -PITCH_MAX, PITCH_MAX) / DEG2RAD;
+  }
+  s->rng_two = replay == g_rng_gun[0];
   s->wp = p->wp;
   s->rng = g_rng_gun[0];
   tr->last_shot_tick = instant_tick;
@@ -922,18 +984,121 @@ static void recoil_print_samples(const recoil_trace_t *tr, const recoil_metric_t
          (double)(s->side * 1000.0f), (double)s->muzzle_deg, (double)s->punch);
 }
 
+// --- The pattern itself: one magazine, then the clock that re-arms it ---------------
+// The offsets are read straight off the weapon after each firing tick, which is where
+// they are authored: gun_cool recovers at the top of a tick and gun_shoot sets at the
+// bottom, so what stands after a shot IS that round's place in the table. A magazine
+// is exactly the table's useful length (30 AR rounds against 32 rows), so one run
+// covers the tight base, the climb and the whole crown.
+#define RECOIL_PATTERN_SHOTS 30
+
 typedef struct {
   int shots;
-  float sway_peak, bore_peak, shot_span;
-  float vm_err, body_err, anchor_err, bore_err, head_err;
+  float p[RECOIL_PATTERN_SHOTS], y[RECOIL_PATTERN_SHOTS];
+  // The barrel FOLLOWS the pattern, so the offset a round leaves along and the offset
+  // that round eventually buys are two numbers: p/y are the first (read at the shot),
+  // peak_p the second — the highest the follower ever reaches in the whole run.
+  float peak_p;
+  int quiet_ticks, zero_ticks, rearm_ticks;  // release -> <0.02deg / 0 / idx re-armed
+  int monotone;                    // the release decays, never grows, never overshoots
+  int again_shots, again_idx;      // the one round fired after the release
+  float again_p, again_y;
+} recoil_pattern_t;
+
+// Held trigger through the production path, a measured release, then one more press.
+// wait_ticks is how long the finger is off: the re-arm is a clock the player can
+// count, so the fixture is run at both sides of it.
+// One production tick of the staged shooter with the trigger in the given state,
+// answering how many rounds it left. A pattern run is this one tick asked three
+// different questions: hold, release, press once more.
+static int recoil_pattern_tick(player_t *p, int fire) {
+  int held[IN_COUNT] = {0};
+  held[IN_FIRE] = fire;
+  int ev0 = g_num_events, fired = 0;
+  weapon_tick(p, 0, held);
+  vm_tick(p);
+  for (int i = 0; i < IN_COUNT; i++) p->prev_held[i] = held[i];
+  for (int i = ev0; i < g_num_events; i++)
+    if (g_events[i].type == EV_FIRE && g_events[i].src == 0) fired++;
+  g_tick++;
+  return fired;
+}
+
+static recoil_pattern_t recoil_pattern_run(int wpn, int shots, int wait_ticks) {
+  recoil_pattern_t out = {0};
+  out.monotone = 1;
+  recoil_stage(1, wpn, 0);
+  player_t *p = &g_players[0];
+  p->grounded = p->prev_grounded = 1;
+  p->vel = (v3){{0.0f, 0.0f, 0.0f}};
+
+  for (int t = 0; t < 640 && out.shots < shots; t++) {
+    int fired = recoil_pattern_tick(p, 1);
+    out.peak_p = fmaxf(out.peak_p, fabsf(p->wp.rec_p));
+    if (fired > 0 && out.shots < RECOIL_PATTERN_SHOTS) {
+      out.p[out.shots] = p->wp.rec_p;
+      out.y[out.shots] = p->wp.rec_y;
+      out.shots++;
+    }
+  }
+
+  float prev_p = fabsf(p->wp.rec_p), prev_y = fabsf(p->wp.rec_y);
+  int sign_p = p->wp.rec_p > 0 ? 1 : p->wp.rec_p < 0 ? -1 : 0;
+  int released = 0;
+  for (int t = 0; t < wait_ticks; t++) {
+    recoil_pattern_tick(p, 0);
+    out.peak_p = fmaxf(out.peak_p, fabsf(p->wp.rec_p));
+    float ap = fabsf(p->wp.rec_p), ay = fabsf(p->wp.rec_y);
+    int sp = p->wp.rec_p > 0 ? 1 : p->wp.rec_p < 0 ? -1 : 0;
+    // THE LAST ROUND IS PAID FIRST. Its target stands for rec_hold ticks after the
+    // trigger comes up, so the opening ticks of a release still climb onto the row that
+    // round asked for; the RETURN is what follows the release, and the return is not a
+    // swing: magnitude may only fall, and the offset may not cross zero on the way (a
+    // spring's follow-through is what this model drops).
+    if (p->wp.rec_hold == 0) {
+      if (released && (ap > prev_p || ay > prev_y || (sp && sign_p && sp != sign_p)))
+        out.monotone = 0;
+      released = 1;
+    }
+    prev_p = ap; prev_y = ay;
+    if (sp) sign_p = sp;
+    if (!out.quiet_ticks && ap < 0.02f && ay < 0.02f) out.quiet_ticks = t + 1;
+    if (!out.zero_ticks && ap == 0.0f && ay == 0.0f) out.zero_ticks = t + 1;
+    if (!out.rearm_ticks && p->wp.idx == 0) out.rearm_ticks = t + 1;
+  }
+
+  out.again_idx = p->wp.idx;
+  out.again_shots = recoil_pattern_tick(p, 1);
+  out.again_p = p->wp.rec_p;
+  out.again_y = p->wp.rec_y;
+  return out;
+}
+
+static void recoil_pattern_print(const char *name, const recoil_pattern_t *r) {
+  printf("recoil pattern %s shots=%d", name, r->shots);
+  for (int i = 0; i < r->shots; i++)
+    printf(" %d:%+.2f/%+.2f", i, (double)r->y[i], (double)r->p[i]);
+  printf(" | peak=%.2f quiet=%d zero=%d rearm=%d mono=%d again=%d idx=%d %+.2f/%+.2f\n",
+         (double)r->peak_p, r->quiet_ticks, r->zero_ticks, r->rearm_ticks,
+         r->monotone, r->again_shots, r->again_idx, (double)r->again_y,
+         (double)r->again_p);
+}
+
+typedef struct {
+  int shots;
+  float sway_peak, bore_peak, shot_span, cone_deg;
+  float vm_err, body_err, anchor_err, head_err_recoil, head_err_sway;
+  // What the EYE does over a magazine, in degrees: the biggest single-tick pitch
+  // step the camera takes, and the height of the climb at rounds 10 and 30.
+  float cam_step_max, cam_r10, cam_r30;
 } recoil_auto_t;
 
 #define RECOIL_WALL_SHOTS 20
 
 typedef struct {
-  int shots, early_rises, tail_turns;
+  int shots;
   float x[RECOIL_WALL_SHOTS], y[RECOIL_WALL_SHOTS];
-  float rise_five, rise_peak, horizontal_span, tail_vertical_span;
+  float rise_ten, rise_peak, horizontal_span;
 } recoil_wall_t;
 
 static float recoil_dir_angle(v3 a, v3 b) {
@@ -943,11 +1108,16 @@ static float recoil_dir_angle(v3 a, v3 b) {
 }
 
 // A held-trigger production loop, including the physical hand follower and both
-// render rigs. Every EV_FIRE is compared against the viewmodel barrel, the current
-// third-person barrel, the immutable fire anchor and the camera's published optical
-// axis. The full-ADS head line must become coaxial as well; hipfire intentionally
-// leaves some arm motion below the eye so the rifle can move without welding the
-// player's head to it.
+// render rigs. TWO axis questions, and the pattern is why they are two: the round is
+// gone before the kick is placed, so the ROUND is judged against the barrel it left —
+// the immutable fire anchor — while the viewmodel, the third-person body and the
+// camera's optical axis are judged against the bore standing at the end of the same
+// tick, which is where the kick has just put them all. The trigger-time bore rebuilt
+// below answers a third question the cone added: how far off that barrel the stance
+// threw the round. The head line is judged once per camera follow: on the RECOIL
+// channel it must be coaxial with the barrel in hipfire as in ADS — that is the
+// reticle's promise — while on the SWAY channel hipfire must leave arm motion below
+// the eye, and the full-ADS cheek weld must give all of it back.
 static recoil_auto_t recoil_auto_run(int ads) {
   recoil_auto_t out = {0};
   int home_save = g_home;
@@ -963,23 +1133,27 @@ static recoil_auto_t recoil_auto_run(int ads) {
   p->vel = (v3){{g_sim_mv[MV_RUN], 0.0f, 0.0f}};
   v3 first_dir = {{0, 0, 0}};
   int have_first = 0;
+  float cam_rest = 0.0f, cam_prev = 0.0f;
 
   // Thirty-six settling ticks establish real stride/breath sway. The first eight also
-  // turn the head, so the hand-lag term is covered independently of recoil.
-  for (int t = -36; t < 120; t++) {
+  // turn the head, so the hand-lag term is covered independently of recoil. The firing
+  // half runs a WHOLE MAGAZINE (30 rounds at 10 ticks each) because the crown — the
+  // half of the pattern the eye complains about — only starts at round ten.
+  for (int t = -36; t < 320; t++) {
     int held[IN_COUNT] = {0};
     held[IN_ADS] = ads;
     held[IN_FIRE] = t >= 0;
     if (t >= -36 && t < -28) p->yaw += 0.010f;
     int ev0 = g_num_events;
+    weapon_t before = p->wp;          // the weapon as this tick found it
     weapon_tick(p, 0, held);
     vm_tick(p);
     for (int i = 0; i < IN_COUNT; i++) p->prev_held[i] = held[i];
     recoil_present_body(p);
 
-    float bore = gun_spread(&p->wp, p->vel, p->grounded);
-    if (t < 0) out.sway_peak = fmaxf(out.sway_peak, bore);
-    else out.bore_peak = fmaxf(out.bore_peak, bore);
+    float off = recoil_muzzle_delta(p);
+    if (t < 0) out.sway_peak = fmaxf(out.sway_peak, off);
+    else out.bore_peak = fmaxf(out.bore_peak, off);
 
     for (int i = ev0; i < g_num_events; i++) {
       const event_t *e = &g_events[i];
@@ -995,15 +1169,74 @@ static recoil_auto_t recoil_auto_run(int ads) {
       cam_basis(c.yaw, c.pitch, c.roll, &head_fwd, &head_rgt, &head_up);
       (void)head_rgt;
       (void)head_up;
+      // THE BARREL THE TRIGGER BROKE ON, rebuilt from the weapon this tick started
+      // with: gun_cool recovered it once and gun_sway_tick moved the hands, both
+      // before gun_shoot took its angles, and nothing after the shot touches sway.
+      // (Re-read, not threaded: the same gun_recoil_step on the same inputs, so it is
+      // bit-identical by construction.) This is the round's own axis, and grading the
+      // shot against it is the link the kick would otherwise hide — the camera's
+      // published axis and the live bore are one function of one state, so comparing
+      // those two proves only that C works.
+      weapon_t at_trigger = before;
+      gun_recoil_step(&at_trigger);
+      at_trigger.sway_p = p->wp.sway_p;
+      at_trigger.sway_y = p->wp.sway_y;
+      v3 fired = gun_bore_dir(&at_trigger, p->yaw, p->pitch);
+      v3 live = gun_bore_dir(&p->wp, p->yaw, p->pitch);
       out.vm_err = fmaxf(out.vm_err,
-                         recoil_dir_angle(shot, vmf.plan.frame.gz));
+                         recoil_dir_angle(live, vmf.plan.frame.gz));
       out.body_err = fmaxf(out.body_err,
-                           recoil_dir_angle(shot, g_player_anim[0].pose.gun_f));
+                           recoil_dir_angle(live, g_player_anim[0].pose.gun_f));
       out.anchor_err = fmaxf(out.anchor_err,
                              recoil_dir_angle(shot, g_fire_anchor_pose.gun_f));
-      out.bore_err = fmaxf(out.bore_err, recoil_dir_angle(shot, c.bore));
-      out.head_err = fmaxf(out.head_err, recoil_dir_angle(shot, head_fwd));
+      // Off the trigger-time barrel by the STANCE'S OWN dispersion and nothing else.
+      // The identity that says which draw sent it there is recoil_fire's, taken with
+      // the weapon in hand; what this full-auto loop adds is that the same thing
+      // happens through the production trigger, under a real cone the fixture's run
+      // speed opens. anchor_err beside it stays exact, because the rifle photographed
+      // for a round is photographed on the round's own axis, cone included.
+      out.cone_deg = fmaxf(out.cone_deg, recoil_dir_angle(shot, fired));
+      // THE CAMERA'S TWO FOLLOWS, measured one channel at a time on the real
+      // rf_camera. The recoil channel is asked by handing that function a body whose
+      // sway is zero: with recoil_view at 1 the eye must then be exactly on the
+      // barrel, hip and ADS alike, because the reticle IS the next round's line. The
+      // sway channel is the live body's remainder — hipfire keeps the arms' breathing
+      // and stride off the head, and a cheek weld at full ADS gives it all back.
+      player_t calm = *p;
+      calm.wp.sway_p = calm.wp.sway_y = 0.0f;
+      calm.wp.prev_sway_p = calm.wp.prev_sway_y = 0.0f;
+      frame_cam_t cr = rf_camera(&calm, 1.0f, NULL);
+      v3 calm_fwd, calm_rgt, calm_up;
+      cam_basis(cr.yaw, cr.pitch, cr.roll, &calm_fwd, &calm_rgt, &calm_up);
+      (void)calm_rgt;
+      (void)calm_up;
+      out.head_err_recoil =
+          fmaxf(out.head_err_recoil,
+                recoil_dir_angle(gun_bore_dir(&calm.wp, p->yaw, p->pitch), calm_fwd));
+      out.head_err_sway = fmaxf(out.head_err_sway,
+                                recoil_dir_angle(live, head_fwd));
       out.shots++;
+      // The climb's height as the EYE reads it, at the two rounds that say whether the
+      // crown is a ceiling or a slope. Taken off the same published camera, so it is
+      // the picture's own pitch and not a second reconstruction of it.
+      if (out.shots == 10) out.cam_r10 = c.pitch / DEG2RAD - cam_rest;
+      if (out.shots == 30) out.cam_r30 = c.pitch / DEG2RAD - cam_rest;
+    }
+    // THE CAMERA CURVE, once per tick on the real rf_camera: a burst is only as calm
+    // as the biggest step the eye takes in one tick. A barrel PLACED at each round's
+    // authored offset and left to bleed between rounds saw-tooths — the whole step
+    // arrives in the tick of the shot — while a barrel FOLLOWING that offset spreads
+    // the same climb across the interval. Rounds 0..3 are excluded: the first rounds
+    // of a burst are a step from rest by design and they are what a tap costs. So is
+    // everything past the magazine's last round (rec_hold is exactly "a round is still
+    // holding the crown up"): the fall afterwards is the RECOVERY the player tunes,
+    // and it is graded for shape — monotone, no swing — by the pattern case.
+    {
+      float cam = rf_camera(p, 1.0f, NULL).pitch / DEG2RAD;
+      if (t < 0) cam_rest = cam;
+      else if (out.shots > 3 && p->wp.rec_hold > 0)
+        out.cam_step_max = fmaxf(out.cam_step_max, fabsf(cam - cam_prev));
+      cam_prev = cam;
     }
     g_tick++;
   }
@@ -1049,45 +1282,200 @@ static recoil_wall_t recoil_wall_run(int ads) {
       int si = out.shots++;
       out.x[si] = wx - first_x;
       out.y[si] = wy - first_y;
-      if (si > 0 && si <= 5 && out.y[si] > out.y[si - 1] + 0.035f)
-        out.early_rises++;
     }
     g_tick++;
   }
 
-  if (out.shots > 5) out.rise_five = out.y[5];
+  if (out.shots > 10) out.rise_ten = out.y[10];
   float xmin = 0.0f, xmax = 0.0f;
-  float tail_min = 1e9f, tail_max = -1e9f;
-  int tail_sign = 0;
   for (int i = 0; i < out.shots; i++) {
     out.rise_peak = fmaxf(out.rise_peak, out.y[i]);
     xmin = fminf(xmin, out.x[i]);
     xmax = fmaxf(xmax, out.x[i]);
-    if (i >= 7) {
-      tail_min = fminf(tail_min, out.y[i]);
-      tail_max = fmaxf(tail_max, out.y[i]);
-    }
-    if (i >= 8) {
-      float dy = out.y[i] - out.y[i - 1];
-      int sign = dy > 0.015f ? 1 : dy < -0.015f ? -1 : 0;
-      if (sign && tail_sign && sign != tail_sign) out.tail_turns++;
-      if (sign) tail_sign = sign;
-    }
   }
   out.horizontal_span = xmax - xmin;
-  if (out.shots > 7) out.tail_vertical_span = tail_max - tail_min;
   return out;
+}
+
+// One stance's row of the auto fixture. `cone_max` is the bound that stance's own gate
+// applies (hipfire pays the hip term, ADS does not), and `tail` is the verdict, present
+// on the last row only.
+typedef struct { int curve, deterministic, ok; } recoil_auto_tail_t;
+
+static void recoil_auto_print(const char *name, const recoil_auto_t *a,
+                              float cone_max, const recoil_auto_tail_t *tail) {
+  printf("recoil auto %s shots=%d sway=%.3fdeg bore=%.3fdeg span=%.3fdeg "
+         "cone=%.3f/%.3fdeg axis(vm/body/anchor)=%.4f/%.4f/%.4fdeg "
+         "head(recoil/sway)=%.4f/%.4fdeg cam_step_max=%.3fdeg r10=%.2f r30=%.2fdeg",
+         name, a->shots, (double)a->sway_peak, (double)a->bore_peak,
+         (double)a->shot_span, (double)a->cone_deg, (double)cone_max,
+         (double)a->vm_err, (double)a->body_err, (double)a->anchor_err,
+         (double)a->head_err_recoil, (double)a->head_err_sway,
+         (double)a->cam_step_max, (double)a->cam_r10, (double)a->cam_r30);
+  if (tail)
+    printf(" curve=%d deterministic=%d %s", tail->curve, tail->deterministic,
+           tail->ok ? "ok" : "FAIL");
+  printf("\n");
 }
 
 static void recoil_wall_print(const char *name, const recoil_wall_t *w) {
   printf("recoil wall %s", name);
   for (int i = 0; i < w->shots; i++)
     printf(" %d:%+.2f/%+.2fm", i, (double)w->x[i], (double)w->y[i]);
-  printf(" | rise5=%.2fm peak=%.2fm lateral=%.2fm "
-         "tail_band=%.2fm turns=%d early=%d/%d\n",
-         (double)w->rise_five, (double)w->rise_peak,
-         (double)w->horizontal_span, (double)w->tail_vertical_span,
-         w->tail_turns, w->early_rises, 5);
+  printf(" | rise10=%.2fm peak=%.2fm lateral=%.2fm\n",
+         (double)w->rise_ten, (double)w->rise_peak, (double)w->horizontal_span);
+}
+
+typedef struct {
+  int shots;
+  float slide_s, bore_err, body_err;
+} recoil_slide_t;
+
+// The slide is where the two barrels can part company. The body tilts under a
+// committed slide, so this fixture holds one at saturation and fires through it.
+// bore_err asks the contract: the round left along the barrel that was photographed
+// for it — the axis the player aims with, the one the reticle marks — no matter what
+// the carry is doing. body_err is the companion reading against the live
+// third-person barrel: the pose owes the bore its direction, and a slide's tilt is
+// exactly that debt. The bore the pose owes is the one standing at the end of the
+// tick, kick included; the round's is the one the trigger broke on.
+static recoil_slide_t recoil_slide_run(int ads) {
+  recoil_slide_t out = {0};
+  recoil_stage(1, WPN_AR, ads);
+  player_t *p = &g_players[0];
+  p->grounded = p->prev_grounded = 1;
+  p->crouched = 1;
+  p->sliding = 1;
+
+  // Forty ticks before the first round drive slide_s to saturation through the real
+  // weapon_anim_tick, so the shots are judged against a fully committed slide pose
+  // rather than its entry ramp. weapon_tick runs vm_tick for the local entity itself.
+  for (int t = -40; t < 30; t++) {
+    int held[IN_COUNT] = {0};
+    held[IN_ADS] = ads;
+    held[IN_CROUCH] = 1;
+    held[IN_FWD] = 1;
+    held[IN_FIRE] = t >= 0;
+    // weapon_tick integrates no velocity (player_tick owns that) but reads the speed
+    // every tick for the slide's exit predicate: hold it at run speed so the fixture
+    // measures the slide and never its settle into a crouch.
+    p->vel = (v3){{0.0f, 0.0f, -g_sim_mv[MV_RUN]}};
+    int ev0 = g_num_events;
+    weapon_tick(p, 0, held);
+    for (int i = 0; i < IN_COUNT; i++) p->prev_held[i] = held[i];
+    recoil_present_body(p);
+    out.slide_s = g_player_anim[0].slide_s;
+
+    v3 bore = gun_bore_dir(&p->wp, p->yaw, p->pitch);
+    for (int i = ev0; i < g_num_events; i++) {
+      const event_t *e = &g_events[i];
+      if (e->type != EV_FIRE || e->src != 0) continue;
+      v3 shot = v3_norm(e->b);
+      out.bore_err = fmaxf(out.bore_err,
+                           recoil_dir_angle(shot, g_fire_anchor_pose.gun_f));
+      out.body_err = fmaxf(out.body_err,
+                           recoil_dir_angle(bore, g_player_anim[0].pose.gun_f));
+      out.shots++;
+    }
+    g_tick++;
+  }
+  return out;
+}
+
+// The fixture's own invariants ride in the verdict rather than the row: a run that
+// fired nothing, or one whose slide settled before the first round, measures nothing
+// and may not read green.
+static int recoil_slide_print(const char *name, const recoil_slide_t *s) {
+  int ok = s->shots >= 3 && s->slide_s > 0.95f &&
+           s->bore_err < 0.001f && s->body_err < 0.001f;
+  printf("recoil slide %s shots=%d bore_err=%.4fdeg body_err=%.4fdeg %s\n",
+         name, s->shots, (double)s->bore_err, (double)s->body_err,
+         ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// THE PATTERN IS THE WEAPON, and this is the case that says so. One magazine of AR
+// proves the shape the player learns: opening rounds that cost nothing, a climb steep
+// enough to feel, a crown that keeps creeping instead of stopping at a ceiling, and a
+// sweep wide enough to have to be answered. Every row here reads the offset AT THE
+// SHOT, which is the follower's position and therefore trails the table by a round —
+// that lag is the whole point of the follower and the windows below are stated in it.
+// The two short runs beside it are the re-arm clock, read from both sides, and the
+// bolt gun's one repeated round.
+static int recoil_pattern_case(void) {
+  const float *arw = g_cfg.wp[WPN_AR];
+  const float *srw = g_cfg.wp[WPN_SR];
+  int ar_rearm = (int)arw[WP_RECOVER_MS] * TICK_HZ / 1000 + 1;
+  int sr_rearm = (int)srw[WP_RECOVER_MS] * TICK_HZ / 1000 + 1;
+  recoil_pattern_t mag = recoil_pattern_run(WPN_AR, RECOIL_PATTERN_SHOTS, 240);
+  recoil_pattern_t mag_again = recoil_pattern_run(WPN_AR,
+                                                 RECOIL_PATTERN_SHOTS, 240);
+  recoil_pattern_t late = recoil_pattern_run(WPN_AR, 3, ar_rearm);
+  recoil_pattern_t early = recoil_pattern_run(WPN_AR, 3, ar_rearm - 12);
+  recoil_pattern_t bolt = recoil_pattern_run(WPN_SR, 1, sr_rearm);
+  recoil_pattern_print("ar", &mag);
+  recoil_pattern_print("sr", &bolt);
+  // TWO ROUNDS LEAVE ALONG THE CALM AIM LINE, not one: the table's first row is zero
+  // and the follower cannot have moved off it before the second round is gone. A tap
+  // pair is exact, and that is the tapper's weapon this pattern promises.
+  int first_exact = mag.p[0] == 0.0f && mag.y[0] == 0.0f &&
+                    mag.p[1] == 0.0f && mag.y[1] == 0.0f;
+  int climb = 1, creep = 1;
+  // A THIRD OF A DEGREE PER ROUND IS THE FELT CLIMB, and the window starts at the round
+  // the climb first reaches: the follower carries the table one round, so the step the
+  // table authors for round n is what round n+1 flies along. The bound is a floor on
+  // the rate, not on the crown — where the climb ENDS is the creep's business below.
+  for (int i = 3; i < 11; i++)
+    if (mag.p[i] < mag.p[i - 1] + 0.3f) climb = 0;
+  float ymin = 1e9f, ymax = -1e9f;
+  for (int i = 10; i < mag.shots; i++) {
+    // THE CROWN CREEPS. No round of it falls back — and the last one sits a clear
+    // tenth above the first, so the twenty-ninth round costs more than the tenth and
+    // a magazine held down keeps asking the player for more. A held ceiling reads as
+    // a cap: past round ten the weapon would stop saying anything.
+    if (i > 10 && mag.p[i] < mag.p[i - 1]) creep = 0;
+    ymin = fminf(ymin, mag.y[i]);
+    ymax = fmaxf(ymax, mag.y[i]);
+  }
+  if (!(mag.p[mag.shots - 1] >= mag.p[10] * 1.15f)) creep = 0;
+  int sweep = mag.shots == RECOIL_PATTERN_SHOTS &&
+              ymax - ymin >= 1.5f * arw[WP_KICK_SIDE];
+  // Recovery is bounded by the authored clock: three time constants ARE RECOVERY,
+  // so falling from the top to nothing is a small multiple of it. The sharp half of
+  // this gate is the exact zero — an exponential alone never reaches one.
+  int recovery = mag.monotone && mag.quiet_ticks > 0 && mag.zero_ticks > 0 &&
+                 mag.zero_ticks >= mag.quiet_ticks &&
+                 mag.zero_ticks * 1000 <= (int)arw[WP_RECOVER_MS] * TICK_HZ * 3;
+  // The re-arm is a clock a finger can count, and it is the RECOVERY clock: one
+  // round after it is round 0 again, one round a tenth of a second short of it is
+  // not. The SR's bolt outlasts its own clock, so every SR round is round 0.
+  int rearm = mag.rearm_ticks * 1000 >= (int)arw[WP_RECOVER_MS] * TICK_HZ &&
+              (mag.rearm_ticks - 1) * 1000 < (int)arw[WP_RECOVER_MS] * TICK_HZ &&
+              late.again_shots == 1 && late.again_idx == 0 &&
+              late.again_p == mag.p[0] && late.again_y == mag.y[0] &&
+              early.again_shots == 1 && early.again_idx != 0;
+  // EVERY SR ROUND IS ROUND 0 — the index identity is exact — so every SR round leaves
+  // along the calm aim line and the kick it buys arrives behind it: the peak the
+  // follower climbs to is where the bolt gun's violence is. The second round is fired
+  // off a barrel the RECOVERY clock has brought back to within a tenth of that kick,
+  // which is what "the bolt outlasts recovery" means once the barrel follows.
+  int sr_single = bolt.shots == 1 && bolt.again_shots == 1 &&
+                  bolt.again_idx == 0 && bolt.p[0] == 0.0f && bolt.y[0] == 0.0f &&
+                  bolt.peak_p > srw[WP_KICK_UP] * 0.8f &&
+                  fabsf(bolt.again_p) < srw[WP_KICK_UP] * 0.1f &&
+                  fabsf(bolt.again_y) < srw[WP_KICK_SIDE] * 0.1f;
+  int pattern_deterministic = !memcmp(&mag, &mag_again, sizeof mag);
+  int pattern_ok = pattern_deterministic && first_exact && climb && creep &&
+                   sweep && recovery && rearm && sr_single;
+  printf("recoil pattern first=%d climb=%d creep=%d(%.2f->%.2fdeg) sweep=%.2fdeg "
+         "recovery=%d quiet=%dt zero=%dt rearm=%dt(%s) sr_single=%d deterministic=%d "
+         "%s\n",
+         first_exact, climb, creep, (double)mag.p[10],
+         (double)mag.p[mag.shots - 1], (double)(ymax - ymin), recovery,
+         mag.quiet_ticks, mag.zero_ticks, mag.rearm_ticks,
+         rearm ? "on clock" : "off clock", sr_single, pattern_deterministic,
+         pattern_ok ? "ok" : "FAIL");
+  return pattern_ok;
 }
 
 static void recoil_proof(void) {
@@ -1105,28 +1493,54 @@ static void recoil_proof(void) {
       recoil_print_samples(&a, &m, wi, ads, burst);
       int deterministic = !memcmp(&a, &b, sizeof a);
       int gameplay = recoil_gameplay_same(&a, &ref);
-      int bore_exact = a.nshot > 0 && fabsf(a.shot[0].wp.rec_p) < 1e-7f &&
-                       fabsf(a.shot[0].wp.rec_y) < 1e-7f;
-      int rng_static = a.nshot > 0 && a.end_rng == a.shot[0].rng;
+      // A CALM RIFLE SHOOTS WHERE IT LOOKS AND WHERE ITS OWN DRAW SENT IT: the first
+      // round of any burst leaves along the untouched aim line, every later one along
+      // the offset the previous round left standing — never along the one it is about
+      // to set — and each of them displaced by exactly the dispersion recoil_fire
+      // reproduced from the trigger-time weapon and stream. The bound is thousandths of
+      // a degree because the row is an IDENTITY, not a tolerance around a cone.
+      int bore_exact = a.nshot > 0 && fabsf(a.shot[0].bore_p) < 1e-7f &&
+                       fabsf(a.shot[0].bore_y) < 1e-7f;
+      // EVERY SHOT DRAWS EXACTLY TWICE. Two rng_rangef calls replayed from the state
+      // the trigger found land on the state the shot left, for a four-degree hip cone
+      // and for an ADS cone of exactly zero alike — that unconditional pair is what
+      // keeps a client's prediction and the server's replay on the same stream.
+      int rng_two = a.nshot > 0;
       for (int si = 0; si < a.nshot; si++) {
         float sy = atan2f(a.shot[si].dir.x, -a.shot[si].dir.z) / DEG2RAD;
         float sp = asinf(f_clamp(a.shot[si].dir.y, -1.0f, 1.0f)) / DEG2RAD;
-        if (fabsf(sy - a.shot[si].wp.rec_y) > 0.002f ||
-            fabsf(sp - a.shot[si].wp.rec_p) > 0.002f)
+        if (fabsf(sy - a.shot[si].want_y) > 0.002f ||
+            fabsf(sp - a.shot[si].want_p) > 0.002f)
           bore_exact = 0;
+        if (!a.shot[si].rng_two) rng_two = 0;
+      }
+      // The offset the last round asked for comes back to EXACTLY zero inside the trace
+      // and stays there: a rest state that is bit-stable is what makes the crosshair
+      // the truth between bursts, and a residual thousandth of a degree is not it.
+      // sample[n] is taken after loop tick n and a shot fired there is stamped n-1, so
+      // the first sample the last round no longer writes is last_shot_tick + 2 — and
+      // the RETURN only starts once that round's target is released, one round interval
+      // plus the pad later (rec_hold, sim/combat.inc). Until then the follower is still
+      // climbing onto the row, which is the last round's kick being paid.
+      int decayed = 0;
+      for (int t = a.last_shot_tick + 2 + gun_round_ticks(wi) + GUN_REC_HOLD_PAD;
+           t <= RECOIL_PROOF_TICKS; t++) {
+        const recoil_sample_t *s = &a.sample[t], *pr = &a.sample[t - 1];
+        if (fabsf(s->rec_p) > fabsf(pr->rec_p) + 1e-9f ||
+            fabsf(s->rec_y) > fabsf(pr->rec_y) + 1e-9f ||
+            s->rec_p * pr->rec_p < 0.0f || s->rec_y * pr->rec_y < 0.0f) {
+          decayed = 0;
+          break;
+        }
+        if (!decayed && s->rec_p == 0.0f && s->rec_y == 0.0f) decayed = t;
       }
       int shape = a.continuous && a.nshot == (burst ? RECOIL_PROOF_SHOTS : 1) &&
-                  bore_exact && rng_static && m.settle_tick &&
-                  m.settle_tick - a.last_shot_tick >= 14 &&
-                  m.settle_tick - a.last_shot_tick <= 58 && m.overshoot < 0.20f &&
-                  m.side > 0.0002f &&
-                  m.side <= (wi == WPN_SR ? 0.0041f : 0.0031f) &&
-                  m.bore_error < 0.001f &&
-                  m.muzzle > (wi == WPN_SR ? 0.8f : 0.12f) &&
-                  // The AR wall-trace tune intentionally reaches 4--6 degrees in
-                  // the airborne three-round fixture; the old 2-degree ceiling was
-                  // the same flat equilibrium that let the wall regression pass.
-                  m.muzzle < (wi == WPN_SR ? 12.5f : 6.5f);
+                  bore_exact && rng_two && decayed && m.side > 0.0002f &&
+                  // The viewmodel's lateral travel stays millimetres either way. The
+                  // SR's ceiling is the looser one because its table signs round 0
+                  // (a spammed pair pulls right twice) where the AR's opens at zero.
+                  m.side <= (wi == WPN_SR ? 0.0050f : 0.0031f) &&
+                  m.bore_error < 0.001f;
       if (!burst) {
         static const float BACK_LO[WPN_COUNT][2] = {
           [WPN_AR] = {0.009f, 0.007f}, [WPN_SR] = {0.018f, 0.010f},
@@ -1142,25 +1556,37 @@ static void recoil_proof(void) {
         const recoil_metric_t *one = &single[wi][ads];
         // At the real cooldown a later impulse can land in the previous spring's
         // return phase, so the absolute back peak need not be the final shot's peak.
-        // What must remain true is continuity, compression before lift, and a bounded
-        // accumulated response rather than a reset or an unbounded stack.
+        // What must remain true is continuity and a bounded accumulated response.
+        // The BORE'S TARGET accumulates nothing — it is the row, per round — so the
+        // AR's third round stands above its first by the table's climb, while the SR's
+        // three rounds all ask for the same row and differ only in how far the follower
+        // got: a spammed pair ends nearer that row, never past it. Neither weapon may
+        // pass the authored top inside a burst; the crown that does is the magazine's,
+        // and it is graded where the creep is (recoil_pattern_case).
+        float top = g_cfg.wp[wi][WP_KICK_UP];
         shape &= m.back > one->back * 0.95f && m.back < one->back * 3.1f &&
-                 m.muzzle > one->muzzle * 1.05f && m.muzzle < one->muzzle * 5.0f;
+                 m.muzzle <= top + 0.01f &&
+                 (wi == WPN_SR ? m.muzzle >= one->muzzle - 0.01f
+                               : m.muzzle > one->muzzle + 0.5f);
       }
       int case_ok = deterministic && gameplay && shape;
       printf("recoil %s %s %s peak back=%.2fmm@T%d lift=%.2fdeg@T%d "
-             "side=%.2fmm muzzle=%.2fdeg bore_err=%.4fdeg punch=%.2f overshoot=%.1f%% "
-             "shots=%d continuous=%d deterministic=%d gameplay_rng=%d %s\n",
+             "side=%.2fmm muzzle=%.2fdeg bore_err=%.4fdeg cone=%.2fdeg draws=2x%d "
+             "punch=%.2f overshoot=%.1f%% "
+             "zero=T%d shots=%d continuous=%d deterministic=%d gameplay_rng=%d %s\n",
              wi == WPN_SR ? "sr" : "ar", ads ? "ads" : "hip",
              burst ? "burst" : "single", (double)(m.back * 1000.0f), m.back_tick,
              (double)(m.lift / DEG2RAD), m.lift_tick, (double)(m.side * 1000.0f),
-             (double)m.muzzle, (double)m.bore_error, (double)m.punch,
-             (double)(m.overshoot * 100.0f),
+             (double)m.muzzle, (double)m.bore_error,
+             (double)(a.nshot ? a.shot[0].cone : 0.0f), rng_two ? a.nshot : 0,
+             (double)m.punch,
+             (double)(m.overshoot * 100.0f), decayed,
              a.nshot, a.continuous, deterministic, gameplay,
              case_ok ? "ok" : "FAIL");
       ok &= case_ok;
     }
   }
+  ok &= recoil_pattern_case();
   recoil_auto_t hip = recoil_auto_run(0);
   recoil_auto_t hip_again = recoil_auto_run(0);
   recoil_auto_t ads = recoil_auto_run(1);
@@ -1168,30 +1594,54 @@ static void recoil_proof(void) {
   int auto_deterministic = !memcmp(&hip, &hip_again, sizeof hip) &&
                            !memcmp(&ads, &ads_again, sizeof ads);
   int auto_axes = hip.vm_err < 0.001f && hip.body_err < 0.001f &&
-                  hip.anchor_err < 0.001f && hip.bore_err < 0.001f &&
+                  hip.anchor_err < 0.001f &&
                   ads.vm_err < 0.001f && ads.body_err < 0.001f &&
-                  ads.anchor_err < 0.001f && ads.bore_err < 0.001f &&
-                  ads.head_err < 0.001f;
+                  ads.anchor_err < 0.001f &&
+                  // The camera carries the WHOLE climb at recoil_view 1, hip and ADS
+                  // alike: aim where the dot is and the next round goes there.
+                  hip.head_err_recoil < 0.001f && ads.head_err_recoil < 0.001f &&
+                  // ...and the cheek weld hands the sway back at full ADS.
+                  ads.head_err_sway < 0.001f;
+  // The widest cone THIS fixture's stance can open: it runs at exactly MV_RUN, which is
+  // a move term of 1.0 — the clamp's 1.5x is a slide, and a slide is not what this
+  // fixture stages — on the ground, with a held trigger loading heat to its cap. A
+  // round outside this came from something that is not the cone; a run whose cone never
+  // opened at all means the draw is not reaching the trigger. ADS pays no hip term by
+  // construction — that is the e-sports promise.
+  const float *arw = g_cfg.wp[WPN_AR];
+  float move_max = arw[WP_MOVE_SPREAD] * 1.0f + GUN_HEAT_SPREAD * GUN_HEAT_CAP;
+  int auto_cone = hip.cone_deg > 0.0f && hip.cone_deg <= arw[WP_HIP_SPREAD] + move_max &&
+                  ads.cone_deg > 0.0f && ads.cone_deg <= move_max;
   int auto_shape = hip.shots >= 10 && ads.shots == hip.shots &&
                    hip.sway_peak > 0.05f && ads.sway_peak > 0.01f &&
                    ads.sway_peak < hip.sway_peak * 0.35f &&
                    hip.bore_peak > 0.80f && ads.bore_peak > 0.50f &&
                    hip.shot_span > 0.35f && ads.shot_span > 0.20f &&
-                   hip.head_err > 0.10f;
-  int auto_ok = auto_deterministic && auto_axes && auto_shape;
-  printf("recoil auto hip shots=%d sway=%.3fdeg bore=%.3fdeg span=%.3fdeg "
-         "axis(vm/body/anchor/bore/head)=%.4f/%.4f/%.4f/%.4f/%.4fdeg\n",
-         hip.shots, (double)hip.sway_peak, (double)hip.bore_peak,
-         (double)hip.shot_span, (double)hip.vm_err, (double)hip.body_err,
-         (double)hip.anchor_err, (double)hip.bore_err, (double)hip.head_err);
-  printf("recoil auto ads shots=%d sway=%.3fdeg bore=%.3fdeg span=%.3fdeg "
-         "axis(vm/body/anchor/bore/head)=%.4f/%.4f/%.4f/%.4f/%.4fdeg "
-         "deterministic=%d %s\n",
-         ads.shots, (double)ads.sway_peak, (double)ads.bore_peak,
-         (double)ads.shot_span, (double)ads.vm_err, (double)ads.body_err,
-         (double)ads.anchor_err, (double)ads.bore_err, (double)ads.head_err,
-         auto_deterministic, auto_ok ? "ok" : "FAIL");
+                   // Hipfire must NOT weld the head to the barrel's SWAY: the arms
+                   // absorb breathing and stride there, and the remainder is what the
+                   // eye does not see. The recoil channel is welded on purpose.
+                   hip.head_err_sway > 0.05f;
+  // THE EYE'S OWN CURVE, and the two things the player asked of it. A single tick may
+  // not carry a third of a degree of climb: the follower's biggest step is one round's
+  // authored gap times its rise coefficient (~0.2 deg at 750 rpm), while a barrel
+  // placed at the offset and bled between rounds delivers the WHOLE gap in one tick.
+  // And the crown must still be a slope rather than a ceiling — round 30 sits at least
+  // a tenth above round 10, or the pattern has stopped saying anything after the climb.
+  int auto_curve = hip.cam_step_max < 0.35f && ads.cam_step_max < 0.35f &&
+                   hip.cam_r30 > hip.cam_r10 * 1.10f &&
+                   ads.cam_r30 > ads.cam_r10 * 1.10f;
+  int auto_ok = auto_deterministic && auto_axes && auto_cone && auto_shape &&
+                auto_curve;
+  // The two stances print one row each; only the second carries the verdict, because
+  // every gate above reads BOTH runs and neither row can be graded on its own.
+  recoil_auto_tail_t auto_tail = {auto_curve, auto_deterministic, auto_ok};
+  recoil_auto_print("hip", &hip, arw[WP_HIP_SPREAD] + move_max, NULL);
+  recoil_auto_print("ads", &ads, move_max, &auto_tail);
   ok &= auto_ok;
+  recoil_slide_t slide_hip = recoil_slide_run(0);
+  recoil_slide_t slide_ads = recoil_slide_run(1);
+  ok &= recoil_slide_print("hip", &slide_hip);
+  ok &= recoil_slide_print("ads", &slide_ads);
   recoil_wall_t wall_hip = recoil_wall_run(0);
   recoil_wall_t wall_hip_again = recoil_wall_run(0);
   recoil_wall_t wall_ads = recoil_wall_run(1);
@@ -1200,23 +1650,18 @@ static void recoil_proof(void) {
   recoil_wall_print("ads", &wall_ads);
   int wall_deterministic = !memcmp(&wall_hip, &wall_hip_again, sizeof wall_hip) &&
                            !memcmp(&wall_ads, &wall_ads_again, sizeof wall_ads);
+  // What the player sees on the wall, and the only two things this fixture claims
+  // about it: by the tenth round the climb has walked the impacts well clear of the
+  // aim point (a floor, not a value — the tuning lives in the table), and the crown
+  // sweeps a lane wide enough to have to be answered and narrow enough to answer.
+  // ADS and hip trace the SAME pattern: aiming buys accuracy, not a different rifle.
   int wall_shape = wall_hip.shots == RECOIL_WALL_SHOTS &&
                    wall_ads.shots == RECOIL_WALL_SHOTS &&
-                   wall_hip.early_rises >= 4 && wall_ads.early_rises >= 4 &&
-                   wall_hip.rise_five > 0.90f && wall_ads.rise_five > 0.58f &&
-                   wall_hip.rise_peak > 1.05f && wall_ads.rise_peak > 0.68f &&
-                   wall_hip.rise_peak > wall_ads.rise_peak * 1.25f &&
-                   wall_hip.horizontal_span > 0.28f &&
-                   wall_ads.horizontal_span > 0.18f &&
-                   wall_hip.horizontal_span < 1.20f &&
-                   wall_ads.horizontal_span < 0.85f &&
-                   // No hard-looking cap: after the initial climb, the loaded
-                   // shoulder must reverse through a bounded vertical band.
-                   wall_hip.tail_vertical_span > 0.12f &&
-                   wall_ads.tail_vertical_span > 0.065f &&
-                   wall_hip.tail_vertical_span < 0.38f &&
-                   wall_ads.tail_vertical_span < 0.24f &&
-                   wall_hip.tail_turns >= 2 && wall_ads.tail_turns >= 2;
+                   wall_hip.rise_ten > 1.5f && wall_ads.rise_ten > 1.5f &&
+                   wall_hip.horizontal_span > 0.5f &&
+                   wall_ads.horizontal_span > 0.5f &&
+                   wall_hip.horizontal_span < 2.0f &&
+                   wall_ads.horizontal_span < 2.0f;
   printf("recoil wall deterministic=%d shape=%d %s\n", wall_deterministic,
          wall_shape, wall_deterministic && wall_shape ? "ok" : "FAIL");
   ok &= wall_deterministic && wall_shape;
@@ -1270,9 +1715,13 @@ static void gunwall_proof(void) {
                    p->wp.rec_p == 0.0f && p->wp.rec_y == 0.0f;
       // The tuck: run the real presentation path and read the carriage. A blocked
       // rifle must settle tucked with its rendered bore depressed; a clear one must
-      // stay level on the aim axis.
+      // stay level on the aim axis. The barrel recovers alongside, exactly as
+      // net_cl_present_advance recovers a figure nobody here simulates: the round
+      // that just left placed the pattern's kick on the bore, and a carriage reading
+      // taken before that has recovered is a reading of the shot, not of the tuck.
       for (int t = 0; t < 90; t++) {
         g_tick++;
+        gun_recoil_step(&p->wp);
         recoil_present_body(p);
       }
       float tuck = g_player_anim[0].gunwall_s;
@@ -1293,6 +1742,127 @@ static void gunwall_proof(void) {
   g_num_solids = save_solids;
   recoil_restore_globals();
   printf("gunwall %s\n", ok ? "ok" : "FAIL");
+  if (!ok) exit(1);
+}
+
+// --- The reticle contract -----------------------------------------------------------
+// Measured, not asserted: an AIMED round must arrive ON the eye line. The player aims
+// with one axis and the only reading that settles the promise is where the round
+// actually lands, so each case stands an impenetrable face in the round's way and
+// reports the impact MINUS the ANALYTIC intersection of the eye ray with that same
+// face. The hip rows measure the same geometry through the stance's cone and are
+// graded against its size; the ADS rows are the promise itself, and their cone is
+// zero by construction rather than by tolerance.
+// TWO SWEEPS, because the two ways this can be wrong fail differently. THREE DISTANCES
+// separate a PARALLEL offset (a muzzle that is not the eye) from an ANGULAR one (a
+// barrel that is not the aim): the first is constant in d, the second grows with it.
+// TWO AIMS put the level axis beside a tilted one, because on the level axis every
+// sine is zero and every cosine is one — a swapped sin/cos or a flipped sign in the
+// bore's own axis reads exactly zero there, and only the tilted pair holds that
+// assignment honest. The face rides in the scratch slot past the generated count, so
+// the reading is independent of the arena seed; both the count AND the slot's contents
+// are restored (at MAX_SOLIDS the clamp overwrites a real solid, and restoring only
+// the count would leave the synthetic face in the live arena for the rest of the run).
+static int boresight_case(int wpn, int ads, float yaw, float pitch, float dist,
+                          int slot) {
+  recoil_stage(1, wpn, ads);
+  // A CALM RIFLE, not a phase of the breathing cycle. Sway is a DELIBERATE wander of
+  // the bore off the aim — the hip crosshair draws it inside its cone, the camera
+  // follows 30% of it at hip and all of it at ADS, and recoil's `sway=` column is
+  // where its size is graded. Left in, this reading would be a lottery on the breath's
+  // phase (0.06 deg at hip, 2 cm at 18.5 m) and would say nothing about the boresight.
+  // Zeroed, the bore IS the aim, so every millimetre left over is the offset this proof
+  // came for. The cone is NOT zeroed: it is what the hip rows are graded against.
+  recoil_wp_zero(WP_SWAY, -1);
+  player_t *p = &g_players[0];
+  p->grounded = p->prev_grounded = 1;
+  p->yaw = yaw;
+  p->pitch = pitch;
+  v3 eye = player_eye_pos(p);
+  // THE REFERENCE RAY IS SPELLED OUT FROM THE ANGLES, deliberately not taken from
+  // bore_axis: an analytic check that asks the helper under test for its own answer
+  // agrees with it through any sign error either of them makes.
+  float hz = cosf(pitch);
+  v3 aim = {{sinf(yaw) * hz, sinf(pitch), -cosf(yaw) * hz}};
+  // The panel stands square across -z with its ENTRY FACE through that intersection,
+  // so `want` is the point the round has to arrive on and the row is the miss measured
+  // on the face. The z face is always the one entered first: the slab is 0.5 m deep
+  // and the aim crosses under a metre of x or y over that depth, against a face 6 m
+  // across. The fixture stands 20 m up (recoil_stage), so a tilted aim meets the panel
+  // and never the arena floor.
+  v3 want = v3_add(eye, v3_scale(aim, dist));
+  g_solids[slot] = (solid_t){
+      .min = {{want.x - 3.0f, want.y - 3.0f, want.z - 0.5f}},
+      .max = {{want.x + 3.0f, want.y + 3.0f, want.z}},
+      .pen = 0};
+  g_num_solids = slot + 1;
+
+  // Sixty ticks of the real weapon and presentation path settle the ADS blend, the
+  // sway springs and the carry pose, so the round leaves a calm rifle and the reading
+  // is the standing geometry rather than a transient.
+  int held[IN_COUNT] = {0};
+  held[IN_ADS] = ads;
+  for (int t = 0; t < 60; t++) {
+    weapon_tick(p, 0, held);
+    for (int i = 0; i < IN_COUNT; i++) p->prev_held[i] = held[i];
+    recoil_present_body(p);
+    g_tick++;
+  }
+  held[IN_FIRE] = 1;
+  int ev0 = g_num_events;
+  weapon_tick(p, 0, held);
+
+  const event_t *fire = NULL;
+  for (int i = ev0; i < g_num_events; i++)
+    if (g_events[i].type == EV_FIRE && g_events[i].src == 0) fire = &g_events[i];
+  // k == 1 is "the round stopped on a solid" — this face is the only solid left in the
+  // arena, so a k of anything else means the shot left the 6 x 6 m panel entirely and
+  // there is no impact to measure. A tilted aim meets the face obliquely, which makes
+  // the same angular error read LARGER on it than on the level axis: the gate is
+  // stricter off-axis, never looser.
+  int found = fire && fire->k == 1;
+  float dy = found ? fire->a.y - want.y : 0.0f;
+  float dx = found ? fire->a.x - want.x : 0.0f;
+  // THE ADS ROWS ARE THE PROMISE: standing, grounded, cold and fully aimed, gun_spread
+  // is hip*(1-1) + move*0 + 0 + 0 = ZERO by construction, so an aimed round arrives on
+  // the eye line to the centimetre. The HIP rows carry the cone and can only be graded
+  // against its size: HIP SPREAD is the whole radius here (the fixture is still and on
+  // the ground, and heat is zero until this very round adds it), and it reads on the
+  // panel as an angle, so the allowance is that angle over the path to the face. The
+  // path is dist/|aim.z| and not dist, because a tilted aim meets a face square across
+  // -z obliquely and the same angular error lands further out on it.
+  float allow = 0.01f;
+  if (!ads) allow += tanf(g_sim_wp[wpn][WP_HIP_SPREAD] * DEG2RAD) * dist /
+                     fmaxf(fabsf(aim.z), 0.1f);
+  int ok = found && fabsf(dy) < allow && fabsf(dx) < allow;
+  printf("boresight %s %s aim=(%+.2f %+.2f) d=%.1f dy=%+.3f dx=%+.3f "
+         "allow=%.3f %s\n",
+         wpn == WPN_SR ? "sr" : "ar", ads ? "ads" : "hip", (double)yaw,
+         (double)pitch, (double)dist, (double)dy, (double)dx, (double)allow,
+         ok ? "ok" : "FAIL");
+  return ok;
+}
+
+static void boresight_proof(void) {
+  recoil_save_globals();
+  int ok = 1;
+  int save_solids = g_num_solids;
+  int slot = save_solids >= MAX_SOLIDS ? MAX_SOLIDS - 1 : save_solids;
+  solid_t save_slot = g_solids[slot];
+  static const float D[3] = {4.5f, 10.5f, 18.5f};
+  // Level, then off both axes at once with unequal magnitudes and opposite signs, so a
+  // swapped sin/cos, a transposed component and a flipped sign each land somewhere
+  // different on the face.
+  static const float AIM[2][2] = {{0.0f, 0.0f}, {0.70f, -0.20f}};
+  for (int wi = 0; wi < WPN_COUNT; wi++)
+    for (int ads = 0; ads < 2; ads++)
+      for (int ai = 0; ai < 2; ai++)
+        for (int di = 0; di < 3; di++)
+          ok &= boresight_case(wi, ads, AIM[ai][0], AIM[ai][1], D[di], slot);
+  g_solids[slot] = save_slot;
+  g_num_solids = save_solids;
+  recoil_restore_globals();
+  printf("boresight %s\n", ok ? "ok" : "FAIL");
   if (!ok) exit(1);
 }
 
@@ -1478,7 +2048,7 @@ typedef struct {
   v3 pub_cam0, pub_cam1;
   float remap0, remap1, publish0, publish1;
   float vm_depth0, fx_depth0, vm_depth1, fx_depth1;
-  float latch, shot_axis, ballistic_anchor;
+  float latch, shot_axis, ballistic_eye;
   long pub_tick0, pub_tick1;
   int fire_events, all_events, map0_ok, map1_ok, stale_rejected;
 } vmframe_fire_t;
@@ -1549,7 +2119,19 @@ static vmframe_fire_t vmframe_fire_case(int predicting) {
   a->ready_s = a->prev_ready_s = 0.0f;
   skel_solve(a, p->pos, p->yaw, p->pitch, WPN_SR, 1, SKEL_POSE_ONLY);
   g_predicting = predicting;
+  // A CONE-FREE RIFLE. What the row below grades is PLUMBING — that the trigger does
+  // not move the barrel between taking the angles and pushing the event, and that a, b
+  // and f invert back onto the eye. The spread cone throws the round off that barrel ON
+  // PURPOSE and by a whole degree, so leaving it in would replace an exact identity
+  // with a reading of the dispersion, which recoil already owns. Only the two stance
+  // columns go; heat and air cannot open a cone on a cold, grounded, single round.
+  recoil_wp_zero(WP_HIP_SPREAD, WP_MOVE_SPREAD);
   int ev0 = g_num_events;
+  // The barrel as the trigger found it. The pattern's kick is placed by this very
+  // call, so the reference has to be taken before it — after it, the weapon stands
+  // one round further on and the round in flight would be graded against a barrel it
+  // never left along.
+  v3 bore_at_trigger = gun_bore_dir(&p->wp, p->yaw, p->pitch);
   gun_shoot(0, &p->wp, player_eye_pos(p), p->yaw, p->pitch,
             p->vel, p->grounded, &g_rng_gun[0]);
 
@@ -1563,10 +2145,23 @@ static vmframe_fire_t vmframe_fire_case(int predicting) {
       const event_t *e = &g_events[i];
       out.fire_events++;
       v3 event_dir = v3_norm(e->b);
-      out.shot_axis = v3_len(v3_sub(event_dir,
-                                    v3_norm(g_fire_anchor_pose.gun_f))) * 1000.0f;
-      v3 event_muzzle = v3_sub(e->a, v3_scale(event_dir, e->f));
-      out.ballistic_anchor = v3_len(v3_sub(event_muzzle, out.anchor0));
+      // THE SIM BORE IS THE REFERENCE, read off the weapon state gun_shoot was handed.
+      // That makes it an identity in every direction but one: the trigger may not move
+      // the barrel between taking the angles and pushing the event, and this is what
+      // holds that (a stray write to rec_* or sway_* ahead of the trace shows up here
+      // and nowhere else on this row — the round's own kick is placed after, and is
+      // graded by recoil's pattern rows). The live "did the round go where the player
+      // aimed" reading lives in boresight's impact and recoil's bore_err/auto axes,
+      // which measure against the world.
+      out.shot_axis = v3_len(v3_sub(event_dir, bore_at_trigger)) * 1000.0f;
+      // ...AND THE ROUND STARTS AT THE EYE THE FIXTURE HANDED gun_shoot, so what this
+      // grades is the TRIPLE'S INVERTIBILITY: a, b and f agree closely enough that
+      // `a - b*f` lands back on the origin. That is a contract, not a formality — it
+      // is how vfx_ev_fire's fallback, audio's shot placement and the fly-by crack all
+      // recover the start, and a `f` measured from anywhere else silently moves three
+      // subsystems at once. The barrel tip is presentation, graded as `anchor`.
+      v3 event_origin = v3_sub(e->a, v3_scale(event_dir, e->f));
+      out.ballistic_eye = v3_len(v3_sub(event_origin, player_eye_pos(p)));
     }
   out.all_events = g_num_events - ev0;
   for (int i = 0; i < MAX_TRACERS; i++)
@@ -1916,6 +2511,12 @@ static void vmframe_proof(void) {
   float fx1 = v3_len(v3_sub(event.fx1, pred.fx1));
   float pose0 = v3_len(v3_sub(event.pose0, pred.pose0));
   float pose1 = v3_len(v3_sub(event.pose1, pred.pose1));
+  // anchor0 is an identity on the anchor branch — vfx_ev_fire starts the tracer on
+  // pose_muzzle(g_fire_anchor_pose) — and the branch is what it grades: the anchor
+  // still carried THIS shot's src and tick when VFX ran. A stale or foreign one drops
+  // in the eye fallback and this reads a metre. visible_hold0 is the live measurement
+  // beside it: the LIVE pose's muzzle against the same tracer, two poses that nothing
+  // assigns to each other.
   float anchor0 = v3_len(v3_sub(event.anchor0, event.tracer));
   float visible_hold0 = v3_len(v3_sub(event.pose0, event.tracer));
   float pub0 = fmaxf(event.publish0, pred.publish0);
@@ -1948,18 +2549,18 @@ static void vmframe_proof(void) {
                 remap0 <= 0.002f && remap1 <= 0.002f &&
                 pose0 <= 0.002f && pose1 > 0.002f && anchor0 <= 0.002f &&
                 visible_hold0 <= 0.002f && event.shot_axis <= 0.001f &&
-                event.ballistic_anchor <= 0.002f;
+                event.ballistic_eye <= 0.002f;
   printf("vmframe fire sr T0 vm_pair=%.3fmm fx_pair=%.3fmm "
          "publish=%.3fmm pair=%.3fmm remap=%.3fmm "
          "pose_pair=%.3fmm anchor=%.3fmm visible_hold=%.3fmm "
-         "bore=%.4fmrad ballistic=%.3fmm "
+         "bore=%.4fmrad ballistic_eye=%.3fmm "
          "depth_vm/fx=%.1f/%.1fmm "
          "tick=%ld stale=%d\n",
          (double)(vm0 * 1000.0f), (double)(fx0 * 1000.0f),
          (double)(pub0 * 1000.0f), (double)(pub_pair0 * 1000.0f),
          (double)(remap0 * 1000.0f), (double)(pose0 * 1000.0f),
          (double)(anchor0 * 1000.0f), (double)(visible_hold0 * 1000.0f),
-         (double)event.shot_axis, (double)(event.ballistic_anchor * 1000.0f),
+         (double)event.shot_axis, (double)(event.ballistic_eye * 1000.0f),
          (double)(event.vm_depth0 * 1000.0f),
          (double)(event.fx_depth0 * 1000.0f), event.pub_tick0,
          event.stale_rejected && pred.stale_rejected);
@@ -2184,13 +2785,29 @@ static int netrecoil_case(int burst) {
                       !memcmp(&p->vm, &endpoint.vm, sizeof p->vm) &&
                       g_rng_gun[0] == endpoint_rng;
   anim_t *ra = &g_player_anim[rh];
+  // THE ECHO SETS A TARGET AND THE FOLLOWER WALKS ONTO IT — the same two halves the
+  // shooter's own weapon has, because it is the same weapon_t and the same one copy of
+  // gun_recoil_set. The echoed round number (echo[1].i = 4, WPN_SR) puts the foreign
+  // TARGET at the pattern's degrees at once, with the barrel itself still where it was;
+  // the presentation tick below is what moves it, off the client's own
+  // net_cl_present_advance, exactly as an unsimulated figure is advanced in play.
+  // gun_recoil_set's own math (sim/combat.inc) is st[1] * wp[WP_KICK_UP] — reproduced
+  // here, not just floored, because a lone lower bound would pass on any nonzero echo,
+  // SR or AR. fabsf rather than bit-equality: this call site and ent_on_event's are not
+  // guaranteed the same FP contraction.
+  float want_rec_p = gun_pattern(WPN_SR, 4)[1] * g_sim_wp[WPN_SR][WP_KICK_UP];
   int body_impulse = ra->recoil_back == 0.0f && ra->recoil_lift == 0.0f &&
                      ra->recoil_back_v > 0.5f && ra->recoil_lift_v == 0.0f &&
-                     remote_p->wp.rec_p == 0.0f && remote_p->wp.rec_p_v > 1.0f;
+                     fabsf(remote_p->wp.rec_tp - want_rec_p) < 1e-6f &&
+                     remote_p->wp.rec_p == 0.0f;
   g_tick++;
+  net_cl_present_advance();
   client_anim_all();
+  // ...and one tick later the barrel is on its way to that target and the target still
+  // stands: rec_hold holds the crown up for a viewer with no trigger to watch.
   int body_moved = ra->recoil_back > 0.004f && ra->recoil_lift == 0.0f &&
-                   remote_p->wp.rec_p_v > 1.0f;
+                   fabsf(remote_p->wp.rec_tp - want_rec_p) < 1e-6f &&
+                   remote_p->wp.rec_p > 0.0f && remote_p->wp.rec_p < want_rec_p;
   int corrected = g_cl_corrections == 1 && g_cl_worst_err_mm > 50.0f;
   int snapshot_sidefx_same = p->shots == forward_player_shots &&
                              g_match.shots[0] == forward_match_shots &&
@@ -2206,6 +2823,7 @@ static int netrecoil_case(int burst) {
            g_cl_ev_applied == 2 && g_cl_ev_dupes == 0;
   printf("netrecoil %s corr=%.1fmm peak=%.2f/%.2fmm@T%d/T%d "
          "end_vm=%d series=%d ammo=%d/%d heat=%.6f rec=(%.6f %.6f) "
+         "remote_rec=%.4f/%.4f "
          "rng=%016llx echo_once=%d replay_body=%d remote3p=(%d %d) "
          "sidefx=%d/%d counts=%d/%d noise_t=%ld events=%d/%d %s\n",
          burst ? "burst" : "single", (double)g_cl_worst_err_mm,
@@ -2213,6 +2831,7 @@ static int netrecoil_case(int burst) {
          ref.peak_tick, peak_tick, endpoint_same, series_same,
          p->wp.ammo[WPN_AR], endpoint.wp.ammo[WPN_AR], (double)p->wp.heat,
          (double)p->wp.rec_p, (double)p->wp.rec_y,
+         (double)remote_p->wp.rec_p, (double)remote_p->wp.rec_tp,
          (unsigned long long)g_rng_gun[0], endpoint_same, replay_anim_same,
          body_impulse, body_moved, direct_sidefx_same, snapshot_sidefx_same,
          forward_player_shots, forward_match_shots, forward_noise.tick,

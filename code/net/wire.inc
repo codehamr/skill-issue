@@ -21,7 +21,15 @@
 // 9: hip spread joined the wp table ACCEPT carries.
 // 10: the three cone parameters became physical hip/move/heat recoil parameters;
 //     layout is unchanged, semantics are not, so mixed builds must not play together.
-#define NET_PROTO 10
+// 11: hip/move recoil became hip/move SPREAD (degrees of cone) and kick_* became the
+//     pattern's scale; layout unchanged, semantics not — mixed builds must not play
+//     together. It also covers the compiled-in RECOIL SEMANTICS the wp table drives:
+//     the pattern table itself and whether the barrel is PLACED on a row or FOLLOWS it
+//     (gun_recoil_step, sim/combat.inc). Two builds numbered 11 from either side of
+//     that change agree on every byte and disagree on every round's bore, and no bump
+//     covers it because nothing shipped in between — a wire number cannot police a
+//     table both ends compile in, so a released build is the only line worth drawing.
+#define NET_PROTO 11
 // Floor on an UNVERIFIED request, so the answer to one is always smaller than the
 // request was and the responder cannot be pointed at a forged source address:
 // NET_CONNECT_MIN 16 against the 7-byte COOKIE reply.

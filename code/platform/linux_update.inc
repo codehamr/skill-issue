@@ -200,6 +200,8 @@ static int native_main(int w, int h, uint32_t seed) {
   }
   int scr = DefaultScreen(g_xdpy);
   g_xroot = RootWindow(g_xdpy, scr);
+  g_win_w = w;   // what a later exit from fullscreen resizes back to
+  g_win_h = h;
   if (g_fullscreen) {
     w = DisplayWidth(g_xdpy, scr);
     h = DisplayHeight(g_xdpy, scr);
