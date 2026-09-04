@@ -927,6 +927,16 @@ static void renderer_init(int width, int height) {
   R.u_gl_scene = glGetUniformLocation(R.prog_glare, "uScene");
   R.u_gl_bloom = glGetUniformLocation(R.prog_glare, "uBloom");
   R.u_gl_aa = glGetUniformLocation(R.prog_glare, "uAA");
+  R.prog_volume = gl_program(BLUR_VS, VOLUME_FS);
+  R.u_vol_depth   = glGetUniformLocation(R.prog_volume, "uDepth");
+  R.u_vol_shadow  = glGetUniformLocation(R.prog_volume, "uShadow");
+  R.u_vol_invvp   = glGetUniformLocation(R.prog_volume, "uInvVP");
+  R.u_vol_lightvp = glGetUniformLocation(R.prog_volume, "uLightVP");
+  R.u_vol_eye     = glGetUniformLocation(R.prog_volume, "uEye");
+  R.u_vol_sundir  = glGetUniformLocation(R.prog_volume, "uSunDir");
+  R.u_vol_suncol  = glGetUniformLocation(R.prog_volume, "uSunCol");
+  R.u_vol_atmo    = glGetUniformLocation(R.prog_volume, "uAtmoTint");
+  R.u_vol_p       = glGetUniformLocation(R.prog_volume, "uVol");
   R.prog_bdown = gl_program(BLUR_VS, BLOOM_DOWN_FS);
   R.u_bd_tex   = glGetUniformLocation(R.prog_bdown, "uTex");
   R.u_bd_px    = glGetUniformLocation(R.prog_bdown, "uPix");
@@ -1043,4 +1053,3 @@ static int glyph_index(char ch) {
   if (c >= 1 && c <= HF_ICONS) return HF_ASCII + (int)c - 1;  // \x01.. icons
   return -1;
 }
-

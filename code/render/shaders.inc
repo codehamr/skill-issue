@@ -1,6 +1,6 @@
 // =============================================================================
 // render/shaders.inc  —  every GLSL source string (GLSL_ENV, WORLD_FS, SKY_FS,
-// BLUR/GLARE/HUD). Proof: the shot-* battery + the shimmer rig (CLAUDE.md).
+// BLUR/VOLUME/GLARE/HUD). Proof: the shot-* battery + the shimmer rig (CLAUDE.md).
 // One TU: included once by game.c, in definition order — moving a definition
 // out is a semantic change.
 // Contract: constants crossing the C/GLSL boundary (WORLD_GROUND_R) are
@@ -764,7 +764,7 @@ static const char *WORLD_FS =
   "  if (uDetail > 0.0) det = exp(-d * 0.035);\n"
   // GATED ON uDetail, WHICH IS ZERO FOR EVERY FIGURE AND THE WHOLE VIEWMODEL. uDetail
   // has three writers: the sky pass sets 0, the two world draws set 1.
-  "  float rough;\n"
+  "  float rough, surf_h = 0.5;\n"
   "  if (uDetail > 0.0) {\n"
   "  vec3 cell = floor(vWorld * 14.0);\n"       // ~7 cm grain, world-anchored
   "  float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);\n"
@@ -773,9 +773,25 @@ static const char *WORLD_FS =
   "  vec2 cp2 = abs(n.y) > 0.5 ? vWorld.xz\n"
   "           : (abs(n.x) > 0.5 ? vWorld.zy : vWorld.xy);\n"
   "  float h2 = vnoise2(cp2 * 1.7);\n"
+  "  surf_h = h2;\n"
   "  alb *= 1.0 + (h - 0.5) * 0.075 * det + (h2 - 0.5) * 0.085 * uDetail;\n"
   "  rough = clamp(vMat.x + (h2 - 0.5) * 0.16 * uDetail, 0.045, 1.0);\n"
   "  } else rough = clamp(vMat.x, 0.045, 1.0);\n"
+  // PROCEDURAL RELIEF FROM THE MATERIAL FIELD ALREADY IN REGISTERS. The broad
+  // concrete variation above is not only pigment: aggregate and worn render leave
+  // shallow height changes that catch a grazing sun. Screen derivatives turn that
+  // same scalar field into a surface gradient without another noise lookup. The
+  // perturbation is restricted to upright world faces (sand and water have their own
+  // normals below), and det fades it before the projected pattern becomes sub-pixel.
+  "  if (uDetail > 0.0 && abs(n.y) < 0.82 && det > 0.04) {\n"
+  "    vec3 dpdx = dFdx(vWorld), dpdy = dFdy(vWorld);\n"
+  "    vec3 r1 = cross(dpdy, n), r2 = cross(n, dpdx);\n"
+  "    float hd = dot(dpdx, r1);\n"
+  "    if (abs(hd) > 1.0e-8) {\n"
+  "      vec3 sg = sign(hd) * (dFdx(surf_h) * r1 + dFdy(surf_h) * r2);\n"
+  "      n = normalize(abs(hd) * n - sg * (0.090 * det));\n"
+  "    }\n"
+  "  }\n"
   // ...and the metalness is its MAGNITUDE: the sign is the tool direction. See
   // mat_lathe. Nothing outside gun_build writes a negative, so the world is unchanged.
   "  float metal = abs(vMat.y), ao = vMat.z;\n"
@@ -1167,7 +1183,7 @@ static const char *WORLD_FS =
   // The glitter rides in AS A LIGHT, after the shadow term and scaled by it: a
   // spark in a wall's shadow is a spark with no sun on it, and adding this
   // before `sh` was the difference between mica and fairy lights.
-  "  if (glint > 0.0) col += SUN_COL * glint * sh * 0.32;\n"
+  "  if (glint > 0.0) col += SUN_COL * glint * sh * 0.44;\n"
   // The viewmodel is not in the world: it has its own projection and its own depth
   // clear, and the world shadow map does not cover it.
   "  if (uVm > 0.5) {\n"
@@ -1459,6 +1475,75 @@ static const char *AOBLUR_FS =
   "  oCol = vec4(acc / ws, c.g, 0.0, 1.0);\n"
   "}\n";
 
+// SHADOWED VOLUMETRIC SUNLIGHT at quarter resolution. Each pixel reconstructs
+// its camera ray from the prepass depth and integrates the arena's height-profiled
+// dust only as far as the first opaque surface. Every step asks the SAME sun shadow
+// map as WORLD_FS, so walls and figures carve light shafts out of the medium instead
+// of a radial screen blur guessing where an occluder might be. Twelve single-tap
+// comparisons at quarter resolution are three quarters of one shadow lookup per
+// full-resolution pixel; the existing Kawase pair filters the deterministic spatial
+// jitter and softens the beam edges before the composite.
+static const char *VOLUME_FS =
+  "#version 330 core\n"
+  "in vec2 vUV; out vec4 oCol;\n"
+  "uniform sampler2D uDepth;\n"
+  "uniform sampler2DShadow uShadow;\n"
+  "uniform mat4 uInvVP, uLightVP;\n"
+  "uniform vec3 uEye, uSunDir, uSunCol, uAtmoTint;\n"
+  // x = medium strength, y = shadow-map gate, z = exposure, w = haze density.
+  "uniform vec4 uVol;\n"
+  "vec3 world_at(float d){\n"
+  "  vec4 p = uInvVP * vec4(vUV * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);\n"
+  "  return p.xyz / p.w;\n"
+  "}\n"
+  "float shadow_at(vec3 p){\n"
+  "  if (uVol.y < 0.5) return 1.0;\n"
+  "  vec4 q = uLightVP * vec4(p, 1.0);\n"
+  "  vec3 s = q.xyz / q.w * 0.5 + 0.5;\n"
+  "  if (s.z <= 0.0 || s.z >= 1.0) return 1.0;\n"
+  // A small receiver bias is enough for volume samples: unlike a surface they
+  // cannot self-shadow, and the bilinear comparison already supplies a soft edge.
+  "  return texture(uShadow, vec3(s.xy, s.z - 0.00020));\n"
+  "}\n"
+  "void main(){\n"
+  "  if (uVol.x <= 0.0) { oCol = vec4(0.0); return; }\n"
+  "  float z = texture(uDepth, vUV).r;\n"
+  "  vec3 ray = world_at(z >= 0.99999 ? 1.0 : z) - uEye;\n"
+  "  float raw_len = length(ray);\n"
+  "  float ray_len = min(raw_len, 72.0);\n"
+  "  if (ray_len < 0.18) { oCol = vec4(0.0); return; }\n"
+  "  vec3 rd = ray / raw_len;\n"
+  // Schlick's rational fit to a forward-scattering dust phase function. It has
+  // the strong sun-facing peak that makes shafts read, without a sqrt per sample.
+  "  float mu = clamp(dot(rd, uSunDir), -1.0, 1.0);\n"
+  "  float k = 0.792, den = 1.0 - k * mu;\n"
+  "  float phase = 0.0293337 / max(den * den, 1.0e-4);\n"
+  // Stable screen-space jitter breaks twelve hard depth bands; the following
+  // quarter-resolution blur integrates it, while deterministic captures stay exact.
+  "  vec3 h = fract(vec3(gl_FragCoord.xy, gl_FragCoord.x + 19.1) * 0.1031);\n"
+  "  h += dot(h, h.yzx + 33.33);\n"
+  "  float jitter = fract((h.x + h.y) * h.z);\n"
+  "  float step_len = ray_len * (1.0 / 12.0);\n"
+  "  float optical = 0.0, lit_depth = 0.0;\n"
+  "  for (int i = 0; i < 12; i++) {\n"
+  "    float t = (float(i) + 0.25 + jitter * 0.50) * step_len;\n"
+  "    vec3 p = uEye + rd * t;\n"
+  // Second-order reciprocal approximation to exp(-height / 9 m): monotone,
+  // close over the arena's 0..5 m range and no transcendental inside the loop.
+  "    float yh = max(p.y, 0.0) * 0.1111;\n"
+  "    float density = 1.0 / (1.0 + yh * (1.0 + 0.50 * yh));\n"
+  "    optical += density * step_len;\n"
+  "    float trans = 1.0 / (1.0 + optical * uVol.w * 0.020);\n"
+  "    lit_depth += shadow_at(p) * density * trans * step_len;\n"
+  "  }\n"
+  // The result joins a display-referred composite, so apply the same exposure and
+  // a compact shoulder here. sqrt is the renderer's gamma-2 display encoding.
+  "  vec3 c = uSunCol * uAtmoTint\n"
+  "         * (lit_depth * uVol.w * phase * uVol.x * 0.0065 * uVol.z);\n"
+  "  c = sqrt(clamp(c / (1.0 + c), 0.0, 1.0));\n"
+  "  oCol = vec4(c, 1.0);\n"
+  "}\n";
+
 // THE BLOOM CHAIN — progressive, the Call of Duty: Advanced Warfare
 // construction (Jimenez 2014): a 13-tap downsample from each level to the
 // next (four levels from a quarter of the frame down to a thirty-second),
@@ -1663,4 +1748,3 @@ static const char *HUD_FS =
   "  if (vMode >= 2.0) a = v;\n"
   "  else { float w = max(fwidth(v), 1e-4); a = smoothstep(vMode - w, vMode + w, v); }\n"
   "  oCol = vec4(vCol.rgb, vCol.a * a); }\n";
-

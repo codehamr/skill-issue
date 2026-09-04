@@ -359,6 +359,11 @@ typedef struct {
   GLuint prog_glare;                // bloom + light shafts (see glare_pass)
   GLint  u_gl_tex, u_gl_sun, u_gl_knee, u_gl_gain, u_gl_mode, u_gl_grade;
   GLint  u_gl_scene;                // the composite's read of the scene target
+  // Quarter-resolution shadow-map volume integration. The output reuses the
+  // glare ping-pong pair and therefore owns no render target of its own.
+  GLuint prog_volume;
+  GLint  u_vol_depth, u_vol_shadow, u_vol_invvp, u_vol_lightvp;
+  GLint  u_vol_eye, u_vol_sundir, u_vol_suncol, u_vol_atmo, u_vol_p;
   int    blur_w, blur_h;            // size the blur chain was built for
   // THE SCENE TARGET: where the picture is built when MSAA is off, and where the
   // multisample target resolves to when it is on. Its colour is what the

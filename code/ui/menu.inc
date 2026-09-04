@@ -1113,7 +1113,8 @@ static void rt_bind(GLuint fbo, int w, int h) {
 // It reuses the frosted menu's ping-pong pair rather than owning targets:
 // scene -> blur[0] (the blit), bright+shafts -> blur[1], two Kawase taps back
 // and forth. Nothing here allocates.
-static void glare_chain(float sx, float sy, float rays) {
+static void glare_chain(float sx, float sy, float rays, const mat4 *vp,
+                        v3 eye, int shadow_on) {
   glBindFramebuffer(GL_READ_FRAMEBUFFER, R.scene_fbo);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, R.blur_fbo[0]);
   glBlitFramebuffer(0, 0, R.width, R.height, 0, 0, R.blur_w, R.blur_h,
@@ -1144,17 +1145,45 @@ static void glare_chain(float sx, float sy, float rays) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
   }
   glDisable(GL_BLEND);
-  // The shafts: the march through the bloom-weighted picture, quarter res.
+  // The shafts: a true camera-ray integration through the shadowed atmosphere,
+  // quarter res. The depth stops the integral at the first visible surface and
+  // the shadow map carves the sunlit medium into spatial beams.
   glViewport(0, 0, R.blur_w, R.blur_h);
+  glUseProgram(R.prog_volume);
+  glUniform1i(R.u_vol_depth, 1);
+  glUniform1i(R.u_vol_shadow, 0);
+  { mat4 inv = m4_inverse(vp);
+    v3 at = atmo_tint();
+    glUniformMatrix4fv(R.u_vol_invvp, 1, GL_FALSE, inv.m);
+    glUniformMatrix4fv(R.u_vol_lightvp, 1, GL_FALSE, R.light_vp.m);
+    glUniform3f(R.u_vol_eye, eye.x, eye.y, eye.z);
+    glUniform3f(R.u_vol_sundir, g_sun.dir.x, g_sun.dir.y, g_sun.dir.z);
+    glUniform3f(R.u_vol_suncol, g_sun.col.x, g_sun.col.y, g_sun.col.z);
+    glUniform3f(R.u_vol_atmo, at.x, at.y, at.z);
+    glUniform4f(R.u_vol_p, rays, shadow_on ? 1.0f : 0.0f,
+                g_sun.exposure * g_cfg.brightness, atmo_haze()); }
+  rt_bind(R.blur_fbo[1], R.blur_w, R.blur_h);
+  gl_active_texture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, R.depth_tex);
+  gl_active_texture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, R.sm_tex);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+
+  // A restrained radial component remains as lens scatter around the source.
+  // It adds shape near the solar disc while the shadowed volume carries the
+  // world-space structure, and is intentionally much weaker than the old shaft.
   glUseProgram(R.prog_glare);
   glUniform1i(R.u_gl_tex, 0);   // mode 0 reads this one and no other
   glUniform1f(R.u_gl_mode, 0.0f);
   glUniform3f(R.u_gl_sun, sx * 0.5f + 0.5f, sy * 0.5f + 0.5f, rays);
   glUniform2f(R.u_gl_knee, 0.78f, 0.97f);
-  glUniform3f(R.u_gl_gain, 0.0f, 0.85f, 0.0f);   // shafts only; the bloom has its chain
+  glUniform3f(R.u_gl_gain, 0.0f, 0.18f, 0.0f);   // lens scatter; bloom has its chain
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE);
   glBindFramebuffer(GL_FRAMEBUFFER, R.blur_fbo[1]);
   glBindTexture(GL_TEXTURE_2D, R.blur_tex[0]);
   glDrawArrays(GL_TRIANGLES, 0, 3);
+  glDisable(GL_BLEND);
   // Two growing dual-Kawase taps: a ten-tap march at quarter res is banded,
   // and this is the filter that was already here to fix that.
   glUseProgram(R.prog_blur);
@@ -1178,7 +1207,8 @@ static void glare_chain(float sx, float sy, float rays) {
 //
 // The glare itself is glare_chain and is optional; the ONE full-screen composite
 // draw below is not — it is how the scene target reaches the present buffer.
-static void glare_pass(float yaw, float pitch, float roll, float fovy, float aspect) {
+static void glare_pass(float yaw, float pitch, float roll, float fovy, float aspect,
+                       const mat4 *vp, v3 eye, int shadow_on) {
   blur_update();
   msaa_resolve();   // the glare reads a FINISHED frame; also final-safe
   if (!R.blur_fbo[0] || !R.blur_fbo[1]) {
@@ -1227,7 +1257,7 @@ static void glare_pass(float yaw, float pitch, float roll, float fovy, float asp
   // the picture from the scene target into the present buffer, and it is also
   // the grade, the FXAA and the grain, so it runs with both glare gains at zero
   // and the reads behind them gated in GLARE_FS.
-  if (g_cfg.bloom) glare_chain(sx, sy, rays);
+  if (g_cfg.bloom) glare_chain(sx, sy, rays, vp, eye, shadow_on);
   // The composite: the scene target on unit 1, the glare on unit 0, the
   // present buffer as the target. No blending — see the branch in GLARE_FS.
   rt_bind(frame_fbo(), R.width, R.height);

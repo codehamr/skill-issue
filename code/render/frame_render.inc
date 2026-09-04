@@ -1179,7 +1179,7 @@ static void render_frame(const player_t *p, float alpha, int fps,
 
   // The picture is finished here; everything after this line is interface.
   rf_mark(11);
-  glare_pass(yaw, pitch, roll, fovy, aspect);
+  glare_pass(yaw, pitch, roll, fovy, aspect, &vp, eye, shadow_on);
 
   rf_hud_pass(p, &cam, fps, sr.scope);
   rf_mark(-1);
