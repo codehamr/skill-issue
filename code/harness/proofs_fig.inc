@@ -9078,14 +9078,7 @@ enum {
 // frames and first return overshoot; it contains no copied recoil amplitudes.
 static vmtrig_recoil_state_t vmtrig_recoil_sample(int view, int wpn, float ads,
                                                    int which) {
-  int shot_pos = 0, shot_neg = 0;
-  for (int shot = 0; shot < 64; shot++) {
-    float side = recoil_side_sample(17, shot, wpn);
-    if (side > 0.0f && !shot_pos) shot_pos = shot + 1;
-    if (side < 0.0f && !shot_neg) shot_neg = shot + 1;
-  }
-  int shot = (which == VMTRIG_REC_SIDE_NEG ? shot_neg : shot_pos) - 1;
-  if (shot < 0) shot = 0;
+  int shot = which == VMTRIG_REC_SIDE_NEG ? 0 : 1;
   float back = 0, lift = 0, side = 0;
   float back_v = 0, lift_v = 0, side_v = 0;
   if (view) {

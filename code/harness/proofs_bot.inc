@@ -2438,6 +2438,7 @@ static void leanstep_proof(void) {
   memcpy(ls_alive_save, g_cl_alive_prev, sizeof ls_alive_save);
   int ls_online_save = g_online, ls_local_save = g_local_ent;
   const float *ls_sim_mv_save = g_sim_mv;
+  const float *ls_sim_gun_save = g_sim_gun;
   const float (*ls_sim_wp_save)[WP_COUNT] = g_sim_wp;
   v3 ls_cam_save = g_cam_eye;
   int ls_cull_save = g_cam_cull, ls_kcap_save = g_fig_kcap;
@@ -2449,6 +2450,7 @@ static void leanstep_proof(void) {
   int ls_side_save = g_lean_step_side;
 
   g_sim_mv = g_cfg.mv;
+  g_sim_gun = g_cfg.gun;
   g_sim_wp = g_cfg.wp;
   g_predicting = 0;
   g_cam_eye = (v3){{0, 0.9f, 0}};
@@ -2593,6 +2595,7 @@ static void leanstep_proof(void) {
   g_online = ls_online_save;
   g_local_ent = ls_local_save;
   g_sim_mv = ls_sim_mv_save;
+  g_sim_gun = ls_sim_gun_save;
   g_sim_wp = ls_sim_wp_save;
   g_cam_eye = ls_cam_save;
   g_cam_cull = ls_cull_save;

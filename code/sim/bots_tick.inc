@@ -44,8 +44,8 @@ static void bot_arm_engage(bot_t *b, const bot_skill_t *sk, float tdist,
     // away, and a bot that is pinpoint at 30 m does not read as a person.
     float rng_k = 1.0f + f_clamp(tdist * 0.020f, 0.0f, 0.55f);
     // Fight the recoil, as far as this skill can.
-    float cy = (b->wp.rec_y + b->wp.sway_y) * sk->rec_comp * DEG2RAD;
-    float cp = (b->wp.rec_p + b->wp.sway_p) * sk->rec_comp * DEG2RAD;
+    float cy = b->wp.rec_y * sk->rec_comp * DEG2RAD;
+    float cp = b->wp.rec_p * sk->rec_comp * DEG2RAD;
     want_yaw = atan2f(dx, -dz) + (b->off_y * rng_k + b->fl_y) * DEG2RAD - cy;
     want_pitch = f_clamp(atan2f(dy, hl) + (b->off_p * rng_k + b->fl_p) * DEG2RAD - cp,
                          -1.2f, 1.2f);
@@ -624,7 +624,6 @@ static void bot_tick(int bi) {
   // crouch-walk speed.
   b->crouch = b->crouch || b->sliding;
   float ms = (b->crouch ? g_sim_mv[MV_CROUCH_SP] : g_sim_mv[MV_RUN]) * pace;
-  ms *= mv_ads_walk_scale(b->wp.ads_s);   // aimed walk: the player's tactical slow
   sp2d = mv_locomote(b, wx, wz, wlen, sp2d, ms);
   // The jump reads grounded AFTER the locomotion step, which cannot change it.
   if (b->grounded && want_jump) {
@@ -650,9 +649,6 @@ static void bot_tick(int bi) {
   if (wx * wx + wz * wz > 0.01f && hs < 0.3f) b->pin++;
   else b->pin = 0;
 
-  // This is the bot's one physical-hold step, after movement and aim have reached their
-  // tick values and before wall/trigger consumers read the barrel.
-  gun_sway_tick(&b->wp, b->vel, b->grounded, b->yaw, b->pitch);
   if (!engaging && b->tgt >= 0 && b->belief != BOT_BELIEF_VISIBLE &&
       b->stuck > 30) {
     bot_search_plan_next(b, sk);
@@ -709,6 +705,7 @@ static void bot_tick(int bi) {
                gun_wall_blocked((v3){{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}},
                                 b->yaw, b->pitch, &b->wp);
   trigger = trigger && !walled;
+  gun_recoil_step(&b->wp, trigger);
   // THE STARE, counted because it is the one failure a player reports in words and no
   // other number here can see: the bot can shoot, has someone to shoot at, and the
   // trigger never comes. tacstat reports the longest run.
@@ -731,15 +728,11 @@ static void bot_tick(int bi) {
   }
 
   // ADS on the same ramp and the same ADS TIME as the player's: a bot shoulders the
-  // weapon for a distant target, which buys it the tuned base spread and costs it the
-  // same aimed-walk slow.
+  // weapon for a distant target, which removes hip spread without changing its speed.
   int want_ads = engaging && b->wp.reload_t == 0 && b->wp.switch_t == 0 &&
                  !b->sliding && !walled && tdist > 9.0f;
   // ...and the PUPPET can ask for it directly.
   gun_ads(&b->wp, want_ads);
-  // Recoil recovers the same way it does for the player: only once the trigger
-  // is off, so a bot has to fight its own climb through a burst.
-  gun_recover(&b->wp, trigger);
   // Bots do not lean yet: the pose supports it (the puppet drives it) but no AI
   // branch asks for it, so this is 0 by construction rather than by omission.
   b->wp.ready_want = (unsigned char)(b->tgt >= 0 || startled || b->alert_t > 0);

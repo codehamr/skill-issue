@@ -256,7 +256,7 @@ static float pad_ads_look_scale(const player_t *p) {
   if (p->wp.cur == WPN_SR) {
     s = 1.0f + (PAD_SR_SCOPE_K - 1.0f) * ads * ads;
   } else {
-    float fov_ads = fov * g_cfg.wp[p->wp.cur][WP_ADS_ZOOM] * 0.01f;
+    float fov_ads = fminf(fov, g_cfg.wp[p->wp.cur][WP_ADS_FOV]);
     float f = fov + (fov_ads - fov) * ads;
     s = tanf(f * 0.5f * DEG2RAD) / tanf(fov * 0.5f * DEG2RAD);
   }

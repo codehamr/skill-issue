@@ -348,7 +348,7 @@ typedef struct {
   // decor after, and only the solids cast: a shadow map is 4096 over 62 m, i.e. 15 mm a
   // texel, and a 22 mm grass blade at that resolution is not a shadow, it is one texel
   // of noise flickering under the figure standing on it.
-  int    world_cast_verts, world_decor_verts;
+  int    world_cast_verts, world_pre_verts, world_decor_verts;
   GLuint present_fbo;               // frame destination: 0 on Windows, harness FBO on Linux
   GLuint msaa_fbo, msaa_rb[2];      // multisampled scene target, msaa_fbo 0 = MSAA off
   int    frame_resolved;            // this frame's resolve has happened; see msaa_resolve
@@ -633,8 +633,8 @@ static void ao_off(void) { g_ao_min = 1.0f; g_ao_rate = 0.0f; }
 // The world's own occlusion ramp for a solid: concentrated in the bottom half metre,
 // because spread over 1.7 m it is an 8% wash with nothing at the contact, which is the
 // one place occlusion shows.
-#define WORLD_AO_RATE (1.0f / 0.55f)
-#define WORLD_AO_MIN  0.55f
+#define WORLD_AO_RATE (1.0f / 0.35f)
+#define WORLD_AO_MIN  0.78f
 // ...and the two finishes the world pass gives its own surfaces, for the same
 // reason: a decal whose roughness does not match its host has a silhouette at
 // GRAZING angles, which is exactly where a wall you are running past is seen.
@@ -715,11 +715,11 @@ static float ao_at(float y) {
 #define GROUND_STEP  (2.0f * ARENA_HALF / (float)GROUND_CELLS)
 #define GROUND_VERTS (GROUND_CELLS * GROUND_CELLS * 6)
 
-// What the floor is MADE OF at one point, as three independent scalars.
+// What the floor is MADE OF at one point. Contact darkness is deliberately not
+// baked here: a one-metre vertex grid turns a narrow wall skirt into triangles.
 typedef struct {
   float drift;    // wind-blown sand banked against an obstacle
   float compact;  // open ground, packed by traffic: darker, less loose
-  float skirt;    // the metre nearest a wall: contact darkening
 } gsurf_t;
 
 // Smooth value noise in C, matching the shader's own construction so a term baked here
@@ -766,7 +766,7 @@ static float wind_shadow(const solid_t *s, float x, float z, v3 w, float sgn) {
 
 // One point of floor against every solid.
 static gsurf_t ground_sample(float x, float z) {
-  gsurf_t g = {0.0f, 0.0f, 0.0f};
+  gsurf_t g = {0.0f, 0.0f};
   v3 w = wind_dir();
   float near_d = 1e9f;
   for (int i = 0; i < g_num_solids; i++) {
@@ -800,15 +800,8 @@ static gsurf_t ground_sample(float x, float z) {
   lane = (lane - 0.44f) * 3.6f;
   lane = lane < 0.0f ? 0.0f : lane > 1.0f ? 1.0f : lane;
   g.compact = open01 * lane;
-  g.skirt = expf(-near_d / 1.30f);
   // Drift and traffic are the same sand arguing over the same ground: a lane that is
   // walked flat cannot also be a dune.
   g.drift *= 1.0f - 0.75f * g.compact;
   return g;
-}
-
-// The floor's own occlusion, asked for by NAME because mark_stamp has to stamp an
-// impact crater into ground whose occlusion it did not build.
-static float ground_skirt_ao(float x, float z) {
-  return 1.0f - 0.34f * ground_sample(x, z).skirt;
 }

@@ -314,11 +314,10 @@ static void cmd_updcheck(sim_ctx_t *s) {
 
 static void cmd_cfg(sim_ctx_t *s) {
   (void)s;
-  printf("cfg sense=%.2f ads_sense=%.2f fov=%d recoil_view=%.2f vsync=%d fps_cap=%d "
+  printf("cfg sense=%.2f ads_sense=%.2f fov=%d vsync=%d fps_cap=%d "
          "show_fps=%d msaa=%d ssao=%d ssr=%d fullscreen=%d shadows=%d bloom=%d "
          "dust=%d grain=%d brightness=%.2f binds=",
-         (double)g_cfg.sense, (double)g_cfg.ads_sense, (int)g_cfg.fov,
-         (double)g_cfg.recoil_view, g_cfg.vsync,
+         (double)g_cfg.sense, (double)g_cfg.ads_sense, (int)g_cfg.fov, g_cfg.vsync,
          g_cfg.fps_cap, g_cfg.show_fps, g_cfg.msaa, g_cfg.ssao, g_cfg.ssr,
          g_cfg.fullscreen, g_cfg.shadows, g_cfg.bloom, g_cfg.dust, g_cfg.grain,
          (double)g_cfg.brightness);
@@ -329,6 +328,9 @@ static void cmd_cfg(sim_ctx_t *s) {
   printf("mv");
   for (int i = 0; i < MV_COUNT; i++)
     printf(" %s=%.2f", MV_DEF[i].key, (double)g_cfg.mv[i]);
+  printf("\ngun");
+  for (int i = 0; i < GP_COUNT; i++)
+    printf(" %s=%.2f", GP_DEF[i].key, (double)g_cfg.gun[i]);
   printf("\nwp vol=%.2f", (double)g_cfg.vol);
   for (int w = 0; w < WPN_COUNT; w++)
     for (int i = 0; i < WP_COUNT; i++) {
@@ -378,13 +380,13 @@ static void cmd_lean(sim_ctx_t *s) {
 static void cmd_wpn(sim_ctx_t *s) {
   const weapon_t *w = &s->p->wp;
   const vm_t *v = &s->p->vm;
-  printf("wpn t=%ld cur=%s ammo=%d bore=%.3f rec=(%.3f %.3f) heat=%.3f ads=%.3f "
-         "reload=%d switch=%d punch=%.3f vm sway=(%.4f %.4f) lag=(%.4f %.4f %.4f) "
+  printf("wpn t=%ld cur=%s ammo=%d bore=%.3f rec=(%.3f %.3f) ads=%.3f "
+         "fire=%d reload=%d switch=%d vm sway=(%.4f %.4f) lag=(%.4f %.4f %.4f) "
          "kick=(%.4f %.3fdeg %.4f) roll=%.4f scope=(%.1f %.1f %.1f)\n",
          s->tick, WPN_DEF[w->cur].prefix, w->ammo[w->cur],
          (double)gun_bore_offset(w),
-         (double)w->rec_p, (double)w->rec_y, (double)w->heat,
-         (double)w->ads_s, w->reload_t, w->switch_t, (double)w->punch,
+         (double)w->rec_p, (double)w->rec_y,
+         (double)w->ads_s, w->fire_want, w->reload_t, w->switch_t,
          (double)v->sway_p, (double)v->sway_y,
          (double)v->lag_x, (double)v->lag_y, (double)v->lag_z,
          (double)v->kick_back, (double)(v->kick_lift / DEG2RAD),
@@ -495,22 +497,32 @@ static void cmd_sun(sim_ctx_t *s) {
 
 static void cmd_map(sim_ctx_t *s) {
   (void)s;
-  // The theme decides the whole surface treatment now (ripples, glitter,
+  // The theme owns the whole surface treatment (loose grain, glitter,
   // standing water) and it was previously unprintable — you could only find
   // out which one a seed rolled by photographing it.
   { v3 sp = surf_params();
     static const char *SN[] = {"grit", "wet", "sand"};
-    printf("map theme=%s mood=%s sig=%s wind=%.3f ripple=%.2f glint=%.2f "
-           "water=%.2f haze=%.2f sun_elev=%.2f\n",
+    printf("map theme=%s mood=%s sig=%s wind=%.3f grain=%.2f glint=%.2f "
+           "water=%.2f haze=%.2f sun_elev=%.2f damage=%u/%u/%u/%u/%u\n",
            SN[g_theme.surf], MOOD_DEF[g_theme.surf][g_mood_preset].name,
            SIG_NAME[g_meta.sig], (double)g_wind_ang,
            (double)sp.x, (double)sp.y, (double)sp.z, (double)atmo_haze(),
            (double)(asinf(f_clamp(g_sun.dir.y, -1.0f, 1.0f))
-                    * (180.0f / F_PI))); }
+                    * (180.0f / F_PI)),
+           (unsigned)g_meta.damage[0], (unsigned)g_meta.damage[1],
+           (unsigned)g_meta.damage[2], (unsigned)g_meta.damage[3],
+           (unsigned)g_meta.damage[4]); }
   for (int i = 0; i < g_num_solids; i++)
     printf("solid %d min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f)\n", i,
            (double)g_solids[i].min.x, (double)g_solids[i].min.y, (double)g_solids[i].min.z,
            (double)g_solids[i].max.x, (double)g_solids[i].max.y, (double)g_solids[i].max.z);
+  for (int i = 0; i < g_meta.nedge; i++) {
+    const medge_t *e = &g_meta.edge[i];
+    if (e->kind != ME_FRACTURE) continue;
+    printf("fracture ax=%u a=(%.2f %.2f %.2f) b=(%.2f %.2f %.2f)\n",
+           (unsigned)e->ax, (double)e->a.x, (double)e->a.y, (double)e->a.z,
+           (double)e->b.x, (double)e->b.y, (double)e->b.z);
+  }
 }
 
 static void cmd_mood(sim_ctx_t *s) {
@@ -811,12 +823,7 @@ static void cmd_parity(sim_ctx_t *s) {
   weapon_t pw = p->wp, bw = b->wp;
   pw.cur = bw.cur = WPN_AR;
   pw.ads_s = bw.ads_s = 0.0f;
-  pw.heat = bw.heat = 0.0f;
   pw.rec_p = bw.rec_p = pw.rec_y = bw.rec_y = 0.0f;
-  // Compare the shared calm-bore contract, not whichever unrelated breathing phase
-  // the live player and bot happened to occupy before `parity` was invoked.
-  pw.sway_p = bw.sway_p = pw.sway_y = bw.sway_y = 0.0f;
-  v3 rest = {{0, 0, 0}}, run = {{mv[MV_RUN], 0, 0}};
   int ppart = 0, bpart = 0;
   v3 dn = {{0, -1, 0}};
   v3 pabove = {{p->pos.x, p->pos.y + 4.0f, p->pos.z}};
@@ -834,7 +841,7 @@ static void cmd_parity(sim_ctx_t *s) {
   struct { const char *n; double pv, bv; int shared; } row[] = {
     {"run_speed",     mv[MV_RUN],                       mv[MV_RUN], 1},
     {"crouch_speed",  mv[MV_CROUCH_SP],                 mv[MV_CROUCH_SP], 1},
-    {"accel_ms",      mv[MV_ACCEL_MS],                  mv[MV_ACCEL_MS], 1},
+    {"response_ms",   mv[MV_RESPONSE_MS],               mv[MV_RESPONSE_MS], 1},
     {"jump_speed",    mv_jump_speed(),                  mv_jump_speed(), 1},
     {"air_ctl",       mv[MV_AIR_CTL],                   mv[MV_AIR_CTL], 1},
     {"slide_boost",   mv_slide_boost(),                 mv_slide_boost(), 1},
@@ -844,14 +851,11 @@ static void cmd_parity(sim_ctx_t *s) {
     {"mag",           WPN_DEF[WPN_AR].mag,              WPN_DEF[WPN_AR].mag, 1},
     {"reload_ticks",  WPN_DEF[WPN_AR].reload_ticks,     WPN_DEF[WPN_AR].reload_ticks, 1},
     {"dmg",           WPN_DEF[WPN_AR].dmg,              WPN_DEF[WPN_AR].dmg, 1},
-    // The spread cone at three stances, from a calm normalized weapon: standing,
-    // at run speed, and the same run speed with both feet off the ground. One
-    // gun_shoot draws from one gun_spread, so a bot's inaccuracy is the player's.
-    {"cone_rest",     gun_spread(&pw, rest, 1),         gun_spread(&bw, rest, 1), 0},
-    {"cone_run",      gun_spread(&pw, run, 1),          gun_spread(&bw, run, 1), 0},
-    {"cone_air",      gun_spread(&pw, run, 0),          gun_spread(&bw, run, 0), 0},
-    {"kick_up",       g_cfg.wp[WPN_AR][WP_KICK_UP],     g_cfg.wp[WPN_AR][WP_KICK_UP], 1},
-    {"recover_ms",    g_cfg.wp[WPN_AR][WP_RECOVER_MS],  g_cfg.wp[WPN_AR][WP_RECOVER_MS], 1},
+    {"cone_ground",   gun_spread(&pw, 1, 0),            gun_spread(&bw, 1, 0), 0},
+    {"cone_air",      gun_spread(&pw, 0, 0),            gun_spread(&bw, 0, 0), 0},
+    {"cone_slide",    gun_spread(&pw, 1, 1),            gun_spread(&bw, 1, 1), 0},
+    {"recoil_up",     g_cfg.wp[WPN_AR][WP_RECOIL_UP],   g_cfg.wp[WPN_AR][WP_RECOIL_UP], 1},
+    {"recenter",      g_cfg.gun[GP_RECENTER],           g_cfg.gun[GP_RECENTER], 1},
     {"eye_stand",     EYE_STAND,                        EYE_STAND, 1},
     {"eye_crouch",    EYE_CROUCH,                       EYE_CROUCH, 1},
     {"height_stand",  HEIGHT_STAND,                     HEIGHT_STAND, 1},
@@ -3257,7 +3261,8 @@ static void cmd_mapcheck(sim_ctx_t *s) {
   // wall faces that is the most visible flicker in the game.
   long n = next_n();
   if (n < 1) n = 1;
-  long worst = 0, total = 0;
+  long worst = 0, total = 0, solid_peak = 0, solid_full = 0, edge_peak = 0;
+  long open_probes = 0, open_blocked = 0, void_peak = 0, void_full = 0;
   // The check is a property of the GENERATOR, so it walks the seed chain
   // (map_seed_next, the same chain `restart` advances) and must put it back:
   // leaving the seed N steps on desynchronises every later `restart`, and leaving
@@ -3267,6 +3272,26 @@ static void cmd_mapcheck(sim_ctx_t *s) {
   uint32_t bad_seed = g_map_seed;
   for (long m = 0; m < n; m++) {
     long hits = 0;
+    if (g_num_solids > solid_peak) solid_peak = g_num_solids;
+    if (g_num_solids == MAX_SOLIDS) solid_full++;
+    if (g_meta.nedge > edge_peak) edge_peak = g_meta.nedge;
+    if (g_meta.nvoid > void_peak) void_peak = g_meta.nvoid;
+    if (g_meta.nvoid == META_VOID_MAX) void_full++;
+    for (int q = 0; q < g_meta.nvoid; q++) {
+      const mvoid_t *v = &g_meta.voids[q];
+      v3 d = v->ax ? (v3){{0.0f, 0.0f, 1.0f}}
+                   : (v3){{1.0f, 0.0f, 0.0f}};
+      float reach = v->half_depth + 0.08f;
+      v3 o = v3_sub(v->p, v3_scale(d, reach));
+      int blocked = 0;
+      for (int i = 0; i < g_num_solids && !blocked; i++) {
+        v3 nrm;
+        float t = ray_aabb(o, d, g_solids[i].min, g_solids[i].max, &nrm);
+        if (t > 0.0f && t < reach * 2.0f - 0.001f) blocked = 1;
+      }
+      open_probes++;
+      open_blocked += blocked;
+    }
     for (int i = 0; i < g_num_solids; i++)
       for (int j = i + 1; j < g_num_solids; j++) {
         const solid_t *A = &g_solids[i], *B = &g_solids[j];
@@ -3293,8 +3318,13 @@ static void cmd_mapcheck(sim_ctx_t *s) {
   g_map_seed = seed0;
   map_generate(seed0);
   g_world_dirty = 1;
-  printf("mapcheck maps=%ld coplanar_total=%ld worst=%ld worst_seed=%u\n",
-         n, total, worst, bad_seed);
+  printf("mapcheck maps=%ld coplanar_total=%ld worst=%ld worst_seed=%u "
+         "solid_peak=%ld/%d solid_full=%ld edge_peak=%ld/%d "
+         "open_probes=%ld blocked=%ld void_peak=%ld/%d void_full=%ld\n",
+         n, total, worst, bad_seed, solid_peak, MAX_SOLIDS, solid_full,
+         edge_peak, META_EDGE_MAX, open_probes, open_blocked,
+         void_peak, META_VOID_MAX, void_full);
+  if (open_blocked || void_full) exit(1);
 }
 
 static const script_cmd_t SCRIPT_CMDS[] = {

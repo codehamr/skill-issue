@@ -21,15 +21,10 @@
 // 9: hip spread joined the wp table ACCEPT carries.
 // 10: the three cone parameters became physical hip/move/heat recoil parameters;
 //     layout is unchanged, semantics are not, so mixed builds must not play together.
-// 11: hip/move recoil became hip/move SPREAD (degrees of cone) and kick_* became the
-//     pattern's scale; layout unchanged, semantics not — mixed builds must not play
-//     together. It also covers the compiled-in RECOIL SEMANTICS the wp table drives:
-//     the pattern table itself and whether the barrel is PLACED on a row or FOLLOWS it
-//     (gun_recoil_step, sim/combat.inc). Two builds numbered 11 from either side of
-//     that change agree on every byte and disagree on every round's bore, and no bump
-//     covers it because nothing shipped in between — a wire number cannot police a
-//     table both ends compile in, so a released build is the only line worth drawing.
-#define NET_PROTO 11
+// 11: hip/move recoil became hip/move spread and kick_* became a pattern scale.
+// 12: ACCEPT carries the compact movement/global-gun/weapon tables; snapshots publish
+//     trigger intent so every client can linearly recenter the same recoil axis.
+#define NET_PROTO 12
 // Floor on an UNVERIFIED request, so the answer to one is always smaller than the
 // request was and the responder cannot be pointed at a forged source address:
 // NET_CONNECT_MIN 16 against the 7-byte COOKIE reply.
@@ -300,27 +295,24 @@ static void tele_tick(void) {
 // exactly that reason: a client re-solves the POSE, but only from inputs it was given,
 // and three of anim_tick's inputs are booleans the client can never derive on its own
 // (it never sees a foreign player's buttons). One bit each, no field added, no record
-// grown. Named because there are seven of them now and `>> 5 & 1` next to `>> 3 & 1`
+// grown. Named because all eight bits now carry state and `>> 5 & 1` next to `>> 3 & 1`
 // is the mistake this byte would otherwise be waiting for.
 enum {
   NEF_ALIVE    = 1 << 0,
   NEF_GROUNDED = 1 << 1,
   NEF_CROUCH   = 1 << 2,
   NEF_SLIDE    = 1 << 3,
-  // The carriage triple — see net_ent_from_live for where each is published and
-  // net_cl_present_advance for how the client turns the two intents back into blends.
+  // Carriage/recoil intents — see net_ent_from_live for where each is published and
+  // net_cl_present_advance for how the client turns them back into presentation.
   NEF_ADS      = 1 << 4,   // aim INTENT, not the blend: the client runs its own ramp
   NEF_READY    = 1 << 5,   // fighting — stock up, rather than the low/patrol carry
   NEF_TUCK     = 1 << 6,   // mid-air crouch: the legs are folded into pos.y, and the
                            // figure must not follow that step (the amount is the one
                            // stand-to-crouch constant, so the bit IS the value)
-  // bit 7 free.
+  NEF_FIRE     = 1 << 7,   // trigger intent: freezes recoil until release
 };
-// ADDITIVE, AND DELIBERATELY NOT A NET_PROTO BUMP — the same argument NP_TELE makes.
-// No field moved and no byte was added, and bits 4-6 read zero out of every older
-// build: an old client against a new server renders the carriage it always did, a new
-// client against an old server likewise. A bump here would lock out every un-updated
-// client to fix a pose.
+// The byte did not grow, but bit 7 is recoil semantics rather than an optional visual;
+// NET_PROTO 12 therefore rejects clients that would leave remote barrels frozen.
 typedef struct {
   uint8_t  id, flags;      // the NEF_* set above
   uint8_t  hp, weapon;     // weapon: 2 bits used
@@ -441,9 +433,18 @@ static uint32_t net_world_hash(void) {
   static int cache_n = -1;
   if (cache_seed == g_map_seed && cache_n == g_num_solids) return cache;
   uint32_t h = 2166136261u;
-  const unsigned char *p = (const unsigned char *)g_solids;
-  size_t n = (size_t)g_num_solids * sizeof g_solids[0];
-  for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+  // The historical authoritative record ends immediately before `mat`.
+  // Hash each record separately: the render tag widens the live stride, so one
+  // contiguous prefix would accidentally include earlier render tags and skip
+  // bytes from later collision records. This keeps cosmetic material choices
+  // out of network identity without changing the protocol.
+  _Static_assert(__builtin_offsetof(solid_t, mat) == 40,
+                 "solid_t authoritative wire prefix changed");
+  for (int s = 0; s < g_num_solids; s++) {
+    const unsigned char *p = (const unsigned char *)&g_solids[s];
+    for (size_t i = 0; i < __builtin_offsetof(solid_t, mat); i++)
+      h = (h ^ p[i]) * 16777619u;
+  }
   h = (h ^ (uint32_t)g_num_solids) * 16777619u;
   cache = h; cache_seed = g_map_seed; cache_n = g_num_solids;
   return h;
@@ -451,7 +452,7 @@ static uint32_t net_world_hash(void) {
 
 // Angle validation: absolute angles per tick without checks hand the client two things
 // server authority is supposed to hold. gun_shoot adds the weapon's physical
-// recoil+sway angles to the validated head angles. A modified client that subtracts
+// recoil angles to the validated head angles. A modified client that subtracts
 // the expected motion therefore moves its head to compensate; it cannot recover a
 // hidden camera-axis laser because no such ballistic axis exists.
 #define NET_MAX_TURN_PER_TICK 0.6f   // rad/tick (~4100 deg/s): far above human,

@@ -295,6 +295,7 @@ static void net_srv_packet(const unsigned char *b, int n, uint32_t ip, uint16_t 
     np_w32(&w, net_world_hash());
     np_w32(&w, g_conns[conn].token);
     for (int i = 0; i < MV_COUNT; i++) np_wf(&w, g_cfg.mv[i]);
+    for (int i = 0; i < GP_COUNT; i++) np_wf(&w, g_cfg.gun[i]);
     for (int wp = 0; wp < WPN_COUNT; wp++)
       for (int i = 0; i < WP_COUNT; i++) np_wf(&w, g_cfg.wp[wp][i]);
     net_udp_send(g_srv_fd, ip, port, out, (int)w.at);
@@ -527,7 +528,8 @@ typedef struct {
   int        reject;                 // last REJECT reason, 0 = none
   int        synced;                 // first authoritative fix received?
   float      srv_mv[MV_COUNT];       // the SERVER's sim tuning, from ACCEPT —
-  float      srv_wp[WPN_COUNT][WP_COUNT];  // g_sim_mv/g_sim_wp point here online
+  float      srv_gun[GP_COUNT];
+  float      srv_wp[WPN_COUNT][WP_COUNT];  // g_sim_* point here online
   uint32_t   seq;                    // our own input counter (prediction anchor)
   uint32_t   sync_seq;               // seq at the first authoritative fix —
                                      // predpos entries before it are the PRE-
@@ -680,6 +682,7 @@ static void net_cl_disconnect(void) {
   // The sim tuning goes back to the player's own config BEFORE g_cl is wiped
   // — the pointers aim into g_cl.srv_mv/srv_wp while online(light).
   g_sim_mv = g_cfg.mv;
+  g_sim_gun = g_cfg.gun;
   g_sim_wp = g_cfg.wp;
   // SAY GOODBYE. Best effort and unacknowledged — UDP, and a client that has already
   // lost the link cannot be helped — but in the common case (LEAVE MATCH, or quitting)
@@ -728,6 +731,7 @@ static void net_cl_apply_ent(const net_ent_t *e) {
     // carry predicate the client cannot run itself; the tuck is one constant or
     // nothing, which is why one bit carries the whole of it.
     p->wp.ads_want = !!(e->flags & NEF_ADS);
+    p->wp.fire_want = !!(e->flags & NEF_FIRE);
     p->wp.ready_want = !!(e->flags & NEF_READY);
     p->tuck_y = (e->flags & NEF_TUCK) ? HEIGHT_STAND - HEIGHT_CROUCH : 0.0f;
     if (!g_humans_on[h]) {
@@ -756,6 +760,7 @@ static void net_cl_apply_ent(const net_ent_t *e) {
     b->crouch = !!(e->flags & NEF_CROUCH); b->sliding = !!(e->flags & NEF_SLIDE);
     b->hp = e->hp; b->wp.cur = e->weapon; b->active = 1;
     b->wp.ads_want = !!(e->flags & NEF_ADS);      // a bot's carriage is the same
+    b->wp.fire_want = !!(e->flags & NEF_FIRE);
     b->wp.ready_want = !!(e->flags & NEF_READY);  // two bits (it never tucks)
     if (tele) anim_reset(&b->anim, pos, b->yaw, b->wp.cur);
     if (e->id > g_match.nbots) g_match.nbots = e->id;   // grow the roster to fit
@@ -774,11 +779,7 @@ static void net_cl_apply_ent(const net_ent_t *e) {
 //     the same gun_reload_tick the shooter ran — without the countdown reload_t would
 //     be stamped once and never move, i.e. a magazine change that begins and never
 //     ends;
-//   the BARREL, following the recoil target each shot echo set (gun_recoil_step, whose
-//     rec_hold releases the crown a round interval after the last echo — a viewer has
-//     no trigger to watch). Heat is NOT advanced here and must not be: its readers are
-//     the grip correction and the round's cone, both of which belong to the process
-//     that simulates the shooter, and the visual kick asks the round's index instead.
+//   the BARREL, kicked by each shot echo and linearly returned from NEF_FIRE.
 //
 // FOREIGN ONLY, both of them: our own body is predicted, and re-running either clock
 // on top of prediction would double it.
@@ -795,16 +796,14 @@ static void net_cl_present_advance(void) {
     if (!p->alive) continue;
     gun_ads(&p->wp, p->wp.ads_want);   // idempotent on the intent it re-publishes
     gun_reload_tick(&p->wp);
-    gun_recoil_step(&p->wp);
-    gun_sway_tick(&p->wp, p->vel, p->grounded, p->yaw, p->pitch);
+    gun_recoil_step(&p->wp, p->wp.fire_want);
   }
   for (int i = 0; i < g_match.nbots; i++) {
     bot_t *b = &g_bots[i];
     if (!b->active || !b->alive) continue;
     gun_ads(&b->wp, b->wp.ads_want);
     gun_reload_tick(&b->wp);
-    gun_recoil_step(&b->wp);
-    gun_sway_tick(&b->wp, b->vel, b->grounded, b->yaw, b->pitch);
+    gun_recoil_step(&b->wp, b->wp.fire_want);
   }
 }
 
@@ -1257,6 +1256,11 @@ static int net_cl_poll(void) {
         g_cl.srv_mv[i] = v >= MV_DEF[i].lo ? (v <= MV_DEF[i].hi ? v : MV_DEF[i].hi)
                                            : MV_DEF[i].lo;
       }
+      for (int i = 0; i < GP_COUNT; i++) {
+        float v = np_rf(&r);
+        g_cl.srv_gun[i] = v >= GP_DEF[i].lo ? (v <= GP_DEF[i].hi ? v : GP_DEF[i].hi)
+                                             : GP_DEF[i].lo;
+      }
       for (int wp = 0; wp < WPN_COUNT; wp++)
         for (int i = 0; i < WP_COUNT; i++) {
           float v = np_rf(&r);
@@ -1264,6 +1268,7 @@ static int net_cl_poll(void) {
                                                  : WP_DEF[i].lo;
         }
       g_sim_mv = g_cl.srv_mv;
+      g_sim_gun = g_cl.srv_gun;
       g_sim_wp = g_cl.srv_wp;
       g_world_dirty = 1;                       // renderer re-uploads the VBO
       // g_local_ent / g_online flip only on the FIRST snapshot: keep

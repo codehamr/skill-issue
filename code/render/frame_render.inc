@@ -50,26 +50,14 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
   float leanv = p->prev_lean + (p->lean - p->prev_lean) * alpha;
   eye = v3_add(eye, lean_offset(p->yaw, leanv));
   eye.y -= lean_eye_drop(leanv);
-  // The head and rifle are coupled by TWO follows, because the barrel's two offsets
-  // are two different things to the player. The camera follows RECOIL by recoil_view
-  // (1.0 = the reticle is always the next round's line, in hip as in ADS; the climb is
-  // fought with the mouse and the recovery brings the view back down by whatever was
-  // not compensated). It follows SWAY partially: hipfire lets the arms absorb
-  // breathing and stride, ADS brings the cheek onto the stock until camera, sight line
-  // and bore are coaxial. Both offsets are read from the one weapon_t state hitscan
-  // uses — nothing here can move a round.
+  // The camera follows the full physical recoil axis. The reticle, scope, rendered
+  // barrel and next hitscan therefore always agree in hipfire and ADS.
   const weapon_t *w = &p->wp;
   float ads = w->prev_ads_s + (w->ads_s - w->prev_ads_s) * alpha;
-  float fr = g_cfg.recoil_view, fs = 0.30f + 0.70f * ads;
-  // The two channels of gun_bore_angles_lerp's own interpolation, taken apart because
-  // only the camera weights them differently; the bore below still asks that function.
   float rp = w->prev_rec_p + (w->rec_p - w->prev_rec_p) * alpha;
   float ry = w->prev_rec_y + (w->rec_y - w->prev_rec_y) * alpha;
-  float sp = w->prev_sway_p + (w->sway_p - w->prev_sway_p) * alpha;
-  float sy = w->prev_sway_y + (w->sway_y - w->prev_sway_y) * alpha;
-  float yaw = p->yaw + (ry * fr + sy * fs) * DEG2RAD;
-  float pitch = f_clamp(p->pitch + (rp * fr + sp * fs) * DEG2RAD,
-                        -PITCH_MAX, PITCH_MAX);
+  float yaw = p->yaw + ry * DEG2RAD;
+  float pitch = f_clamp(p->pitch + rp * DEG2RAD, -PITCH_MAX, PITCH_MAX);
   // The optics and the viewmodel ride the WHOLE barrel, followed or not: the scope
   // picture is what the rifle sees, and the rendered weapon is where the rifle is.
   float bore_yaw, bore_pitch;
@@ -82,10 +70,9 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
     ov = &home_ov;
   int cam_free = ov && (ov->active || ov->bot || ov->orbit);
   int third = g_cfg.third_person && !cam_free;   // shoulder cam, body visible
-  // Lean rolls the picture; so does a shot.
-  float proll = w->prev_punch_roll + (w->punch_roll - w->prev_punch_roll) * alpha;
+  // Lean is the only camera roll; recoil itself is the visible barrel axis.
   float roll = (third || cam_free) ? 0.0f
-             : leanv * LEAN_ANGLE * LEAN_VIEW_K + proll * DEG2RAD;
+             : leanv * LEAN_ANGLE * LEAN_VIEW_K;
   float tp_dist = 2.7f;  // final camera pull-back; short = body would clip
   if (third) {
     // Shoulder camera: pivot slightly right of and above the head, pulled back along
@@ -128,11 +115,9 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
                  -cosf(pitch) * cosf(yaw)}};
 
   float aspect = (float)R.width / (float)R.height;
-  // Slide FOV kick, interpolated like the camera for smooth surges; ADS
-  // narrows the whole thing by the ZOOM factor.
-  float kick = p->prev_fov_kick + (p->fov_kick - p->prev_fov_kick) * alpha;
-  float fov_deg = f_clamp(g_cfg.fov + kick * g_cfg.mv[MV_FOV_KICK], 40.0f, 150.0f);
-  fov_deg *= 1.0f - (1.0f - g_cfg.wp[p->wp.cur][WP_ADS_ZOOM] * 0.01f) * ads;
+  float fov_deg = g_cfg.fov;
+  float ads_fov = fminf(fov_deg, g_cfg.wp[p->wp.cur][WP_ADS_FOV]);
+  fov_deg += (ads_fov - fov_deg) * ads;
   float fovy = 2.0f * atanf(tanf(fov_deg * (F_PI / 180.0f) * 0.5f) / aspect);
   // ZNEAR is the single biggest lever on depth precision: resolution goes as
   // z^2*(f-n)/(n*f*2^24), so it is set by 1/n.
@@ -177,11 +162,14 @@ static void rf_shadow_pass(void) {
   glBindTexture(GL_TEXTURE_2D, R.sm_tex);   // stays bound for every lit pass
 }
 
-// THE GEOMETRY PREPASS: the solids, the floor and the figures once more, into
+// THE GEOMETRY PREPASS: solids, floor, large horizon scenery and figures once
+// more, into
 // the prepass target (depth + world normal), single-sample whatever the MSAA
-// setting. Decor is left out on purpose — a grass blade is not an occluder, it
-// is a texel of noise the AO would smear under every figure standing in it —
-// and so is everything drawn later with its own depth clear (the viewmodel).
+// setting. Fine decor is left out on purpose — a grass blade is not an
+// occluder, it is a texel of noise the AO would smear under every figure
+// standing in it — and so is everything drawn later with its own depth clear
+// (the viewmodel). Distant architecture is inside world_pre_verts because god
+// rays must stop at its silhouette even though it casts no arena shadow.
 // Reads no state the lit pass does not: same VBOs, same camera, same cull.
 static void rf_pre_pass(const frame_cam_t *c) {
   rt_bind(R.pre_fbo, R.width, R.height);
@@ -194,9 +182,7 @@ static void rf_pre_pass(const frame_cam_t *c) {
   glUniformMatrix4fv(R.u_pre_vp, 1, GL_FALSE, c->vp.m);
   glUniform1f(R.u_pre_pool, surf_params().z);
   glBindVertexArray(R.vao_world);
-  { int n = R.world_cast_verts + GROUND_VERTS;
-    if (n > R.world_verts) n = R.world_verts;
-    glDrawArrays(GL_TRIANGLES, 0, n); }
+  glDrawArrays(GL_TRIANGLES, 0, R.world_pre_verts);
   scene_draw_vp(&c->vp);
   glClearColor(0.71f, 0.73f, 0.75f, 0.0f);   // the lit pass's own clear, restored
 }
@@ -220,13 +206,12 @@ static void rf_ao_pass(const frame_cam_t *c) {
   glUniform3f(R.u_ao_eye, c->eye.x, c->eye.y, c->eye.z);
   glUniform4f(R.u_ao_scr, (float)R.ao_w, (float)R.ao_h,
               1.0f / (float)R.ao_w, 1.0f / (float)R.ao_h);
-  // 0.45 m: a crate's foot and the hand's width of floor under a wall, not a
-  // grime band up a third of the wall — and a wall half a metre behind a
-  // figure no longer greys its whole body. Intensity 2.0: a right-angle
-  // corner reads about half-dark at the seam and clean by the radius.
+  // 0.32 m: contact, not a broad grime band. The restrained 1.15 intensity
+  // complements the authored wall-foot ramp instead of multiplying it into a
+  // black corner; both numbers were audited on the marked close-wall rig.
   glUniform4f(R.u_ao_z, ZNEAR, ZFAR,
-              (float)R.ao_h * 0.5f / tanf(c->fovy * 0.5f), 0.45f);
-  glUniform1f(R.u_ao_i, 2.0f);
+              (float)R.ao_h * 0.5f / tanf(c->fovy * 0.5f), 0.32f);
+  glUniform1f(R.u_ao_i, 1.15f);
   gl_active_texture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, R.nrm_tex);
   gl_active_texture(GL_TEXTURE0);
@@ -573,8 +558,9 @@ static void rf_dust_pass(const frame_cam_t *c) {
   }
 }
 
-// Viewmodel pass: depth cleared so the gun never clips into walls, own fixed-FOV
-// projection so the world FOV slider never distorts it.
+// Viewmodel pass: isolated depth when MSAA is on, near depth slice otherwise,
+// so the gun never clips into walls; its fixed-FOV projection keeps the world
+// FOV slider from distorting it.
 static float vm_render_ready(const player_t *p, const anim_t *a, float alpha) {
   if (!a) return 1.0f;
   float ready = a->prev_ready_s + (a->ready_s - a->prev_ready_s) * alpha;
@@ -596,7 +582,15 @@ static void rf_vm_pass(const player_t *p, const frame_cam_t *c,
 
   if (vmf->active) {
     v3 fwd = vmf->fwd, rgt = vmf->rgt, upv = vmf->upv;
-    glClear(GL_DEPTH_BUFFER_BIT);
+    // With MSAA the viewmodel owns a separate multisample depth buffer and can
+    // clear it. Without MSAA, scene_fbo deliberately shares the sampled
+    // prepass depth texture: clearing it would erase world occlusion just before
+    // the volume/glare chain reads it. Map the weapon into the nearest
+    // one percent instead; it remains in front, self-depth still works, and
+    // untouched pixels retain the world's atmosphere stop distance.
+    int vm_depth_slice = R.msaa_fbo == 0;
+    if (vm_depth_slice) glDepthRange(0.0, 0.01);
+    else glClear(GL_DEPTH_BUFFER_BIT);
     mat4 vmvp = m4_mul(m4_perspective(VM_FOV_DEG * DEG2RAD, aspect, 0.01f, 5.0f),
                        m4_look(eye, yaw, pitch, roll));
     glUniformMatrix4fv(R.u_vp, 1, GL_FALSE, vmvp.m);
@@ -709,6 +703,7 @@ static void rf_vm_pass(const player_t *p, const frame_cam_t *c,
       scene_draw();
       fx_pass_end();
     }
+    if (vm_depth_slice) glDepthRange(0.0, 1.0);
   }
 }
 
@@ -814,8 +809,8 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
     float ccx = g_ui_vw * 0.5f, ccy = g_ui_vh * 0.5f;
     int in_play = p->alive && !g_match.over;
     // Crosshair: the gap IS the spread cone the stance opens. At rest and aimed it is
-    // exactly the base gap, because the round is exact; hip carry, movement, air and
-    // heat open it. Recoil is not in it — that is on screen already as the view.
+    // exactly the base gap, because the round is exact; hip carry and jump/slide open
+    // it. Recoil is not in it — that is on screen already as the view.
     float ch_hide = p->wp.cur == WPN_SR ? 0.02f : 0.95f;
     if ((ads < ch_hide || third) && in_play) {  // 3rd person: crosshair even in ADS
       // 2.5x on the honest cone projection — pure readability — plus the HIT KICK, so

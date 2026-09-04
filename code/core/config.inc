@@ -1,5 +1,5 @@
 // =============================================================================
-// core/config.inc  —  config.cfg vocabulary: action_t/ACTION_DEF, MV_DEF/
+// core/config.inc  —  config.cfg vocabulary: action_t/ACTION_DEF, MV_DEF/GP_DEF/
 // WP_DEF/WP_DEFAULTS parameter tables, ent_next/ENT_FOREACH, SP_BOTS_DEF/
 // SP_FRAG_DEF.
 // Proof: cfg. One TU: included once by game.c, in definition order — moving a
@@ -47,21 +47,18 @@ static const action_def_t ACTION_DEF[IN_COUNT] = {
 typedef struct { const char *key, *label; float def, lo, hi, step; } param_def_t;
 
 typedef enum {
-  MV_RUN, MV_CROUCH_SP, MV_ACCEL_MS, MV_STOP_MS, MV_JUMP_H,
-  MV_AIR_CTL, MV_SLIDE_BOOST, MV_SLIDE_LEN, MV_FOV_KICK, MV_COUNT
+  MV_RUN, MV_CROUCH_SP, MV_RESPONSE_MS, MV_JUMP_H,
+  MV_AIR_CTL, MV_SLIDE_BOOST, MV_SLIDE_LEN, MV_COUNT
 } mv_param_t;
 
 static const param_def_t MV_DEF[MV_COUNT] = {
-  [MV_RUN]         = {"mv_run_speed",     "RUN SPEED",      6.5f,  2.0f,   14.0f,  0.1f},
-  [MV_CROUCH_SP]   = {"mv_crouch_speed",  "CROUCH SPEED",   2.5f,  0.5f,    6.0f,  0.1f},
-  [MV_ACCEL_MS]    = {"mv_accel_ms",      "ACCEL TIME",   200.0f, 30.0f, 1000.0f, 10.0f},
-  [MV_STOP_MS]     = {"mv_stop_ms",       "STOP TIME",    200.0f, 30.0f, 1000.0f, 10.0f},
-  [MV_JUMP_H]      = {"mv_jump_height",   "JUMP HEIGHT",    1.2f,  0.3f,    3.0f,  0.1f},
-  [MV_AIR_CTL]     = {"mv_air_ctl_pct",   "AIR CONTROL",   30.0f,  0.0f,  100.0f,  5.0f},
-  [MV_SLIDE_BOOST] = {"mv_slide_boost_x", "SLIDE BOOST",    2.5f,  1.0f,    5.0f,  0.1f},
-  [MV_SLIDE_LEN]   = {"mv_slide_len",     "SLIDE LENGTH",  10.0f,  2.0f,   20.0f,  0.5f},
-  // 0.0 BY CHOICE, not by an accident of multiplying by zero. Turn it up to 9.0.
-  [MV_FOV_KICK]    = {"mv_fov_kick",      "FOV KICK",       0.0f,  0.0f,   20.0f,  0.5f},
+  [MV_RUN]         = {"mv_run_speed",          "RUN SPEED",       6.5f,  2.0f,  14.0f,  0.1f},
+  [MV_CROUCH_SP]   = {"mv_crouch_speed",       "CROUCH SPEED",    2.5f,  0.5f,   6.0f,  0.1f},
+  [MV_RESPONSE_MS] = {"mv_ground_response_ms", "GROUND RESPONSE", 200.0f, 30.0f, 600.0f, 10.0f},
+  [MV_JUMP_H]      = {"mv_jump_height",        "JUMP HEIGHT",     1.2f,  0.3f,   3.0f,  0.1f},
+  [MV_AIR_CTL]     = {"mv_air_ctl_pct",        "AIR CONTROL",    30.0f,  0.0f, 100.0f,  5.0f},
+  [MV_SLIDE_BOOST] = {"mv_slide_boost_x",      "SLIDE BOOST",     2.5f,  1.0f,   5.0f,  0.1f},
+  [MV_SLIDE_LEN]   = {"mv_slide_len",          "SLIDE LENGTH",   10.0f,  2.0f,  20.0f,  0.5f},
 };
 
 // Weapon FEEL — one algorithm, per-weapon parameter sets, persisted as
@@ -73,101 +70,36 @@ typedef enum { WPN_AR, WPN_SR, WPN_COUNT } wpn_id_t;
 // one value rather than silently maintaining parallel grip scales.
 #define GUN_GIRTH_3P 1.05f
 
+// Two rules are deliberately global: jumping/sliding costs the same accuracy with
+// every gun, and every recoil offset returns at the same visible angular speed.
+typedef enum { GP_ACTION_SPREAD, GP_RECENTER, GP_COUNT } gun_param_t;
+
+static const param_def_t GP_DEF[GP_COUNT] = {
+  [GP_ACTION_SPREAD] = {"gun_action_spread", "JUMP / SLIDE", 2.5f, 0.0f, 6.0f, 0.1f},
+  [GP_RECENTER]      = {"gun_recenter",      "RECENTER",    12.0f, 0.0f, 30.0f, 0.5f},
+};
+
 typedef enum {
-  WP_RPM, WP_KICK_UP, WP_KICK_SIDE, WP_RECOVER_MS, WP_HIP_SPREAD, WP_MOVE_SPREAD,
-  WP_HEAT, WP_ADS_MS, WP_ADS_ZOOM, WP_PUNCH, WP_SWAY, WP_COUNT
+  WP_RPM, WP_RECOIL_UP, WP_RECOIL_SIDE, WP_HIP_SPREAD,
+  WP_ADS_MS, WP_ADS_FOV, WP_COUNT
 } wp_param_t;
 
 // `def` is deliberately 0: defaults are PER-WEAPON, in WP_DEFAULTS, the one
 // authority config_defaults and the DEV reset both read.
 static const param_def_t WP_DEF[WP_COUNT] = {
-  [WP_RPM]        = {"rpm",        "FIRE RATE",  0,  40.0f, 1000.0f, 10.0f},
-  // KICK UP and KICK SIDE are the DEGREES AT PATTERN VALUE 1.0, not a per-round push:
-  // the table in sim/player.inc is normalized to that, so these two numbers are the
-  // whole size of the VIEW's climb and of its sweep — and a full magazine ends about a
-  // quarter above KICK UP, because the crown creeps past the authored 1.0 rather than
-  // sitting on it. gun_recoil_set (sim/combat.inc) writes the row AFTER the round's own
-  // direction is drawn, so an impact lands at whatever fraction of that climb the
-  // follower had reached, not at the authored row.
-  [WP_KICK_UP]    = {"kick_up",    "KICK UP",    0,   0.0f,   25.0f,  0.5f},
-  [WP_KICK_SIDE]  = {"kick_side",  "KICK SIDE",  0,   0.0f,    6.0f,  0.1f},
-  [WP_RECOVER_MS] = {"recover_ms", "RECOVERY",   0,  50.0f,  800.0f, 10.0f},
-  // ACCURACY IS A CONE THE STANCE OPENS, and these are its two per-weapon halves, in
-  // DEGREES OF RADIUS: HIP SPREAD is what firing from the hip costs and it closes with
-  // ads_s, so a full ADS stand pays nothing; MOVE SPREAD is what run speed costs and
-  // saturates at 1.5x under a slide. Airborne and heat are shared constants
-  // (GUN_AIR_SPREAD, GUN_HEAT_SPREAD, sim/player.inc). Neither reaches the kick — the
-  // pattern is absolute, so a round's RECOIL is the same braced or running, and what
-  // the stance prices is the round's ACCURACY. HEAT/SHOT accumulates per shot and
-  // feeds both the shoulder's grip correction and the cone.
-  [WP_HIP_SPREAD]  = {"hip_spread",  "HIP SPREAD",  0,  0.0f,    4.0f,  0.05f},
-  [WP_MOVE_SPREAD] = {"move_spread", "MOVE SPREAD", 0,  0.0f,    5.0f,  0.05f},
-  [WP_HEAT]       = {"heat",        "HEAT/SHOT",  0,   0.0f,    0.4f,  0.01f},
-  [WP_ADS_MS]     = {"ads_ms",     "ADS TIME",   0,  80.0f,  500.0f, 10.0f},
-  [WP_ADS_ZOOM]   = {"ads_zoom",   "ADS ZOOM",   0,  40.0f,  100.0f,  1.0f},
-  [WP_PUNCH]      = {"punch",      "VIEW PUNCH", 0,   0.0f,    3.0f,  0.1f},
-  [WP_SWAY]       = {"sway",       "SWAY/BOB",   0,   0.0f,    3.0f,  0.1f},
+  [WP_RPM]         = {"rpm",         "FIRE RATE",   0, 40.0f, 1000.0f, 10.0f},
+  [WP_RECOIL_UP]   = {"recoil_up",   "RECOIL UP",   0,  0.0f,   8.0f,  0.05f},
+  [WP_RECOIL_SIDE] = {"recoil_side", "RECOIL SIDE", 0,  0.0f,   1.0f,  0.01f},
+  [WP_HIP_SPREAD]  = {"hip_spread",  "HIP SPREAD",  0,  0.0f,   4.0f,  0.05f},
+  [WP_ADS_MS]      = {"ads_time",    "ADS TIME",    0, 40.0f, 500.0f, 10.0f},
+  [WP_ADS_FOV]     = {"ads_fov",     "ADS FOV",     0, 40.0f, 100.0f,  1.0f},
 };
 
-// Key names an older build EMITTED, read here and written nowhere. `hip_recoil` and
-// `move_recoil` named the spring the cone replaced; a config that build wrote still has
-// to land its values in these two columns, because the untouched-install migration in
-// config_load recognises a legacy profile by the WHOLE row, and an unknown key would
-// leave the new default standing in the column and hide the row. config_write emits
-// WP_DEF's names and only those, so a migrated install stops carrying the old
-// spelling forward.
-static const struct { const char *key; int idx; } WP_LEGACY_KEY[] = {
-  {"hip_recoil", WP_HIP_SPREAD}, {"move_recoil", WP_MOVE_SPREAD},
-};
-
-// The AR's first three rounds are a tapper's weapon and its thirtieth is ten degrees up
-// and sweeping: KICK UP is the size of a climb the player can learn and pull back down,
-// not an average. Eight degrees of it, because the barrel FOLLOWS the pattern and the
-// whole authored climb therefore reaches the screen — a placed offset bleeds part of
-// every round back before the next and needs a bigger number for the same picture. The
-// sniper is the violent single shot — one round, always the same round, because the
-// bolt outlasts the recovery.
+// Per-shot degrees, not hidden pattern amplitudes. Round zero flies on the current
+// barrel axis; only after it leaves are these two values added to the next axis.
 static const float WP_DEFAULTS[WPN_COUNT][WP_COUNT] = {
-  [WPN_AR] = {750, 8.0f, 2.0f, 460, 0.90f, 1.50f, 0.15f, 180, 80, 1.00f, 0.7f},
-  // ads_zoom 89 not 100: the scope's PiP pass owns the magnification; the base
-  // FOV drop only sells the transition. rpm caps the semi-auto trigger interval
-  // at 60 ms; it is not a fire rate (fire mode is structural, in WPN_DEF).
-  [WPN_SR] = {1000, 4.5f, 0.6f, 400, 2.50f, 3.00f, 0.10f, 80, 89, 2.20f, 1.0f},
-};
-
-// Exact emitted signature of the pre-physical-bore AR defaults. Config loading uses
-// the whole row to distinguish an untouched install from a user-authored tune: one
-// changed field preserves the entire row.
-static const float WP_AR_DEFAULTS_PRE_PHYSICAL[WP_COUNT] = {
-  750, 0.30f, 0.15f, 200, 1.10f, 0.30f, 0.06f, 180, 80, 1.00f, 0.6f,
-};
-
-// The first physical-bore tune proved axis identity but not a useful full-auto wall
-// trace: its spring reached a sub-degree equilibrium by round four. Recognize that
-// exact emitted row as another untouched default so existing installs receive the
-// visible climb without overwriting any hand-tuned profile.
-static const float WP_AR_DEFAULTS_PRE_WALL_TRACE[WP_COUNT] = {
-  750, 0.52f, 0.28f, 260, 1.30f, 0.48f, 0.10f, 180, 80, 1.00f, 0.7f,
-};
-
-// KICK UP and KICK SIDE changed MEANING with the absolute pattern — they are the
-// degrees at the table's top now, not a spring peak per round — so a spring-era row
-// left in place reads as a rifle with no climb at all. Both weapons have one, because
-// both changed: the SR's single round is authored at its own kick now.
-static const float WP_AR_DEFAULTS_PRE_PATTERN[WP_COUNT] = {
-  750, 0.95f, 0.42f, 460, 1.45f, 0.48f, 0.15f, 180, 80, 1.00f, 0.7f,
-};
-static const float WP_SR_DEFAULTS_PRE_PATTERN[WP_COUNT] = {
-  1000, 1.80f, 0.20f, 400, 1.35f, 0.50f, 0.10f, 80, 89, 2.20f, 1.0f,
-};
-
-// A row authored for a PLACED offset over-drives a followed barrel: the placed value
-// bled 42% of each round's climb back before the next round arrived, where the follower
-// puts all of it on screen. This exact emitted row is that tune, and it is migrated
-// down. The SR has none — a bolt gun fires one round per burst, so nothing about its
-// numbers is a follower question.
-static const float WP_AR_DEFAULTS_PRE_FOLLOWER[WP_COUNT] = {
-  750, 11.0f, 2.6f, 460, 0.90f, 1.50f, 0.15f, 180, 80, 1.00f, 0.7f,
+  [WPN_AR] = {750, 0.30f, 0.08f, 0.90f, 180, 80},
+  [WPN_SR] = {1000, 4.50f, 0.00f, 2.50f, 80, 89},
 };
 
 // Structural weapon identity — not sliders: these change WHAT the weapon is.

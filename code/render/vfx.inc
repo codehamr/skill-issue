@@ -347,10 +347,9 @@ static void mark_stamp(v3 at, v3 n, int solid) {
   } else {                                  // the arena floor is its own plane
     mn = (v3){{-ARENA_HALF, 0.0f, -ARENA_HALF}};
     mx = (v3){{ ARENA_HALF, 0.0f,  ARENA_HALF}};
-    // The floor is no longer ao_off: mesh_ground_vert bakes a contact skirt into
-    // it, and a crater stamped at a flat 1.0 sits BRIGHTER than the ground it is
-    // in wherever that skirt bites. One function, two readers.
-    surf = g_theme.ground; aom = ground_skirt_ao(at.x, at.z);
+    // Narrow wall contact is screen-space; the coarse ground vertex grid keeps
+    // impact marks at neutral AO so it cannot stamp triangular skirts into them.
+    surf = g_theme.ground; aom = 1.0f;
     rough = WORLD_GROUND_R;
   }
   // MERGE FIRST: if this round landed on top of an existing hole on the same plane,

@@ -31,8 +31,8 @@
 #define GLSL_NUM(v)  GLSL_NUM2(v)
 // The floor's baseline roughness, and it lives up here because the FRAGMENT SHADER
 // needs it too: mesh_ground_vert writes looseness into the roughness channel as a
-// signed offset from this value, and the ripple field reads it back to decide where
-// loose sand exists at all.
+// signed offset from this value, and the granular floor field reads it back to decide
+// where loose sand exists at all.
 #define WORLD_GROUND_R 0.86f   // dry dusty floor: a wide, weak sheen at grazing
 #define GLSL_ENV \
   /* Smooth value noise, SHARED. It lives here rather than in WORLD_FS because
@@ -62,6 +62,19 @@
   "  f = f * f * (3.0 - 2.0 * f);\n" \
   "  return mix(mix(vhash2(i), vhash2(i + vec2(1.0, 0.0)), f.x),\n" \
   "             mix(vhash2(i + vec2(0.0, 1.0)), vhash2(i + vec2(1.0, 1.0)), f.x), f.y);\n" \
+  "}\n" \
+  /* Value plus its analytic world-space gradient. WORLD_FS uses this for the
+     nearest floor aggregate: analytic derivatives remain valid behind the
+     footprint gate, unlike dFdx/dFdy inside fragment-divergent control flow. */ \
+  "vec3 vnoise2d(vec2 p){\n" \
+  "  vec2 i = floor(p), f = fract(p);\n" \
+  "  float a = vhash2(i), b = vhash2(i + vec2(1.0, 0.0));\n" \
+  "  float c = vhash2(i + vec2(0.0, 1.0)), d = vhash2(i + vec2(1.0, 1.0));\n" \
+  "  vec2 u = f * f * (3.0 - 2.0 * f), du = 6.0 * f * (1.0 - f);\n" \
+  "  float v = mix(mix(a, b, u.x), mix(c, d, u.x), u.y);\n" \
+  "  vec2 g = du * vec2(mix(b - a, d - c, u.y),\n" \
+  "                     mix(c - a, d - b, u.x));\n" \
+  "  return vec3(v, g);\n" \
   "}\n" \
   /* THE STANDING WATER, as one function with two readers: the lit floor
      (which shades the film) and the geometry prepass (which flags it for the
@@ -593,8 +606,9 @@ static const char *WORLD_FS =
   "uniform vec3 uFill, uRim;\n"
   // The weapon's OWN frame, published by vm_build once per viewmodel pass.
   "uniform vec3 uMdlO, uMdlX, uMdlZ;\n"   // no uMdlY: nothing reads an up axis
-  // THE FLOOR'S OWN TREATMENT, one vec4: ripple strength, glitter strength, standing-
-  // water level and the wind heading.
+  // THE FLOOR'S OWN TREATMENT, one vec4: loose-grain strength, glitter strength,
+  // standing-water level and the wind heading. Floor shading itself stays isotropic;
+  // the heading remains useful to the atmosphere and world decoration.
   "uniform vec4 uSurf;\n"
   "uniform vec2 uSmStep;\n"               // one shadow texel in UV
   "uniform sampler2DShadow uSm;\n"
@@ -636,21 +650,18 @@ static const char *WORLD_FS =
   // THE SUN HAS A SIZE, AND THE SHADOW SHOWS IT. Percentage-closer soft shadows:
   // a blocker search on the raw depth (unit 2, the same texture without the
   // compare) finds how far in front of this surface the caster is, the sun's
-  // angular size turns that distance into a penumbra width, and a Vogel disc
+  // angular size turns that distance into a penumbra width, and a stable tent
   // of hardware-compared taps at that width filters it. A wall's shadow is a
   // razor at its foot and a hand's width soft twenty metres out, which is what
   // a low sun across an arena actually draws — the old 4x4 grid was three
   // texels wide everywhere.
-  // The disc is rotated per pixel by interleaved-gradient noise (the same
-  // construction the tonemap dither and the AO use: a pure function of the
-  // fragment coordinate, so a screenshot cannot depend on the frame before it).
-  // THE CAP IS WHAT KEEPS THE PENUMBRA CLEAN. Twenty-four bilinear taps cover
-  // a disc of about five and a half texels completely; at eight they cover
-  // half of it and every wide penumbra is grain (measured: 7.1 levels of
-  // neighbour difference against 2.1 on flat sand), at ten it was stipple on
-  // the entry screen's wall shadow. 5.5 texels is eight centimetres of
-  // penumbra — the far end of a long wall shadow is softer than that in
-  // life, but a soft edge that does not crawl beats a wide one that does.
+  // The disc orientation is fixed in light space. Rotating a sparse kernel per
+  // screen pixel frays a long straight shadow and makes it crawl under camera
+  // motion; a fixed Vogel set trades invisible isotropy for a stable edge.
+  // THE CAP IS WHAT KEEPS THE PENUMBRA CLEAN. A 5x5 separable tent gives a
+  // straight edge nine monotonic coverage levels instead of exposing the
+  // individual points of a sparse disc. Its fixed light-space footprint is
+  // important: every neighbouring screen pixel sees the same filter.
   "vec2 vogel(int i, int n, float phi){\n"
   "  float r = sqrt((float(i) + 0.5) / float(n));\n"
   "  float t = 2.3999632 * float(i) + phi;\n"
@@ -665,13 +676,7 @@ static const char *WORLD_FS =
   "  vec3 p = vLit.xyz / vLit.w;\n"
   "  if (p.z >= 1.0) return 1.0;\n"
   "  p = p * 0.5 + 0.5;\n"
-  // Hash noise for the disc's rotation, not interleaved-gradient: a sparse
-  // disc under IGN leaves IGN's diagonal lattice in every wide penumbra,
-  // which read as a screen door on the entry screen's wall shadow. Hash
-  // noise leaves grain, and grain is what the composite already adds.
-  "  vec3 hq = fract(vec3(gl_FragCoord.xy, gl_FragCoord.x + 7.3) * 0.1031);\n"
-  "  hq += dot(hq, hq.yzx + 33.33);\n"
-  "  float phi = 6.2831853 * fract((hq.x + hq.y) * hq.z);\n"
+  "  const float phi = 0.731;\n"
   // THE WIDE TEST FIRST. Twelve compared taps over the widest penumbra the
   // filter can draw: all lit or all shadowed means this pixel is further from
   // any edge than the penumbra can reach, and that is the answer — most of
@@ -706,11 +711,21 @@ static const char *WORLD_FS =
   "    if (d < p.z - uSmPcss.y) { bmax = max(bmax, d); bn += 1.0; }\n"
   "  }\n"
   "  if (bn < 0.5) return 1.0;\n"
-  "  float pen = clamp((p.z - bmax) * uSmPcss.x, 1.0, 5.5);\n"
+  // A three-texel minimum removes the last staircase at contact. It is still
+  // only about 4 cm on the high map. Hardware comparison filtering supplies
+  // the sub-texel samples; the explicit tent removes quantised diagonal teeth.
+  "  float pen = clamp((p.z - bmax) * uSmPcss.x, 3.0, 5.5);\n"
   "  s = 0.0;\n"
-  "  for (int i = 0; i < 24; i++)\n"
-  "    s += texture(uSm, vec3(p.xy + vogel(i, 24, phi) * uSmStep * pen, p.z));\n"
-  "  return s * (1.0 / 24.0);\n"
+  "  float sw = 0.0;\n"
+  "  for (int y = -2; y <= 2; y++) {\n"
+  "    for (int x = -2; x <= 2; x++) {\n"
+  "      float k = (3.0 - abs(float(x))) * (3.0 - abs(float(y)));\n"
+  "      vec2 o = vec2(float(x), float(y)) * (0.5 * pen);\n"
+  "      s += texture(uSm, vec3(p.xy + o * uSmStep, p.z)) * k;\n"
+  "      sw += k;\n"
+  "    }\n"
+  "  }\n"
+  "  return s / sw;\n"
   "}\n"
   // DEPTH-AWARE UPSAMPLE of the half-res occlusion: the four texels under this
   // pixel, bilinear weights scaled by how close each one's surface is to THIS
@@ -764,32 +779,51 @@ static const char *WORLD_FS =
   "  if (uDetail > 0.0) det = exp(-d * 0.035);\n"
   // GATED ON uDetail, WHICH IS ZERO FOR EVERY FIGURE AND THE WHOLE VIEWMODEL. uDetail
   // has three writers: the sky pass sets 0, the two world draws set 1.
+  // A negative authored roughness is the zero-width wall-finish tag carried by
+  // generated ruins. The BRDF always sees its magnitude.
+  "  bool wall_finish = vMat.x < 0.0;\n"
+  "  float base_rough = abs(vMat.x);\n"
   "  float rough, surf_h = 0.5;\n"
-  "  if (uDetail > 0.0) {\n"
-  "  vec3 cell = floor(vWorld * 14.0);\n"       // ~7 cm grain, world-anchored
-  "  float h = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);\n"
-  // Two octaves, not one: a single 7 cm grain is film grain, and what makes concrete
-  // read as concrete is patchiness a hand's width across UNDER that grain.
   "  vec2 cp2 = abs(n.y) > 0.5 ? vWorld.xz\n"
   "           : (abs(n.x) > 0.5 ? vWorld.zy : vWorld.xy);\n"
-  "  float h2 = vnoise2(cp2 * 1.7);\n"
-  "  surf_h = h2;\n"
-  "  alb *= 1.0 + (h - 0.5) * 0.075 * det + (h2 - 0.5) * 0.085 * uDetail;\n"
-  "  rough = clamp(vMat.x + (h2 - 0.5) * 0.16 * uDetail, 0.045, 1.0);\n"
-  "  } else rough = clamp(vMat.x, 0.045, 1.0);\n"
+  "  if (uDetail > 0.0) {\n"
+  // Two smooth, low-frequency bands. A hard centimetre cell hash looked detailed
+  // while standing still but became unfilterable noise as soon as the camera moved.
+  "  float macro = vnoise2(cp2 * 0.38 + vec2(19.2, -7.4));\n"
+  "  float meso = vnoise2(cp2 * 1.35 + vec2(-3.7, 11.8));\n"
+  "  surf_h = mix(macro, meso, 0.34);\n"
+  "  alb *= 1.0 + (macro - 0.5) * 0.090 * det\n"
+  "             + (meso - 0.5) * 0.040 * det;\n"
+  "  rough = clamp(base_rough + (meso - 0.5) * 0.085 * det, 0.045, 1.0);\n"
+  "  } else rough = clamp(base_rough, 0.045, 1.0);\n"
+  // --- QUIET WALL FINISH -------------------------------------------------
+  // Ruin boxes are plastered or cast surfaces, including their top faces. The
+  // wall tag adds only broad weathering and a dustier cap; construction detail
+  // lives in the real 3D fracture modules instead of a repeating shader veneer.
+  "  if (wall_finish && uDetail > 0.0) {\n"
+  "    float plaster = vnoise2(cp2 * 0.62 + vec2(8.3, 27.1));\n"
+  "    float weather = vnoise2(cp2 * 0.24 + vec2(-14.6, 5.9));\n"
+  "    float cap = smoothstep(0.72, 0.98, abs(n.y));\n"
+  "    alb *= 0.990 + (weather - 0.5) * 0.120 * det\n"
+  "                 + (plaster - 0.5) * 0.055 * det + cap * 0.035;\n"
+  "    rough = mix(rough, 0.88 + cap * 0.035\n"
+  "                      + (plaster - 0.5) * 0.035, 0.42);\n"
+  "    surf_h = mix(surf_h, mix(weather, plaster, 0.35), 0.36);\n"
+  "  }\n"
   // PROCEDURAL RELIEF FROM THE MATERIAL FIELD ALREADY IN REGISTERS. The broad
   // concrete variation above is not only pigment: aggregate and worn render leave
   // shallow height changes that catch a grazing sun. Screen derivatives turn that
   // same scalar field into a surface gradient without another noise lookup. The
   // perturbation is restricted to upright world faces (sand and water have their own
   // normals below), and det fades it before the projected pattern becomes sub-pixel.
-  "  if (uDetail > 0.0 && abs(n.y) < 0.82 && det > 0.04) {\n"
+  "  if (uDetail > 0.0 && abs(n.y) < 0.82 && det > 0.04 && base_rough > 0.14) {\n"
   "    vec3 dpdx = dFdx(vWorld), dpdy = dFdy(vWorld);\n"
   "    vec3 r1 = cross(dpdy, n), r2 = cross(n, dpdx);\n"
   "    float hd = dot(dpdx, r1);\n"
   "    if (abs(hd) > 1.0e-8) {\n"
   "      vec3 sg = sign(hd) * (dFdx(surf_h) * r1 + dFdy(surf_h) * r2);\n"
-  "      n = normalize(abs(hd) * n - sg * (0.090 * det));\n"
+  "      float relief = wall_finish ? 0.035 : 0.070;\n"
+  "      n = normalize(abs(hd) * n - sg * (relief * det));\n"
   "    }\n"
   "  }\n"
   // ...and the metalness is its MAGNITUDE: the sign is the tool direction. See
@@ -860,7 +894,7 @@ static const char *WORLD_FS =
   "    alb *= 1.0 + (gh - 0.5) * 0.085 + br * 0.040 * bore;\n"
   "  }\n"
   // Geometric specular antialiasing.
-  "  if (uDetail > 0.0 && abs(n.y) < 0.5) {\n"  // vertical faces: panel seams
+  "  if (uDetail > 0.0 && !wall_finish && abs(n.y) < 0.5) {\n"  // vertical faces: panel seams
   "    float sc = abs(n.x) > 0.5 ? vWorld.z : vWorld.x;\n"
   "    float sf = abs(fract(sc / 3.0) - 0.5) * 3.0;\n"
   "    float sm = 1.0 - smoothstep(0.02, 0.05, sf);\n"
@@ -868,8 +902,8 @@ static const char *WORLD_FS =
   "    rough = mix(rough, 1.0, 0.5 * det * sm);\n"
   "  }\n"
   // --- THE FLOOR ----------------------------------------------------------
-  // Half the screen is this surface, and it used to be a 2 m checker plus an 8 m seam
-  // grid: a tiled hall on an outdoor arena, carrying less information than a wall.
+  // Half the screen is this surface, so it needs outdoor variation without a
+  // seam grid that would turn the arena into a tiled hall.
   "  float wet = 0.0, glint = 0.0;\n"
   "  if (n.y > 0.95 && vWorld.y < 0.05) {\n"
   "    vec2 P = vWorld.xz;\n"
@@ -877,81 +911,78 @@ static const char *WORLD_FS =
   // lengths is the sqrt of the max of the squared lengths, bit for bit.
   "    vec2 dpx = dFdx(P), dpy = dFdy(P);\n"
   "    float fp = sqrt(max(dot(dpx, dpx), dot(dpy, dpy)));\n"
-  // GATED ON THE THEME. surf_params returns uSurf.x == 0 for GRIT and WET, and
-  // then nv/loose/rv/lam/vis feed only the else branch below, which is
-  // `clamp(rough + 0.0, ...)` on a rough already inside that range — a literal
-  // no-op costing two vnoise2 and three smoothsteps per floor pixel.
+  // GATED ON THE THEME. surf_params returns uSurf.x == 0 for GRIT and WET, so only
+  // loose SAND pays for its broad crust field. The field has no privileged
+  // direction and no repeating crest profile.
   "    if (uSurf.x > 0.0) {\n"
-  "    float nv = max(dot(n, V), 0.0);\n"
-  // --- AEOLIAN RIPPLES ----------------------------------------------------
-  // NOT fbm: isotropic noise on a floor reads as dirt or as nothing.
-  "    float loose = clamp((vMat.x - " GLSL_NUM(WORLD_GROUND_R) ") * 8.0 + 0.75,\n"
-  "                        0.0, 1.0)\n"
-  "               * smoothstep(0.14, 0.52, vnoise2(P * 0.13));\n"
-  // The two fades are computed BEFORE the field they fade, so a pixel whose ripples
-  // would be filtered away to nothing does not pay to compute them — past about fifteen
-  // metres, and at every grazing angle, that is most of the floor in frame.
-  "    float rv = vnoise2(P * 0.105);\n"
-  "    float lam = 0.125 * (0.78 + 0.44 * rv);\n"
-  // THE FOOTPRINT FADE IS A LEGIBILITY DECISION, NOT AN ALIASING FIX, and the
-  // instrument says so. At lam * 1.8 the field is still at full strength when
-  // the pixel footprint is one and a half TIMES the wavelength — measured on
-  // the overview camera, fp = 85 mm against a 125 mm ripple, 1.5 samples a
-  // cycle — and once a low sun started raking across it the whole floor read
-  // as corduroy rather than as sand. The natural conclusion is "that is
-  // aliasing", and it is WRONG: the shimmer rig (1x against 4x supersampled
-  // and downsampled, over the floor region) reads 2.901 before and 2.881
-  // after, i.e. unchanged, on frames whose pixels differ over a third of the
-  // time. The supersampled reference shows the same lattice, because at this
-  // scale the pattern is resolved and simply reads as fabric.
-  // So: lam * 0.5 is the Nyquist limit and lam * 0.16 is about six samples a
-  // cycle, and the fade is pulled back to them because a ripple you cannot
-  // read as relief should not be drawn as one — not because it was flickering.
-  // It costs the ripples past ~8 m at eye height, which is about where real
-  // sand stops showing them, and everything the fade takes is handed to
-  // ROUGHNESS by the branch below.
-  "    float vis = (1.0 - smoothstep(lam * 0.16, lam * 0.5, fp))\n"
-  "              * smoothstep(0.10, 0.42, nv) * loose;\n"
-  "    if (vis > 0.004) {\n"
-  // The heading barely moves, and that is the correction.
-  "      float ang = uSurf.w + 0.16 * (vnoise2(P * 0.028) - 0.5);\n"
-  "      vec2 wd = vec2(cos(ang), sin(ang));\n"
-  // The warp has to be TWO octaves and weak.
-  "      float u = dot(P, wd) / lam\n"
-  "             + 0.055 * vnoise2(P * 0.31) + 0.030 * vnoise2(P * 3.10);\n"
-  "      float sq = fract(u);\n"
-  // Asymmetric, and the lee face is 0.34 rather than the measured 0.28: at 0.28
-  // the crest is a razor line one pixel wide that the normal cannot filter, and
-  // a ripple crest is a rounded ridge of loose grains, not a fold.
-  "      float hh = sq < 0.66 ? sq / 0.66 : (1.0 - sq) / 0.34;\n"
-  "      float dh = sq < 0.66 ? 1.0 / 0.66 : -1.0 / 0.34;\n"
-  // Two independent fades, and both are needed. `fp` is Nyquist. `nv` is the
-  // OTHER failure: a bump on a flat quad has no parallax and no self-occlusion,
-  // so edge-on it stops reading as relief and starts reading as a printed
-  // pattern — exactly where the footprint is largest anyway, so the two fades
-  // agree about direction and only disagree about which artefact they prevent.
-
-  // 7 mm on a 12.5 cm wavelength, i.e. an 11-degree lee face: 9 mm read as
-  // corduroy under a raking sun once the shadows went soft around it.
-  "      float amp = 0.0072 * uSurf.x * vis * (0.62 + 0.50 * rv);\n"
-  "      vec2 gr = wd * (dh * amp / lam);\n"
-  "      n = normalize(n - vec3(gr.x, 0.0, gr.y));\n"
-  // The albedo term is deliberately weak.
-  "      alb *= 1.0 + (hh - 0.5) * 0.075 * uSurf.x * vis;\n"
-  "      rough = clamp(rough + 0.11 * uSurf.x * (1.0 - vis), 0.045, 1.0);\n"
-  "    } else {\n"
-  // What the early-out skipped still has to arrive as ROUGHNESS, or there is a
-  // visible ring around the player where relief turns to plastic.
-  "      rough = clamp(rough + 0.11 * uSurf.x, 0.045, 1.0);\n"
+  // --- LOOSE CRUST --------------------------------------------------------
+  // Two deliberately incommensurate, isotropic bands form eroded patches rather
+  // than lines: metre-scale colour underneath hand-scale compaction. Both remain
+  // resolved into the middle distance, so their contrast fades by distance only.
+  "      float loose = clamp((vMat.x - " GLSL_NUM(WORLD_GROUND_R) ") * 8.0 + 0.75,\n"
+  "                          0.0, 1.0);\n"
+  "      float crust0 = vnoise2(P * 0.47 + vec2(8.1, -3.7));\n"
+  "      float crust1 = vnoise2(P * 2.35 - vec2(1.9, 6.4));\n"
+  "      float crust = crust0 * 0.68 + crust1 * 0.32;\n"
+  "      float crust_vis = (1.0 - smoothstep(0.18, 0.52, fp)) * loose * det;\n"
+  "      alb *= 1.0 + (crust - 0.5) * 0.14 * crust_vis;\n"
+  "      rough = clamp(rough + (0.54 - crust) * 0.13 * crust_vis\n"
+  "                    + 0.045 * uSurf.x, 0.045, 1.0);\n"
   "    }\n"
+  // --- AGGREGATE ----------------------------------------------------------
+  // Every dry floor gets two size bands of mineral aggregate. Each band disappears
+  // before its wavelength falls below a few pixels, avoiding the crawling grain a
+  // fixed high-frequency texture produces. The fine band also supplies a shallow
+  // height field; geometric specular AA below catches its remaining normal variance.
+  "    float mvis = 1.0 - smoothstep(0.035, 0.16, fp);\n"
+  "    float fvis = 1.0 - smoothstep(0.006, 0.038, fp);\n"
+  "    float grit_m = 0.5;\n"
+  "    vec3 grit_fd = vec3(0.5, 0.0, 0.0);\n"
+  "    if (mvis > 0.004) grit_m = vnoise2(P * 6.7 + vec2(2.6, 11.2));\n"
+  "    if (fvis > 0.004) grit_fd = vnoise2d(P * 27.0 - vec2(7.4, 3.1));\n"
+  "    float grit = (grit_m - 0.5) * 0.105 * mvis\n"
+  "               + (grit_fd.x - 0.5) * 0.095 * fvis;\n"
+  "    alb *= 1.0 + grit * det;\n"
+  "    rough = clamp(rough + grit * 0.62 * det, 0.045, 1.0);\n"
+  "    float relief_vis = fvis * det;\n"
+  "    if (relief_vis > 0.004) {\n"
+  "      float ra = mix(0.00065, 0.00135, clamp(uSurf.x, 0.0, 1.0));\n"
+  "      vec2 gg = grit_fd.yz * 27.0;\n"
+  "      n = normalize(n - vec3(gg.x, 0.0, gg.y) * ra * relief_vis);\n"
   "    }\n"
-  // --- GRIT ---------------------------------------------------------------
-  // The other floor: dry warm concrete with dust and gravel on it.
-  "    float gvis = 1.0 - smoothstep(0.02, 0.09, fp);\n"
-  "    if (gvis > 0.004) {\n"
-  "      float gz = vnoise2(P * 23.0);\n"
-  "      alb *= 1.0 + (gz - 0.5) * 0.16 * det * gvis;\n"
-  "      rough = clamp(rough + (gz - 0.5) * 0.10 * det * gvis, 0.045, 1.0);\n"
+  // Sparse pebbles are cell-contained (their centres stay away from every boundary),
+  // so adjacent cells cannot clip a pebble in half. A second hash is evaluated only in
+  // occupied cells and gives the chip an independent angle, aspect and material. The
+  // edge is widened by the actual pixel footprint, then the whole signal fades out
+  // before the pebble becomes sub-pixel. No temporal phase or camera-dependent input.
+  "    float chip_vis = 1.0 - smoothstep(0.004, 0.030, fp);\n"
+  "    if (chip_vis > 0.004 && uSurf.z < 0.01) {\n"
+  "      const float chip_cs = 0.105;\n"
+  "      vec2 chip_id = floor(P / chip_cs);\n"
+  "      vec3 chip_r = vhash3(chip_id + vec2(19.7, 43.1));\n"
+  "      if (chip_r.z > 0.83) {\n"
+  "        vec3 chip_s = vhash3(chip_id - vec2(37.2, 13.9));\n"
+  "        vec2 chip_p = fract(P / chip_cs) - mix(vec2(0.30), vec2(0.70), chip_r.xy);\n"
+  "        float chip_ang = chip_s.x * 6.2831853;\n"
+  "        vec2 chip_ax = vec2(cos(chip_ang), sin(chip_ang));\n"
+  "        vec2 chip_q = vec2(dot(chip_p, chip_ax),\n"
+  "                           dot(chip_p, vec2(-chip_ax.y, chip_ax.x)));\n"
+  "        float chip_aspect = mix(0.76, 1.28, chip_s.y);\n"
+  "        chip_q *= vec2(chip_aspect, 1.0 / chip_aspect);\n"
+  "        float chip_rad = mix(0.075, 0.175, chip_s.z);\n"
+  "        float chip_aa = clamp(fp / chip_cs, 0.012, 0.10);\n"
+  "        float chip_dist = mix(length(chip_q),\n"
+  "                              (abs(chip_q.x) + abs(chip_q.y)) * 0.76, 0.22);\n"
+  "        float chip = (1.0 - smoothstep(chip_rad - chip_aa,\n"
+  "                                      chip_rad + chip_aa, chip_dist))\n"
+  "                   * chip_vis * det;\n"
+  "        float chip_tone = mix(0.78, 1.10, chip_s.x);\n"
+  "        alb *= mix(1.0, chip_tone, chip * 0.38);\n"
+  "        rough = mix(rough, mix(0.62, 0.88, chip_s.y), chip * 0.42);\n"
+  "        vec3 chip_n = normalize(n + vec3((chip_s.x - 0.5) * 0.20, 0.0,\n"
+  "                                          (chip_s.y - 0.5) * 0.20));\n"
+  "        n = normalize(mix(n, chip_n, chip * 0.34));\n"
+  "      }\n"
   "    }\n"
   // --- SUN GLITTER --------------------------------------------------------
   // Mica in sand, and it is three invariants rather than a noise function.
@@ -1050,7 +1081,7 @@ static const char *WORLD_FS =
   // wavelength — and the diffuse goes away. Zero extra instructions; the existing
   // env * Fe path then gives a near-black reflection on axis rising to a coloured one
   // at the edge, which is the whole cue.
-  "  if (vMat.x < 0.14 && metal < 0.5) {\n"
+  "  if (base_rough < 0.14 && metal < 0.5) {\n"
   "    F0 = vec3(0.004, 0.010, 0.006);\n"
   "    f90 = alb * 8.0;\n"
   "    diff = vec3(0.0);\n"
@@ -1279,8 +1310,8 @@ static const char *SKY_FS =
   // BANDS, NOT BLOBS. A deck sampled on an isotropic grid is cotton wool; what
   // a sky actually shows is the wind, drawn out along it. The lookup runs in
   // the WIND'S frame and is squashed 4:1 across it, so the streaks lie along
-  // the same heading that combs the sand into ripples and drags the drifts on
-  // the lee of every wall — one wind, three places it shows.
+  // the same heading that drags the drifts on the lee of every wall — one wind
+  // shared by the cloud deck and ground deposits.
   "float deck(vec2 p){\n"
   "  vec2 q0 = vec2(dot(p, uWindD), dot(p, vec2(-uWindD.y, uWindD.x)));\n"
   "  q0 = vec2(q0.x * 0.52, q0.y * 1.28);\n"
@@ -1387,12 +1418,12 @@ static const char *BLUR_FS =
   "  oCol = vec4(c * 0.125, 1.0); }\n";   // exact, and three fdiv fewer
 
 // SCREEN-SPACE AMBIENT OBSCURANCE, McGuire's estimator (SAO, 2012), at half
-// resolution over the prepass. Twelve samples on a golden-angle spiral whose
+// resolution over the prepass. Twelve samples on a fixed golden-angle spiral whose
 // radius is a WORLD radius projected — so a crate's foot is occluded the same
-// amount from across the arena as from a metre away — rotated per pixel by
-// interleaved-gradient noise on the fragment coordinate: deterministic per
-// pixel, no history, no temporal term (a harness screenshot must not depend on
-// the frame before it). Positions come back through the inverse view-projection
+// amount from across the arena as from a metre away. A per-pixel rotation made
+// the half-resolution result look like square grain in corners and crawl during
+// camera motion; the blur has a stable pattern to integrate now. Positions come
+// back through the inverse view-projection
 // rather than through a view-space reconstruction: the normals are stored in
 // WORLD space, the estimator is a dot product and a distance, and one matrix
 // per sample at a quarter of the pixels is cheaper than getting a second frame
@@ -1431,14 +1462,12 @@ static const char *SSAO_FS =
   "  float z0 = lin_z(d0);\n"
   "  vec3 n = normalize(texture(uNrm, vUV).rgb * 2.0 - 1.0);\n"
   "  float rpx = clamp(uZ.z * uZ.w / z0, 1.5, 80.0);\n"
-  "  float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy,\n"
-  "                                          vec2(0.06711056, 0.00583715))));\n"
   "  float rr = uZ.w * uZ.w;\n"
   "  float bias = 0.015 + 0.004 * z0;\n"
   "  float occ = 0.0;\n"
   "  for (int i = 0; i < 12; i++) {\n"
   "    float a = (float(i) + 0.5) * (1.0 / 12.0);\n"
-  "    float ang = float(i) * 2.3999632 + ign * 6.2831853;\n"
+  "    float ang = float(i) * 2.3999632 + 0.731;\n"
   "    vec2 suv = vUV + vec2(cos(ang), sin(ang)) * (sqrt(a) * rpx) * uScr.zw;\n"
   "    float d = texture(uDepth, suv).r;\n"
   "    if (d >= 0.99999) continue;\n"

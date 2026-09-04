@@ -17,11 +17,15 @@
 // plus three rubble blocks where it used to be one box, and all of them are real cover
 // that has to be in the collision set. int16 carries the solid index on the wire
 // (net_ev_from_live) and the world hash is over the USED entries, so the ceiling itself
-// is free — what it costs is 16 lobbies x 32 x 40 bytes of server memory.
+// is free — what it costs is 16 lobbies x 160 x 44 bytes of server memory.
 #define MAX_SOLIDS   160
 
-// `pen` = a round may cross this box if its budget stretches that far.
-typedef struct { v3 min, max, color; int pen; } solid_t;
+// `pen` = a round may cross this box if its budget stretches that far. `mat`
+// is render-only metadata, deliberately a full int so the struct has no ABI-
+// dependent trailing padding. net_world_hash explicitly stops before it;
+// proof fixtures that omit it get SOLID_CONCRETE through zero-init.
+enum { SOLID_CONCRETE, SOLID_WALL };
+typedef struct { v3 min, max, color; int pen, mat; } solid_t;
 
 static solid_t g_solids_all[SRV_LOBBIES][MAX_SOLIDS];
 #define g_solids (g_solids_all[g_lobby])
@@ -40,7 +44,15 @@ static const v3 SPAWN_POS = {{0.0f, 0.0f, 18.0f}};
 
 static void map_add(v3 mn, v3 mx, v3 col) {
   if (g_num_solids >= MAX_SOLIDS) return;
-  g_solids[g_num_solids++] = (solid_t){mn, mx, col, 1};
+  g_solids[g_num_solids++] =
+      (solid_t){.min = mn, .max = mx, .color = col, .pen = 1,
+                .mat = SOLID_CONCRETE};
+}
+
+static void map_add_mat(v3 mn, v3 mx, v3 col, int mat) {
+  int at = g_num_solids;
+  map_add(mn, mx, col);
+  if (g_num_solids > at) g_solids[at].mat = mat;
 }
 
 // Perimeter = 4 wall bases + 4 accent bands, always solids 0..7.
@@ -79,6 +91,12 @@ static void map_add_sym(v3 mn, v3 mx, v3 col) {
   map_add((v3){{-mx.x, mn.y, -mx.z}}, (v3){{-mn.x, mx.y, -mn.z}}, col);
 }
 
+static void map_add_sym_mat(v3 mn, v3 mx, v3 col, int mat) {
+  map_add_mat(mn, mx, col, mat);
+  map_add_mat((v3){{-mx.x, mn.y, -mx.z}},
+              (v3){{-mn.x, mx.y, -mn.z}}, col, mat);
+}
+
 static v3 col_tint(v3 c, float lo, float hi) {
   float t = rng_range(lo, hi);
   return (v3){{c.x * t, c.y * t, c.z * t}};
@@ -99,7 +117,7 @@ static const theme_t THEMES[] = {
    .band_ew = {{0.33f, 0.34f, 0.36f}}, .band_n = {{0.29f, 0.48f, 0.65f}},
    .band_s = {{0.80f, 0.48f, 0.20f}},  .cover = {{0.64f, 0.44f, 0.34f}},
    .crate_a = {{0.63f, 0.56f, 0.45f}}, .crate_b = {{0.53f, 0.51f, 0.48f}},
-   .mid = {{0.15f, 0.47f, 0.49f}}, .surf = SURF_GRIT},
+   .mid = {{0.22f, 0.40f, 0.39f}}, .surf = SURF_GRIT},
   // SLATE — cool overcast grays, signal-orange landmark
   {.ground = {{0.555f, 0.57f, 0.595f}}, .wall = {{0.63f, 0.65f, 0.67f}},
    .band_ew = {{0.30f, 0.32f, 0.34f}}, .band_n = {{0.30f, 0.52f, 0.72f}},
@@ -330,21 +348,31 @@ typedef enum {
 // harness `map` print, which is Linux-only.
 [[maybe_unused]] static const char *SIG_NAME[] = {
   "none", "tree", "collapse", "boulders", "fallen", "split"};
-typedef enum { ME_FOOT = 0, ME_SILL, ME_TOP } medge_kind_t;
+typedef enum { ME_FOOT = 0, ME_SILL, ME_TOP, ME_FRACTURE } medge_kind_t;
 typedef struct { v3 a, b; uint8_t kind, ax; } medge_t;
 #define META_EDGE_MAX 48
+typedef struct { v3 p; float half_depth; uint8_t ax; } mvoid_t;
+#define META_VOID_MAX 48
 typedef struct {
   uint8_t sig;
+  uint8_t damage[5];   // canonical wall archetype census for deterministic audits
   int16_t bould[2];     // solid indices of the boulder pair, else -1
   int16_t tree[2];      // solid indices of the two trunks, else -1
   int     nedge;
   medge_t edge[META_EDGE_MAX];
+  int     nvoid;
+  mvoid_t voids[META_VOID_MAX];  // through-wall samples inside full fissures
 } map_meta_t;
 static map_meta_t g_meta;
 
 static void meta_edge(v3 a, v3 b, int kind, int ax) {
   if (g_meta.nedge >= META_EDGE_MAX) return;   // dressing degrades, never UB
   g_meta.edge[g_meta.nedge++] = (medge_t){a, b, (uint8_t)kind, (uint8_t)ax};
+}
+
+static void meta_void(v3 p, float half_depth, int ax) {
+  if (g_meta.nvoid >= META_VOID_MAX) return;
+  g_meta.voids[g_meta.nvoid++] = (mvoid_t){p, half_depth, (uint8_t)ax};
 }
 
 // THE SIGNATURE IS ONE SLOT, hash-gated off the seed with ordered rolls —
@@ -413,7 +441,7 @@ static void wall_piece(v3 mn, v3 mx, int ax, float a, float b,
   v3 p0 = mn, p1 = mx;
   if (ax) { p0.x = a; p1.x = b; } else { p0.z = a; p1.z = b; }
   p0.y = y0; p1.y = y1;
-  map_add_sym(p0, p1, col);
+  map_add_sym_mat(p0, p1, col, SOLID_WALL);
 }
 
 // Rubble at the foot of a break.
@@ -453,7 +481,7 @@ static void wall_rubble(v3 mn, v3 mx, int ax, float at, float dir, int count,
     if (p0.x < -(H - RING_W) || p0.z < -(H - RING_W) ||
         p1.x > H - RING_W || p1.z > H - RING_W) continue;
     if (!map_sym_free(p0, p1, 0.012f)) continue;
-    map_add_sym(p0, p1, col_tint(col, 0.84f, 0.96f));
+    map_add_sym_mat(p0, p1, col_tint(col, 0.84f, 0.96f), SOLID_WALL);
   }
 }
 
@@ -472,8 +500,11 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
   int kind = (len >= 3.2f &&
               (float)(roll & 1023u) * (1.0f / 1024.0f) <
                   0.15f + 0.55f * g_mood.ruin)
-             ? (int)((roll >> 10) % 3u) : -1;
+             ? (int)((roll >> 10) % 5u) : -1;
   if (kind == 1 && h < 1.8f) kind = 2;
+  if (kind == 3 && (h < 1.55f || len < 3.6f)) kind = 2;
+  if (kind == 4 && (h < 1.4f || len < 4.5f)) kind = 0;
+  if (kind >= 0) g_meta.damage[kind]++;
   switch (kind) {
   case 0: {  // BROKEN END: the last stretch has come down to a climbable stub
     float bl = rng_range(0.9f, 1.6f);
@@ -489,6 +520,8 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
       wall_rubble(mn, mx, ax, hi, 1.0f, 1, hs * 0.82f, col);
       meta_edge(wall_pt(mn, mx, ax, cut, hs), wall_pt(mn, mx, ax, hi, hs),
                 ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, cut, hs + 0.04f),
+                wall_pt(mn, mx, ax, cut, h - 0.04f), ME_FRACTURE, ax);
       meta_edge(wall_pt(mn, mx, ax, cut, 0.0f),
                 wall_pt(mn, mx, ax, cut + 0.9f, 0.0f), ME_FOOT, ax);
     } else {
@@ -497,6 +530,8 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
       wall_rubble(mn, mx, ax, lo, -1.0f, 1, hs * 0.82f, col);
       meta_edge(wall_pt(mn, mx, ax, lo, hs), wall_pt(mn, mx, ax, cut, hs),
                 ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, cut, hs + 0.04f),
+                wall_pt(mn, mx, ax, cut, h - 0.04f), ME_FRACTURE, ax);
       meta_edge(wall_pt(mn, mx, ax, cut - 0.9f, 0.0f),
                 wall_pt(mn, mx, ax, cut, 0.0f), ME_FOOT, ax);
     }
@@ -515,6 +550,7 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
     // THE HOLE IS RAGGED, and it is ragged in the collision set as well as in the
     // picture.
     int cols = 2 + (int)((roll >> 14) & 1u);
+    int chipped_cap = (int)((roll >> 20) % (uint32_t)cols);
     for (int c = 0; c < cols; c++) {
       float ca = a + (b - a) * (float)c / (float)cols;
       float cb = a + (b - a) * (float)(c + 1) / (float)cols;
@@ -530,7 +566,17 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
       if (jy0 < 0.34f) jy0 = 0.34f;
       if (jy1 - jy0 < 0.30f) jy1 = jy0 + 0.30f;
       wall_piece(mn, mx, ax, ca, cb, 0.0f, jy0, col);
-      wall_piece(mn, mx, ax, ca, cb, jy1, h, col);
+      // One lintel segment has lost its top courses. This is honest geometry
+      // (and honest collision), so the skyline of a breach is not a perfect
+      // rectangular slab even when seen against bright sky.
+      float cap_h = h;
+      if (c == chipped_cap && g_mood.ruin > 0.38f)
+        cap_h -= 0.25f + 0.05f * (float)((roll >> 22) & 3u);
+      if (cap_h > jy1 + 0.12f)
+        wall_piece(mn, mx, ax, ca, cb, jy1, cap_h, col);
+      if (cap_h < h)
+        meta_edge(wall_pt(mn, mx, ax, ca, cap_h),
+                  wall_pt(mn, mx, ax, cb, cap_h), ME_TOP, ax);
       if (jy0 >= 0.50f)  // a sill worth a brick is a ledge, not a kerb
         meta_edge(wall_pt(mn, mx, ax, ca, jy0), wall_pt(mn, mx, ax, cb, jy0),
                   ME_SILL, ax);
@@ -565,7 +611,10 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
       segh[ns++] = ch;
     }
     segt[ns] = hi;
-    if (ns == 0) { map_add_sym(mn, mx, col); break; }
+    if (ns == 0) {
+      map_add_sym_mat(mn, mx, col, SOLID_WALL);
+      break;
+    }
     float dmin = h, dat = lo;
     int i0 = 0;
     for (int i = 1; i <= ns; i++) {
@@ -583,6 +632,105 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
       wall_rubble(mn, mx, ax, dat, 0.0f, 1, dmin * 0.55f, col);
       meta_edge(wall_pt(mn, mx, ax, dat - 0.5f, 0.0f),
                 wall_pt(mn, mx, ax, dat + 0.5f, 0.0f), ME_FOOT, ax);
+    }
+  } break;
+  case 3: {  // FISSURE: a stepped, full-depth opening in render AND collision.
+    // Six two-course zones form a connected crack from the wall foot to
+    // open sky. Each zone is two solids separated by air, so the dark line is
+    // never paint: light, sight and projectiles really pass through it. The
+    // limited lateral walk keeps the fracture structural rather than noisy.
+    const int bands = 6;
+    float base = rng_range(lo + 0.90f, hi - 0.90f);
+    float centre = base + rng_range(-0.05f, 0.05f);
+    float prev_w = 0.0f;
+    for (int band = 0; band < bands; band++) {
+      float y0 = h * (float)band / (float)bands;
+      float y1 = band + 1 == bands ? h
+                                   : h * (float)(band + 1) / (float)bands;
+      float walk = band > 0 ? rng_range(-0.15f, 0.15f) : 0.0f;
+      // A settling crack opens toward the failed top courses. The per-zone
+      // variation prevents the gap from becoming a constant-width saw cut.
+      float cw = rng_range(0.11f, 0.17f) + 0.018f * (float)band;
+      if (band > 0) {
+        // Consecutive air intervals overlap by at least 25 mm. Without this
+        // topological constraint a visually zig-zagging pair of voids could
+        // secretly be separated by one unbroken horizontal course.
+        float max_walk = (prev_w + cw) * 0.5f - 0.025f;
+        walk = f_clamp(walk, -max_walk, max_walk);
+        centre = f_clamp(centre + walk, base - 0.32f, base + 0.32f);
+      }
+      float ca = centre - cw * 0.5f, cb = centre + cw * 0.5f;
+      wall_piece(mn, mx, ax, lo, ca, y0, y1, col);
+      wall_piece(mn, mx, ax, cb, hi, y0, y1, col);
+
+      // Fractured teeth are real cut-corner 3D modules emitted on alternating
+      // faces of the exposed crack. One edge per zone is enough to roughen the
+      // silhouette without filling the opening it exists to reveal.
+      float edge = ((band + (int)(roll >> 21)) & 1) ? ca : cb;
+      meta_edge(wall_pt(mn, mx, ax, edge, y0 + 0.03f),
+                wall_pt(mn, mx, ax, edge, y1 - 0.03f), ME_FRACTURE, ax);
+      // Upper zones stay above the believable rubble plug at the foot. These
+      // samples let mapcheck cast through the complete collision thickness,
+      // so a painted or accidentally capped crack cannot satisfy the proof.
+      if ((y0 + y1) * 0.5f > 0.46f) {
+        float half_depth = ax ? (mx.z - mn.z) * 0.5f
+                              : (mx.x - mn.x) * 0.5f;
+        meta_void(wall_pt(mn, mx, ax, centre, (y0 + y1) * 0.5f),
+                  half_depth, ax);
+      }
+      prev_w = cw;
+    }
+    wall_rubble(mn, mx, ax, base, 0.0f, 1, 0.42f, col);
+    meta_edge(wall_pt(mn, mx, ax, base - 0.58f, 0.0f),
+              wall_pt(mn, mx, ax, base + 0.58f, 0.0f), ME_FOOT, ax);
+  } break;
+  case 4: {  // COLLAPSED RUN: disconnected wall remains around open ground.
+    // Keep one structural mass, one stepped shoulder and one isolated low
+    // stump. Everything between shoulder and stump is genuinely absent, which
+    // makes this the walk-through counterpart to the narrow sight fissure.
+    int flip = (int)((roll >> 21) & 1u);
+    float cut = rng_range(lo + len * 0.42f, lo + len * 0.62f);
+    float shoulder_w = rng_range(0.42f, 0.68f);
+    float stump_w = rng_range(0.55f, 0.82f);
+    float shoulder_h = map_eyeband(h * rng_range(0.60f, 0.78f), h,
+                                   (roll >> 22) & 1u);
+    float stump_h = h * rng_range(0.26f, 0.43f);
+    if (!flip) {
+      wall_piece(mn, mx, ax, lo, cut - shoulder_w, 0.0f, h, col);
+      wall_piece(mn, mx, ax, cut - shoulder_w, cut, 0.0f, shoulder_h, col);
+      wall_piece(mn, mx, ax, hi - stump_w, hi, 0.0f, stump_h, col);
+      meta_edge(wall_pt(mn, mx, ax, cut - shoulder_w, shoulder_h),
+                wall_pt(mn, mx, ax, cut, shoulder_h), ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, hi - stump_w, stump_h),
+                wall_pt(mn, mx, ax, hi, stump_h), ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, cut, 0.04f),
+                wall_pt(mn, mx, ax, cut, shoulder_h - 0.04f),
+                ME_FRACTURE, ax);
+      meta_edge(wall_pt(mn, mx, ax, hi - stump_w, 0.04f),
+                wall_pt(mn, mx, ax, hi - stump_w, stump_h - 0.04f),
+                ME_FRACTURE, ax);
+      wall_rubble(mn, mx, ax, cut + 0.30f, 0.0f, 1,
+                  fminf(0.46f, shoulder_h * 0.55f), col);
+      meta_edge(wall_pt(mn, mx, ax, cut, 0.0f),
+                wall_pt(mn, mx, ax, hi - stump_w, 0.0f), ME_FOOT, ax);
+    } else {
+      wall_piece(mn, mx, ax, cut + shoulder_w, hi, 0.0f, h, col);
+      wall_piece(mn, mx, ax, cut, cut + shoulder_w, 0.0f, shoulder_h, col);
+      wall_piece(mn, mx, ax, lo, lo + stump_w, 0.0f, stump_h, col);
+      meta_edge(wall_pt(mn, mx, ax, cut, shoulder_h),
+                wall_pt(mn, mx, ax, cut + shoulder_w, shoulder_h), ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, lo, stump_h),
+                wall_pt(mn, mx, ax, lo + stump_w, stump_h), ME_TOP, ax);
+      meta_edge(wall_pt(mn, mx, ax, cut, 0.04f),
+                wall_pt(mn, mx, ax, cut, shoulder_h - 0.04f),
+                ME_FRACTURE, ax);
+      meta_edge(wall_pt(mn, mx, ax, lo + stump_w, 0.04f),
+                wall_pt(mn, mx, ax, lo + stump_w, stump_h - 0.04f),
+                ME_FRACTURE, ax);
+      wall_rubble(mn, mx, ax, cut - 0.30f, 0.0f, 1,
+                  fminf(0.46f, shoulder_h * 0.55f), col);
+      meta_edge(wall_pt(mn, mx, ax, lo + stump_w, 0.0f),
+                wall_pt(mn, mx, ax, cut, 0.0f), ME_FOOT, ax);
     }
   } break;
   default: {
@@ -620,7 +768,7 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
         meta_edge(wall_pt(mn, mx, ax, c2, h1), wall_pt(mn, mx, ax, c1, h1),
                   ME_TOP, ax);
       }
-    } else map_add_sym(mn, mx, col);
+    } else map_add_sym_mat(mn, mx, col, SOLID_WALL);
   } break;
   }
 }
@@ -673,11 +821,11 @@ static v3 ridge_params(float *dark) {
   }
 }
 
-// Ripple strength / glitter strength / standing-water level, per treatment.
+// Loose-grain strength / glitter strength / standing-water level, per treatment.
 static v3 surf_params(void) {
   switch (g_theme.surf) {
   case SURF_SAND: return (v3){{1.00f, 1.00f, 0.00f}};
-  // A wet floor has no ripples (water flattens loose material) and no glitter
+  // A wet floor has no loose crust (water binds the fines) and no glitter
   // (the film buries the crystal faces that would catch the sun) — the two are
   // off because the surface is telling a different story, not to save the ALU.
   // The WATER LEVEL is the SLATE moods' loudest scalar: DOWNPOUR floods it,
@@ -686,7 +834,7 @@ static v3 surf_params(void) {
   case SURF_WET:
     return (v3){{0.00f, 0.00f, g_mood_preset == 0 ? 0.38f
                               : g_mood_preset == 1 ? 0.18f : 0.30f}};
-  // Dry concrete gets NO ripples.
+  // Dry concrete gets no sand crust, but the shared aggregate still shades it.
   default:        return (v3){{0.00f, 0.22f, 0.00f}};
   }
 }
@@ -867,8 +1015,9 @@ static void map_gen_walls(void) {
           amn.x = dmid - 0.30f - dsh; amx.x = dmid + 0.30f - dsh - 0.24f;
           bmn.x = dmid - 0.30f + dsh + 0.24f; bmx.x = dmid + 0.30f + dsh;
         }
-        map_add_sym(amn, amx, wcol);
-        map_add_sym(bmn, bmx, col_tint(g_theme.cover, 0.90f, 1.00f));
+        map_add_sym_mat(amn, amx, wcol, SOLID_WALL);
+        map_add_sym_mat(bmn, bmx, col_tint(g_theme.cover, 0.90f, 1.00f),
+                        SOLID_WALL);
         // Advertisement on BOTH faces: spill lines at the joint, both sides.
         meta_edge(wall_pt(mn, mx, ax, m - 0.8f, 0.0f),
                   wall_pt(mn, mx, ax, m + 0.8f, 0.0f), ME_FOOT, ax);
@@ -1008,4 +1157,3 @@ static void map_generate(uint32_t seed) {
   map_gen_walls();
   map_gen_crates();
 }
-

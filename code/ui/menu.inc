@@ -174,10 +174,11 @@ static void ui_menu(void) {
     if (ui_button("RESET CURRENT", px + 16, y, pw - 32, 16, click, cx, cy, 0)) {
       if (g_ui_dev_sub == 0)
         for (int i = 0; i < MV_COUNT; i++) g_cfg.mv[i] = MV_DEF[i].def;
-      else if (g_ui_dev_sub == 1)
+      else if (g_ui_dev_sub == 1) {
+        for (int i = 0; i < GP_COUNT; i++) g_cfg.gun[i] = GP_DEF[i].def;
         for (int i = 0; i < WP_COUNT; i++)
           g_cfg.wp[g_ui_wpn][i] = WP_DEFAULTS[g_ui_wpn][i];
-      else
+      } else
         for (int i = PAD_AS_FRIC; i <= PAD_AS_DIST; i++)
           g_cfg.pad[i] = PAD_DEF[i].def;
     }
@@ -698,8 +699,7 @@ static float ui_page_dev(float px, float pw, float y, int click, float cx, float
     y += 4;
     ui_section("FEEL", px, pw, y);
     y += 14;
-    y = ui_mv_row(MV_ACCEL_MS, px, y, click, cx, cy);
-    y = ui_mv_row(MV_STOP_MS, px, y, click, cx, cy);
+    y = ui_mv_row(MV_RESPONSE_MS, px, y, click, cx, cy);
 
     y += 4;
     ui_section("AIR", px, pw, y);
@@ -713,10 +713,6 @@ static float ui_page_dev(float px, float pw, float y, int click, float cx, float
     y = ui_mv_row(MV_SLIDE_BOOST, px, y, click, cx, cy);
     y = ui_mv_row(MV_SLIDE_LEN, px, y, click, cx, cy);
 
-    y += 4;
-    ui_section("VIEW", px, pw, y);
-    y += 14;
-    y = ui_mv_row(MV_FOV_KICK, px, y, click, cx, cy);
     } else if (g_ui_dev_sub == 1) {
     // Weapon selector: same editor, per-weapon parameter set underneath.
     const char *wopts[WPN_COUNT];
@@ -724,34 +720,28 @@ static float ui_page_dev(float px, float pw, float y, int click, float cx, float
     ui_subsel(wopts, WPN_COUNT, &g_ui_wpn, px, pw, y, click, cx, cy);
     y += 18;
 
-    // VIEW PUNCH and BLOOM/SHOT keep their config keys and their mechanics but
-    // lost their rows (2026-08-25): the punch is a camera-feel constant the
-    // unified player-model pass settled, and per-shot bloom is spray identity —
-    // neither is a knob anyone turned twice. What was missing was HIP SPREAD:
-    // the page offered ADS spread on a pair of weapons whose whole hip/ADS
-    // trade is the hip number.
+    ui_section("GLOBAL", px, pw, y);
+    y += 14;
+    y = ui_gun_row(GP_ACTION_SPREAD, px, y, click, cx, cy);
+    y = ui_gun_row(GP_RECENTER, px, y, click, cx, cy);
+
+    y += 4;
     ui_section("RECOIL", px, pw, y);
     y += 14;
-    y = ui_wp_row(WP_KICK_UP, px, y, click, cx, cy);
-    y = ui_wp_row(WP_KICK_SIDE, px, y, click, cx, cy);
-    y = ui_wp_row(WP_RECOVER_MS, px, y, click, cx, cy);
+    y = ui_wp_row(WP_RECOIL_UP, px, y, click, cx, cy);
+    y = ui_wp_row(WP_RECOIL_SIDE, px, y, click, cx, cy);
 
     y += 4;
     ui_section("SPREAD", px, pw, y);
     y += 14;
     y = ui_wp_row(WP_HIP_SPREAD, px, y, click, cx, cy);
-    y = ui_wp_row(WP_MOVE_SPREAD, px, y, click, cx, cy);
 
     y += 4;
-    // SWAY rides in HANDLING rather than its own one-row FEEL section: the
-    // header pair it had put this tab past the panel's height clamp, and the
-    // footer hint chips drew over the BACK row.
     ui_section("HANDLING", px, pw, y);
     y += 14;
     y = ui_wp_row(WP_RPM, px, y, click, cx, cy);
     y = ui_wp_row(WP_ADS_MS, px, y, click, cx, cy);
-    y = ui_wp_row(WP_ADS_ZOOM, px, y, click, cx, cy);
-    y = ui_wp_row(WP_SWAY, px, y, click, cx, cy);
+    y = ui_wp_row(WP_ADS_FOV, px, y, click, cx, cy);
     } else {
     // ASSIST — the friction-only aim-assist workbench (see PAD_DEF's PAD_AS_* comment
     // for what each knob means).

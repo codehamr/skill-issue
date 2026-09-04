@@ -442,9 +442,12 @@ static void scat_plan_flora(void) {
   float H = ARENA_HALF;
   float growth = g_mood.growth;
   int grass = g_theme.surf != SURF_WET;
-  // SHRUB — dry openwork sticks at wall bases and beside rocks, never the
-  // open field; the growth latent's woody half. Dry themes only.
-  if (grass)
+  int moss = g_theme.surf == SURF_WET && g_mood_preset == 2;
+  // SHRUB — openwork sticks at wall bases and beside rocks, never the open
+  // field; the growth latent's woody half. On dry themes the upper tail gets
+  // sparse olive leaves. MOSSTONE reuses exactly the same skeleton as low
+  // fern fans: one construction, coherent ecology, no foliage draw call.
+  if (grass || moss)
     for (int iz = 0; iz < 9; iz++)
       for (int ix = -9; ix < 9; ix++) {
         uint32_t cx = (uint32_t)(ix + 64), cz = (uint32_t)iz;
@@ -455,15 +458,73 @@ static void scat_plan_flora(void) {
         if (fmaxf(fabsf(x), fabsf(z)) > H - RING_W) continue;
         int wi2, c2;
         float wd = scat_wall(x, z, &wi2, &c2);
-        float viab = growth * (0.06f + 0.55f * f_smoothstep(1.7f, 0.3f, wd)) *
+        float vigour = moss ? 0.48f : growth;
+        float viab = vigour * (0.06f + 0.55f * f_smoothstep(1.7f, 0.3f, wd)) *
                      (c2 ? 1.8f : 1.0f);
         if (scat01(SCAT_SHRUB, cx, cz, 0) > viab) continue;
         uint32_t h = scat_h(SCAT_SHRUB, cx, cz, 3);
         uint64_t st = (uint64_t)h * 2654435761u + 1;
         float r = rng_rangef(&st, 0.14f, 0.22f);
         if (!scat_free(x, z, r * 0.6f)) continue;
-        scat_push((v3){{x, 0.0f, z}}, r, h, -1, SCAT_SHRUB, 0);
+        int leafy = moss || (growth > 0.45f && (h & 3u) != 0u);
+        scat_push((v3){{x, 0.0f, z}}, r, h, -1, SCAT_SHRUB,
+                  (leafy ? 1 : 0) | (c2 ? 2 : 0) | (moss ? 4 : 0));
       }
+
+  // SHELTERED CORNER GROVES — a jittered field can miss the exact place the
+  // eye expects life: the pocket just beyond a wall end. Sample one candidate
+  // corner per canonical cover solid and build a tiny facilitation cluster
+  // there (bush + grass). It is deterministic per solid, paired by 180-degree
+  // symmetry, non-colliding, and capped at four canonical sites so visual
+  // richness cannot turn into geometry snow when the generator adds walls.
+  if (grass || moss) {
+    int groves = 0;
+    float vigour = moss ? 0.62f : growth;
+    for (int i = 0; i < g_num_solids && groves < 4; i++) {
+      const solid_t *s = &g_solids[i];
+      if (!scat_host_ok(s) || s->pen == 0) continue;
+      float cx0 = (s->min.x + s->max.x) * 0.5f;
+      float cz0 = (s->min.z + s->max.z) * 0.5f;
+      if (cz0 < -0.001f || (fabsf(cz0) <= 0.001f && cx0 <= 0.0f)) continue;
+      uint32_t h = scat_h(SCAT_SHRUB, (uint32_t)i, 0xC071u, 0);
+      if (scat01(SCAT_SHRUB, (uint32_t)i, 0xC071u, 1) >
+          0.16f + 0.62f * vigour)
+        continue;
+      uint64_t st = (uint64_t)h * 2654435761u + 1;
+      float r = rng_rangef(&st, 0.17f, 0.215f);
+      // Diagonal from the AABB corner clears both faces at once, so the
+      // plant reads tucked into the endpoint without intersecting collision.
+      int xp = (h >> 3) & 1u, zp = (h >> 7) & 1u;
+      float off = 0.13f + r * 0.65f;
+      v3 p = {{xp ? s->max.x + off : s->min.x - off, 0.0f,
+               zp ? s->max.z + off : s->min.z - off}};
+      // Keep the stored site canonical; its negative is the fair twin.
+      if (p.z < -0.001f || (fabsf(p.z) <= 0.001f && p.x < 0.0f))
+        p = v3_scale(p, -1.0f);
+      if (p.x * p.x + p.z * p.z < 6.5f * 6.5f) continue;
+      if (!scat_free(p.x, p.z, r * 0.60f) ||
+          !scat_free(-p.x, -p.z, r * 0.60f))
+        continue;
+      scat_push(p, r, h, -1, SCAT_SHRUB, 1 | 2 | (moss ? 4 : 0));
+      groves++;
+      if (grass) {
+        // Two small satellites make a patch rather than a placed prop. Their
+        // golden-angle offsets are keyed to the grove and therefore cannot
+        // re-roll the parent or any other scatter family.
+        for (int k = 0; k < 2; k++) {
+          float a = (float)k * 2.39996f + rng_rangef(&st, -0.35f, 0.35f);
+          float d = rng_rangef(&st, 0.18f, 0.32f);
+          v3 q = v3_add(p, (v3){{cosf(a) * d, 0.0f, sinf(a) * d}});
+          if (!scat_free(q.x, q.z, 0.05f) ||
+              !scat_free(-q.x, -q.z, 0.05f))
+            continue;
+          scat_push(q, rng_rangef(&st, 0.72f, 1.02f),
+                    scat_h(SCAT_TUFT, (uint32_t)i, 0xC071u,
+                           (uint32_t)k), -1, SCAT_TUFT, 2);
+        }
+      }
+    }
+  }
 
   // CACTUS — SAND, THORNS only: the one green mass in the desert, rare by
   // identity. Low pear fans and squat barrels; no saguaro, ever — a humanoid
@@ -521,8 +582,10 @@ static void scat_plan_bricks(void) {
   for (int e = 0; e < g_meta.nedge; e++) {
     const medge_t *ed = &g_meta.edge[e];
     int nb = ed->kind == ME_FOOT
-                 ? 2 + (int)(scat_h(SCAT_BRICK, (uint32_t)e, 90, 0) %
-                             (uint32_t)(2.0f + 4.0f * g_mood.ruin))
+                 ? 3 + (int)(scat_h(SCAT_BRICK, (uint32_t)e, 90, 0) %
+                             (uint32_t)(3.0f + 5.0f * g_mood.ruin))
+             : ed->kind == ME_FRACTURE
+                 ? 1 + (int)(scat_h(SCAT_BRICK, (uint32_t)e, 92, 0) % 2u)
                  : 2 + (int)(scat_h(SCAT_BRICK, (uint32_t)e, 91, 0) % 3u);
     for (int k = 0; k < nb; k++) {
       uint32_t h = scat_h(SCAT_BRICK, (uint32_t)e, (uint32_t)k, 7);
@@ -535,6 +598,12 @@ static void scat_plan_bricks(void) {
         if (ed->ax) p.z += side; else p.x += side;
         p.y = 0.0f;
         if (!scat_free(p.x, p.z, 0.10f)) continue;
+      } else if (ed->kind == ME_FRACTURE) {
+        // The metadata line lies on the wall centre plane. Put each tooth on
+        // one actual face of the 60 cm wall so it protrudes into light rather
+        // than disappearing inside the host solid.
+        float face = (h & 1u) ? 0.315f : -0.315f;
+        if (ed->ax) p.z += face; else p.x += face;
       }
       if (g_scat_n >= SCAT_MAX) break;
       scat_push(p, rng_rangef(&st, 0.85f, 1.10f), h, -1, SCAT_BRICK,
@@ -591,11 +660,9 @@ static void mesh_quad(v3 a, v3 b, v3 c, v3 d, v3 n, v3 col) {
 // One baked corner of the floor grid. Everything the bake decides lands in the three
 // channels a vertex already carries, so the fragment shader pays nothing:
 //   albedo    drift lightens (loose dry sand scatters more), traffic darkens (packed
-//             ground is darker ground), skirt darkens further
+//             ground is darker ground)
 //   roughness loose sand is rougher than a packed lane
-//   AO        the contact skirt — the wall/floor join was a hard line with no
-//             occlusion anywhere on it, and that join is the most artificial edge in a
-//             box arena
+//   AO        only broad prop/damage stamps; narrow contact belongs to stable SSAO
 //
 // AND IT IS LOW-PASSED BEFORE IT IS EMITTED. Three values per vertex on a 1.5 m grid,
 // linearly interpolated across two triangles, show their own lattice as soon as
@@ -652,45 +719,15 @@ static void gbake_smear(v3 a, v3 b, float r, v3 to, float amt, float ao_amt) {
 static void ground_bake(void) {
   float H = ARENA_HALF;
   int N = GROUND_CELLS + 1;
-  v3 w = wind_dir();
-  int wet = g_theme.surf == SURF_WET;
   for (int iz = 0; iz < N; iz++)
     for (int ix = 0; ix < N; ix++) {
       float x = -H + (float)ix * GROUND_STEP, z = -H + (float)iz * GROUND_STEP;
       gsurf_t g = ground_sample(x, z);
-      float t = 1.0f + 0.33f * g.drift - 0.11f * g.compact - 0.15f * g.skirt;
+      float t = 1.0f + 0.33f * g.drift - 0.11f * g.compact;
       t *= 0.965f + 0.07f * fnoise2(x * 0.11f, z * 0.11f);
       float r = WORLD_GROUND_R + 0.13f * g.drift - 0.08f * g.compact;
       v3 tv = {{t, t, t}};
-      // THE SLATE MOODS' FOOT BANDS live on the skirt the sample already
-      // computed: DOWNPOUR's waterline is a cool dark band along every wall
-      // base (rain ran off the walls); MOSSTONE's is a green one (the foot
-      // of a wall is where damp lasts). Hue work, which is why tint is a v3.
-      if (wet && g_mood_preset == 0) {
-        float k = g.skirt * 0.9f;
-        tv.x *= 1.0f - 0.30f * k; tv.y *= 1.0f - 0.22f * k; tv.z *= 1.0f - 0.10f * k;
-      } else if (wet && g_mood_preset == 2) {
-        float k = g.skirt * 0.65f;
-        tv.x *= 1.0f - 0.14f * k; tv.z *= 1.0f - 0.20f * k;
-      } else if (wet && g_mood_preset == 1) {
-        // DRAINED: runoff ran SOMEWHERE — dark streamlines lying along the
-        // wind, strongest in the wall-adjacent band the water came off.
-        float along = x * w.x + z * w.z, across = -x * w.z + z * w.x;
-        float streak = fnoise2(along * 0.33f + 31.0f, across * 1.9f - 7.0f);
-        float band = g.skirt * (1.0f - g.skirt);   // near walls, not under them
-        tv.x *= 1.0f - 0.34f * streak * band;
-        tv.y *= 1.0f - 0.32f * streak * band;
-        tv.z *= 1.0f - 0.28f * streak * band;
-        // And the TIDE LINE: a pale mineral crust ring where the water stood
-        // and left. The naming test could pick DRAINED only by elimination —
-        // its identity was an absence; this is the positive mark.
-        float crust = f_smoothstep(0.42f, 0.62f, g.skirt) *
-                      (1.0f - f_smoothstep(0.78f, 0.94f, g.skirt));
-        tv.x *= 1.0f + 0.13f * crust;
-        tv.y *= 1.0f + 0.11f * crust;
-        tv.z *= 1.0f + 0.05f * crust;
-      }
-      g_gbake[iz * N + ix] = (gvert_t){tv, r, 1.0f - 0.34f * g.skirt};
+      g_gbake[iz * N + ix] = (gvert_t){tv, r, 1.0f};
     }
   // THE PLAN STAMPS THE BAKE — placement is data and ran before this pass.
   // Every stamped site marks BOTH twins (the emit rule, in pigment).
@@ -747,8 +784,8 @@ static void ground_bake(void) {
     v3 to = {{f_clamp(0.85f + 0.15f * wc2.x / fmaxf(g_theme.ground.x, 0.05f), 0.7f, 1.15f),
               f_clamp(0.85f + 0.15f * wc2.y / fmaxf(g_theme.ground.y, 0.05f), 0.7f, 1.15f),
               f_clamp(0.85f + 0.15f * wc2.z / fmaxf(g_theme.ground.z, 0.05f), 0.7f, 1.15f)}};
-    gbake_smear(e->a, e->b, 0.8f, to, 0.65f, 0.25f);
-    gbake_smear(v3_scale(e->a, -1.0f), v3_scale(e->b, -1.0f), 0.8f, to, 0.65f, 0.25f);
+    gbake_smear(e->a, e->b, 0.8f, to, 0.65f, 0.08f);
+    gbake_smear(v3_scale(e->a, -1.0f), v3_scale(e->b, -1.0f), 0.8f, to, 0.65f, 0.08f);
   }
   static gvert_t tmp[(GROUND_CELLS + 1) * (GROUND_CELLS + 1)];
   memcpy(tmp, g_gbake, sizeof tmp);
@@ -783,6 +820,10 @@ static void mesh_ground_vert(int ix, int iz, v3 base) {
 // boxes, tapered blades and sloped wedges, and every one of those already exists as a
 // scene_* primitive.
 static void mesh_decor(void);
+// Large horizon silhouettes do not cast into the arena, but they do occlude
+// screen-space atmosphere. They are emitted between ground and fine decor so
+// the geometry prepass can draw one cheap contiguous prefix.
+static void mesh_large_scenery(void);
 // The CASTING specials — the boulder pair's chamfered render and the dead
 // trees' crowns — live down there too (same primitives), but must be emitted
 // BEFORE the shadow prefix latch: a boulder without a shadow is a sticker,
@@ -808,6 +849,11 @@ static void mesh_build(void) {
     // six-quad emit would fight the chamfered copy, so it is skipped here
     // and mesh_cast_extra owns the draw.
     if (i == g_meta.bould[0] || i == g_meta.bould[1]) continue;
+    // The roughness sign is render metadata, not negative physics: WORLD_FS
+    // takes abs() for the BRDF and uses the sign for the quiet plaster finish
+    // on generated wall pieces. The vertex layout stays at 12 floats and
+    // concrete/crates remain untouched.
+    mat_set(s->mat == SOLID_WALL ? -WORLD_SOLID_R : WORLD_SOLID_R, 0.0f);
     v3 mn = s->min, mx = s->max, c = s->color;
     // +x -x +y -y +z -z faces, wound counter-clockwise from outside.
     mesh_quad((v3){{mx.x,mn.y,mn.z}},(v3){{mx.x,mx.y,mn.z}},(v3){{mx.x,mx.y,mx.z}},(v3){{mx.x,mn.y,mx.z}},(v3){{1,0,0}},c);
@@ -841,6 +887,8 @@ static void mesh_build(void) {
       mesh_ground_vert(ix + 1, iz,     ground_col);
     }
   int decor0 = g_mesh_floats;
+  mesh_large_scenery();
+  R.world_pre_verts = g_mesh_floats / VERT_FLOATS;
   mesh_decor();
   R.world_decor_verts = (g_mesh_floats - decor0) / VERT_FLOATS;
 }
@@ -851,6 +899,7 @@ static void world_upload(void) {
   mesh_build();
   R.world_verts = g_mesh_floats / VERT_FLOATS;
   if (R.world_cast_verts > R.world_verts) R.world_cast_verts = R.world_verts;
+  if (R.world_pre_verts > R.world_verts) R.world_pre_verts = R.world_verts;
   glBindBuffer(GL_ARRAY_BUFFER, R.vbo_world);
   glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(g_mesh_floats * sizeof(float)), g_mesh, GL_STATIC_DRAW);
 }

@@ -379,7 +379,7 @@ static vm_frame_t vm_stage_springs(const vm_pose_t *ps, const vm_t *v, float alp
   // the honest point of aim and a sway that moves the picture but not the
   // shot would split them.
   float bt = ((float)g_tick + alpha) * TICK_DT;
-  float swc = g_cfg.wp[cur][WP_SWAY];
+  float swc = vm_motion_scale(cur);
   float br_k = swc * (0.22f + 0.78f * hip);
   float br_p = (sinf(bt * F_TAU * 0.30f) * 0.7f +
                 sinf(bt * F_TAU * 0.47f) * 0.3f) * 0.0032f * br_k;

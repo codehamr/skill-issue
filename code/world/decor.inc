@@ -91,6 +91,26 @@ static void dec_twig(v3 root, v3 dir, float len, float w0, v3 col, float sg) {
   scene_poly3(b1, b0, rt, rn, col);
 }
 
+// One low-poly leaf cluster. The kite is open in the middle rather than a
+// solid blob, double-sided because no authored plant can promise which face a
+// player approaches, and aligned to its supporting twig. Four triangles are
+// enough to catch a moving sun highlight without paying for alpha textures or
+// a second foliage draw call.
+static void dec_leaf(v3 root, v3 dir, float len, float width, v3 col,
+                     float sg) {
+  v3 up = fabsf(dir.y) > 0.92f ? (v3){{1, 0, 0}} : (v3){{0, 1, 0}};
+  v3 side = v3_scale(v3_norm(v3_cross(dir, up)), width);
+  v3 a = v3_add(root, v3_scale(dir, len * 0.08f));
+  v3 m = v3_add(root, v3_scale(dir, len * 0.47f));
+  v3 b = v3_add(root, v3_scale(dir, len));
+  v3 l = v3_sub(m, side), r = v3_add(m, side);
+  v3 n = v3_norm(v3_cross(v3_sub(r, a), v3_sub(l, a)));
+  v3 ra = dec_rot(a, sg), rb = dec_rot(b, sg);
+  v3 rl = dec_rot(l, sg), rr = dec_rot(r, sg), rn = dec_rot(n, sg);
+  scene_poly3(ra, rr, rb, rn, col); scene_poly3(ra, rb, rl, rn, col);
+  scene_poly3(ra, rb, rr, rn, col); scene_poly3(ra, rl, rb, rn, col);
+}
+
 // An ANGULAR rock — the chamfered box's sibling for stone that broke rather
 // than tumbled. Eight box corners, some pulled toward the centroid, every
 // face split into two flat triangles: a "worn corner" is one vertex moved, the
@@ -360,23 +380,51 @@ static void scat_emit_pave(const scat_t *sc, v3 at, float sg, v3 host, uint64_t 
 }
 
 static void scat_emit_shrub(const scat_t *sc, v3 at, float sg, v3 w2, uint64_t st) {
-        // A dry shrub: openwork twigs up-and-out from one root, leaning a
-        // little downwind. It never exceeds 0.35 m and you can see through
-        // it — which is what keeps it honestly outside the cover language.
-        int ns2 = 7 + (int)(rng_next(&st) % 4u);
-        v3 wcol2 = (v3){{0.24f, 0.21f, 0.17f}};
+        // One reusable plant skeleton, three ecologies. A plain site is the
+        // dry openwork; a leafy site puts sparse olive kites on the same
+        // twigs; MOSSTONE grows a low fern fan. Corner clusters (bit 1) get a
+        // few extra stems, never extra draw calls — all three are baked into
+        // the world mesh and remain transparent enough to preserve target
+        // silhouettes. Bits: 0 leafy, 1 sheltered corner, 2 wet fern.
+        int leafy = !!(sc->var & 1), corner = !!(sc->var & 2);
+        int fern = !!(sc->var & 4);
+        int ns2 = (fern ? 8 : 7) + corner * 2 + (int)(rng_next(&st) % 4u);
+        v3 wcol2 = fern ? (v3){{0.18f, 0.22f, 0.14f}}
+                        : (v3){{0.24f, 0.21f, 0.17f}};
+        v3 lcol = fern ? (v3){{0.24f, 0.34f, 0.17f}}
+                       : g_theme.surf == SURF_SAND
+                           ? (v3){{0.35f, 0.37f, 0.23f}}
+                           : (v3){{0.31f, 0.36f, 0.18f}};
         for (int k = 0; k < ns2; k++) {
           float ya = rng_rangef(&st, 0.0f, 6.283f);
-          float el = rng_rangef(&st, 0.35f, 1.15f);
+          float el = fern ? rng_rangef(&st, 0.22f, 0.70f)
+                          : rng_rangef(&st, 0.35f, 1.15f);
           v3 dir = {{cosf(ya) * cosf(el), sinf(el), sinf(ya) * cosf(el)}};
-          dir = v3_norm(v3_add(dir, v3_scale(w2, 0.18f)));
-          float len = sc->s * rng_rangef(&st, 0.75f, 1.35f);
+          dir = v3_norm(v3_add(dir, v3_scale(w2, fern ? 0.10f : 0.18f)));
+          float len = sc->s * rng_rangef(&st, fern ? 0.95f : 0.75f,
+                                         fern ? 1.45f : 1.35f);
           v3 root = v3_add(at, (v3){{rng_rangef(&st, -0.02f, 0.02f), 0.0f,
                                      rng_rangef(&st, -0.02f, 0.02f)}});
           // tips read lighter: sun-bleached dead wood
           v3 c2 = v3_scale(wcol2, rng_rangef(&st, 0.88f, 1.06f) +
                                       0.4f * len / sc->s * 0.15f);
           dec_twig(root, dir, len, rng_rangef(&st, 0.005f, 0.009f), c2, sg);
+          float top = root.y + dir.y * len;
+          if (top > g_scat_top) g_scat_top = top;
+          // Leaves do not cover every branch: that alternating open rhythm is
+          // the difference between a bush and an opaque green game prop. Fern
+          // fronds all carry a kite; a dry plant only carries them when the
+          // planner's growth/corner story asked for foliage.
+          if (fern || (leafy && ((k + (int)(sc->h & 1u)) & 1) == 0)) {
+            v3 lr = v3_add(root, v3_scale(dir, len * rng_rangef(&st, 0.32f, 0.54f)));
+            float ll = len * rng_rangef(&st, 0.34f, 0.48f);
+            float lw = ll * rng_rangef(&st, fern ? 0.12f : 0.18f,
+                                       fern ? 0.18f : 0.26f);
+            dec_leaf(lr, dir, ll, lw,
+                     v3_scale(lcol, rng_rangef(&st, 0.86f, 1.10f)), sg);
+            top = lr.y + dir.y * ll;
+            if (top > g_scat_top) g_scat_top = top;
+          }
         }
 }
 
@@ -440,24 +488,59 @@ static void scat_emit_tumble(const scat_t *sc, v3 at, float sg, v3 dry, uint64_t
 }
 
 static void scat_emit_brick(const scat_t *sc, v3 at, float sg, v3 host, uint64_t st) {
-        // The house brick module, 0.30 x 0.14 x 0.10, in the host wall's own
-        // cast: rotated on the ledges, spilled and part-buried at the feet.
+        // The house brick module, 0.30 x 0.14 x 0.10. Its fired-clay core is
+        // mixed back toward the host so a break reads as construction, not a
+        // pile of orange props; theme-specific clay keeps wet slate, quartz
+        // concrete and desert masonry in their own palettes.
         int kind = sc->var & 0xF, bax = (sc->var >> 4) & 1;
+        int fracture = kind == ME_FRACTURE;
         float s = sc->s;
-        float bx = 0.15f * s, by = 0.05f * s, bz = 0.07f * s;
+        float bx = (fracture ? 0.12f : 0.15f) * s;
+        float by = (fracture ? 0.07f : 0.05f) * s;
+        float bz = (fracture ? 0.10f : 0.07f) * s;
         float yaw = (bax ? 0.0f : 1.5708f) + rng_rangef(&st, -0.6f, 0.6f);
         if (rng_rangef(&st, 0.0f, 1.0f) < 0.18f)
           yaw += rng_rangef(&st, 0.8f, 1.6f);   // the outlier that sells it
         float tilt = kind == ME_FOOT ? rng_rangef(&st, -0.30f, 0.30f)
-                                     : rng_rangef(&st, 0.08f, 0.45f);
-        v3 bcol = v3_scale(host, rng_rangef(&st, 0.84f, 0.96f));
+                   : fracture ? rng_rangef(&st, -0.65f, 0.65f)
+                              : rng_rangef(&st, 0.08f, 0.45f);
+        v3 clay = g_theme.surf == SURF_WET ? (v3){{0.39f, 0.28f, 0.23f}}
+                : g_theme.surf == SURF_SAND ? (v3){{0.53f, 0.36f, 0.23f}}
+                                            : (v3){{0.50f, 0.30f, 0.21f}};
+        v3 bcol = v3_scale(v3_lerp(host, clay, 0.56f),
+                           rng_rangef(&st, 0.86f, 1.02f));
         if (kind == ME_FOOT) {
           float sink = rng_rangef(&st, 0.20f, 0.40f);
           at.y = by * (1.0f - 2.0f * sink);
+        } else if (fracture) {
+          at.y = sc->pos.y;
         } else {
           at.y = sc->pos.y + by * 0.75f;
         }
-        dec_rock(at, bx, by, bz, yaw, tilt, 0u, 0.0f, 0, bcol, sg);
+        // Footfall bricks broke on impact; ledge bricks retain the rectangular
+        // module that makes the damage edge legible from range.
+        uint32_t cuts = kind == ME_FOOT ? (sc->h & 0x2Du)
+                      : fracture ? (sc->h | 0x5Au) : 0u;
+        dec_rock(at, bx, by, bz, yaw, tilt, cuts,
+                 cuts ? rng_rangef(&st, fracture ? 0.20f : 0.12f,
+                                        fracture ? 0.38f : 0.22f) : 0.0f,
+                 0, bcol, sg);
+        // One small shard for roughly every third fallen brick. It shares the
+        // parent's hash stream and material, so it enriches the cluster
+        // without becoming another scatter family or changing draw calls.
+        if (kind == ME_FOOT && sc->h % 3u == 0u) {
+          float a = rng_rangef(&st, 0.0f, 6.283f);
+          float d = rng_rangef(&st, 0.10f, 0.20f);
+          v3 q = v3_add(at, (v3){{cosf(a) * d, 0.0f, sinf(a) * d}});
+          float sy = rng_rangef(&st, 0.018f, 0.028f);
+          q.y = sy * rng_rangef(&st, 0.35f, 0.70f);
+          dec_rock(q, rng_rangef(&st, 0.045f, 0.075f), sy,
+                   rng_rangef(&st, 0.035f, 0.060f),
+                   rng_rangef(&st, 0.0f, 6.283f),
+                   rng_rangef(&st, -0.20f, 0.20f),
+                   (uint32_t)rng_next(&st) & 0x5Au, 0.20f, 0,
+                   v3_scale(bcol, rng_rangef(&st, 0.88f, 0.98f)), sg);
+        }
 }
 
 static void scat_emit(void) {
@@ -627,6 +710,119 @@ static void mesh_cast_extra(void) {
   g_scene_peak = save_peak; g_scene_drops = save_drops;
 }
 
+// Horizon-scale scenery is its own static batch. It is placed before grass,
+// stones and sticks in the world VBO: the shadow pass still ends before the
+// ground, while the screen-space prepass can include this batch in one prefix.
+static void mesh_large_scenery(void) {
+  int save_floats = g_scene_floats, save_want = g_scene_want;
+  int save_peak = g_scene_peak;
+  long save_drops = g_scene_drops;
+  g_scene_floats = 0;
+  g_ao_mul = 1.0f;
+  ao_off();
+
+  const theme_t *th = &g_theme;
+  // A second pair measured +9.5% on a one-thread llvmpipe sky frame. Keep one
+  // rotationally fair pair and spend the reserve on a readable roofline.
+  uint64_t st = (uint64_t)scat_h(0xE110u, 0, 1, 2) * 2654435761u + 1;
+  float ang = rng_rangef(&st, 0.0f, 2.0f * F_PI);
+  // 86..96 m keeps every corner of both silhouettes inside ZFAR from every
+  // playable point. They are depth-masked, so the 72 m volume march terminates
+  // correctly when a silhouette lies inside it from the near rim.
+  float r = rng_rangef(&st, 86.0f, 96.0f);
+  float hgt = rng_rangef(&st, 11.0f, 16.0f);
+  float wx = rng_rangef(&st, 4.0f, 9.0f), wz = rng_rangef(&st, 2.5f, 5.0f);
+  v3 radial = {{cosf(ang), 0.0f, sinf(ang)}};
+  v3 tangent = {{-radial.z, 0.0f, radial.x}};
+  v3 c = {{radial.x * r, (hgt - 20.0f) * 0.5f, radial.z * r}};
+  v3 mass_col = v3_scale(th->wall, rng_rangef(&st, 0.82f, 0.94f));
+  float shoulder_h = hgt * rng_rangef(&st, 0.45f, 0.65f);
+  float shoulder_w = wx * rng_rangef(&st, 0.5f, 0.8f);
+  float shoulder_off = wx + shoulder_w * 0.9f;
+
+  for (int t = 0; t < 2; t++) {
+    float sg = t ? -1.0f : 1.0f;
+    v3 rr = dec_rot(radial, sg), tt = dec_rot(tangent, sg);
+    v3 cc = dec_rot(c, sg);
+    if (th->surf == SURF_SAND) {
+      // Buried, asymmetric mesa shoulders keep the desert horizon geological.
+      mat_set(WORLD_SOLID_R, 0.0f);
+      scene_box(cc, v3_scale(tt, wx),
+                (v3){{0, (hgt + 20.0f) * 0.5f, 0}},
+                v3_scale(rr, wz), mass_col);
+      v3 c2 = v3_add(c, v3_scale(tangent, shoulder_off));
+      c2.y = (shoulder_h - 20.0f) * 0.5f;
+      scene_box(dec_rot(c2, sg), v3_scale(tt, shoulder_w),
+                (v3){{0, (shoulder_h + 20.0f) * 0.5f, 0}},
+                v3_scale(rr, wz * 0.8f), v3_scale(mass_col, 0.96f));
+      continue;
+    }
+
+    // RUINED OUTPOST: deep foundation, offset wing, broken parapet and a
+    // service mast. The silhouette carries the read; facade geometry stays
+    // deliberately sparse at this distance.
+    float base = -12.0f, top = hgt + 4.5f;
+    v3 body = cc;
+    body.y = (base + top) * 0.5f;
+    mat_set(-0.79f, 0.0f);
+    scene_box(body, v3_scale(tt, wx * 0.72f),
+              (v3){{0, (top - base) * 0.5f, 0}},
+              v3_scale(rr, wz * 0.72f), mass_col);
+    float wing_top = hgt * 0.68f + 2.2f;
+    v3 wing = v3_add(cc, v3_scale(tt, wx * 0.98f));
+    wing.y = (base + wing_top) * 0.5f;
+    scene_box(wing, v3_scale(tt, wx * 0.38f),
+              (v3){{0, (wing_top - base) * 0.5f, 0}},
+              v3_scale(rr, wz * 0.92f), v3_scale(mass_col, 0.93f));
+    v3 core = v3_add(cc, v3_scale(tt, -wx * 0.30f));
+    core.y = top + 0.75f;
+    scene_box(core, v3_scale(tt, wx * 0.16f), (v3){{0, 0.75f, 0}},
+              v3_scale(rr, wz * 0.22f), v3_scale(mass_col, 0.88f));
+    v3 lip = cc;
+    lip.y = top + 0.28f;
+    scene_box(lip, v3_scale(tt, wx * 0.30f), (v3){{0, 0.28f, 0}},
+              v3_scale(rr, wz * 0.78f), v3_scale(mass_col, 0.95f));
+    v3 mast = v3_add(cc, v3_scale(tt, -wx * 0.28f));
+    mast.y = top + 2.65f;
+    scene_box(mast, v3_scale(tt, 0.055f), (v3){{0, 1.65f, 0}},
+              v3_scale(rr, 0.055f), v3_scale(mass_col, 0.58f));
+    v3 aerial = v3_add(cc, v3_scale(tt, -wx * 0.28f));
+    aerial.y = top + 3.45f;
+    scene_box(aerial, v3_scale(tt, 0.60f), (v3){{0, 0.055f, 0}},
+              v3_scale(rr, 0.055f), v3_scale(mass_col, 0.58f));
+
+    // Dark dielectric panes use the existing PBR path. Hash omissions break
+    // the grid into intact, boarded and empty-looking bays.
+    mat_set(0.09f, 0.0f);
+    v3 glass = th->surf == SURF_WET ? (v3){{0.10f, 0.17f, 0.21f}}
+                                    : (v3){{0.14f, 0.17f, 0.16f}};
+    for (int wy = 0; wy < 3; wy++)
+      for (int xx = -1; xx <= 1; xx++) {
+        uint32_t wh = scat_h(0xB17Du, 0, (uint32_t)(wy + 3),
+                             (uint32_t)(xx + 2));
+        if ((wh & 7u) == 0u) continue;
+        v3 wp = v3_add(cc, v3_scale(rr, -(wz * 0.72f + 0.025f)));
+        wp = v3_add(wp, v3_scale(tt, (float)xx * wx * 0.38f));
+        wp.y = 6.4f + (float)wy * 3.05f;
+        scene_box(wp, v3_scale(tt, wx * 0.115f), (v3){{0, 0.48f, 0}},
+                  v3_scale(rr, 0.025f), glass);
+      }
+  }
+  mat_set(WORLD_GROUND_R, 0.0f);
+  ao_off();
+
+  int n = g_scene_floats;
+  int cap = (int)(sizeof g_mesh / sizeof g_mesh[0]);
+  if (g_mesh_floats + n > cap) n = cap - g_mesh_floats;
+  if (n < g_scene_floats && !g_mesh_drops++)
+    fprintf(stderr, "mesh: large-scenery budget exhausted — geometry dropped\n");
+  memcpy(g_mesh + g_mesh_floats, g_scene, (size_t)n * sizeof(float));
+  g_mesh_floats += n;
+  g_scene_floats = save_floats; g_scene_want = save_want;
+  g_scene_peak = save_peak; g_scene_drops = save_drops;
+  g_scene_dirty = 1;
+}
+
 static void mesh_decor(void) {
   int save_floats = g_scene_floats, save_want = g_scene_want;
   int save_peak = g_scene_peak;
@@ -719,52 +915,6 @@ static void mesh_decor(void) {
       }
     }
   scat_emit();
-
-  // BEYOND THE SHELL — two to four mesa-scale silhouette prisms, 60-100 m
-  // out and 8 m or taller, never in g_solids: render-only mass for the
-  // horizon third of every eye-level frame, sold for free by the aerial
-  // perspective's height falloff. Emitted as symmetric PAIRS so both
-  // players' horizons are equivalent; well inside ZFAR from any eye.
-  {
-    ao_off();
-    // ONE pair, deep in the haze: a second pair doubled the fragment bill of
-    // every sky-heavy frame (the world shader is not cheap, and a prism's
-    // pixels are exactly the sky pixels that used to cost one gradient) —
-    // measured +9.5 % on a one-thread llvmpipe sky frame with two pairs,
-    // which over-reports fragment cost but points the right way.
-    int npr = 1;
-    for (int k = 0; k < npr; k++) {
-      uint64_t st = (uint64_t)scat_h(0xE110u, (uint32_t)k, 1, 2) *
-                    2654435761u + 1;
-      float ang = rng_rangef(&st, 0.0f, 2.0f * F_PI);
-      float r = rng_rangef(&st, 74.0f, 100.0f);
-      float hgt = rng_rangef(&st, 9.0f, 14.0f);
-      float wx = rng_rangef(&st, 4.0f, 9.0f), wz = rng_rangef(&st, 2.5f, 5.0f);
-      // The prisms run 20 m BELOW the floor plane: there is no terrain out
-      // there, so a base sitting at y = 0 showed a base LINE against the
-      // sky's below-horizon gradient from any raised camera — levitating
-      // scenery. With the base buried, every camera reads them as standing
-      // behind the shell. A CRANE camera (harness/media, 8 m+) can still see
-      // a soft seam where the prism's fogged lower half meets the darker
-      // below-horizon sky — priced and accepted: a PLAY camera never can,
-      // because the eye (max ~3.1 m on a crate) never clears the 3.2 m
-      // shell, which occludes everything below its own top line out there.
-      v3 c = {{cosf(ang) * r, (hgt - 20.0f) * 0.5f, sinf(ang) * r}};
-      v3 mesa = v3_scale(th->wall, rng_rangef(&st, 0.82f, 0.94f));
-      float sh = hgt * rng_rangef(&st, 0.45f, 0.65f);   // the lower shoulder
-      float sx = wx * rng_rangef(&st, 0.5f, 0.8f);
-      float sof = wx + sx * 0.9f;
-      for (int t = 0; t < 2; t++) {
-        float sg = t ? -1.0f : 1.0f;
-        scene_box(dec_rot(c, sg), (v3){{wx * sg, 0, 0}},
-                  (v3){{0, (hgt + 20.0f) * 0.5f, 0}}, (v3){{0, 0, wz * sg}}, mesa);
-        v3 c2 = {{c.x + sof, (sh - 20.0f) * 0.5f, c.z}};
-        scene_box(dec_rot(c2, sg), (v3){{sx * sg, 0, 0}},
-                  (v3){{0, (sh + 20.0f) * 0.5f, 0}},
-                  (v3){{0, 0, wz * 0.8f * sg}}, v3_scale(mesa, 0.96f));
-      }
-    }
-  }
 
   // What a dead tree sheds: a few fallen sticks at each trunk's base — the
   // ground story that ties the crown to the floor without any aerial twigs.

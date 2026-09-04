@@ -12,10 +12,9 @@
 // Locomotion, shared by the player and by every bot. There is exactly ONE set of
 // movement numbers in this game and these helpers are it.
 
-// Ground move: exponential approach to the intent's target velocity. With intent
-// the gap closes in ACCEL TIME, without it in STOP TIME.
+// Ground move: one response time for both taking and releasing intent.
 static void mv_walk(v3 *vel, float wx, float wz, float wlen, float max_speed) {
-  float alpha = mv_alpha(wlen > 1e-5f ? g_sim_mv[MV_ACCEL_MS] : g_sim_mv[MV_STOP_MS]);
+  float alpha = mv_alpha(g_sim_mv[MV_RESPONSE_MS]);
   vel->x += (wx * max_speed - vel->x) * alpha;
   vel->z += (wz * max_speed - vel->z) * alpha;
   if (wlen < 1e-5f && vel->x * vel->x + vel->z * vel->z < 1e-4f)
@@ -41,10 +40,6 @@ static float mv_slide_end_speed(void) {
 static int mv_slide_should_end(int grounded, int hold, float sp2d) {
   return !hold || !grounded || sp2d < mv_slide_end_speed();
 }
-
-// Aimed walk: the tactical slow every entity pays while ADS — one definition,
-// because `parity` cannot see a locomotion factor that exists twice.
-static float mv_ads_walk_scale(float ads_s) { return 1.0f - 0.1f * ads_s; }
 
 // Rotate the horizontal velocity toward the intent at CONSTANT speed — the
 // slide's carve and the above-run-speed air redirect are the same operation, and
@@ -95,11 +90,10 @@ static void mv_air(v3 *vel, float wx, float wz, float wlen, float sp2d) {
   if (wlen <= 1e-5f || mv[MV_AIR_CTL] <= 0) return;
   float ctl = mv[MV_AIR_CTL] * 0.01f;
   if (sp2d <= mv[MV_RUN]) {
-    float alpha = mv_alpha(mv[MV_ACCEL_MS]) * ctl;
+    float alpha = mv_alpha(mv[MV_RESPONSE_MS]) * ctl;
     vel->x += (wx * mv[MV_RUN] - vel->x) * alpha;
     vel->z += (wz * mv[MV_RUN] - vel->z) * alpha;
   } else {
     mv_steer(vel, sp2d, wx, wz, ctl);
   }
 }
-

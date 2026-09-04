@@ -417,7 +417,7 @@ static const char *pad_disp(const char *tok) {
 
 enum { DRAG_SENSE = 1, DRAG_FOV, DRAG_CAP, DRAG_VOL, DRAG_BOTS, DRAG_FRAG,
        DRAG_ADS_SENSE,  // 7, the one id left before the MV block starts
-       DRAG_MV0 = 8, DRAG_WP0 = 32, DRAG_PAD0 = 56,  // +i = tuning slider i
+       DRAG_MV0 = 8, DRAG_GP0 = 24, DRAG_WP0 = 32, DRAG_PAD0 = 56,
        // The first id past the last block, derived so widening PAD_DEF cannot
        // collide with it the way a hand-written 63 would.
        DRAG_BRIGHT = DRAG_PAD0 + PAD_COUNT };
@@ -624,6 +624,10 @@ static float ui_param_row(const param_def_t *d, float *val, int drag_id,
 
 static float ui_mv_row(int i, float px, float y, int click, float cx, float cy) {
   return ui_param_row(&MV_DEF[i], &g_cfg.mv[i], DRAG_MV0 + i, px, y, click, cx, cy);
+}
+
+static float ui_gun_row(int i, float px, float y, int click, float cx, float cy) {
+  return ui_param_row(&GP_DEF[i], &g_cfg.gun[i], DRAG_GP0 + i, px, y, click, cx, cy);
 }
 
 static int g_ui_wpn;  // which weapon the DEV/WEAPON view edits (WPN_AR / WPN_SR)

@@ -323,11 +323,6 @@ typedef struct {
   // Plain multiplier on the same ADS ramp; 1.00 is the identity everywhere.
   float ads_sense;           // mouse ADS sensitivity multiplier, 1 = unchanged
   float fov;                 // horizontal FOV in degrees
-  // How much of the recoil offset the CAMERA follows, 0..1. At 1 the reticle is
-  // always the next round's line and the climb is fought with the mouse; below it
-  // the crosshair lies about the barrel by the remainder. No menu row on purpose:
-  // it is the aim contract, not a taste setting, and the sway follow is separate.
-  float recoil_view;
   int   vsync;
   int   fps_cap;             // frame limiter, 0 = off
   int   show_fps;
@@ -355,6 +350,7 @@ typedef struct {
   int   third_person;        // camera: 0 = first person, 1 = shoulder cam
   int   devmode;             // show the DEV tab; hard-gated by DEV_MENU, def 0
   float mv[MV_COUNT];        // movement tuning, see MV_DEF
+  float gun[GP_COUNT];       // global accuracy/recoil rules, see GP_DEF
   float wp[WPN_COUNT][WP_COUNT];  // per-weapon tuning, see WP_DEF/WPN_DEF
   float pad[PAD_COUNT];      // gamepad feel, see PAD_DEF
   int   pad_curve;           // aim response curve, index into PAD_CURVE_OPTS
@@ -381,6 +377,7 @@ static char     g_cfg_path[512];
 
 // The tuning tables the SIM reads.
 static const float *g_sim_mv = g_cfg.mv;
+static const float *g_sim_gun = g_cfg.gun;
 static const float (*g_sim_wp)[WP_COUNT] = g_cfg.wp;
 
 // Q/E are the lean keys, so the weapon TOGGLE moved to x; an existing `bind_swap q` is
@@ -416,9 +413,8 @@ static char name_glyph(char c) {
 static config_t config_defaults(void) {
   // fov 100 is the genre's PC default; vsync 0 + fps_cap 120 matches the handheld
   // panel without vsync's latency; msaa 8 because flat facets and long straight
-  // silhouettes are what MSAA is cheap on and what crawls without it. recoil_view 1
-  // is the open value: the camera carries the whole climb, so the reticle never lies.
-  config_t c = {.sense = 1.0f, .ads_sense = 1.0f, .fov = 100.0f, .recoil_view = 1.0f,
+  // silhouettes are what MSAA is cheap on and what crawls without it.
+  config_t c = {.sense = 1.0f, .ads_sense = 1.0f, .fov = 100.0f,
                 .vsync = 0, .fps_cap = 120, .show_fps = 1, .msaa = 8,
                 .ssao = 1, .ssr = 1,
                 // The graphics defaults ARE the top quality preset, deliberately:
@@ -441,6 +437,7 @@ static config_t config_defaults(void) {
                 // rather than left to the implicit zero: tele_tick branches on it.
                 .update_check = 1, .telemetry = 1, .tele_id = 0};
   for (int i = 0; i < MV_COUNT; i++) c.mv[i] = MV_DEF[i].def;
+  for (int i = 0; i < GP_COUNT; i++) c.gun[i] = GP_DEF[i].def;
   for (int w = 0; w < WPN_COUNT; w++)
     for (int i = 0; i < WP_COUNT; i++) c.wp[w][i] = WP_DEFAULTS[w][i];
   for (int i = 0; i < PAD_COUNT; i++) c.pad[i] = PAD_DEF[i].def;
@@ -466,7 +463,6 @@ static void config_emit(FILE *f, const config_t *c) {
     "sense %.3f\n"
     "ads_sense %.3f\n"
     "fov %.0f\n"
-    "recoil_view %.2f\n"
     "vsync %d\n"
     "fps_cap %d\n"
     "show_fps %d\n"
@@ -481,7 +477,7 @@ static void config_emit(FILE *f, const config_t *c) {
     "brightness %.2f\n"
     "third_person %d\n"
     "devmode %d\n",
-    (double)c->sense, (double)c->ads_sense, (double)c->fov, (double)c->recoil_view,
+    (double)c->sense, (double)c->ads_sense, (double)c->fov,
     c->vsync, c->fps_cap,
     c->show_fps, c->msaa, c->ssao, c->ssr,
     c->fullscreen, c->shadows, c->bloom, c->dust, c->grain, (double)c->brightness,
@@ -497,6 +493,8 @@ static void config_emit(FILE *f, const config_t *c) {
           c->telemetry, c->tele_id);
   for (int i = 0; i < MV_COUNT; i++)
     fprintf(f, "%s %.2f\n", MV_DEF[i].key, (double)c->mv[i]);
+  for (int i = 0; i < GP_COUNT; i++)
+    fprintf(f, "%s %.2f\n", GP_DEF[i].key, (double)c->gun[i]);
   for (int w = 0; w < WPN_COUNT; w++)
     for (int i = 0; i < WP_COUNT; i++) {
       char key[32];
@@ -619,23 +617,32 @@ static void config_bind_migrate(config_t *c, int pad) {
   }
 }
 
-// DID THIS LINE NAME A WEAPON PARAMETER? Two vocabularies, one column and one clamp:
-// WP_DEF's live names, and the superseded ones in WP_LEGACY_KEY, which are parsed and
-// never emitted because the untouched-install migration below reads a WHOLE profile
-// and a key it cannot place is a row it cannot recognise.
+// Did this line name one of the six current per-weapon parameters?
 static int config_wp_key(config_t *c, const char *key, const char *val) {
   for (int w = 0; w < WPN_COUNT; w++) {
     int i = -1;
     for (int k = 0; k < WP_COUNT && i < 0; k++)
       if (wp_key_match(key, w, WP_DEF[k].key)) i = k;
-    for (unsigned li = 0;
-         li < sizeof WP_LEGACY_KEY / sizeof *WP_LEGACY_KEY && i < 0; li++)
-      if (wp_key_match(key, w, WP_LEGACY_KEY[li].key)) i = WP_LEGACY_KEY[li].idx;
     if (i < 0) continue;
     c->wp[w][i] = parse_float(val, c->wp[w][i], WP_DEF[i].lo, WP_DEF[i].hi);
     return 1;
   }
   return 0;
+}
+
+// Old weapon knobs changed meaning or disappeared. Consume their keys without
+// importing their values into the new model; this gives an existing config the clean
+// defaults once, and config_write drops the obsolete vocabulary on the next save.
+static int config_old_gun_key(const char *key) {
+  static const char *const old[] = {
+    "kick_up", "kick_side", "recover_ms", "move_spread", "heat", "punch", "sway",
+    "ads_ms", "ads_zoom", "hip_recoil", "move_recoil",
+  };
+  for (int w = 0; w < WPN_COUNT; w++)
+    for (unsigned i = 0; i < sizeof old / sizeof *old; i++)
+      if (wp_key_match(key, w, old[i])) return 1;
+  return !strcmp(key, "recoil_view") || !strcmp(key, "mv_fov_kick") ||
+         !strcmp(key, "mv_accel_ms") || !strcmp(key, "mv_stop_ms");
 }
 
 static void config_load_or_create(const char *path, config_t *c) {
@@ -679,10 +686,6 @@ static void config_load_or_create(const char *path, config_t *c) {
     // ask for more than the menu offers, and the menu must not rewrite it.
     else if (!strcmp(key, "ads_sense")) c->ads_sense = parse_float(val, c->ads_sense, 0.01f, 10.0f);
     else if (!strcmp(key, "fov"))   c->fov   = parse_float(val, c->fov, 50.0f, 130.0f);
-    // 0 = the camera ignores the climb entirely, 1 = it carries all of it. Clamped to
-    // that range: past 1 the view would outrun the barrel it is supposed to be on.
-    else if (!strcmp(key, "recoil_view"))
-      c->recoil_view = parse_float(val, c->recoil_view, 0.0f, 1.0f);
     // The 0/1 flags stay on `? 1 : 0` rather than a parse_int(0, 1) clamp: a
     // hand-edited `vsync -1` means "on" today and a clamp would make it "off".
     else if (!strcmp(key, "vsync"))    c->vsync    = parse_long(val, c->vsync) ? 1 : 0;
@@ -762,7 +765,13 @@ static void config_load_or_create(const char *path, config_t *c) {
           c->mv[i] = parse_float(val, c->mv[i], MV_DEF[i].lo, MV_DEF[i].hi);
           hit = 1;
         }
+      for (int i = 0; i < GP_COUNT && !hit; i++)
+        if (!strcmp(key, GP_DEF[i].key)) {
+          c->gun[i] = parse_float(val, c->gun[i], GP_DEF[i].lo, GP_DEF[i].hi);
+          hit = 1;
+        }
       if (!hit) hit = config_wp_key(c, key, val);
+      if (!hit) hit = config_old_gun_key(key);
       for (int i = 0; i < PAD_COUNT && !hit; i++)
         if (!strcmp(key, PAD_DEF[i].key)) {
           c->pad[i] = parse_float(val, c->pad[i], PAD_DEF[i].lo, PAD_DEF[i].hi);
@@ -806,33 +815,6 @@ static void config_load_or_create(const char *path, config_t *c) {
     }
   }
   fclose(f);
-
-  // An existing untouched config otherwise pins a superseded weapon profile forever:
-  // defaults only fill missing keys. Migrate an exact complete legacy row, never a
-  // partially matching one, so one deliberate user tune protects all of it. Each
-  // weapon is judged on its own row, and every superseded row a shipped build ever
-  // wrote stays listed — a player who skipped a version arrives from the older one.
-  int legacy_ar = 1, flat_trace_ar = 1, spring_ar = 1, placed_ar = 1, spring_sr = 1;
-  for (int i = 0; i < WP_COUNT; i++) {
-    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_PHYSICAL[i]) > 0.0001f)
-      legacy_ar = 0;
-    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_WALL_TRACE[i]) > 0.0001f)
-      flat_trace_ar = 0;
-    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_PATTERN[i]) > 0.0001f)
-      spring_ar = 0;
-    if (fabsf(c->wp[WPN_AR][i] - WP_AR_DEFAULTS_PRE_FOLLOWER[i]) > 0.0001f)
-      placed_ar = 0;
-    if (fabsf(c->wp[WPN_SR][i] - WP_SR_DEFAULTS_PRE_PATTERN[i]) > 0.0001f)
-      spring_sr = 0;
-  }
-  if (legacy_ar || flat_trace_ar || spring_ar || placed_ar) {
-    memcpy(c->wp[WPN_AR], WP_DEFAULTS[WPN_AR], sizeof c->wp[WPN_AR]);
-    fprintf(stderr, "config: migrated untouched AR profile to follower defaults\n");
-  }
-  if (spring_sr) {
-    memcpy(c->wp[WPN_SR], WP_DEFAULTS[WPN_SR], sizeof c->wp[WPN_SR]);
-    fprintf(stderr, "config: migrated untouched SR profile to pattern defaults\n");
-  }
 
   config_bind_migrate(c, 0);
   config_bind_migrate(c, 1);

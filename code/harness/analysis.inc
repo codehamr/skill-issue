@@ -254,7 +254,7 @@ static void usage(void) {
        "  warp X Y Z         teleport the player (peek/camera framing tests)\n"
        "  pos                print tick/position/velocity/eye/grounded/lean/shots\n"
        "  lean               print lean command/clearance/eye+head offset/exposure\n"
-       "  wpn                print ammo/barrel recoil/heat/ads/reload\n"
+       "  wpn                print ammo/barrel recoil/ads/reload + cosmetic VM state\n"
        "  bot                print every bot: position/hp/state/target + belief\n"
        "  aimbot             snap yaw/pitch onto the nearest bot's head\n"
        "  botfreeze [on|off] toggle or set ALL bot AI (stable capture target)\n"
@@ -285,7 +285,7 @@ static void usage(void) {
        "  sfx DIR            dump all synthesized sounds as WAV + level stats\n"
        "  sfxlog N           print every audio routing decision for N ticks\n"
        "  mixdown P.wav N    render the real voice mixer + limiter for N ticks\n"
-       "  map                theme/wind/surface treatment + all collision solids\n"
+       "  map                theme/wind/surface, collision solids + fracture edges\n"
        "  sun [ELEV AZI]     the arena's light: elevation/azimuth in DEGREES,\n"
        "                     the extinguished sun colour, the exposure and the\n"
        "                     shadow box. With two arguments it MOVES the sun —\n"
@@ -350,12 +350,9 @@ static void usage(void) {
        "                     the analytic eye-ray intersection on it must be inside 1 cm\n"
        "                     for an aimed round (cone 0) and inside HIP SPREAD's own\n"
        "                     angle over the path from the hip (hard gate)\n"
-       "  recoil             AR/SR hip+ADS, single+burst: T0/1/2/4/8/16/settle,\n"
-       "                     muzzle axis, camera punch, shot direction reproduced from\n"
-       "                     the trigger-time bore and the round's own two spread draws,\n"
-       "                     deterministic curve and gameplay isolation; plus the auto,\n"
-       "                     slide (fired vs sim bore under a committed slide) and wall\n"
-       "                     fixtures (hard gate)\n"
+       "  recoil             compact gun contract: first-shot axis, fixed up + alternating\n"
+       "                     side steps, held-trigger freeze, linear exact recenter, and\n"
+       "                     identical jump/slide spread for AR/SR (hard gate)\n"
        "  vmtrig             hard hand contract over FP/3P Hip/ADS, reload\n"
        "                     15/35/55/75/90, SR bolt, recoil peaks, Low-Ready\n"
        "                     and death: guard/blade, actual allowed bite and\n"
@@ -363,7 +360,7 @@ static void usage(void) {
        "                     guard >=0, blade >=-4.5 mm, forbidden <=0.5 mm,\n"
        "                     proxy/actual bite 2..4 mm, allowed wall <=4.5 mm,\n"
        "                     live clamp=0 (death is reported separately)\n"
-       "  mapcheck N         regenerate N arenas; count coplanar same-facing faces\n"
+       "  mapcheck N         arenas: coplanar/capacity + through-fissure rays\n"
        "  parity             24 player-vs-bot gameplay rows, ok/MISMATCH each\n"
        "  bothear            authoritative shot/step hearing and investigation proof\n"
        "  botweapon          bot weapon-choice/swap/cooldown hysteresis proof\n"
@@ -478,14 +475,14 @@ static void usage(void) {
 }
 
 // HOW FAR OFF THE CALM AIM THE BARREL ITSELF IS, in degrees: the magnitude of exactly
-// the two terms gun_bore_angles adds, the recoil place and the sway wander. It is a
+// the two recoil components gun_bore_angles adds. It is a
 // measurement and lives here because only measurements ask it — the sim never needs
 // the magnitude, only the angles — and one copy of it keeps `wpn`'s column and the
-// recoil rows from developing separate opinions about where the rifle is pointing.
+// recoil proof from developing separate opinions about where the rifle is pointing.
 // Deliberately NOT gun_spread: that is the cone the STANCE opens around this axis.
 static float gun_bore_offset(const weapon_t *w) {
-  float p = w->rec_p + w->sway_p;
-  float y = w->rec_y + w->sway_y;
+  float p = w->rec_p;
+  float y = w->rec_y;
   return sqrtf(p * p + y * y);
 }
 
@@ -798,5 +795,5 @@ static void proof_world_restore(const proof_world_t *w) {
 static void bothear_emit_shot(int src, v3 pos) {
   weapon_t w = {.cur = WPN_AR};
   wpn_fill_mags(&w);
-  gun_shoot(src, &w, pos, 0.0f, 0.0f, (v3){{0,0,0}}, 1, &g_rng_bot);
+  gun_shoot(src, &w, pos, 0.0f, 0.0f, 1, 0, &g_rng_bot);
 }

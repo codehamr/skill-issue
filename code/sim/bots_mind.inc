@@ -395,13 +395,12 @@ typedef enum {
   BOT_BELIEF_SEARCH_SWEEP
 } bot_belief_state_t;
 
-// The recoil column is a ladder that stays well under 1, and that is the contract:
-// the pattern is ABSOLUTE, so a bot subtracting all of it would trace the barrel's
-// exact inverse and hold a whole spray on one point. The rungs are set by what a
+// The recoil column is a ladder that stays well under 1: a bot subtracting all of the
+// visible cumulative climb would hold a whole spray on one point. The rungs are set by what a
 // seeded minute at 4 bots measures — HARD 0.40 lands the tier near 29 kills at a 19%
 // hit rate over 48 such minutes; near-full compensation runs a quarter hotter on kills
 // and a fifth on hit rate (+26% / +22% measured), which is a machine holding the
-// pattern down. EASY and NORMAL barely answer this knob at all (their aim error
+// climb down. EASY and NORMAL barely answer this knob at all (their aim error
 // dominates it), so their rungs exist to keep the ladder strictly increasing, which
 // is the whole of what a difficulty row promises.
 static const bot_skill_t BOT_SKILL[3] = {
@@ -707,13 +706,14 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
   // published at the one place it is DECIDED (gun_ads for the aim intent; each
   // producer's own anim_tick call for the carry state), so the packet and the server's
   // own pose are the same value and cannot drift into disagreeing about the same man.
-  int ads, ready, tuck;
+  int fire, ads, ready, tuck;
   if (h >= 0) {
     const player_t *p = &g_players[h];
     pos = p->pos; vel = p->vel; yaw = p->yaw; pitch = p->pitch; lean = p->lean;
     alive = p->alive; grounded = p->grounded; crouch = p->crouched; slide = p->sliding;
     hp = p->hp; wpn = p->wp.cur;
-    ads = p->wp.ads_want; ready = p->wp.ready_want; tuck = p->tuck_y > 0.0f;
+    fire = p->wp.fire_want; ads = p->wp.ads_want;
+    ready = p->wp.ready_want; tuck = p->tuck_y > 0.0f;
   } else {
     const bot_t *b = &g_bots[ent - 1];
     pos = b->pos; vel = b->vel; yaw = b->yaw; pitch = b->pitch; lean = 0.0f;
@@ -721,13 +721,13 @@ static void net_ent_from_live(net_ent_t *e, int ent) {
     hp = b->hp; wpn = b->wp.cur;
     // Bots never tuck — bot_tick passes anim_tick a literal 0.0f — so this is 0 by
     // construction rather than by omission, exactly as their lean is.
-    ads = b->wp.ads_want; ready = b->wp.ready_want; tuck = 0;
+    fire = b->wp.fire_want; ads = b->wp.ads_want; ready = b->wp.ready_want; tuck = 0;
   }
   e->id = (uint8_t)ent;
   e->flags = (uint8_t)((alive    ? NEF_ALIVE    : 0) | (grounded ? NEF_GROUNDED : 0) |
                        (crouch   ? NEF_CROUCH   : 0) | (slide    ? NEF_SLIDE    : 0) |
                        (ads      ? NEF_ADS      : 0) | (ready    ? NEF_READY    : 0) |
-                       (tuck     ? NEF_TUCK     : 0));
+                       (tuck     ? NEF_TUCK     : 0) | (fire     ? NEF_FIRE     : 0));
   e->hp = (uint8_t)f_clamp((float)hp, 0.0f, 255.0f);
   e->weapon = (uint8_t)(wpn & 3);
   e->spawn_seq = g_spawn_seq[ent];

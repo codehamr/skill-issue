@@ -100,7 +100,7 @@ typedef struct {
 } recoil_pose_t;
 
 static const recoil_pose_t RECOIL_POSE[WPN_COUNT] = {
-  // Angular rise belongs to weapon_t's physical barrel spring. These event-fed
+  // Angular rise belongs to weapon_t's immediate deterministic recoil. These event-fed
   // channels retain only stock compression and tiny lateral/cant response, so a
   // remote body cannot display a second muzzle direction over the authoritative one.
   [WPN_AR] = {1.25f, 0.00f, 0.20f, 3.10f, 0.00f, 0.24f, 0.72f},
@@ -120,55 +120,19 @@ static const recoil_pose_t *recoil_pose(int wpn) {
   return &RECOIL_POSE[wpn >= 0 && wpn < WPN_COUNT ? wpn : WPN_AR];
 }
 
-// Stateless presentation variation. The pattern chooses the learnable side whenever
-// it has one; its zero steps use a hash bit. A different hash byte adds only +/-15%
-// amplitude, with no draw from either gameplay RNG stream.
-static uint32_t recoil_hash(int src, int shot, int wpn) {
-  uint32_t x = (uint32_t)src * 0x9e3779b9u ^
-               (uint32_t)shot * 0x85ebca6bu ^
-               (uint32_t)wpn * 0xc2b2ae35u ^ 0x27d4eb2fu;
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  return x ^ (x >> 16);
-}
-
-static float recoil_side_sample(int src, int shot, int wpn) {
-  uint32_t h = recoil_hash(src, shot, wpn);
-  float sign = gun_pattern_sign(wpn, shot, (int)(h & 1u));
-  float amp = 0.85f + (float)((h >> 8) & 255u) * (0.30f / 255.0f);
-  return sign * amp;
-}
-
 static float recoil_brace(const recoil_pose_t *r, float ads) {
   return 1.0f + (r->ads_k - 1.0f) * f_clamp(ads, 0.0f, 1.0f);
 }
 
-// A SHOULDER ALREADY ABSORBING A BURST ABSORBS THE NEXT ROUND BETTER, and the round's
-// own NUMBER is what says how braced it is: the round that opens a burst throws its
-// whole authored impulse (shot 0 is 1.0 by construction — the tap and the sniper's
-// single shot are never taxed), and the crown's rounds throw exactly half of it from
-// round ten on. The index rather than the accumulated heat, because every viewer
-// already has it — the shooter as w->idx, a watcher as the fire event's own e->i — so
-// the damping is identical on every screen without a byte of wire or a second clock.
-// PRESENTATION ONLY: this scales stock compression, lateral response and the view's
-// roll. THE AXIS IS NEVER TOUCHED — where the barrel points is the pattern's alone.
-static float recoil_kick_damp(int shot) {
-  // Clamped BOTH ways: the index reaching here off a fire event is the wire's int16 and
-  // hostile, so the damp is bounded to [0.5, 1] whatever arrives.
-  float s = fminf(fmaxf((float)shot, 0.0f) / 10.0f, 1.0f);
-  return 1.0f - 0.5f * s;
-}
-
 // The local view and the event-fed body deliberately share the same source values,
-// bracing rule, burst damping and stateless side sample. Proofs call these two entry
+// bracing rule and alternating side. Proofs call these two entry
 // points too, so they can exercise production impulses without copying presentation
 // constants.
 static void recoil_vm_impulse(vm_t *vm, int src, int shot, int wpn, float ads) {
+  (void)src;
   const recoil_pose_t *rp = recoil_pose(wpn);
-  float brace = recoil_brace(rp, ads) * recoil_kick_damp(shot);
-  float side = recoil_side_sample(src, shot, wpn);
+  float brace = recoil_brace(rp, ads);
+  float side = gun_recoil_side_sign(shot);
   vm->kick_back_v += rp->vm_back_v * brace;
   vm->kick_lift_v += rp->vm_lift_v * brace;
   vm->kick_side_v += rp->vm_side_v * brace * side;
@@ -557,9 +521,10 @@ static int g_fire_anchor_src = -1;
 static long g_fire_anchor_tick = -1;
 
 static void recoil_body_impulse(anim_t *a, int src, int shot, int wpn, float ads) {
+  (void)src;
   const recoil_pose_t *rp = recoil_pose(wpn);
-  float brace = recoil_brace(rp, ads) * recoil_kick_damp(shot);
-  float side = recoil_side_sample(src, shot, wpn);
+  float brace = recoil_brace(rp, ads);
+  float side = gun_recoil_side_sign(shot);
   a->recoil_back_v += rp->body_back_v * brace;
   a->recoil_lift_v += rp->body_lift_v * brace;
   a->recoil_side_v += rp->body_side_v * brace * side;

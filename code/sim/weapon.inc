@@ -8,11 +8,8 @@
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Weapon — the trigger, swap and reload path for BOTH weapons: fire mode is
-// structural (WPN_DEF.full_auto) and per-weapon feel is g_cfg.wp. Recoil, look lag,
-// breathing and stride are physical pitch/yaw state of the barrel; the camera, the
-// visible gun and the shot direction all consume that state. What the shooter's
-// STANCE costs is separate and lives in gun_spread's cone, drawn per round inside
-// gun_shoot and stored nowhere.
+// structural (WPN_DEF.full_auto) and per-weapon feel is g_cfg.wp. Visible recoil is
+// the barrel axis; cosmetic viewmodel motion never enters combat.
 // ---------------------------------------------------------------------------
 
 // THE keystone call: real entity id, per-human RNG stream, per-human
@@ -21,20 +18,18 @@
 static void weapon_fire(player_t *p, int ent) {
   int h = human_of_ent(ent);
   v3 o = player_eye_pos(p);
-  gun_shoot(ent, &p->wp, o, p->yaw, p->pitch, p->vel, p->grounded, &g_rng_gun[h]);
+  gun_shoot(ent, &p->wp, o, p->yaw, p->pitch, p->grounded, p->sliding,
+            &g_rng_gun[h]);
 }
 
 static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
   weapon_t *w = &p->wp;
   const wpn_def_t *def = &WPN_DEF[w->cur];
-  w->prev_rec_p = w->rec_p;
-  w->prev_rec_y = w->rec_y;
-  w->prev_punch = w->punch;
-  w->prev_punch_roll = w->punch_roll;
   w->prev_ads_s = w->ads_s;
   w->prev_switch = (float)w->switch_t / GUN_SWITCH_TICKS;
 
   gun_cool(w);
+  gun_recoil_step(w, held[IN_FIRE] && p->alive && !g_match.over);
 
   // Swap: instant identity change, then the raise animation gates everything. A running
   // reload is abandoned (the mag stays as it was).
@@ -61,10 +56,6 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
     w->idx = 0;
   }
   int busy = w->reload_t > 0 || w->switch_t > 0;
-
-  // Step the physical hold before any bore consumer. The wall test, ADS denial and a
-  // same-tick shot must all see the weapon in the pose the hands reached this tick.
-  gun_sway_tick(w, p->vel, p->grounded, p->yaw, p->pitch);
 
   // A walled rifle cannot be shouldered onto the eye line: ADS intent is denied by
   // the same predicate that lowers the carriage and refuses the trigger, so all
@@ -106,8 +97,6 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
       w->dry_done = 1;
     }
   }
-
-  gun_recover(w, held[IN_FIRE]);
 }
 
 // The viewmodel's life comes from spring groups: look sway, move inertia, walk bob,
@@ -115,7 +104,7 @@ static void weapon_tick(player_t *p, int ent, const int held[IN_COUNT]) {
 // with the camera.
 static void vm_tick(player_t *p) {
   vm_t *v = &p->vm;
-  float sc = g_cfg.wp[p->wp.cur][WP_SWAY];
+  float sc = vm_motion_scale(p->wp.cur);
   v->prev_sway_p = v->sway_p; v->prev_sway_y = v->sway_y;
   v->prev_lag_x = v->lag_x; v->prev_lag_y = v->lag_y; v->prev_lag_z = v->lag_z;
   v->prev_bob_x = v->bob_x; v->prev_bob_y = v->bob_y;
@@ -127,9 +116,8 @@ static void vm_tick(player_t *p) {
   v->prev_slide_s = v->slide_s;
   v->prev_gunwall = v->gunwall;
 
-  // Local pose follower retained for reload/slide composition and hand inertia. The
-  // fireable barrel's angular sway is authoritative weapon_t state (gun_sway_tick), so
-  // vm_stage_springs never uses this follower to invent another shootable axis.
+  // Local cosmetic follower for reload/slide composition and hand inertia. It never
+  // enters gun_bore_angles or the shot direction.
   float dyaw = p->yaw - v->last_yaw, dpit = p->pitch - v->last_pitch;
   v->last_yaw = p->yaw; v->last_pitch = p->pitch;
   float damp = 1.0f - 0.88f * p->wp.ads_s;  // ADS pins the sight
@@ -261,7 +249,6 @@ static void player_move_tick(player_t *p, int ent, const int held[IN_COUNT],
   const float *mv = g_sim_mv;
   p->prev_pos = p->pos;
   p->prev_eye = p->eye;
-  p->prev_fov_kick = p->fov_kick;
   p->prev_land_dip = p->land_dip;
   int was_grounded = p->grounded;
 
@@ -357,7 +344,6 @@ static void player_move_tick(player_t *p, int ent, const int held[IN_COUNT],
   }
   float height = player_col_height(p);
   float max_speed = p->crouched ? mv[MV_CROUCH_SP] : mv[MV_RUN];
-  max_speed *= mv_ads_walk_scale(p->wp.ads_s);  // aimed walk: slight tactical slow
 
   // Wish direction in the yaw plane.
   float fx = sinf(p->yaw), fz = -cosf(p->yaw);
@@ -415,10 +401,6 @@ static void player_move_tick(player_t *p, int ent, const int held[IN_COUNT],
   // Dead: the camera sinks toward the floor — a cheap, readable death cam.
   float eye_target = !p->alive ? 0.35f : p->crouched ? EYE_CROUCH : EYE_STAND;
   p->eye += (eye_target - p->eye) * f_clamp(EYE_LERP_RATE * TICK_DT, 0, 1);
-
-  // FOV kick: widen while sliding, eased both ways for a smooth speed surge.
-  float kick_target = p->sliding ? 1.0f : 0.0f;
-  p->fov_kick += (kick_target - p->fov_kick) * f_clamp(FOV_KICK_RATE * TICK_DT, 0, 1);
 
   // Lean before the weapon: a shot fired this tick leaves from the leaned eye.
   player_lean_tick(p, held);
