@@ -211,7 +211,7 @@ static void rf_ao_pass(const frame_cam_t *c) {
   // black corner; both numbers were audited on the marked close-wall rig.
   glUniform4f(R.u_ao_z, ZNEAR, ZFAR,
               (float)R.ao_h * 0.5f / tanf(c->fovy * 0.5f), 0.32f);
-  glUniform1f(R.u_ao_i, 1.15f);
+  glUniform1f(R.u_ao_i, 0.92f);
   gl_active_texture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, R.nrm_tex);
   gl_active_texture(GL_TEXTURE0);
@@ -318,6 +318,17 @@ static void rf_world_pass(const frame_cam_t *c, int shadow_on) {
   { v3 sp = surf_params();
     glUniform4f(R.u_surf, sp.x, sp.y, sp.z, g_wind_ang); }
   rig_upload(&R.rig_world);
+  glUniform3f(R.u_foliage, cosf(g_wind_ang), sinf(g_wind_ang), (float)g_tick / 120.0f);
+  glUniform1i(R.u_lamp_n, g_map_light_n);
+  glUniform1i(R.u_lamp_tex, 4);
+  gl_active_texture(GL_TEXTURE0 + 4);
+  glBindTexture(GL_TEXTURE_2D, R.lamp_tex);
+  gl_active_texture(GL_TEXTURE0);
+  for (int i = 0; i < g_map_light_n; i++) {
+    const map_light_t *l = &g_map_lights[i];
+    glUniform4f(R.u_lamp_pos[i], l->pos.x, l->pos.y, l->pos.z, l->radius);
+    glUniform3f(R.u_lamp_col[i], l->col.x, l->col.y, l->col.z);
+  }
   glUniform1f(R.u_emis, 0.0f);
   glUniform1i(R.u_sm, 0);
   glUniform1f(R.u_shadow, shadow_on ? 1.0f : 0.0f);
@@ -355,7 +366,7 @@ static void rf_world_pass(const frame_cam_t *c, int shadow_on) {
   { float texel_m = 2.0f * g_sun.sh_half / (float)R.sm_built;
     float rng = g_sun.sh_depth - 0.5f;
     glUniform1i(R.u_smraw, 2);
-    glUniform2f(R.u_smpcss, rng * 0.0139f / texel_m, 2.0f * texel_m / rng); }
+    glUniform2f(R.u_smpcss, rng * (g_biome.night > 0.5f ? 0.022f : 0.0139f) / texel_m, 2.0f * texel_m / rng); }
   glUniformMatrix4fv(R.u_lightvp, 1, GL_FALSE, R.light_vp.m);
   glBindVertexArray(R.vao_world);
   glDrawArrays(GL_TRIANGLES, 0, R.world_verts);

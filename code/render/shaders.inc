@@ -97,6 +97,7 @@
      above is a radiance in the same unit as the sky the player can see, so ONE
      number decides where mid-grey lands and the balance between sun, sky and
      reflection is never re-derived per surface. */ \
+  "uniform vec4 uBiome;\n" \
   "uniform vec3 SUN_DIR;\n" \
   "uniform vec3 SUN_COL;\n" \
   "uniform vec3 SKY_HOR;\n" \
@@ -425,6 +426,7 @@ static const char *WORLD_VS =
   "layout(location=2) in vec3 aCol;\n"
   "layout(location=3) in vec3 aMat;\n"   // roughness, metalness, ambient occl.
   "uniform mat4 uVP;\n"
+  "uniform vec3 uFoliage;\n"
   "uniform mat4 uLightVP;\n"
   "uniform float uSmTexel;\n"            // shadow texel size in world metres
   "out vec3 vNrm; out vec3 vCol; out vec3 vWorld; out vec3 vMat; out vec4 vLit;\n"
@@ -434,7 +436,14 @@ static const char *WORLD_VS =
   // sample sideways out of the surface's own shadow and needs no slope term at all.
   "void main(){ vNrm=aNrm; vCol=aCol; vMat=aMat; vWorld=aPos;\n"
   "  vLit = uLightVP * vec4(aPos + normalize(aNrm) * uSmTexel * 1.7, 1.0);\n"
-  "  gl_Position=uVP*vec4(aPos,1.0); }\n";
+  // Fine foliage is excluded from both shadow and depth prepasses. Bending
+  // only its tips leaves roots fixed and adds no CPU rebuild or draw call.
+  "  if (aMat.x < -1.0 && aPos.y < 0.40 && aPos.y > 0.0) {\n"
+  "    float tip = clamp(aPos.y / 0.30, 0.0, 1.0);\n"
+  "    float sway = sin(aPos.x * 0.63 + aPos.z * 0.55 + uFoliage.z * 1.4);\n"
+  "    vWorld.xz += uFoliage.xy * (sway * tip * tip * 0.018);\n"
+  "  }\n"
+  "  gl_Position=uVP*vec4(vWorld,1.0); }\n";
 
 // Depth-only pass that fills the shadow map.
 static const char *DEPTH_VS =
@@ -610,6 +619,10 @@ static const char *WORLD_FS =
   // standing-water level and the wind heading. Floor shading itself stays isotropic;
   // the heading remains useful to the atmosphere and world decoration.
   "uniform vec4 uSurf;\n"
+  "uniform int uLampN;\n"
+  "uniform vec4 uLampPos[" GLSL_NUM(MAP_LIGHT_MAX) "];\n"
+  "uniform vec3 uLampCol[" GLSL_NUM(MAP_LIGHT_MAX) "];\n"
+  "uniform sampler2DShadow uLampShadow;\n"
   "uniform vec2 uSmStep;\n"               // one shadow texel in UV
   "uniform sampler2DShadow uSm;\n"
   "uniform sampler2D uSmRaw;\n"           // the same map, no compare: blocker depths
@@ -750,6 +763,23 @@ static const char *WORLD_FS =
   "    }\n"
   "  return ws > 1.0e-3 ? acc / ws : near_ao;\n"
   "}\n"
+  // The atlas is baked once from the same AABBs that stop a bullet. Guard
+  // texels keep the filtered kernel inside each lamp's own projection.
+  "float lamp_shadow(int id, vec3 delta, float radius){\n"
+  "  if (uShadow < 0.5) return 1.0;\n"
+  "  vec2 q = delta.xz / max(-delta.y, 0.01) / " GLSL_NUM(LAMP_SPREAD) " * 0.5 + 0.5;\n"
+  "  q = clamp(q, vec2(0.0), vec2(1.0));\n"
+  "  vec2 texel = 1.0 / vec2(" GLSL_NUM(LAMP_SH_W) ", " GLSL_NUM(LAMP_SH_H) ");\n"
+  "  vec2 uv = (vec2(id % 3, id / 3) * float(" GLSL_NUM(LAMP_SH_TILE) ")\n"
+  "          + 1.0 + q * float(" GLSL_NUM(LAMP_SH_SIZE) ")) * texel;\n"
+  "  float dist = length(delta);\n"
+  "  float depth = (dist - 0.08 - dist * 0.009) / radius;\n"
+  "  vec2 px = texel * 0.65;\n"
+  "  return (texture(uLampShadow, vec3(uv + vec2(px.x, px.y), depth))\n"
+  "        + texture(uLampShadow, vec3(uv + vec2(-px.x, px.y), depth))\n"
+  "        + texture(uLampShadow, vec3(uv + vec2(px.x, -px.y), depth))\n"
+  "        + texture(uLampShadow, vec3(uv - px, depth))) * 0.25;\n"
+  "}\n"
   "void main(){\n"
   // A glow's bloom weight comes from its own brightness: a tracer core and a
   // muzzle star spill, a dust mote (dim by construction) does not.
@@ -758,6 +788,9 @@ static const char *WORLD_FS =
   // out where nothing but sky is behind it. The prepass is single-sample, so
   // a mote on a wall's silhouette edge may flicker by one pixel; the motes
   // are a pixel and a half wide, nobody will see it.
+  "  if (vMat.x > 1.5) {\n"
+  "    oCol = vec4(tonemap(vCol), bloom_w(vCol)); return;\n"
+  "  }\n"
   "  if (uEmis > 0.5) {\n"
   "    float gl = dot(vCol, vec3(0.2126, 0.7152, 0.0722));\n"
   "    float keep = 1.0;\n"
@@ -781,8 +814,8 @@ static const char *WORLD_FS =
   // has three writers: the sky pass sets 0, the two world draws set 1.
   // A negative authored roughness is the zero-width wall-finish tag carried by
   // generated ruins. The BRDF always sees its magnitude.
-  "  bool wall_finish = vMat.x < 0.0;\n"
-  "  float base_rough = abs(vMat.x);\n"
+  "  bool wall_finish = vMat.x < 0.0 && vMat.x > -1.0;\n"
+  "  float base_rough = vMat.x < -1.0 ? 0.88 : abs(vMat.x);\n"
   "  float rough, surf_h = 0.5;\n"
   "  vec2 cp2 = abs(n.y) > 0.5 ? vWorld.xz\n"
   "           : (abs(n.x) > 0.5 ? vWorld.zy : vWorld.xy);\n"
@@ -1051,6 +1084,14 @@ static const char *WORLD_FS =
   "      wet = pool;\n"
   "    }\n"
   "  }\n"
+  // Snow accumulates on upward surfaces; vertical concrete retains its
+  // colder underlying palette. Low-frequency variation preserves quiet areas.
+  "  if (uDetail > 0.5 && uBiome.y > 0.5) {\n"
+  "    float cover = smoothstep(0.45, 0.92, n.y);\n"
+  "    float powder = vnoise2(vWorld.xz * 0.72) * 0.06;\n"
+  "    alb = mix(alb, vec3(0.76, 0.84, 0.88) + powder, cover * 0.82);\n"
+  "    rough = mix(rough, 0.88, cover);\n"
+  "  }\n"
   // GEOMETRIC SPECULAR ANTIALIASING, IN THE SPACE THE DERIVATION IS IN. This added the
   // normal variance to ALPHA (rough*rough); Tokuyoshi & Kaplanyan add it to ALPHA
   // SQUARED, and the difference is not cosmetic. Measured against the authored
@@ -1211,6 +1252,22 @@ static const char *WORLD_FS =
   "           + diff * irr\n"
   "           + env * Fe\n"
   "           + sheen * mix(0.55, 1.0, aoi) + bounce;\n"
+  // Six bounded spotlights, with smooth cone and distance falloff. The
+  // viewmodel has a separate projection, so its local lamp sample uses the eye.
+  "  for (int i = 0; i < uLampN; i++) {\n"
+  "    vec3 lp = uVm > 0.5 ? uEye : vWorld;\n"
+  "    vec3 delta = lp - uLampPos[i].xyz;\n"
+  "    float d2 = dot(delta, delta), radius = uLampPos[i].w;\n"
+  "    if (d2 >= radius * radius || delta.y >= -0.04) continue;\n"
+  "    float ld = sqrt(max(d2, 0.001));\n"
+  "    vec3 L = -delta / ld;\n"
+  "    float cone = smoothstep(0.42, 0.69, L.y);\n"
+  "    if (cone <= 0.001) continue;\n"
+  "    float fall = 1.0 - smoothstep(radius * 0.50, radius, ld);\n"
+  "    float shadow = lamp_shadow(i, delta, radius);\n"
+  "    vec3 rad = uLampCol[i] * (fall * cone * shadow / (1.0 + d2 * 0.045));\n"
+  "    col += lit(n, V, L, diff, F0, f90, rough, rad);\n"
+  "  }\n"
   // The glitter rides in AS A LIGHT, after the shadow term and scaled by it: a
   // spark in a wall's shadow is a spark with no sun on it, and adding this
   // before `sh` was the difference between mica and fairy lights.
@@ -1304,6 +1361,64 @@ static const char *SKY_FS =
   "uniform vec3 uFwd, uRight, uUp; uniform vec2 uTan;\n"
   // (cos, sin) of the arena's OWN wind heading, and the deck's coverage.
   "uniform vec2 uWindD; uniform float uCov;\n"
+  "uniform float uSkyTime;\n"
+  // A hemisphere projection has no longitude seam or polar singularity. Each
+  // cell owns at most one star; its footprint softens subpixel points without
+  // camera-space noise or a full-screen search over neighboring cells.
+  "vec3 night_stars(vec3 d){\n"
+  "  vec2 p = d.xz / (1.0 + max(d.y, 0.0)) * 190.0;\n"
+  "  vec3 rnd = vhash3(floor(p));\n"
+  "  vec2 q = fract(p) - mix(vec2(0.20), vec2(0.80), rnd.xy);\n"
+  "  float footprint = max(length(fwidth(p)), 0.015);\n"
+  "  float radius = 0.035 + rnd.x * rnd.x * 0.09;\n"
+  "  float aa = footprint * 0.55;\n"
+  "  float point = 1.0 - smoothstep(max(radius - aa, 0.0), radius + aa, length(q));\n"
+  "  point *= min(1.0, radius / max(aa, 0.001));\n"
+  "  float bright = smoothstep(0.984, 1.0, rnd.z);\n"
+  "  bright *= bright * (0.28 + rnd.y * 1.05);\n"
+  "  vec3 tint = mix(vec3(0.59, 0.73, 1.0), vec3(1.0, 0.85, 0.64), rnd.x * rnd.x);\n"
+  "  return tint * (point * bright * smoothstep(0.035, 0.24, d.y));\n"
+  "}\n"
+  // Two thin curtains on the northern hemisphere. Low-frequency bends and
+  // vertical striations share one slowly moving field; the lower hem and upper
+  // falloff both fade smoothly. The bounded analytic bands need no raymarch.
+  "vec3 night_aurora(vec3 d){\n"
+  "  float x = atan(d.x, d.z), y = asin(clamp(d.y, 0.0, 1.0));\n"
+  "  float tm = uSkyTime * 0.035;\n"
+  "  float window = smoothstep(-1.45, -0.85, x) * (1.0 - smoothstep(0.82, 1.50, x));\n"
+  "  vec3 glow = vec3(0.0);\n"
+  "  for (int i = 0; i < 2; ++i) {\n"
+  "    float layer = float(i), xx = x + layer * 0.48;\n"
+  "    float bend = 0.29 + layer * 0.19 + sin(xx * 2.3 + tm) * 0.075\n"
+  "               + sin(xx * 5.8 - tm * 0.6) * 0.023;\n"
+  "    float h = y - bend;\n"
+  "    float thread = vnoise2(vec2(xx * 43.0 + tm * 0.6, layer * 8.1 + tm * 0.12));\n"
+  "    float billow = vnoise2(vec2(xx * 5.5 - tm * 0.25, layer * 3.7 + tm * 0.1));\n"
+  "    h += (thread - 0.5) * 0.018;\n"
+  "    float curtain = smoothstep(-0.050, 0.024, h) * exp(-max(h, 0.0) * 13.0);\n"
+  "    curtain *= (0.58 + thread * thread * 0.42) * smoothstep(0.10, 0.78, billow);\n"
+  "    vec3 tint = mix(vec3(0.024, 0.17, 0.105), vec3(0.07, 0.065, 0.17),\n"
+  "                    smoothstep(0.07, 0.26, h) * 0.75);\n"
+  "    glow += tint * curtain * (1.0 - layer * 0.62);\n"
+  "  }\n"
+  "  return glow * window * smoothstep(0.09, 0.22, d.y);\n"
+  "}\n"
+  // A finite lunar disc keeps the daylight sun's glare out of night skies.
+  // Mare texture and a directional terminator give it a shaded surface.
+  "vec3 night_moon(vec3 d){\n"
+  "  float alignment = dot(d, SUN_DIR);\n"
+  "  if (alignment < 0.9996) return vec3(0.0);\n"
+  "  vec3 right = normalize(cross(SUN_DIR, vec3(0.0, 1.0, 0.0)));\n"
+  "  vec3 up = cross(right, SUN_DIR);\n"
+  "  vec2 q = vec2(dot(d, right), dot(d, up)) / 0.008;\n"
+  "  float r = length(q), aa = max(fwidth(r), 0.01);\n"
+  "  float disc = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);\n"
+  "  vec3 normal = vec3(q, sqrt(max(1.0 - dot(q, q), 0.0)));\n"
+  "  float phase = max(dot(normal, normalize(vec3(-0.48, 0.12, 0.86))), 0.0);\n"
+  "  float mare = vnoise2(q * 3.8 + vec2(4.3, 7.9)) * 0.7\n"
+  "             + vnoise2(q * 8.1 + vec2(1.2, 9.1)) * 0.3;\n"
+  "  return vec3(0.70, 0.80, 0.95) * disc * (0.10 + phase * 0.90) * (0.70 + mare * 0.30);\n"
+  "}\n"
   // The sun's heading, normalized once on the CPU: it is a uniform, so doing it
   // per pixel is a rsqrt for a value that cannot change within the draw.
   "uniform vec2 uSunXZ;\n"
@@ -1336,8 +1451,12 @@ static const char *SKY_FS =
   "}\n"
   "void main(){\n"
   "  vec3 dir = normalize(uFwd + uRight * (vNdc.x * uTan.x) + uUp * (vNdc.y * uTan.y));\n"
-  "  vec3 c = sky_env(dir, 1.0);\n"
+  "  vec3 c = sky_env(dir, 1.0 - uBiome.x);\n"
   "  float up = dir.y;\n"
+  "  if (uBiome.x > 0.01 && up > 0.0) {\n"
+  "    c += uBiome.x * (night_stars(dir) + night_moon(dir));\n"
+  "    if (uBiome.w > 0.01) c += night_aurora(dir) * uBiome.w;\n"
+  "  }\n"
   "  if (up < 0.12 && uRidge.y > 0.0) {\n"
   "    vec2 hd = normalize(dir.xz);\n"
   "    float e = max(fwidth(up), 1.0e-5);\n"
@@ -1357,7 +1476,7 @@ static const char *SKY_FS =
   // the clouds a hand's width above the one place they had to be.
   "  if (up > 0.012) {\n"
   "    float t = min(1.0 / max(up, 0.05), 16.0);\n"
-  "    vec2 p = dir.xz * t * 0.86;\n"
+  "    vec2 p = dir.xz * t * 0.86 + uWindD * (uSkyTime * 0.004);\n"
   "    float n = deck(p);\n"
   "    float dens = smoothstep(1.0 - uCov, 1.0 - uCov + 0.20, n);\n"
   "    dens *= smoothstep(0.012, 0.20, up);\n"

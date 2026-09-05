@@ -52,10 +52,12 @@ static void dec_stone(v3 at, float rx, float ry, float rz, float yaw,
 // old signature shipped.
 static void dec_tuft(v3 at, float h, v3 wind, float lean, v3 col, float sg,
                      uint64_t *st, int nb) {
+  float saved_rough = g_mat_rough;
+  g_mat_rough = -1.25f;  // fine foliage: shader bends tips in the map wind
   for (int b = 0; b < nb; b++) {
     float a = (float)b * (6.2832f / (float)nb) + rng_rangef(st, -0.44f, 0.44f);
     float bh = h * rng_rangef(st, 0.62f, 1.0f);
-    float bw = rng_rangef(st, 0.010f, 0.017f);
+    float bw = rng_rangef(st, 0.010f, 0.017f) * (g_biome.forest > 0.5f ? 1.40f : 1.0f);
     v3 dir = {{cosf(a), 0.0f, sinf(a)}};
     v3 perp = {{-sinf(a), 0.0f, cosf(a)}};
     // Splay out from the root, then lean downwind. The splay is what gives the
@@ -75,6 +77,7 @@ static void dec_tuft(v3 at, float h, v3 wind, float lean, v3 col, float sg,
     scene_poly3(r0, r1, rt, rn, tint);
     scene_poly3(r1, r0, rt, rn, tint);
   }
+  g_mat_rough = saved_rough;
 }
 
 // ONE TWIG — a tapered double-sided blade, the tuft blade's woody sibling:
@@ -98,6 +101,8 @@ static void dec_twig(v3 root, v3 dir, float len, float w0, v3 col, float sg) {
 // a second foliage draw call.
 static void dec_leaf(v3 root, v3 dir, float len, float width, v3 col,
                      float sg) {
+  float saved_rough = g_mat_rough;
+  g_mat_rough = -1.25f;  // fine foliage: shader bends tips in the map wind
   v3 up = fabsf(dir.y) > 0.92f ? (v3){{1, 0, 0}} : (v3){{0, 1, 0}};
   v3 side = v3_scale(v3_norm(v3_cross(dir, up)), width);
   v3 a = v3_add(root, v3_scale(dir, len * 0.08f));
@@ -109,6 +114,7 @@ static void dec_leaf(v3 root, v3 dir, float len, float width, v3 col,
   v3 rl = dec_rot(l, sg), rr = dec_rot(r, sg), rn = dec_rot(n, sg);
   scene_poly3(ra, rr, rb, rn, col); scene_poly3(ra, rb, rl, rn, col);
   scene_poly3(ra, rb, rr, rn, col); scene_poly3(ra, rl, rb, rn, col);
+  g_mat_rough = saved_rough;
 }
 
 // An ANGULAR rock — the chamfered box's sibling for stone that broke rather
@@ -347,6 +353,9 @@ static void scat_emit_tuft(const scat_t *sc, v3 at, float sg, v3 w2, v3 dry, v3 
         // Log-uniform biased small: many short tufts, a few tall ones.
         float u = rng_rangef(&st, 0.0f, 1.0f);
         float h = 0.085f * powf(0.235f / 0.085f, u * u) * sc->s;
+        if (g_biome.forest > 0.5f)
+          h = fminf(0.14f * powf(0.285f / 0.14f, u) * sc->s, 0.285f);
+        if (h > g_scat_top) g_scat_top = h;
         v3 col = (sc->var & 2) ? green : dry;
         float lean = rng_rangef(&st, 0.16f, 0.34f);
         // Band tufts (face-attached) get the 7-blade build — they are what a
@@ -560,6 +569,14 @@ static void scat_emit(void) {
   // must read from the play camera, not only in a crop.
   if (th->surf == SURF_GRIT && g_mood_preset == 2) dry = v3_scale(dry, 1.08f);
   v3 green = v3_lerp(dry, (v3){{0.30f, 0.34f, 0.14f}}, 0.55f);
+  if (g_biome.forest > 0.5f || g_biome.kind == BIOME_MARSH) {
+    dry = v3_lerp(th->ground, (v3){{0.28f, 0.36f, 0.16f}}, 0.78f);
+    green = (v3){{0.22f, 0.34f, 0.17f}};
+  }
+  if (g_biome.snow > 0.5f) {
+    dry = (v3){{0.43f, 0.44f, 0.37f}};
+    green = dry;
+  }
   for (int n = 0; n < g_scat_n; n++) {
     const scat_t *sc = &g_scat[n];
     // The host tint once per PAIR, off the canonical position — a stone takes
@@ -623,6 +640,72 @@ static void dec_stick(v3 a, v3 b, float r, v3 col, float sg) {
             v3_scale(dec_rot(s1, sg), r), v3_scale(dec_rot(s2, sg), r), col);
 }
 
+// Seven broad facets keep the foliage in the same visual language as stone.
+// The lower ring is inset, so a crown has a rounded shoulder rather than a
+// box outline. A conifer uses a pointed profile with a drooping lower skirt.
+static void dec_crown(v3 at, float radius, float h, float yaw, int pine,
+                       v3 col, float snow, float sg) {
+  const int N = 7;
+  v3 lower[N], rim[N];
+  for (int i = 0; i < N; i++) {
+    float a = yaw + (float)i * (2.0f * F_PI / (float)N);
+    float irregular = pine ? 0.13f : 0.06f;
+    float r = radius * (1.0f - irregular + irregular * sinf((float)i * 2.17f + yaw));
+    rim[i] = v3_add(at, (v3){{cosf(a) * r, h * (pine ? 0.12f : 0.38f), sinf(a) * r}});
+    lower[i] = v3_add(at, (v3){{cosf(a) * r * 0.60f, 0.0f, sinf(a) * r * 0.60f}});
+  }
+  v3 top = v3_add(at, (v3){{radius * 0.08f, h, radius * 0.04f}});
+  v3 bottom = v3_add(at, (v3){{0.0f, h * 0.08f, 0.0f}});
+  for (int i = 0; i < N; i++) {
+    int j = (i + 1) % N;
+    v3 n = v3_norm(v3_cross(v3_sub(rim[j], top), v3_sub(rim[i], top)));
+    if (n.y < 0.0f) n = v3_scale(n, -1.0f);
+    v3 leaf = v3_scale(col, 0.90f + 0.10f * sinf((float)i * 1.91f + yaw));
+    v3 cap = v3_lerp(leaf, (v3){{0.75f, 0.82f, 0.85f}}, snow * 0.84f);
+    scene_poly3(dec_rot(top, sg), dec_rot(rim[i], sg), dec_rot(rim[j], sg),
+                dec_rot(n, sg), cap);
+    v3 side = v3_norm((v3){{rim[i].x + rim[j].x - 2.0f * at.x,
+                          -0.15f * radius, rim[i].z + rim[j].z - 2.0f * at.z}});
+    scene_poly4(dec_rot(rim[i], sg), dec_rot(lower[i], sg),
+                dec_rot(lower[j], sg), dec_rot(rim[j], sg), dec_rot(side, sg), leaf);
+    scene_poly3(dec_rot(bottom, sg), dec_rot(lower[i], sg), dec_rot(lower[j], sg),
+                (v3){{0, -1, 0}}, v3_scale(leaf, 0.83f));
+  }
+}
+
+// Large vegetation belongs beyond the boundary. Its solid foliage never
+// offers fictional cover, and the whole grove remains one static VBO batch.
+static void dec_backdrop_tree(v3 at, float h, int pine, uint64_t st, float sg) {
+  v3 wood = v3_lerp((v3){{0.25f, 0.23f, 0.19f}}, g_theme.wall, 0.12f);
+  v3 leaf = pine ? (v3){{0.14f, 0.23f, 0.19f}} : (v3){{0.24f, 0.32f, 0.17f}};
+  leaf = v3_scale(leaf, rng_rangef(&st, 0.90f, 1.12f));
+  v3 tip = v3_add(at, (v3){{h * 0.035f, h * 0.87f, h * 0.025f}});
+  dec_stick(at, tip, h * 0.023f, wood, sg);
+  float yaw = rng_rangef(&st, 0.0f, 6.2832f);
+  if (pine) {
+    int layers = 2 + (int)(rng_next(&st) % 3u);
+    float spread = rng_rangef(&st, 0.18f, 0.285f);
+    float skirt = rng_rangef(&st, 0.19f, 0.28f);
+    for (int j = 0; j < layers; j++) {
+      float u = (float)j / (float)(layers - 1);
+      v3 q = v3_add(at, (v3){{h * (0.01f + u * 0.03f), h * (skirt + (0.68f - skirt) * u), 0.0f}});
+      dec_crown(q, h * spread * (1.0f - 0.58f * u), h * (layers == 2 ? 0.42f : 0.36f),
+                yaw + (float)j * 0.34f, 1, v3_scale(leaf, 1.0f + (float)j * 0.05f),
+                g_biome.snow, sg);
+    }
+  } else {
+    for (int j = 0; j < 3; j++) {
+      float a = yaw + (float)j * 2.4f;
+      float rad = h * rng_rangef(&st, 0.10f, 0.19f);
+      v3 q = v3_add(at, (v3){{cosf(a) * rad, h * (0.55f + (float)j * 0.08f), sinf(a) * rad}});
+      dec_stick(v3_add(at, (v3){{0, h * 0.42f, 0}}),
+                v3_add(q, (v3){{0, h * 0.10f, 0}}), h * 0.015f, wood, sg);
+      dec_crown(q, h * rng_rangef(&st, 0.23f, 0.29f), h * 0.28f,
+                a, 0, v3_scale(leaf, 0.95f + 0.06f * (float)j), 0.0f, sg);
+    }
+  }
+}
+
 // The CASTING specials, emitted into the pre-latch region of the world mesh:
 // the boulder pair's chamfered render (its collision stays the AABB — the
 // 0.04 m bevel is under the wire quantization players already live with) and
@@ -632,7 +715,7 @@ static void dec_stick(v3 a, v3 b, float r, v3 col, float sg) {
 // headless-shadow defect wearing bark. Branches are 40+ mm across, over the
 // shadow map's own texel floor; the sub-texel twigs live in the decor pass.
 static void mesh_cast_extra(void) {
-  if (g_meta.bould[0] < 0 && g_meta.tree[0] < 0) return;
+  if (g_meta.bould[0] < 0 && g_meta.tree[0] < 0 && g_meta.ngrove == 0) return;
   int save_floats = g_scene_floats, save_want = g_scene_want;
   int save_peak = g_scene_peak;
   long save_drops = g_scene_drops;
@@ -686,6 +769,13 @@ static void mesh_cast_extra(void) {
         v3 a = v3_add(base, (v3){{0.0f, rng_rangef(&st, -0.28f, -0.05f), 0.0f}});
         v3 b2 = v3_add(a, v3_scale(dir, ln));
         dec_stick(a, b2, 0.055f, wood, sg);
+        if (g_biome.forest > 0.5f || g_biome.snow > 0.5f) {
+          v3 crown = b2;
+          crown.y = f_clamp(crown.y - 0.15f, 2.65f, 3.62f);
+          dec_crown(crown, g_biome.snow > 0.5f ? 0.72f : 0.90f,
+                    0.82f, ya, g_biome.snow > 0.5f,
+                    (v3){{0.22f, 0.32f, 0.18f}}, g_biome.snow, sg);
+        }
         int nsec = 2 + (int)(rng_next(&st) % 2u);
         for (int q = 0; q < nsec; q++) {
           float ya2 = ya + rng_rangef(&st, -0.9f, 0.9f);
@@ -698,7 +788,31 @@ static void mesh_cast_extra(void) {
       }
     }
   }
+  // The playable grove uses real collision trunks and open headroom beneath
+  // a low irregular canopy. Every leaf stays within the shadow fit's 4.6 m
+  // casting ceiling, and branches stay inside the placement clearance.
   ao_off();
+  mat_set(0.90f, 0.0f);
+  for (int i = 0; i < g_meta.ngrove; i++) {
+    const solid_t *s = &g_solids[g_meta.grove[i]];
+    float sg = i & 1 ? -1.0f : 1.0f;
+    v3 base = dec_rot((v3){{(s->min.x + s->max.x) * 0.5f, 3.05f,
+                            (s->min.z + s->max.z) * 0.5f}}, sg);
+    uint64_t st = (uint64_t)scat_h(0xCA90u, (uint32_t)(i / 2), 2, 7) * 2654435761u + 1;
+    float yaw = rng_rangef(&st, 0.0f, 6.2832f);
+    for (int branch = 0; branch < 3; branch++) {
+      float a = yaw + (float)branch * 2.3f;
+      float reach = rng_rangef(&st, 0.35f, 0.55f);
+      v3 crown = v3_add(base, (v3){{cosf(a) * reach, (float)branch * 0.16f,
+                                   sinf(a) * reach}});
+      v3 tip = v3_add(crown, (v3){{0, 0.25f, 0}});
+      dec_stick(base, tip, 0.045f, s->color, sg);
+      dec_crown(crown, rng_rangef(&st, 0.84f, 1.08f),
+                rng_rangef(&st, 0.92f, 1.10f), a, 0,
+                v3_scale((v3){{0.25f, 0.34f, 0.19f}}, rng_rangef(&st, 0.91f, 1.09f)),
+                0.0f, sg);
+    }
+  }
   int n = g_scene_floats;
   int cap = (int)(sizeof g_mesh / sizeof g_mesh[0]);
   if (g_mesh_floats + n > cap) n = cap - g_mesh_floats;
@@ -710,9 +824,121 @@ static void mesh_cast_extra(void) {
   g_scene_peak = save_peak; g_scene_drops = save_drops;
 }
 
-// Horizon-scale scenery is its own static batch. It is placed before grass,
-// stones and sticks in the world VBO: the shadow pass still ends before the
-// ground, while the screen-space prepass can include this batch in one prefix.
+// Place a box in a backdrop site's radial/tangential coordinates.
+static void dec_hbox(v3 c, v3 radial, v3 tangent, float x, float y, float z,
+                      float rx, float ry, float rz, v3 col, float sg) {
+  v3 p = v3_add(c, v3_add(v3_scale(tangent, x), v3_scale(radial, z)));
+  p.y = y;
+  scene_box(dec_rot(p, sg), v3_scale(dec_rot(tangent, sg), rx),
+            (v3){{0, ry, 0}}, v3_scale(dec_rot(radial, sg), rz), col);
+}
+
+// Octagonal industrial tanks read distinctly from the rectangular masonry.
+static void dec_tank(v3 c, float lo, float hi, float radius, float yaw,
+                     v3 col, float sg) {
+  for (int i = 0; i < 8; i++) {
+    float a = yaw + (float)i * (F_PI * 0.25f);
+    float b = a + F_PI * 0.25f;
+    v3 p = {{c.x + cosf(a) * radius, lo, c.z + sinf(a) * radius}};
+    v3 q = {{c.x + cosf(b) * radius, lo, c.z + sinf(b) * radius}};
+    v3 u = p, v = q; u.y = hi; v.y = hi;
+    v3 n = {{cosf((a + b) * 0.5f), 0, sinf((a + b) * 0.5f)}};
+    scene_poly4(dec_rot(p, sg), dec_rot(q, sg), dec_rot(v, sg), dec_rot(u, sg),
+                dec_rot(n, sg), col);
+    scene_poly3(dec_rot((v3){{c.x, hi, c.z}}, sg), dec_rot(u, sg), dec_rot(v, sg),
+                (v3){{0, 1, 0}}, v3_lerp(col, (v3){{0.74f, 0.80f, 0.83f}}, g_biome.snow * 0.85f));
+    scene_poly3(dec_rot((v3){{c.x, lo, c.z}}, sg), dec_rot(p, sg), dec_rot(q, sg),
+                (v3){{0, -1, 0}}, v3_scale(col, 0.85f));
+  }
+}
+
+// Five utilitarian rooflines share the arena's materials. Details are sized
+// for the horizon: narrow religious-looking towers and mast crossbars have
+// no place in this abandoned industrial landscape.
+static void dec_backdrop_building(v3 c, v3 radial, v3 tangent, float h,
+                                  float wx, float wz, int kind,
+                                  uint64_t st, float sg) {
+  v3 col = v3_scale(g_theme.wall, rng_rangef(&st, 0.72f, 0.87f));
+  v3 trim = v3_lerp(col, (v3){{0.24f, 0.28f, 0.27f}}, 0.40f);
+  v3 roof = v3_lerp(v3_scale(col, 0.85f), (v3){{0.73f, 0.81f, 0.85f}}, g_biome.snow * 0.90f);
+  v3 glass = {{0.13f, 0.19f, 0.21f}};
+  mat_set(-0.82f, 0.0f);
+  if (kind == 0) {
+    // Loading depot with a stepped service wing and a long roof monitor.
+    dec_hbox(c, radial, tangent, 0, (h - 12.0f) * 0.5f, 0,
+              wx, (h + 12.0f) * 0.5f, wz, col, sg);
+    dec_hbox(c, radial, tangent, wx * 1.32f, (h * 0.62f - 12.0f) * 0.5f, 0.6f,
+              wx * 0.43f, (h * 0.62f + 12.0f) * 0.5f, wz * 0.83f,
+              v3_scale(col, 0.91f), sg);
+    dec_hbox(c, radial, tangent, -wx * 0.12f, h + 0.6f, 0,
+              wx * 0.56f, 0.6f, wz * 0.44f, trim, sg);
+    dec_hbox(c, radial, tangent, -wx * 0.12f, h + 1.3f, 0,
+              wx * 0.62f, 0.10f, wz * 0.54f, roof, sg);
+    mat_set(0.25f, 0.0f);
+    for (int k = -2; k <= 2; k++)
+      dec_hbox(c, radial, tangent, (float)k * wx * 0.33f, h * 0.76f, -wz - 0.025f,
+                wx * 0.11f, 0.52f, 0.025f, glass, sg);
+  } else if (kind == 1) {
+    // Elevated reservoir: four splayed legs and an unmistakably broad tank.
+    mat_set(0.73f, 0.18f);
+    for (int j = 0; j < 4; j++) {
+      float x = j & 1 ? 1.0f : -1.0f, z = j & 2 ? 1.0f : -1.0f;
+      v3 a = v3_add(c, v3_add(v3_scale(tangent, x * 2.1f), v3_scale(radial, z * 2.1f)));
+      v3 b = v3_add(c, v3_add(v3_scale(tangent, x * 1.45f), v3_scale(radial, z * 1.45f)));
+      a.y = -8.0f; b.y = h;
+      dec_stick(a, b, 0.22f, trim, sg);
+    }
+    dec_tank(c, h - 0.4f, h + 4.3f, wx * 0.51f, 0.18f, col, sg);
+    dec_tank(c, h - 0.60f, h - 0.36f, wx * 0.54f, 0.18f, trim, sg);
+    dec_tank(c, h + 4.3f, h + 4.52f, wx * 0.54f, 0.18f, roof, sg);
+    dec_hbox(c, radial, tangent, wx * 0.65f, 1.0f, 0,
+              wx * 0.36f, 9.0f, wz * 0.65f, v3_scale(col, 0.91f), sg);
+  } else if (kind == 2) {
+    // Paired processing silos with unequal heights, connected by a low shed.
+    mat_set(0.66f, 0.08f);
+    for (int j = 0; j < 2; j++) {
+      v3 q = v3_add(c, v3_scale(tangent, j ? wx * 0.45f : -wx * 0.45f));
+      float top = h + (j ? 3.0f : 0.0f);
+      dec_tank(q, -12.0f, top, wx * 0.34f, 0.1f,
+                v3_scale(col, j ? 0.93f : 1.0f), sg);
+      dec_tank(q, top, top + 0.22f, wx * 0.36f, 0.1f, roof, sg);
+    }
+    dec_hbox(c, radial, tangent, wx, -0.8f, 1.5f,
+              wx * 0.38f, 8.0f, wz * 0.72f, trim, sg);
+  } else if (kind == 3) {
+    // Observation post: broad glazing, flat overhang, low adjoining barracks.
+    dec_hbox(c, radial, tangent, 0, (h - 14.0f) * 0.5f, 0,
+              wx * 0.33f, (h + 14.0f) * 0.5f, wz * 0.66f, col, sg);
+    dec_hbox(c, radial, tangent, 0, h + 0.55f, 0,
+              wx * 0.56f, 0.55f, wz * 0.84f, trim, sg);
+    mat_set(0.18f, 0.0f);
+    dec_hbox(c, radial, tangent, 0, h + 1.65f, 0,
+              wx * 0.49f, 0.54f, wz * 0.76f, glass, sg);
+    mat_set(0.84f, 0.0f);
+    dec_hbox(c, radial, tangent, 0, h + 2.4f, 0,
+              wx * 0.65f, 0.20f, wz, roof, sg);
+    dec_hbox(c, radial, tangent, wx * 0.98f, -1.0f, 1.0f,
+              wx * 0.62f, 9.0f, wz * 0.76f, v3_scale(col, 0.92f), sg);
+  } else {
+    // A broad earth-sheltered bunker shoulder; its slit is too wide and low
+    // to read as another tower. The berm is visibly geological at the ends.
+    float yaw = atan2f(-tangent.z, tangent.x);
+    v3 q = c; q.y = -1.0f;
+    dec_rock(q, wx * 1.6f, h * 0.92f + 1.0f, wz * 1.4f, yaw, 0,
+              0xFFFFu, 0.28f, 0, v3_lerp(col, g_theme.ground, 0.54f), sg);
+    dec_hbox(c, radial, tangent, 0, h * 0.76f, -wz * 0.60f,
+              wx * 0.79f, 1.25f, wz * 0.74f, col, sg);
+    dec_hbox(c, radial, tangent, 0, h * 0.76f + 1.5f, -wz * 0.65f,
+              wx * 0.90f, 0.28f, wz * 0.86f, roof, sg);
+    mat_set(0.86f, 0.0f);
+    dec_hbox(c, radial, tangent, 0, h * 0.76f + 0.15f, -wz * 1.35f,
+              wx * 0.55f, 0.32f, 0.035f, glass, sg);
+  }
+}
+
+// Horizon-scale scenery is its own static batch before grass and stones.
+// Canopies and buildings stay inside ZFAR from all playable positions; the
+// depth prepass therefore terminates atmosphere rays on their silhouettes.
 static void mesh_large_scenery(void) {
   int save_floats = g_scene_floats, save_want = g_scene_want;
   int save_peak = g_scene_peak;
@@ -720,93 +946,50 @@ static void mesh_large_scenery(void) {
   g_scene_floats = 0;
   g_ao_mul = 1.0f;
   ao_off();
-
-  const theme_t *th = &g_theme;
-  // A second pair measured +9.5% on a one-thread llvmpipe sky frame. Keep one
-  // rotationally fair pair and spend the reserve on a readable roofline.
   uint64_t st = (uint64_t)scat_h(0xE110u, 0, 1, 2) * 2654435761u + 1;
   float ang = rng_rangef(&st, 0.0f, 2.0f * F_PI);
-  // 86..96 m keeps every corner of both silhouettes inside ZFAR from every
-  // playable point. They are depth-masked, so the 72 m volume march terminates
-  // correctly when a silhouette lies inside it from the near rim.
-  float r = rng_rangef(&st, 86.0f, 96.0f);
-  float hgt = rng_rangef(&st, 11.0f, 16.0f);
-  float wx = rng_rangef(&st, 4.0f, 9.0f), wz = rng_rangef(&st, 2.5f, 5.0f);
-  v3 radial = {{cosf(ang), 0.0f, sinf(ang)}};
-  v3 tangent = {{-radial.z, 0.0f, radial.x}};
-  v3 c = {{radial.x * r, (hgt - 20.0f) * 0.5f, radial.z * r}};
-  v3 mass_col = v3_scale(th->wall, rng_rangef(&st, 0.82f, 0.94f));
-  float shoulder_h = hgt * rng_rangef(&st, 0.45f, 0.65f);
-  float shoulder_w = wx * rng_rangef(&st, 0.5f, 0.8f);
-  float shoulder_off = wx + shoulder_w * 0.9f;
-
+  float r = rng_rangef(&st, 78.0f, 87.0f);
+  float h = rng_rangef(&st, 10.5f, 14.0f);
+  float wx = rng_rangef(&st, 5.2f, 7.5f), wz = rng_rangef(&st, 2.8f, 4.2f);
+  v3 radial = {{cosf(ang), 0, sinf(ang)}};
+  v3 tangent = {{-radial.z, 0, radial.x}};
+  v3 c = v3_scale(radial, r);
+  int kind = (int)(rng_next(&st) % 5u);
+  if (g_biome.kind == BIOME_FOREST) kind = 4;
+  if (g_biome.kind == BIOME_NIGHT) kind = (scat_h(0xE110u, 1, 2, 3) & 1u) ? 1 : 3;
   for (int t = 0; t < 2; t++) {
     float sg = t ? -1.0f : 1.0f;
-    v3 rr = dec_rot(radial, sg), tt = dec_rot(tangent, sg);
-    v3 cc = dec_rot(c, sg);
-    if (th->surf == SURF_SAND) {
-      // Buried, asymmetric mesa shoulders keep the desert horizon geological.
+    dec_backdrop_building(c, radial, tangent, h, wx, wz, kind, st, sg);
+    if (g_biome.kind == BIOME_DUNES) {
+      // Low cut mesas frame the industrial relic without sealing the horizon.
+      v3 q = v3_add(c, v3_scale(tangent, -18.0f)); q.y = -2.0f;
       mat_set(WORLD_SOLID_R, 0.0f);
-      scene_box(cc, v3_scale(tt, wx),
-                (v3){{0, (hgt + 20.0f) * 0.5f, 0}},
-                v3_scale(rr, wz), mass_col);
-      v3 c2 = v3_add(c, v3_scale(tangent, shoulder_off));
-      c2.y = (shoulder_h - 20.0f) * 0.5f;
-      scene_box(dec_rot(c2, sg), v3_scale(tt, shoulder_w),
-                (v3){{0, (shoulder_h + 20.0f) * 0.5f, 0}},
-                v3_scale(rr, wz * 0.8f), v3_scale(mass_col, 0.96f));
-      continue;
+      dec_rock(q, 9.0f, 11.5f, 5.5f, ang, 0.0f, 0xFFFFu, 0.23f, 1,
+                v3_scale(g_theme.wall, 0.86f), sg);
     }
+  }
 
-    // RUINED OUTPOST: deep foundation, offset wing, broken parapet and a
-    // service mast. The silhouette carries the read; facade geometry stays
-    // deliberately sparse at this distance.
-    float base = -12.0f, top = hgt + 4.5f;
-    v3 body = cc;
-    body.y = (base + top) * 0.5f;
-    mat_set(-0.79f, 0.0f);
-    scene_box(body, v3_scale(tt, wx * 0.72f),
-              (v3){{0, (top - base) * 0.5f, 0}},
-              v3_scale(rr, wz * 0.72f), mass_col);
-    float wing_top = hgt * 0.68f + 2.2f;
-    v3 wing = v3_add(cc, v3_scale(tt, wx * 0.98f));
-    wing.y = (base + wing_top) * 0.5f;
-    scene_box(wing, v3_scale(tt, wx * 0.38f),
-              (v3){{0, (wing_top - base) * 0.5f, 0}},
-              v3_scale(rr, wz * 0.92f), v3_scale(mass_col, 0.93f));
-    v3 core = v3_add(cc, v3_scale(tt, -wx * 0.30f));
-    core.y = top + 0.75f;
-    scene_box(core, v3_scale(tt, wx * 0.16f), (v3){{0, 0.75f, 0}},
-              v3_scale(rr, wz * 0.22f), v3_scale(mass_col, 0.88f));
-    v3 lip = cc;
-    lip.y = top + 0.28f;
-    scene_box(lip, v3_scale(tt, wx * 0.30f), (v3){{0, 0.28f, 0}},
-              v3_scale(rr, wz * 0.78f), v3_scale(mass_col, 0.95f));
-    v3 mast = v3_add(cc, v3_scale(tt, -wx * 0.28f));
-    mast.y = top + 2.65f;
-    scene_box(mast, v3_scale(tt, 0.055f), (v3){{0, 1.65f, 0}},
-              v3_scale(rr, 0.055f), v3_scale(mass_col, 0.58f));
-    v3 aerial = v3_add(cc, v3_scale(tt, -wx * 0.28f));
-    aerial.y = top + 3.45f;
-    scene_box(aerial, v3_scale(tt, 0.60f), (v3){{0, 0.055f, 0}},
-              v3_scale(rr, 0.055f), v3_scale(mass_col, 0.58f));
-
-    // Dark dielectric panes use the existing PBR path. Hash omissions break
-    // the grid into intact, boarded and empty-looking bays.
-    mat_set(0.09f, 0.0f);
-    v3 glass = th->surf == SURF_WET ? (v3){{0.10f, 0.17f, 0.21f}}
-                                    : (v3){{0.14f, 0.17f, 0.16f}};
-    for (int wy = 0; wy < 3; wy++)
-      for (int xx = -1; xx <= 1; xx++) {
-        uint32_t wh = scat_h(0xB17Du, 0, (uint32_t)(wy + 3),
-                             (uint32_t)(xx + 2));
-        if ((wh & 7u) == 0u) continue;
-        v3 wp = v3_add(cc, v3_scale(rr, -(wz * 0.72f + 0.025f)));
-        wp = v3_add(wp, v3_scale(tt, (float)xx * wx * 0.38f));
-        wp.y = 6.4f + (float)wy * 3.05f;
-        scene_box(wp, v3_scale(tt, wx * 0.115f), (v3){{0, 0.48f, 0}},
-                  v3_scale(rr, 0.025f), glass);
-      }
+  int forest = g_biome.forest > 0.5f, frost = g_biome.snow > 0.5f;
+  int marsh = g_biome.kind == BIOME_MARSH;
+  int nt = forest ? 14 : frost ? 12 : marsh ? 7 : g_biome.kind == BIOME_DUNES ? 0 : 3;
+  mat_set(0.91f, 0.0f);
+  for (int j = 0; j < nt; j++) {
+    uint64_t ts = (uint64_t)scat_h(0x7AEEu, (uint32_t)j, 7, 9) * 2654435761u + 1;
+    // Two loose groves with gaps between them. Jittered depth and height
+    // supply parallax without turning the perimeter into a uniform fence.
+    int cluster = j < (nt + 1) / 2 ? 0 : 1;
+    float a = ang + 0.74f + (float)cluster * 1.65f + rng_rangef(&ts, -0.40f, 0.40f);
+    float rad = rng_rangef(&ts, forest ? 39.0f : 45.0f, 77.0f);
+    float ht = rng_rangef(&ts, forest ? 10.0f : 8.0f, forest ? 19.0f : 17.0f);
+    if ((forest || frost || marsh) && j % 4 == 0) {
+      rad = rng_rangef(&ts, 34.0f, 42.0f);
+      ht = rng_rangef(&ts, 5.5f, 8.0f);
+    }
+    rad = fmaxf(rad, (ARENA_HALF + 3.5f) / fmaxf(fabsf(cosf(a)), fabsf(sinf(a))));
+    v3 at = {{cosf(a) * rad, -0.4f, sinf(a) * rad}};
+    int pine = frost || (forest && j % 3 == 0);
+    for (int t = 0; t < 2; t++)
+      dec_backdrop_tree(at, ht, pine, ts, t ? -1.0f : 1.0f);
   }
   mat_set(WORLD_GROUND_R, 0.0f);
   ao_off();
@@ -830,7 +1013,7 @@ static void mesh_decor(void) {
   g_scene_floats = 0;
 
   const theme_t *th = &g_theme;
-  int drifts = th->surf == SURF_SAND;
+  int drifts = th->surf == SURF_SAND || g_biome.snow > 0.5f;
   v3 wind = wind_dir();
   mat_set(WORLD_GROUND_R, 0.0f);
   // scene_push multiplies its AO by g_ao_mul, which is FIGURE state: a global the

@@ -32,6 +32,12 @@ either. The arena, both weapons, the soldiers and every sound are built in code 
 instead of loaded from a file. What carries over between matches is your aim and your
 movement.
 
+**Different places, different light.** Desert ruins, wet industrial yards, forest
+clearings and snowfields share the same angular style. Night arenas mix stars and
+moonlight with warm lamps, cool floodlights and red watch lights; winter nights can
+bring aurora. Broken masonry has real stepped openings, and forest trunks are solid.
+All scenery and lighting remain procedural.
+
 **Two guns, everyone gets both.** An automatic rifle and a bolt sniper that kills with a
 single body hit. Both are hitscan. No loadouts, no battle pass. Rounds cross up to 1.2 m
 of material at *full* damage. Most cover in the arena is therefore a timing problem rather

@@ -495,11 +495,30 @@ static void cmd_sun(sim_ctx_t *s) {
            (double)S->exposure, (double)S->sh_half); }
 }
 
+static void cmd_biome(sim_ctx_t *s) {
+  (void)s;
+  char *a = take_tok();
+  int change = 0;
+  if (a && !strcmp(a, "off")) { g_biome_force = -1; change = 1; }
+  else if (a) {
+    for (int i = 0; i < 7; i++)
+      if (!strcmp(a, BIOME_NAMES[i])) { g_biome_force = i; change = 1; break; }
+    if (!change) g_tok_pushback = a;
+  }
+  if (change) { map_generate(g_map_seed); g_world_dirty = 1; }
+  printf("biome kind=%s night=%.0f snow=%.0f forest=%.0f aurora=%.0f lights=%d\n",
+         BIOME_NAMES[g_biome.kind], (double)g_biome.night, (double)g_biome.snow,
+         (double)g_biome.forest, (double)g_biome.aurora, g_map_light_n);
+}
+
 static void cmd_map(sim_ctx_t *s) {
   (void)s;
   // The theme owns the whole surface treatment (loose grain, glitter,
   // standing water) and it was previously unprintable — you could only find
   // out which one a seed rolled by photographing it.
+  printf("biome kind=%s night=%.0f snow=%.0f forest=%.0f aurora=%.0f lights=%d\n",
+         BIOME_NAMES[g_biome.kind], (double)g_biome.night, (double)g_biome.snow,
+         (double)g_biome.forest, (double)g_biome.aurora, g_map_light_n);
   { v3 sp = surf_params();
     static const char *SN[] = {"grit", "wet", "sand"};
     printf("map theme=%s mood=%s sig=%s wind=%.3f grain=%.2f glint=%.2f "
@@ -3282,15 +3301,22 @@ static void cmd_mapcheck(sim_ctx_t *s) {
       v3 d = v->ax ? (v3){{0.0f, 0.0f, 1.0f}}
                    : (v3){{1.0f, 0.0f, 0.0f}};
       float reach = v->half_depth + 0.08f;
-      v3 o = v3_sub(v->p, v3_scale(d, reach));
-      int blocked = 0;
-      for (int i = 0; i < g_num_solids && !blocked; i++) {
-        v3 nrm;
-        float t = ray_aabb(o, d, g_solids[i].min, g_solids[i].max, &nrm);
-        if (t > 0.0f && t < reach * 2.0f - 0.001f) blocked = 1;
+      // The generator publishes canonical-half samples. Both physical
+      // openings must remain clear, including when capacity pressure could
+      // otherwise truncate one member of a symmetric wall pair.
+      for (int mirror = 0; mirror < 2; mirror++) {
+        v3 p = v->p;
+        if (mirror) { p.x = -p.x; p.z = -p.z; }
+        v3 o = v3_sub(p, v3_scale(d, reach));
+        int blocked = 0;
+        for (int i = 0; i < g_num_solids && !blocked; i++) {
+          v3 nrm;
+          float t = ray_aabb(o, d, g_solids[i].min, g_solids[i].max, &nrm);
+          if (t > 0.0f && t < reach * 2.0f - 0.001f) blocked = 1;
+        }
+        open_probes++;
+        open_blocked += blocked;
       }
-      open_probes++;
-      open_blocked += blocked;
     }
     for (int i = 0; i < g_num_solids; i++)
       for (int j = i + 1; j < g_num_solids; j++) {
@@ -3324,7 +3350,7 @@ static void cmd_mapcheck(sim_ctx_t *s) {
          n, total, worst, bad_seed, solid_peak, MAX_SOLIDS, solid_full,
          edge_peak, META_EDGE_MAX, open_probes, open_blocked,
          void_peak, META_VOID_MAX, void_full);
-  if (open_blocked || void_full) exit(1);
+  if (total || solid_full || open_blocked || void_full) exit(1);
 }
 
 static const script_cmd_t SCRIPT_CMDS[] = {
@@ -3344,7 +3370,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"wpn", cmd_wpn}, {"bot", cmd_bot}, {"match", cmd_match}, {"map", cmd_map},
   {"lean", cmd_lean}, {"cfg", cmd_cfg}, {"budget", cmd_budget},
   {"netstat", cmd_netstat}, {"updinfo", cmd_updinfo}, {"updcheck", cmd_updcheck},
-  {"sun", cmd_sun}, {"mood", cmd_mood}, {"scat", cmd_scat}, {"uistat", cmd_uistat},
+  {"sun", cmd_sun}, {"biome", cmd_biome}, {"mood", cmd_mood}, {"scat", cmd_scat}, {"uistat", cmd_uistat},
   {"vmsight", cmd_vmsight}, {"vmscope", cmd_vmscope}, {"parity", cmd_parity},
   {"rag", cmd_rag}, {"ragsoak", cmd_ragsoak}, {"ragx", cmd_ragx},
   {"figv", cmd_figv}, {"figcheck", cmd_figcheck}, {"kine", cmd_kine},

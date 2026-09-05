@@ -1169,14 +1169,16 @@ static float dust_sunlit(v3 p) {
 }
 
 static void fx_dust(v3 eye) {
-  float dens = atmo_haze();
+  int snow = g_biome.snow > 0.5f;
+  float dens = snow ? 0.36f : atmo_haze();
   if (dens <= 0.0f) return;
   float t = (float)g_tick * (float)TICK_DT;
   v3 wd = wind_dir();
   // The lattice's own displacement. Subtracting it before choosing the cell
   // window and adding it back to the mote is what makes the FIELD move while
   // the WINDOW stays on the camera.
-  v3 flow = {{wd.x * 0.42f * t, 0.11f * sinf(t * 0.31f), wd.z * 0.42f * t}};
+  v3 flow = {{wd.x * 0.42f * t, snow ? -0.48f * t : 0.11f * sinf(t * 0.31f),
+               wd.z * 0.42f * t}};
   v3 base = v3_sub(eye, flow);
   int c0 = (int)floorf(base.x / DUST_CELL);
   int c1 = (int)floorf(base.y / DUST_CELL);
@@ -1205,7 +1207,7 @@ static void fx_dust(v3 eye) {
     // falls to a fiftieth away from the sun and the air is empty everywhere
     // but one cone, which is not what dust does — the ratio is what carries
     // the effect, not the extinction.
-    float amp = 0.05f + dust_phase(v3_dot(vd, g_sun.dir));
+    float amp = snow ? 0.40f : 0.05f + dust_phase(v3_dot(vd, g_sun.dir));
     // Twinkle: a triangle wave off the mote's own hash, squared. A grain is a
     // faceted crystal tumbling in the air, so what the eye actually sees is it
     // catching and losing the sun, not a steady point.
@@ -1249,9 +1251,27 @@ static void fx_dust(v3 eye) {
     // rectangle — at these sizes a lit rectangle is exactly what it looks
     // like. Two segments tapering to nothing at both ends give a speck with
     // ends that fade, which is all a two-pixel mote needs.
-    v3 str = v3_scale(wd, w * 2.2f);
+    v3 str = v3_scale(snow ? (v3){{wd.x * 0.3f, -0.7f, wd.z * 0.3f}} : wd, w * 2.2f);
     v3 a = v3_sub(p, str), b = v3_add(p, str);
-    v3 col = v3_scale(g_sun.col, k);
+    v3 light = g_sun.col;
+    if (snow) light = v3_add(v3_scale(light, 0.3f), (v3){{0.42f, 0.48f, 0.55f}});
+    // Local pools reveal drifting flakes and dust; candidate count is bounded
+    // by the same field, and occlusion uses the shared world ray test.
+    for (int j = 0; j < g_map_light_n; j++) {
+      const map_light_t *lamp = &g_map_lights[j];
+      v3 delta = v3_sub(lamp->pos, p);
+      float ld2 = v3_dot(delta, delta);
+      if (delta.y <= 0.0f || ld2 >= lamp->radius * lamp->radius || ld2 < 0.01f) continue;
+      float dist_l = sqrtf(ld2);
+      v3 dir_l = v3_scale(delta, 1.0f / dist_l), nn;
+      float cone = f_smoothstep(0.42f, 0.69f, dir_l.y);
+      if (cone < 0.01f) continue;
+      float hit = trace_world(p, dir_l, &nn, NULL);
+      if (hit > 0.0f && hit < dist_l - 0.02f) continue;
+      float fall = 1.0f - f_smoothstep(lamp->radius * 0.5f, lamp->radius, dist_l);
+      light = v3_add(light, v3_scale(lamp->col, fall * cone / (1.0f + ld2 * 0.045f)));
+    }
+    v3 col = v3_scale(light, k);
     const v3 z0 = {{0.0f, 0.0f, 0.0f}};
     fx_seg(a, p, eye, w * 0.12f, w, z0, col);
     fx_seg(p, b, eye, w, w * 0.12f, col, z0);

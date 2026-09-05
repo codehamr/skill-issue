@@ -175,7 +175,10 @@ static void scat_push(v3 pos, float s, uint32_t h, int host, int fam,
 static void scat_plan_rocks(void) {
   float H = ARENA_HALF;
   float strew = g_mood.strew, growth = g_mood.growth;
-  int grass = g_theme.surf != SURF_WET;
+  int verdant = g_biome.kind == BIOME_FOREST || g_biome.kind == BIOME_MARSH;
+  if (verdant) growth = fmaxf(growth, g_biome.forest > 0.5f ? 0.80f : 0.65f);
+  if (g_biome.snow > 0.5f) growth *= 0.18f;
+  int grass = g_theme.surf != SURF_WET || verdant;
   // ROCK — jittered grid, cell 3.0 m, canonical half. The theme's bedrock:
   // each accepted rock immediately seeds its children (stones), a pebble ring
   // and a facilitation tuft or two, all keyed off the rock's own cell so no
@@ -294,7 +297,10 @@ static void scat_plan_ground(void) {
   v3 w = wind_dir();
   float H = ARENA_HALF;
   float strew = g_mood.strew, growth = g_mood.growth;
-  int grass = g_theme.surf != SURF_WET;
+  int verdant = g_biome.kind == BIOME_FOREST || g_biome.kind == BIOME_MARSH;
+  if (verdant) growth = fmaxf(growth, g_biome.forest > 0.5f ? 0.80f : 0.65f);
+  if (g_biome.snow > 0.5f) growth *= 0.18f;
+  int grass = g_theme.surf != SURF_WET || verdant;
   // PEBBLE, field tier — the fines that survive as mesh. Sparse everywhere
   // walls are near; allowed closer to the middle than anything else (they
   // obstruct nothing and the landmark should not stand on swept concrete).
@@ -441,8 +447,11 @@ static void scat_plan_flora(void) {
   v3 w = wind_dir();
   float H = ARENA_HALF;
   float growth = g_mood.growth;
-  int grass = g_theme.surf != SURF_WET;
-  int moss = g_theme.surf == SURF_WET && g_mood_preset == 2;
+  int verdant = g_biome.kind == BIOME_FOREST || g_biome.kind == BIOME_MARSH;
+  if (verdant) growth = fmaxf(growth, g_biome.forest > 0.5f ? 0.80f : 0.65f);
+  if (g_biome.snow > 0.5f) growth *= 0.18f;
+  int grass = g_theme.surf != SURF_WET || verdant;
+  int moss = verdant || (g_theme.surf == SURF_WET && g_mood_preset == 2);
   // SHRUB — openwork sticks at wall bases and beside rocks, never the open
   // field; the growth latent's woody half. On dry themes the upper tail gets
   // sparse olive leaves. MOSSTONE reuses exactly the same skeleton as low
@@ -830,6 +839,84 @@ static void mesh_large_scenery(void);
 // and the crown's long shadow is the whole reason the tree signature exists.
 static void mesh_cast_extra(void);
 
+// One static depth atlas for the six downward fixtures. Each guarded 96x96
+// tile stores radial distance to the collision geometry; four filtered reads
+// give a soft penumbra without six extra shadow passes on every frame.
+static void lamp_shadow_build(void) {
+  if (!R.lamp_tex) glGenTextures(1, &R.lamp_tex);
+  if (!g_map_light_n) return;
+  static float depths[LAMP_SH_W * LAMP_SH_H];
+  for (int i = 0; i < LAMP_SH_W * LAMP_SH_H; i++) depths[i] = 1.0f;
+  for (int l = 0; l < g_map_light_n; l++) {
+    const map_light_t *lamp = &g_map_lights[l];
+    int near_solids[MAX_SOLIDS], count = 0;
+    for (int i = 0; i < g_num_solids; i++)
+      if (scat_box_d(&g_solids[i], lamp->pos.x, lamp->pos.z) < lamp->radius)
+        near_solids[count++] = i;
+    for (int z = 0; z < LAMP_SH_TILE; z++)
+      for (int x = 0; x < LAMP_SH_TILE; x++) {
+        float u = ((float)x - 0.5f) / (float)LAMP_SH_SIZE * 2.0f - 1.0f;
+        float v = ((float)z - 0.5f) / (float)LAMP_SH_SIZE * 2.0f - 1.0f;
+        v3 dir = v3_norm((v3){{u * LAMP_SPREAD, -1.0f, v * LAMP_SPREAD}});
+        float depth = lamp->radius;
+        for (int j = 0; j < count; j++) {
+          const solid_t *q = &g_solids[near_solids[j]];
+          v3 normal;
+          float d = ray_aabb(lamp->pos, dir, q->min, q->max, &normal);
+          if (d > 0.0f && d < depth) depth = d;
+        }
+        int at = (l / 3 * LAMP_SH_TILE + z) * LAMP_SH_W + l % 3 * LAMP_SH_TILE + x;
+        depths[at] = depth / lamp->radius;
+      }
+  }
+  gl_active_texture(GL_TEXTURE0 + 4);
+  glBindTexture(GL_TEXTURE_2D, R.lamp_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, LAMP_SH_W, LAMP_SH_H,
+               0, GL_DEPTH_COMPONENT, GL_FLOAT, depths);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+  gl_active_texture(GL_TEXTURE0);
+}
+
+static void mesh_lamp_box(v3 c, v3 r, v3 col, float rough) {
+  v3 p[8];
+  for (int i = 0; i < 8; i++)
+    p[i] = (v3){{c.x + (i & 1 ? r.x : -r.x), c.y + (i & 2 ? r.y : -r.y),
+                 c.z + (i & 4 ? r.z : -r.z)}};
+  static const int faces[6][4] = {{1,3,7,5}, {4,6,2,0}, {2,6,7,3},
+                                 {4,0,1,5}, {4,5,7,6}, {0,2,3,1}};
+  static const v3 norms[6] = {{{1,0,0}},{{-1,0,0}},{{0,1,0}},{{0,-1,0}},{{0,0,1}},{{0,0,-1}}};
+  mat_set(rough, 0.0f);
+  for (int f = 0; f < 6; f++)
+    mesh_quad(p[faces[f][0]], p[faces[f][1]], p[faces[f][2]], p[faces[f][3]], norms[f], col);
+}
+
+static void mesh_lamps(void) {
+  v3 metal = {{0.19f, 0.22f, 0.24f}};
+  for (int i = 0; i < g_map_light_n; i++) {
+    const map_light_t *l = &g_map_lights[i];
+    v3 c = l->pos;
+    float h = (c.y - l->base) * 0.5f;
+    c.y = l->base + h;
+    mesh_lamp_box(c, (v3){{0.065f, h, 0.065f}}, metal, 0.58f);
+    c = l->pos; c.y += 0.13f;
+    mesh_lamp_box(c, (v3){{l->style == 1 ? 0.55f : 0.30f, 0.13f, 0.23f}}, metal, 0.58f);
+    c.y -= 0.14f;
+    // A dedicated material tag emits through the same static world batch.
+    v3 glow = v3_scale(l->col, 0.8f);
+    mesh_lamp_box(c, (v3){{l->style == 1 ? 0.48f : 0.24f, 0.018f, 0.18f}}, glow, 2.0f);
+    if (l->style == 1) {
+      c = l->pos; c.y -= 0.55f;
+      mesh_lamp_box(c, (v3){{0.34f, 0.035f, 0.11f}}, metal, 0.6f);
+    }
+  }
+  mat_set(WORLD_SOLID_R, 0.0f);
+}
+
 static void mesh_build(void) {
   g_mesh_floats = 0;
   v3 ground_col = g_theme.ground;
@@ -864,6 +951,7 @@ static void mesh_build(void) {
     mesh_quad((v3){{mx.x,mn.y,mn.z}},(v3){{mn.x,mn.y,mn.z}},(v3){{mn.x,mx.y,mn.z}},(v3){{mx.x,mx.y,mn.z}},(v3){{0,0,-1}},c);
   }
   ao_off();
+  mesh_lamps();
   mesh_cast_extra();   // boulder render + tree crowns: casters, so pre-latch
   // EVERYTHING THAT CASTS IS NOW BEHIND US. The floor cannot: it is the lowest surface
   // in the world and there is nothing under it to shadow, so its 4608 triangles were
@@ -897,6 +985,7 @@ static void mesh_build(void) {
 // the sim then flags g_world_dirty and the next frame re-uploads once.
 static void world_upload(void) {
   mesh_build();
+  lamp_shadow_build();
   R.world_verts = g_mesh_floats / VERT_FLOATS;
   if (R.world_cast_verts > R.world_verts) R.world_cast_verts = R.world_verts;
   if (R.world_pre_verts > R.world_verts) R.world_pre_verts = R.world_verts;
@@ -933,6 +1022,16 @@ static void renderer_init(int width, int height) {
   R.u_eye = glGetUniformLocation(R.prog_world, "uEye");
   R.u_detail = glGetUniformLocation(R.prog_world, "uDetail");
   R.u_surf = glGetUniformLocation(R.prog_world, "uSurf");
+  R.u_foliage = glGetUniformLocation(R.prog_world, "uFoliage");
+  R.u_lamp_n = glGetUniformLocation(R.prog_world, "uLampN");
+  R.u_lamp_tex = glGetUniformLocation(R.prog_world, "uLampShadow");
+  for (int i = 0; i < MAP_LIGHT_MAX; i++) {
+    char name[32];
+    snprintf(name, sizeof name, "uLampPos[%d]", i);
+    R.u_lamp_pos[i] = glGetUniformLocation(R.prog_world, name);
+    snprintf(name, sizeof name, "uLampCol[%d]", i);
+    R.u_lamp_col[i] = glGetUniformLocation(R.prog_world, name);
+  }
   R.rig_world = rig_locs(R.prog_world);
   R.u_emis = glGetUniformLocation(R.prog_world, "uEmis");
   R.u_screen = glGetUniformLocation(R.prog_hud, "uScreen");
@@ -1011,6 +1110,7 @@ static void renderer_init(int width, int height) {
   R.u_sky_cov = glGetUniformLocation(R.prog_sky, "uCov");
   R.u_sky_sunxz = glGetUniformLocation(R.prog_sky, "uSunXZ");
   R.u_sky_ridge = glGetUniformLocation(R.prog_sky, "uRidge");
+  R.u_sky_time = glGetUniformLocation(R.prog_sky, "uSkyTime");
   R.rig_sky = rig_locs(R.prog_sky);
   glGenVertexArrays(1, &R.vao_sky);  // attribute-less: verts from gl_VertexID
 

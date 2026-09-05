@@ -726,52 +726,28 @@ def die(msg):
 
 
 # --- the still recipes -----------------------------------------------------
-# The two README stills — ordinary gameplay frames from live 12-bot matches on
-# hard; only the SUN is staged (a weapon needs a raking light to read; these
-# arenas draw it flat overhead).
+# Two controlled gameplay stills: a real opponent, normal weapon handling,
+# collision and effects, with deterministic positions and lighting. The warm
+# dunes frame shows the AR at 10.5 m; the forest frame puts a target 15 m away
+# inside the SR optic. Both retain the live player's HUD.
 #
-# fight.png  seed 20348, t=1404, dusk. The throwaway pre-shot exists because
-#            the local tracer re-anchors to the viewmodel muzzle only once a
-#            frame has actually RENDERED — without it the beam leaves the
-#            third-person anchor under the camera — and the SECOND throwaway
-#            shot mid-flight re-anchors it again, or the recoil moves the
-#            muzzle off the beam's frozen start (the "tracer torn off the
-#            barrel" frame). Two ticks after the trigger the tracer is a
-#            continuous beam from the muzzle into the crosshair starburst,
-#            and the killfeed's top line is the player's own headshot.
-# scope.png  seed 80468 (GRIT — teal against fight.png's warm sand), t=1354.
-#            Through the scope, ONE tick after a 37 m headshot on PIVOT: the
-#            tracer still enters the disc diagonally INTO the fresh spark
-#            burst, a second bot stands armed in the glass, and the killfeed
-#            tops with the player's own headshot. The `look 0 90` is RECOIL
-#            COMPENSATION, calibrated by sweep (0/60/90/120/300/600): the
-#            round leaves with rec = 0 and lands on the head, but one tick
-#            later the kick has already lifted the camera ~30 px off the
-#            impact — 90 counts of pull-down puts the crosshair back ON the
-#            burst, exactly the discipline a real shooter's hand does. The
-#            aim is a fixed `aim` at PIVOT's head: aimbot snaps to the
-#            NEAREST bot, the wrong one at long range.
+# A rendered warm frame before firing supplies the viewmodel muzzle anchor.
+# The intermediate render follows recoil, so the final tracer remains joined
+# to the visible barrel. No long unattended fight can kill the camera player.
+# The SR's 205-count downward input counters its 4.5-degree shot recoil and
+# keeps the struck opponent centred in the optic.
 STILLS = {
-    # Re-staged 2026-08-25 after the map-gen v2 seed break re-rolled every
-    # arena: the old seeds/coords photographed the ELIMINATED screen (fight)
-    # and a wall one metre past the muzzle (scope). Both recipes aim by
-    # AIMBOT now, never by fixed world coordinates — a layout change then
-    # re-frames instead of breaking. Seeds were scanned for "player alive at
-    # the freeze + a bot 8-16 m down the muzzle" (php>0 in `match`, bang d=).
-    # 20350: grit QUARRY + collapse signature — tracer to a hit-lit bot who
-    # is aiming BACK, three more behind, a corpse and brick spill in frame.
-    "fight.png": (20350, "bots 12; skill hard; fraglimit 1000; wait 1400; "
-                  "botfreeze on; wait 4; weapon ar; sun 7 -75; aimbot; "
+    "fight.png": (59, "showfps off; biome dunes; bots 1; fraglimit 1000; wait 3; "
+                  "botfreeze on; puppet on; puppet warp -6.1 -11.25; "
+                  "puppet face -167; puppet ready 1; puppet ads 1; "
+                  "warp -8.5 0 -1; weapon ar; sun 18 145; wait 90; aimbot; "
                   "shot {tmp}; +fire; wait 1; shot {tmp}; wait 1; "
                   "shot media/fight.png"),
-    # 31337: grit SWEPT — the second aimbot AFTER the ADS ramp re-centres
-    # the scope on the head; the frame lands two ticks after the trigger,
-    # impact star on the target in the glass, the kill already atop the
-    # killfeed, casing in the air. The warm shots stay: the tracer needs a
-    # RENDERED frame before the trigger or it anchors at the 3P muzzle.
-    "scope.png": (31337, "bots 12; skill hard; fraglimit 1000; wait 1350; "
-                  "botfreeze on; wait 4; weapon sr; sun 14 -55; aimbot; "
-                  "+ads; wait 130; aimbot; shot {tmp}; +fire; wait 1; "
+    "scope.png": (4, "showfps off; biome forest; bots 1; fraglimit 1000; wait 3; "
+                  "botfreeze on; puppet on; puppet warp -5 -20; "
+                  "puppet face 180; puppet ready 1; puppet ads 1; "
+                  "warp -5 0 -5; weapon sr; sun 36 155; +ads; wait 130; "
+                  "aim -5 1.2 -20; shot {tmp}; +fire; wait 1; look 0 205; "
                   "shot {tmp}; wait 1; shot media/scope.png"),
 }
 

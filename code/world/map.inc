@@ -135,6 +135,30 @@ static const theme_t THEMES[] = {
 static theme_t g_theme_all[SRV_LOBBIES];
 #define g_theme (g_theme_all[g_lobby])
 
+// Biome state is independent of the layout RNG and belongs to each server lobby.
+// Surface families remain the three shared material algorithms; biome palettes,
+// weather and vegetation layer on top of those algorithms.
+typedef enum { BIOME_QUARRY, BIOME_DUNES, BIOME_MARSH, BIOME_FOREST,
+               BIOME_FROST, BIOME_NIGHT } biome_kind_t;
+typedef struct { int kind; float night, snow, forest, aurora; } biome_t;
+static biome_t g_biome_all[SRV_LOBBIES];
+#define g_biome (g_biome_all[g_lobby])
+static int g_biome_force = -1;
+[[maybe_unused]] static const char *BIOME_NAMES[] = {"quarry", "dunes", "marsh", "forest",
+                                    "frost", "night", "aurora"};
+#define MAP_LIGHT_MAX 6
+#define LAMP_SH_SIZE 96
+#define LAMP_SH_TILE (LAMP_SH_SIZE + 2)
+#define LAMP_SH_W (LAMP_SH_TILE * 3)
+#define LAMP_SH_H (LAMP_SH_TILE * 2)
+#define LAMP_SPREAD 2.4f
+// Lamps sit on solid wall tops; their brackets stay above head height.
+typedef struct { v3 pos, col; float radius, base; int style; } map_light_t;
+static map_light_t g_map_lights_all[SRV_LOBBIES][MAP_LIGHT_MAX];
+static int g_map_light_n_all[SRV_LOBBIES];
+#define g_map_lights (g_map_lights_all[g_lobby])
+#define g_map_light_n (g_map_light_n_all[g_lobby])
+
 // ONE wind direction per arena.
 static float g_wind_ang_all[SRV_LOBBIES];
 #define g_wind_ang (g_wind_ang_all[g_lobby])
@@ -192,6 +216,18 @@ static v3 sun_extinct(float sin_elev, float elev_deg) {
                3.60f * expf(-0.356f * am)}};
 }
 
+static void biome_night_light(void) {
+  if (g_biome.night < 0.5f) return;
+  g_sun.col = g_biome.snow > 0.5f ? (v3){{0.115f, 0.165f, 0.235f}}
+                                    : (v3){{0.15f, 0.23f, 0.38f}};
+  g_sun.sky_top = (v3){{0.006f, 0.014f, 0.035f}};
+  g_sun.sky_hor = (v3){{0.035f, 0.059f, 0.095f}};
+  g_sun.sky_gnd = (v3){{0.025f, 0.034f, 0.045f}};
+  g_sun.exposure = 1.65f;
+  g_sun.disc = 0.0f;
+  g_sun.cloud = 0.08f;
+}
+
 static void sun_set(float elev_deg, float azi_rad);
 
 static void sun_build(uint32_t seed) {
@@ -214,6 +250,7 @@ static void sun_build(uint32_t seed) {
   uint32_t h3 = h * 3266489917u + 0x9E37u;
   h3 ^= h3 >> 15; h3 *= 2246822519u; h3 ^= h3 >> 13;
   g_sun.cloud = 0.13f + 0.26f * ((float)(h3 >> 8) * (1.0f / 16777216.0f));
+  biome_night_light();
 }
 
 // The whole rig from one angle pair. Split out of sun_build because the harness
@@ -268,6 +305,92 @@ static void sun_set(float elev_deg, float azi_rad) {
   S->sh_depth = 2.2f * S->sh_half + 40.0f;
   v3 dh = v3_norm((v3){{S->dir.x, 0.0f, S->dir.z}});
   S->sh_centre = (v3){{-dh.x * smear * 0.5f, 1.6f, -dh.z * smear * 0.5f}};
+  biome_night_light();
+}
+
+// Seed selection gives seven readable treatments, with frost offered both by
+// daylight and under aurora. The harness override uses this same constructor.
+static void biome_build(uint32_t seed) {
+  uint32_t h = seed * 2246822519u + 0xB10Eu;
+  h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+  int kind = g_theme.surf == SURF_SAND ? BIOME_DUNES
+           : g_theme.surf == SURF_WET ? BIOME_MARSH : BIOME_QUARRY;
+  unsigned draw = h % 6u;
+  if (draw == 2u) kind = BIOME_FOREST;
+  if (draw == 3u || draw == 4u) kind = BIOME_FROST;
+  if (draw == 5u) kind = BIOME_NIGHT;
+  int night = kind == BIOME_NIGHT || (kind == BIOME_FROST && draw == 4u);
+  if (g_biome_force >= 0) {
+    kind = g_biome_force == 6 ? BIOME_FROST : g_biome_force;
+    night = g_biome_force == 6 || kind == BIOME_NIGHT;
+  }
+  g_biome = (biome_t){kind, (float)night, kind == BIOME_FROST,
+                      kind == BIOME_FOREST, kind == BIOME_FROST && night};
+  if (kind == BIOME_DUNES) g_theme = THEMES[2];
+  if (kind == BIOME_QUARRY) g_theme = THEMES[0];
+  if (kind == BIOME_MARSH || kind == BIOME_NIGHT) g_theme = THEMES[1];
+  if (kind == BIOME_FOREST) {
+    g_theme = THEMES[0];
+    g_theme.ground = (v3){{0.39f, 0.43f, 0.30f}};
+    g_theme.wall = (v3){{0.57f, 0.60f, 0.51f}};
+    g_theme.cover = (v3){{0.49f, 0.46f, 0.36f}};
+    g_theme.mid = (v3){{0.38f, 0.46f, 0.36f}};
+  }
+  if (kind == BIOME_FROST) {
+    g_theme = THEMES[0];
+    g_theme.ground = (v3){{0.86f, 0.90f, 0.92f}};
+    g_theme.wall = (v3){{0.65f, 0.70f, 0.74f}};
+    g_theme.cover = (v3){{0.49f, 0.54f, 0.59f}};
+    g_theme.mid = (v3){{0.30f, 0.44f, 0.51f}};
+    g_theme.band_n = (v3){{0.32f, 0.44f, 0.53f}};
+    g_theme.band_s = (v3){{0.56f, 0.33f, 0.26f}};
+  }
+  sun_build(seed);
+  if (night) {
+    float az = atan2f(g_sun.dir.x, -g_sun.dir.z);
+    sun_set(28.0f + (float)(h % 18u), az);
+  } else if (kind == BIOME_FOREST) {
+    g_sun.cloud = 0.34f;
+  }
+}
+
+// A fixed three-pair rig makes pools of light with unlit routes between them.
+// The interior pair is mounted on existing tall cover, the other two pairs on
+// the perimeter. Neither placement consumes layout randomness or adds solids.
+static void map_lights_build(void) {
+  g_map_light_n = 0;
+  if (g_biome.night < 0.5f) return;
+  for (int pair = 0; pair < 3; pair++) {
+    v3 p = pair == 0 ? (v3){{-15.0f, 5.4f, ARENA_HALF + 0.12f}}
+                    : (v3){{ARENA_HALF + 0.12f, 5.7f, 8.0f}};
+    float base = 2.75f;
+    if (pair == 2) {
+      float best = 1e9f;
+      for (int i = 8; i < g_num_solids; i++) {
+        const solid_t *q = &g_solids[i];
+        float x = (q->min.x + q->max.x) * 0.5f;
+        float z = (q->min.z + q->max.z) * 0.5f;
+        if (q->max.y < 1.6f || q->min.y > 0.1f || z < 2.0f || z > 17.0f ||
+            fabsf(x) > 16.0f) continue;
+        float d = x * x + (z - 10.0f) * (z - 10.0f);
+        if (d < best) {
+          best = d; base = q->max.y;
+          p = (v3){{x, base + 2.0f, z}};
+        }
+      }
+      if (best == 1e9f) continue;
+    }
+    v3 col = pair == 0 ? (v3){{6.8f, 4.1f, 1.9f}}
+             : pair == 1 ? (v3){{3.1f, 4.5f, 6.2f}}
+                         : (v3){{3.4f, 0.18f, 0.07f}};
+    for (int twin = 0; twin < 2; twin++) {
+      v3 at = p;
+      if (twin) { at.x = -at.x; at.z = -at.z; }
+      g_map_lights[g_map_light_n++] = (map_light_t){at, col,
+                                                   pair == 2 ? 6.8f : 13.5f,
+                                                   base, pair};
+    }
+  }
 }
 
 // THE MOOD IS MAP STATE, the sun's and the wind's sibling: three latents in
@@ -358,10 +481,12 @@ typedef struct {
   uint8_t damage[5];   // canonical wall archetype census for deterministic audits
   int16_t bould[2];     // solid indices of the boulder pair, else -1
   int16_t tree[2];      // solid indices of the two trunks, else -1
+  int16_t grove[6];     // every forest trunk, including rotational twins
+  int     ngrove;
   int     nedge;
   medge_t edge[META_EDGE_MAX];
   int     nvoid;
-  mvoid_t voids[META_VOID_MAX];  // through-wall samples inside full fissures
+  mvoid_t voids[META_VOID_MAX];  // through-wall samples inside missing-brick apertures
 } map_meta_t;
 static map_meta_t g_meta;
 
@@ -506,35 +631,47 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
   if (kind == 4 && (h < 1.4f || len < 4.5f)) kind = 0;
   if (kind >= 0) g_meta.damage[kind]++;
   switch (kind) {
-  case 0: {  // BROKEN END: the last stretch has come down to a climbable stub
-    float bl = rng_range(0.9f, 1.6f);
-    // A FRACTION of the wall, never an absolute height.
-    float hs = h * rng_range(0.34f, 0.52f);
+  case 0: {  // BROKEN END: coarse descending courses finish in a low stub.
+    float bl = rng_range(1.0f, 1.65f);
+    float hs = h * rng_range(0.30f, 0.44f);
     // NOT `far`. windef.h defines `far` and `near` as macros, so a local of
     // either name compiles clean on gcc and fails only the Windows build.
     int hi_end = (int)((roll >> 13) & 1u);
     float cut = hi_end ? hi - bl : lo + bl;
-    if (hi_end) {
-      wall_piece(mn, mx, ax, lo, cut, 0.0f, h, col);
-      wall_piece(mn, mx, ax, cut, hi, 0.0f, hs, col);
-      wall_rubble(mn, mx, ax, hi, 1.0f, 1, hs * 0.82f, col);
-      meta_edge(wall_pt(mn, mx, ax, cut, hs), wall_pt(mn, mx, ax, hi, hs),
-                ME_TOP, ax);
-      meta_edge(wall_pt(mn, mx, ax, cut, hs + 0.04f),
-                wall_pt(mn, mx, ax, cut, h - 0.04f), ME_FRACTURE, ax);
-      meta_edge(wall_pt(mn, mx, ax, cut, 0.0f),
-                wall_pt(mn, mx, ax, cut + 0.9f, 0.0f), ME_FOOT, ax);
-    } else {
-      wall_piece(mn, mx, ax, lo, cut, 0.0f, hs, col);
-      wall_piece(mn, mx, ax, cut, hi, 0.0f, h, col);
-      wall_rubble(mn, mx, ax, lo, -1.0f, 1, hs * 0.82f, col);
-      meta_edge(wall_pt(mn, mx, ax, lo, hs), wall_pt(mn, mx, ax, cut, hs),
-                ME_TOP, ax);
-      meta_edge(wall_pt(mn, mx, ax, cut, hs + 0.04f),
-                wall_pt(mn, mx, ax, cut, h - 0.04f), ME_FRACTURE, ax);
-      meta_edge(wall_pt(mn, mx, ax, cut - 0.9f, 0.0f),
-                wall_pt(mn, mx, ax, cut, 0.0f), ME_FOOT, ax);
+    wall_piece(mn, mx, ax, hi_end ? lo : cut, hi_end ? cut : hi,
+                0.0f, h, col);
+    int steps = 2 + (int)((roll >> 18) & 1u);
+    float previous_h = h;
+    for (int step = 0; step < steps; step++) {
+      // Broad, unequal treads avoid a regular staircase. Quantized lost
+      // courses keep the silhouette angular even on the low wall class.
+      float ta = (float)step / (float)steps;
+      float tb = (float)(step + 1) / (float)steps;
+      if (step > 0) ta += (step & 1) ? 0.055f : -0.035f;
+      if (step + 1 < steps) tb += ((step + 1) & 1) ? 0.055f : -0.035f;
+      float ca = hi_end ? cut + bl * ta : cut - bl * tb;
+      float cb = hi_end ? cut + bl * tb : cut - bl * ta;
+      float sh = h - ceilf((h - hs) * (float)(step + 1) /
+                           ((float)steps * 0.16f)) * 0.16f;
+      sh = map_eyeband(fmaxf(sh, 0.22f), h, (roll >> 23) & 1u);
+      if (sh > previous_h) sh = previous_h;
+      wall_piece(mn, mx, ax, ca, cb, 0.0f, sh, col);
+      // A few exposed bricks mark the shoulder and the lowest ledge. Dressing
+      // every tread and riser would hide the coarse stepped silhouette.
+      if (step + 1 == steps)
+        meta_edge(wall_pt(mn, mx, ax, ca, sh),
+                  wall_pt(mn, mx, ax, cb, sh), ME_TOP, ax);
+      float edge = hi_end ? ca : cb;
+      if (step == 0 && previous_h - sh > 0.12f)
+        meta_edge(wall_pt(mn, mx, ax, edge, sh + 0.03f),
+                  wall_pt(mn, mx, ax, edge, previous_h - 0.03f),
+                  ME_FRACTURE, ax);
+      previous_h = sh;
     }
+    wall_rubble(mn, mx, ax, hi_end ? hi : lo, hi_end ? 1.0f : -1.0f,
+                1, previous_h * 0.82f, col);
+    meta_edge(wall_pt(mn, mx, ax, hi_end ? cut : lo, 0.0f),
+              wall_pt(mn, mx, ax, hi_end ? hi : cut, 0.0f), ME_FOOT, ax);
   } break;
   case 1: {  // BREACH: material above and below, nothing between. A real hole.
     float bw = rng_range(0.85f, 1.45f);
@@ -634,60 +771,49 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
                 wall_pt(mn, mx, ax, dat + 0.5f, 0.0f), ME_FOOT, ax);
     }
   } break;
-  case 3: {  // FISSURE: a stepped, full-depth opening in render AND collision.
-    // Six two-course zones form a connected crack from the wall foot to
-    // open sky. Each zone is two solids separated by air, so the dark line is
-    // never paint: light, sight and projectiles really pass through it. The
-    // limited lateral walk keeps the fracture structural rather than noisy.
-    const int bands = 6;
-    float base = rng_range(lo + 0.90f, hi - 0.90f);
-    float centre = base + rng_range(-0.05f, 0.05f);
-    float prev_w = 0.0f;
+  case 3: {  // MISSING BRICKS: a compact L or Z aperture through the wall.
+    // Complete masonry above and below keeps this a small local loss. The
+    // aperture follows two or three brick courses, with broad square returns
+    // rather than a thin crack running from the floor to the skyline.
+    int z_profile = (int)((roll >> 18) & 1u);
+    int bands = z_profile ? 3 : 2;
+    int flip = (int)((roll >> 19) & 1u);
+    float brick = rng_range(0.25f, 0.32f);
+    float span = brick * (z_profile ? 3.0f : 2.0f);
+    float base = rng_range(lo + 0.60f, hi - span - 0.60f);
+    float bottom = rng_range(0.68f, 0.88f);
+    float top = fminf(bottom + (float)bands * rng_range(0.17f, 0.21f),
+                      h - 0.22f);
+    top = map_eyeband(top, h - 0.22f, 0u);
+    float course = (top - bottom) / (float)bands;
+    float half_depth = ax ? (mx.z - mn.z) * 0.5f
+                          : (mx.x - mn.x) * 0.5f;
+    wall_piece(mn, mx, ax, lo, hi, 0.0f, bottom, col);
     for (int band = 0; band < bands; band++) {
-      float y0 = h * (float)band / (float)bands;
-      float y1 = band + 1 == bands ? h
-                                   : h * (float)(band + 1) / (float)bands;
-      float walk = band > 0 ? rng_range(-0.15f, 0.15f) : 0.0f;
-      // A settling crack opens toward the failed top courses. The per-zone
-      // variation prevents the gap from becoming a constant-width saw cut.
-      float cw = rng_range(0.11f, 0.17f) + 0.018f * (float)band;
-      if (band > 0) {
-        // Consecutive air intervals overlap by at least 25 mm. Without this
-        // topological constraint a visually zig-zagging pair of voids could
-        // secretly be separated by one unbroken horizontal course.
-        float max_walk = (prev_w + cw) * 0.5f - 0.025f;
-        walk = f_clamp(walk, -max_walk, max_walk);
-        centre = f_clamp(centre + walk, base - 0.32f, base + 0.32f);
-      }
-      float ca = centre - cw * 0.5f, cb = centre + cw * 0.5f;
+      float y0 = bottom + course * (float)band;
+      float y1 = band + 1 == bands ? top
+                                   : bottom + course * (float)(band + 1);
+      float a = z_profile ? (band < 2 ? brick : 0.0f) : 0.0f;
+      float b = z_profile ? (band == 0 ? span : 2.0f * brick)
+                           : (band == 0 ? span : brick);
+      float ca = base + (flip ? span - b : a);
+      float cb = base + (flip ? span - a : b);
       wall_piece(mn, mx, ax, lo, ca, y0, y1, col);
       wall_piece(mn, mx, ax, cb, hi, y0, y1, col);
-
-      // Fractured teeth are real cut-corner 3D modules emitted on alternating
-      // faces of the exposed crack. One edge per zone is enough to roughen the
-      // silhouette without filling the opening it exists to reveal.
-      float edge = ((band + (int)(roll >> 21)) & 1) ? ca : cb;
-      meta_edge(wall_pt(mn, mx, ax, edge, y0 + 0.03f),
-                wall_pt(mn, mx, ax, edge, y1 - 0.03f), ME_FRACTURE, ax);
-      // Upper zones stay above the believable rubble plug at the foot. These
-      // samples let mapcheck cast through the complete collision thickness,
-      // so a painted or accidentally capped crack cannot satisfy the proof.
-      if ((y0 + y1) * 0.5f > 0.46f) {
-        float half_depth = ax ? (mx.z - mn.z) * 0.5f
-                              : (mx.x - mn.x) * 0.5f;
-        meta_void(wall_pt(mn, mx, ax, centre, (y0 + y1) * 0.5f),
-                  half_depth, ax);
-      }
-      prev_w = cw;
+      // Probe each missing course through the complete collision thickness.
+      // No decorative tooth is placed in the opening: its square outline and
+      // the remaining half-brick returns must stay clearly visible.
+      meta_void(wall_pt(mn, mx, ax, (ca + cb) * 0.5f, (y0 + y1) * 0.5f),
+                half_depth, ax);
     }
-    wall_rubble(mn, mx, ax, base, 0.0f, 1, 0.42f, col);
-    meta_edge(wall_pt(mn, mx, ax, base - 0.58f, 0.0f),
-              wall_pt(mn, mx, ax, base + 0.58f, 0.0f), ME_FOOT, ax);
+    wall_piece(mn, mx, ax, lo, hi, top, h, col);
+    meta_edge(wall_pt(mn, mx, ax, base - 0.15f, 0.0f),
+              wall_pt(mn, mx, ax, base + span + 0.15f, 0.0f), ME_FOOT, ax);
   } break;
   case 4: {  // COLLAPSED RUN: disconnected wall remains around open ground.
     // Keep one structural mass, one stepped shoulder and one isolated low
     // stump. Everything between shoulder and stump is genuinely absent, which
-    // makes this the walk-through counterpart to the narrow sight fissure.
+    // makes this the walk-through counterpart to a missing-brick aperture.
     int flip = (int)((roll >> 21) & 1u);
     float cut = rng_range(lo + len * 0.42f, lo + len * 0.62f);
     float shoulder_w = rng_range(0.42f, 0.68f);
@@ -787,6 +913,8 @@ static void map_add_wall_sym(v3 mn, v3 mx, v3 col, int ax) {
 //   SLATE   cool damp mist off wet stone — blue, and the thickest of the three
 //   SAND    ochre desert dust            — warm, and it owns the horizon
 static v3 atmo_tint(void) {
+  if (g_biome.snow > 0.5f) return (v3){{0.82f, 0.94f, 1.08f}};
+  if (g_biome.forest > 0.5f) return (v3){{0.91f, 1.02f, 0.88f}};
   switch (g_theme.surf) {
   case SURF_SAND: return (v3){{1.20f, 0.99f, 0.72f}};
   case SURF_WET:  return (v3){{0.84f, 0.93f, 1.10f}};
@@ -794,6 +922,8 @@ static v3 atmo_tint(void) {
   }
 }
 static float atmo_haze(void) {
+  if (g_biome.night > 0.5f) return 0.20f;
+  if (g_biome.snow > 0.5f) return 0.28f;
   switch (g_theme.surf) {
   case SURF_SAND: return 0.46f;
   case SURF_WET:  return 0.50f;
@@ -823,6 +953,8 @@ static v3 ridge_params(float *dark) {
 
 // Loose-grain strength / glitter strength / standing-water level, per treatment.
 static v3 surf_params(void) {
+  if (g_biome.snow > 0.5f) return (v3){{0.35f, 0.55f, 0.0f}};
+  if (g_biome.forest > 0.5f) return (v3){{0.0f, 0.04f, 0.0f}};
   switch (g_theme.surf) {
   case SURF_SAND: return (v3){{1.00f, 1.00f, 0.00f}};
   // A wet floor has no loose crust (water binds the fines) and no glitter
@@ -1133,14 +1265,41 @@ static void map_gen_crates(void) {
   }
 }
 
+// Forest trunks are cover; foliage is confined above head height. This late
+// pass has a private stream, so adding trees cannot rearrange the arena's
+// existing walls, crates or gameplay randomness.
+static void map_gen_forest(uint32_t seed) {
+  if (g_biome.forest < 0.5f) return;
+  uint64_t st = (uint64_t)(seed ^ 0xF07E57u) * 2654435761u + 1;
+  float limit = ARENA_HALF - RING_W - 1.8f;
+  for (int pair = 0; pair < 3 && g_num_solids <= MAX_SOLIDS - 2; pair++) {
+    for (int attempt = 0; attempt < 96; attempt++) {
+      float x = rng_rangef(&st, -limit, limit);
+      float z = rng_rangef(&st, 2.0f, limit);
+      if (x * x + z * z < 64.0f) continue;
+      v3 mn = {{x - 0.16f, 0.0f, z - 0.16f}};
+      v3 mx = {{x + 0.16f, 3.2f, z + 0.16f}};
+      // The generous gap also keeps canopy edges away from climbable cover;
+      // map_sym_free enforces both spawn exclusions for the complete pair.
+      if (!map_sym_free(mn, mx, 1.8f)) continue;
+      int at = g_num_solids;
+      float shade = rng_rangef(&st, 0.90f, 1.08f);
+      map_add_sym(mn, mx, v3_scale((v3){{0.29f, 0.25f, 0.19f}}, shade));
+      g_meta.grove[g_meta.ngrove++] = (int16_t)at;
+      g_meta.grove[g_meta.ngrove++] = (int16_t)(at + 1);
+      break;
+    }
+  }
+}
+
 static void map_generate(uint32_t seed) {
   g_rng = (uint64_t)seed * 2654435761u + 1;
   for (int h = 0; h < (int)(sizeof g_rng_gun / sizeof g_rng_gun[0]); h++)
     g_rng_gun[h] = rng_gun_seed(seed, h);
   g_rng_bot = (uint64_t)(seed ^ 0xB07u) * 2654435761u + 1;
   g_num_solids = 0;
-  sun_build(seed);   // hashed off the seed, like the wind; see sun_build
   g_theme = THEMES[rng_u32() % (sizeof THEMES / sizeof THEMES[0])];
+  biome_build(seed);
   // Mood then signature, both seed-hashed, both AFTER the theme (their
   // tables are per-theme) and BEFORE any geometry (their numbers feed the
   // generator's own probabilities).
@@ -1156,4 +1315,6 @@ static void map_generate(uint32_t seed) {
   map_gen_landmark();
   map_gen_walls();
   map_gen_crates();
+  map_gen_forest(seed);
+  map_lights_build();
 }

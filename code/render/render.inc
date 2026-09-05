@@ -304,7 +304,7 @@ static float scope_pip_radius(float scope, float vw, float vh) {
 // light to the rig cannot be half-wired.
 typedef struct {
   GLint sun, suncol, skytop, skyhor, skygnd, expo, disc, atmo, haze, hazes;
-  GLint ambd, ambu, bounce, vmfill, vmrim, ambs, sunh, look, bounces;
+  GLint ambd, ambu, bounce, vmfill, vmrim, ambs, sunh, look, bounces, biome;
 } lightloc_t;
 
 // THE LOOK, three of the four components of the vec4 every tonemapping program
@@ -326,6 +326,9 @@ typedef struct {
   GLint  u_lightvp, u_smtexel, u_shadow, u_smstep, u_sm, u_dvp;
   GLint  u_vm, u_fill, u_rim, u_muzc, u_muzl, u_muzp;
   GLint  u_mdlo, u_mdlx, u_mdlz;           // the weapon's own frame
+  GLuint lamp_tex;
+  GLint u_lamp_n, u_lamp_pos[MAP_LIGHT_MAX], u_lamp_col[MAP_LIGHT_MAX], u_lamp_tex;
+  GLint u_foliage;
   GLint  u_surf;                           // the floor's theme treatment
   // TWO PROGRAMS READ THE SAME LIGHT. GLSL_ENV is shared source, so every one of
   // these is declared once, but a uniform location belongs to a PROGRAM: the
@@ -340,7 +343,7 @@ typedef struct {
   GLuint scope_fbo, scope_tex, scope_depth;  // picture-in-picture scope target
   int    scope_size;
   GLint  u_sky_fwd, u_sky_right, u_sky_up, u_sky_tan, u_sky_wind, u_sky_cov;
-  GLint  u_sky_sunxz, u_sky_ridge;
+  GLint  u_sky_sunxz, u_sky_ridge, u_sky_time;
   GLuint vao_world, vbo_world, vao_hud, vbo_hud, vao_sky, font_tex;
   GLuint vao_scene, vbo_scene;   // per-frame dynamic 3D batch (bot, VFX, gun)
   int    world_verts;
@@ -477,6 +480,7 @@ static GLuint gl_compile(GLenum type, const char *src) {
 
 static lightloc_t rig_locs(GLuint p) {
   return (lightloc_t){
+    .biome  = glGetUniformLocation(p, "uBiome"),
     .sun    = glGetUniformLocation(p, "SUN_DIR"),
     .suncol = glGetUniformLocation(p, "SUN_COL"),
     .skytop = glGetUniformLocation(p, "SKY_TOP"),
@@ -509,6 +513,7 @@ static float v3_luma(v3 c) {
 // running one frame behind the world's sun.
 static void rig_upload(const lightloc_t *L) {
   const sun_t *S = &g_sun;
+  glUniform4f(L->biome, g_biome.night, g_biome.snow, g_biome.forest, g_biome.aurora);
   glUniform3f(L->sun, S->dir.x, S->dir.y, S->dir.z);
   glUniform3f(L->suncol, S->col.x, S->col.y, S->col.z);
   glUniform3f(L->skytop, S->sky_top.x, S->sky_top.y, S->sky_top.z);
@@ -696,7 +701,7 @@ static float ao_ramp(float y, float base, float rate, float min_v) {
   if (min_v >= 1.0f) return 1.0f;
   float t = (y - base) * rate;
   t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
-  return min_v + (1.0f - min_v) * t;
+  return min_v + (1.0f - min_v) * t * t * (3.0f - 2.0f * t);
 }
 
 static float ao_at(float y) {
