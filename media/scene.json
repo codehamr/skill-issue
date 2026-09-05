@@ -4,7 +4,7 @@
   "w": 1280,
   "h": 720,
   "bpm": 120,
-  "grade": "eq=contrast=1.035:saturation=1.10:gamma=1.015,unsharp=3:3:0.25",
+  "grade": "unsharp=3:3:0.25",
   "fade_out": 0,
   "gif_width": 832,
   "gif_colors": 160,

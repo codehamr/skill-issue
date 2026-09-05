@@ -6,13 +6,11 @@
 // RESET rows cannot cross-confirm each other; ui_arm_take is the one
 // chokepoint, and nav_move clears it. QUIT and LEAVE MATCH are NOT on that
 // list — both are one press, each argued at its own tile in ui/settings.inc.
-// SETTINGS splits GAME | VIDEO behind the shared sub-select. VIDEO offers a
-// quality profile, AA and shadows; the profile owns AO, reflections, glow and
-// dust. Film look is independent. Profiles compare effective AA so equivalent
-// requests stay one choice on devices that round their sample counts.
-// CUSTOM is derived from the six quality keys and is never written as a profile.
+// SETTINGS splits GAME | VIDEO behind the shared sub-select. VIDEO offers AA
+// and shadows directly. The picture's CLEAR/FILMIC look is independent of those
+// quality controls; lighting and atmosphere use the full-effect defaults.
 // uistat cannot name the settings sub-page: it sees it only as the focus-row
-// count (8 on GAME, 11 on VIDEO), so a row added to either page moves that
+// count (8 on GAME, 10 on VIDEO), so a row added to either page moves that
 // number and the proof's expectation moves with it.
 // =============================================================================
 static float ui_page_binds_kb (float px, float pw, float y, int click, float cx, float cy);
@@ -338,26 +336,6 @@ static float ui_page_binds_kb(float px, float pw, float y, int click, float cx, 
   return y;
 }
 
-// Quality profiles own render cost. Film grain/vignette, brightness and FOV are
-// independent picture preferences, preserved when the profile changes. HIGH
-// matches config_defaults; device-equivalent AA requests match the same profile.
-typedef struct { int msaa, shadows, ssao, ssr, bloom, dust; } gfx_preset_t;
-static const gfx_preset_t GFX_PRESET[3] = {
-  {0, 1, 0, 0, 0, 0},   // PERFORMANCE
-  {2, 1, 1, 0, 1, 1},   // BALANCED
-  {8, 2, 1, 1, 1, 1},   // HIGH
-};
-
-// A hand-edited quality key or a manual override reads CUSTOM. Merely viewing
-// the menu never normalizes or overwrites the user's config.
-static int gfx_preset_index(void) {
-  for (int i = 0; i < 3; i++) { const gfx_preset_t *g = &GFX_PRESET[i];
-    if (msaa_effective(g_cfg.msaa) == msaa_effective(g->msaa) &&
-        g_cfg.shadows == g->shadows && g_cfg.ssao == g->ssao &&
-        g_cfg.ssr == g->ssr && g_cfg.bloom == g->bloom && g_cfg.dust == g->dust) return i; }
-  return 3;
-}
-
 static float ui_page_settings_game(float px, float pw, float y, int click,
                                    float cx, float cy) {
   // IDENTITY FIRST. The name field used to sit on the Singleplayer page, which is where
@@ -480,19 +458,6 @@ static float ui_page_settings_video(float px, float pw, float y, int click,
   y += 4;
   ui_section("QUALITY", px, pw, y);
   y += 14;
-  {
-    // CUSTOM is displayed only for manual settings. Cycling always applies a
-    // profile: forward from CUSTOM reaches PERFORMANCE, backward reaches HIGH.
-    static const char *const PRESET_OPTS[4] = {"PERFORMANCE", "BALANCED", "HIGH", "CUSTOM"};
-    int pi = gfx_preset_index();
-    if (ui_cycle("PROFILE", PRESET_OPTS, pi == 3 ? 4 : 3, &pi,
-                 px, pw, y, click, cx, cy)) {
-      const gfx_preset_t *g = &GFX_PRESET[pi];
-      g_cfg.msaa = g->msaa; g_cfg.shadows = g->shadows; g_cfg.ssao = g->ssao;
-      g_cfg.ssr  = g->ssr;  g_cfg.bloom   = g->bloom;   g_cfg.dust = g->dust;
-    }
-    y += 15;
-  }
   // Offer one row value per actual sample count. The request stays a portable
   // config value; existing aliases remain untouched until the player interacts.
   {
@@ -525,8 +490,6 @@ static float ui_page_settings_video(float px, float pw, float y, int click,
   static const char *const SHADOW_OPTS[3] = {"OFF", "NORMAL", "HIGH"};
   ui_cycle("SHADOWS", SHADOW_OPTS, 3, &g_cfg.shadows, px, pw, y, click, cx, cy);
   y += 15;
-  ui_text("PROFILE SETS LIGHTING AND ATMOSPHERE.", px + 16, y + 2, 0.8f, C_DIM, 1);
-  y += 12;
 
   y += 4;
   ui_section("PICTURE", px, pw, y);
@@ -546,7 +509,7 @@ static float ui_page_settings_video(float px, float pw, float y, int click,
   static const char *const LOOK_OPTS[2] = {"CLEAR", "FILMIC"};
   ui_cycle("LOOK", LOOK_OPTS, 2, &g_cfg.grain, px, pw, y, click, cx, cy);
   y += 15;
-  ui_text("FILMIC ADDS GRAIN AND DARKER CORNERS.", px + 16, y + 2, 0.8f, C_DIM, 1);
+  ui_text("FILMIC: BOLD COLOR, CONTRAST AND GLOW.", px + 16, y + 2, 0.8f, C_DIM, 1);
   y += 12;
   return y;
 }
@@ -1260,22 +1223,18 @@ static void glare_pass(float yaw, float pitch, float roll, float fovy, float asp
   glUniform1i(R.u_gl_bloom, 3);
   glUniform1f(R.u_gl_mode, g_dbg_view == 1 ? 2.0f : g_dbg_view == 2 ? 3.0f
                          : g_dbg_view == 3 ? 4.0f : 1.0f);
-  // x = the bloom's weight in the composite: four accumulated octaves of a
-  // weight that is already a fraction of the colour, so a third of it is a
-  // visible halo on the sun, the water and a tracer and nothing on a wall.
-  // The two settings scale the shipped numbers rather than choosing between two
-  // sets of them, so there is still one copy of each: GLOW off zeroes both glare
-  // gains (and GLARE_FS then skips the reads), FILM GRAIN off zeroes the grain
-  // AND the vignette it belongs to.
+  // CLEAR preserves the neutral composite. FILMIC adds stronger bloom/shafts
+  // and its color/contrast treatment in the same pass, before any HUD is drawn.
+  float film = g_cfg.grain ? 1.0f : 0.0f;
   { float glow = g_cfg.bloom ? 1.0f : 0.0f;
-    glUniform3f(R.u_gl_gain, 0.30f * glow, 0.0f, 0.56f * glow); }
+    glUniform3f(R.u_gl_gain, (0.30f + 0.25f * film) * glow, 0.0f,
+                (0.56f + 0.22f * film) * glow); }
   // The seed walks with the sim tick, so it is deterministic per tick and yet
   // never still in play. 8 ticks is 15 Hz of grain, which is about where film
   // sits: at 120 it strobes, at 1 it is dirt on the lens.
-  { float film = g_cfg.grain ? 1.0f : 0.0f;
-    glUniform4f(R.u_gl_grade, 0.20f * film, 0.045f * film,
-                (float)((g_tick / 8) % 733) * 7.13f,
-                (float)R.width / (float)R.height); }
+  glUniform4f(R.u_gl_grade, 0.42f * film, 0.065f * film,
+              (float)((g_tick / 8) % 733) * 7.13f,
+              (float)R.width / (float)R.height);
   // FXAA only where there is no multisample target to do the job.
   glUniform3f(R.u_gl_aa, R.msaa_fbo ? 0.0f : 1.0f,
               1.0f / (float)R.width, 1.0f / (float)R.height);

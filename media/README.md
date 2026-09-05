@@ -3,8 +3,10 @@
 `hero.gif` is the README trailer. `hero.mp4` is the same edit at 60 fps with
 captured game sound. `fight.png` and `scope.png` share the trailer's staging.
 Every arena, character, movement, tracer and impact comes from the game.
-FFmpeg supplies the cuts, speed changes, a restrained colour adjustment and
-the closing title. There are no generated or painted gameplay frames.
+FFmpeg supplies the cuts, speed changes, light sharpening and the closing
+title. The game's FILMIC look supplies the contrast, cool shadows, warm
+highlights, glow and grain; the edit adds no second colour grade.
+There are no generated or painted gameplay frames.
 
 The loop moves through dunes, forest, marsh, frost, quarry and aurora. It
 alternates third-person movement with first-person fighting: slide, jump,

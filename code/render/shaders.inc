@@ -1797,53 +1797,39 @@ static const char *GLARE_FS =
   "  return (lb < lmin || lb > lmax) ? a : b;\n"
   "}\n"
   "void main(){\n"
-  // --- THE COMPOSITE, AND IT IS ALSO THE GRADE ---------------------------
-  // The finished picture lives in a texture now (the scene target), so this is
-  // a plain full-screen pass that READS it and writes the present buffer: the
-  // glare adds, the vignette and the grain's dark half multiply, and none of
-  // it has to be smuggled through a blend equation. The arithmetic is exactly
-  // the old ONE/SRC_ALPHA composite's — base * mul + add — so a frame with the
-  // screen-space terms off is the frame this pass used to blend.
-  // Mode 2: the harness's `dbgview ao` — the occlusion buffer as the picture.
+  // Composite and display look. Debug views bypass the look, and the HUD is
+  // drawn afterwards. CLEAR uses the scene and glare directly; FILMIC grades
+  // their combined light so even a scene with no bloom has a distinct look.
   "  if (uMode > 3.5) { oCol = vec4(vec3(texture(uScene, vUV).a), 1.0); return; }\n"
   "  if (uMode > 2.5) { oCol = vec4(texture(uScene, vUV).rgb * 2.0, 1.0); return; }\n"
   "  if (uMode > 1.5) { oCol = vec4(vec3(texture(uScene, vUV).r), 1.0); return; }\n"
   "  if (uMode > 0.5) {\n"
-  "    vec2 q = (vUV - 0.5) * vec2(uGrade.w, 1.0);\n"
-  "    float r2 = dot(q, q) * 1.30;\n"
-  // Interleaved-gradient noise: three instructions, and unlike a value-noise
-  // hash it has no visible cell structure at one sample per pixel. The seed is
-  // driven by the SIM TICK and not by the rendered-frame counter — grain that
-  // moves with the render clock would make every harness screenshot depend on
-  // how many frames preceded it, which is the same trap the menu caret's lack
-  // of a blink documents.
-  // Hash noise, not interleaved-gradient: IGN's diagonal lattice is exactly
-  // the structure a grain must not have, and at 2x it read as a screen door
-  // over every flat face. Three fract-multiplies, no cell structure.
-  "    vec3 gq = fract(vec3(gl_FragCoord.xy + uGrade.z, gl_FragCoord.x) * 0.1031);\n"
-  "    gq += dot(gq, gq.yzx + 33.33);\n"
-  "    float g = fract((gq.x + gq.y) * gq.z);\n"
-  "    float gn = (g - 0.5) * uGrade.y;\n"
-  // The vignette starts outside the middle third and never takes more than a
-  // fifth: it was r2^2 at 0.34 and took 40-60% off the corners, which read as
-  // a lens hood on every mood and was most of why the frames looked grey.
-  "    float vig = 1.0 - uGrade.x * smoothstep(0.35, 1.6, r2);\n"
-  // The edges go cool as well as dark. A vignette that only darkens reads as a
-  // lens fault; one that also loses a little warmth reads as the falloff of a
-  // real lens, and it costs an add. FILM GRAIN OFF zeroes uGrade.x, and this
-  // switch turns the cool edge off with it: the tint is the vignette's other
-  // half, and a corner that is blue but not dark is that same lens fault. One
-  // step, so the shipped look multiplies by exactly one.
-  "    float vigk = step(1e-6, uGrade.x);\n"
-  // GLOW OFF zeroes both gains and the two glare targets hold last frame's
-  // picture — an unreadable result, so the fetches are not made.
-  "    vec3 add = (uGain.z > 0.0 ? texture(uTex, vUV).rgb * uGain.z : vec3(0.0))\n"
-  "             + (uGain.x > 0.0 ? texture(uBloom, vUV).rgb * uGain.x : vec3(0.0))\n"
-  "             + max(gn, 0.0) * 0.42\n"
-  "             + vec3(-0.008, -0.002, 0.010) * r2 * vigk;\n"
-  "    float mul = clamp(vig * (1.0 + min(gn, 0.0)), 0.0, 1.0);\n"
   "    vec3 base = uAA.x > 0.5 ? fxaa(vUV) : texture(uScene, vUV).rgb;\n"
-  "    oCol = vec4(base * mul + add, 1.0);\n"
+  "    vec3 glow = (uGain.z > 0.0 ? texture(uTex, vUV).rgb * uGain.z : vec3(0.0))\n"
+  "              + (uGain.x > 0.0 ? texture(uBloom, vUV).rgb * uGain.x : vec3(0.0));\n"
+  "    vec3 col = base + glow;\n"
+  "    if (uGrade.x > 0.0) {\n"
+  // A luminance S-curve keeps hue ratios intact. A lifted toe retains shapes
+  // in night scenes; the shoulder leaves room for warm lamps and muzzle flash.
+  "      float lum = clamp(dot(col, LUMA), 0.0, 1.0);\n"
+  "      float curve = lum * lum * (3.0 - 2.0 * lum);\n"
+  "      float tone = 0.018 + 0.965 * mix(lum, curve, 0.85);\n"
+  "      col *= tone / max(lum, 0.001);\n"
+  "      col = mix(vec3(tone), col, 1.20);\n"
+  // Split-toned shadows and highlights, applied across the whole image rather
+  // than just its corners. The biome's own hues remain the input to the grade.
+  "      float warm = smoothstep(0.12, 0.74, lum);\n"
+  "      col *= mix(vec3(0.74, 1.06, 1.18), vec3(1.15, 1.04, 0.79), warm);\n"
+  "      vec2 q = (vUV - 0.5) * vec2(uGrade.w, 1.0);\n"
+  "      float vig = 1.0 - uGrade.x * smoothstep(0.35, 1.6, dot(q, q) * 1.30);\n"
+  // Tick-driven noise stays deterministic across repeated render frames. Grain
+  // loses strength in the deepest shadows, keeping small dark figures readable.
+  "      vec3 gq = fract(vec3(gl_FragCoord.xy + uGrade.z, gl_FragCoord.x) * 0.1031);\n"
+  "      gq += dot(gq, gq.yzx + 33.33);\n"
+  "      float grain = (fract((gq.x + gq.y) * gq.z) - 0.5) * uGrade.y;\n"
+  "      col = col * vig + grain * (0.25 + 0.55 * smoothstep(0.04, 0.4, lum));\n"
+  "    }\n"
+  "    oCol = vec4(col, 1.0);\n"
   "    return;\n"
   "  }\n"
   // A LUMINANCE KNEE, NOT A SUBTRACTION. Subtracting a threshold from each

@@ -336,7 +336,7 @@ typedef struct {
   int   shadows;
   int   bloom;               // glow: the bloom chain AND the sun shafts, one switch
   int   dust;                // airborne motes
-  int   grain;               // film grain AND the vignette it belongs to
+  int   grain;               // CLEAR (0) / FILMIC (1); retained config key
   // Exposure multiplier applied BEFORE the tonemap curve (uLook.w), so it is a
   // real exposure and not a lift on the displayed picture: 1 is the shipped look.
   float brightness;
@@ -417,9 +417,8 @@ static config_t config_defaults(void) {
   config_t c = {.sense = 1.0f, .ads_sense = 1.0f, .fov = 100.0f,
                 .vsync = 0, .fps_cap = 120, .show_fps = 1, .msaa = 8,
                 .ssao = 1, .ssr = 1,
-                // The graphics defaults ARE the top quality preset, deliberately:
-                // an untouched install renders exactly the picture it rendered
-                // before these keys existed, byte for byte.
+                // Lighting and atmosphere default to full quality. The menu
+                // exposes AA, shadows and the independent CLEAR/FILMIC look.
                 .fullscreen = 1, .shadows = 2, .bloom = 1, .dust = 1, .grain = 1,
                 .brightness = 1.0f,
                 // sp_diff 2 = HARD. The bot count came down to 1, so difficulty
