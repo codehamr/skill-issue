@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="media/hero.gif" alt="bullet time headshot, slide under fire, jump the lens, fire at the camera" width="832">
+  <img src="media/hero.gif" alt="arena FPS trailer: sand slide, forest jump, wet-ground duel, snowy sniper impact and aurora" width="832">
 </p>
 
 <h1 align="center">skill-issue</h1>
@@ -20,8 +20,8 @@
 </p>
 
 <p align="center">
-  <img src="media/fight.png" alt="carbine headshot at dusk on a procedural sand arena" width="49%">
-  <img src="media/scope.png" alt="a bot in the sniper crosshair, one breath before the shot" width="49%">
+  <img src="media/fight.png" alt="carbine counterfire in a procedural industrial arena" width="49%">
+  <img src="media/scope.png" alt="a moving opponent in the sniper crosshair on a snowy arena" width="49%">
 </p>
 
 ## The game

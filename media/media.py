@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""media.py — THE media kit, one file: engine AND button. Regenerates every
-asset in media/ from the current build, reproducibly (same binary + same
-seeds + same scripts = the same media, byte for byte; the PNGs modulo their
-lossless recompression pass). Sound in hero.mp4 is the GAME'S OWN audio from
-the clip captures — there is no music synthesis.
+"""Reproducible game capture and trailer assembly, with verified clip caches.
+Seeds, commands, capture settings and binary hashes identify every take.
+Exact pixels also depend on the graphics driver and encoder versions.
+Sound in hero.mp4 comes from the game itself.
 
     ./media/media.py            # everything: stills + clip re-render + gif + mp4
     ./media/media.py stills     # fight.png + scope.png only            (~2 min)
@@ -11,7 +10,8 @@ the clip captures — there is no music synthesis.
     ./media/media.py mp4        # re-render + hero.mp4 (game sound);
                                 #   `mp4 --skip-render` right after `gif`
     ./media/media.py check      # tooling + staleness report, renders nothing
-    ./media/media.py list       # every shot, frames, seconds, note
+    ./media/media.py list       # every shot and the screenplay's actual cuts
+    ./media/media.py review     # final GIF contact sheet and timing/size report
     ./media/media.py render K.. # (re-)render named clips at full quality
     ./media/media.py probe K N  # N framing stills for shot K, no video —
                                 #   THE authoring loop; then read
@@ -20,9 +20,9 @@ the clip captures — there is no music synthesis.
                                 #   iterating on the EDIT — after a look change
                                 #   the banner would mix two builds)
 
-The folder is three files plus the four assets, and the split is by WHO edits:
-  shots.py     the SCENES (gold_* Takes, GOLD stage = seed 59) — prompt here
-  scene.json   the SCREENPLAY (cuts in beats @126 BPM, speeds, zooms, palette)
+The responsibilities are:
+  shots.py     the scenes and camera choreography
+  scene.json   the screenplay (beat timing, speeds, zooms, palette)
   media.py     this file — the Take builder, renderer, beat assembler and the
                still recipes; touched only when the MACHINERY changes
 The clip list for hero.gif/hero.mp4 is read FROM scene.json, so a shot added
@@ -34,7 +34,7 @@ import tempfile
 
 sys.dont_write_bytecode = True   # keep media/ clean: no __pycache__
 
-import json, math, os, re, shutil, subprocess, random
+import hashlib, json, math, os, re, shutil, subprocess, random, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 GAME = os.path.join(os.path.dirname(ROOT), "build", "game")
@@ -44,6 +44,16 @@ CACHE = os.path.join(ROOT, ".cache")
 CLIPS = os.path.join(CACHE, "clips")
 STAGES = os.path.join(CACHE, "stages")
 TICK = 120.0
+ENCODER_THREADS = "8"
+FILTER_THREADS = "2"
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 # ---------------------------------------------------------------------------
 # camera math — the harness `cam` command takes RADIANS. yaw = atan2(dx, -dz),
@@ -97,16 +107,24 @@ class Stage:
         self.seed = seed
         os.makedirs(STAGES, exist_ok=True)
         p = os.path.join(STAGES, "s%d.json" % seed)
-        if not os.path.exists(p):
-            r = subprocess.run([GAME, "--seed", str(seed), "--config",
-                                os.path.join(STAGES, ".m.cfg"), "--do", "map"],
-                               capture_output=True, text=True, check=True).stdout
+        binary_hash = file_hash(GAME)
+        try:
+            with open(p) as stream:
+                d = json.load(stream)
+        except (OSError, ValueError):
+            d = {}
+        if d.get("binary_sha256") != binary_hash:
+            with tempfile.TemporaryDirectory(prefix="map-", dir=STAGES) as temporary:
+                r = subprocess.run([GAME, "--seed", str(seed), "--config",
+                                    os.path.join(temporary, "fresh.cfg"), "--do", "map"],
+                                   capture_output=True, text=True, check=True).stdout
             theme = re.search(r"theme=(\w+)", r).group(1)
             solids = [tuple(float(x) for x in m.groups())
                       for m in re.finditer(r"solid \d+ min=\((\S+) (\S+) (\S+)\)"
                                            r" max=\((\S+) (\S+) (\S+)\)", r)]
-            json.dump({"theme": theme, "solids": solids}, open(p, "w"))
-        d = json.load(open(p))
+            d = dict(theme=theme, solids=solids, binary_sha256=binary_hash)
+            with open(p, "w") as stream:
+                json.dump(d, stream)
         self.theme, self.solids = d["theme"], [tuple(s) for s in d["solids"]]
 
     def blocker(self, a, b):
@@ -378,10 +396,11 @@ class Take:
         wi = 0
         for i, cmds in enumerate(self.timeline):
             out += cmds
+            # capture_run advances one simulation tick before rendering.
+            out.append("wait 1")
             if wi < len(want) and want[wi] == i:
                 out.append("shot probe/p%04d.png" % i)
                 wi += 1
-            out.append("wait 1")
         return "\n".join(out) + "\n"
 
 
@@ -398,16 +417,93 @@ def _cfg(d, fov):
         open(p, "w").write("fov %d\n" % int(fov))
 
 
+def ffmpeg_threads(cmd):
+    """Bound both decoder pools and filters when an edit opens many inputs."""
+    if not isinstance(cmd, list) or cmd[0] != "ffmpeg":
+        return cmd
+    out = [cmd[0], "-filter_threads", FILTER_THREADS,
+           "-filter_complex_threads", FILTER_THREADS]
+    for arg in cmd[1:]:
+        if arg == "-i":
+            out += ["-threads", ENCODER_THREADS]
+        out.append(arg)
+    return out[:-1] + ["-threads", ENCODER_THREADS, out[-1]]
+
+
 def sh(cmd, **kw):
-    return subprocess.run(cmd, shell=isinstance(cmd, str), check=True, **kw)
+    return subprocess.run(ffmpeg_threads(cmd), shell=isinstance(cmd, str), check=True, **kw)
 
 
-def render(take, w=1920, h=1080, quiet=False):
+def replace_media(source, destination):
+    """Publish atomically, allowing shared-host media indexers to release files."""
+    for attempt in range(20):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.25)
+
+
+def capture_settings(take):
+    w, h = take.res or (1280, 720)
+    return w, h
+
+
+def provenance(take, w=None, h=None):
+    if w is None or h is None:
+        w, h = capture_settings(take)
+    return dict(format_version=1, binary_sha256=file_hash(GAME),
+                script_sha256=hashlib.sha256(take.script().encode()).hexdigest(),
+                seed=take.seed, width=w, height=h, fov=take.fov, frames=take.f)
+
+
+def take_of(key):
+    import shots as library
+    if key not in library.SHOTS:
+        raise ValueError("unknown shot %r — see `list`" % key)
+    return library.SHOTS[key]()
+
+
+def cache_status(key):
+    mp4, wav = clip_paths(key)
+    path = os.path.join(CLIPS, key, "manifest.json")
+    if not all(os.path.isfile(p) for p in (mp4, wav, path)):
+        return "missing clip, audio or provenance; render this take"
+    try:
+        with open(path) as stream:
+            manifest = json.load(stream)
+        if manifest.get("capture") != provenance(take_of(key)):
+            return "binary or take settings changed; render this take"
+        for label, asset in (("video_sha256", mp4), ("audio_sha256", wav)):
+            if manifest.get(label) != file_hash(asset):
+                return "cached media changed or is incomplete; render this take"
+    except (OSError, ValueError) as error:
+        return "invalid provenance: %s" % error
+    return None
+
+
+def require_clips(keys):
+    errors = [(key, cache_status(key)) for key in keys]
+    errors = [(key, error) for key, error in errors if error]
+    if errors:
+        raise ValueError("unusable clip cache:\n" + "\n".join(
+            "  %s: %s" % item for item in errors))
+
+
+def render(take, w=None, h=None, quiet=False):
     """Run the take, encode clips/<key>/<key>.mp4 (120 fps) + .wav + sheet."""
+    if w is None or h is None:
+        w, h = capture_settings(take)
+    expected = provenance(take, w, h)
     d = os.path.join(CLIPS, take.key)
     seg = os.path.join(d, "seg")
     shutil.rmtree(seg, ignore_errors=True)
     os.makedirs(seg, exist_ok=True)
+    manifest_path = os.path.join(d, "manifest.json")
+    if os.path.exists(manifest_path):
+        os.remove(manifest_path)
     open(os.path.join(d, "script.txt"), "w").write(take.script())
     open(os.path.join(d, "frames.txt"), "w").write(
         "".join("%5d  %s\n" % (f, l) for f, l in take.marks))
@@ -421,26 +517,45 @@ def render(take, w=1920, h=1080, quiet=False):
                        stdout=log, stderr=subprocess.STDOUT, check=True)
     mp4 = os.path.join(d, take.key + ".mp4")
     wav = os.path.join(d, take.key + ".wav")
-    allrgb = os.path.join(d, "all.rgb")
-    sh("cat %s/s*.rgb > %s" % (seg, allrgb))
+    rgb_paths = [os.path.join(seg, p) for p in sorted(os.listdir(seg))
+                 if p.endswith(".rgb")]
+    expected_bytes = take.f * w * h * 3
+    if sum(os.path.getsize(p) for p in rgb_paths) != expected_bytes:
+        raise RuntimeError("%s: incomplete raw capture" % take.key)
     with open(os.path.join(d, "wlist.txt"), "w") as f:
         for p in sorted(os.listdir(seg)):
             if p.endswith(".wav"):
                 f.write("file 'seg/%s'\n" % p)
     sh(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
         "-i", os.path.join(d, "wlist.txt"), "-c", "copy", wav])
-    sh(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", "%dx%d" % (w, h), "-framerate", "120", "-i", allrgb,
+    command = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", "%dx%d" % (w, h), "-framerate", "120", "-i", "pipe:0",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
-        "-pix_fmt", "yuv420p", mp4])
-    os.remove(allrgb)
+        "-threads", ENCODER_THREADS, "-pix_fmt", "yuv420p", mp4]
+    with subprocess.Popen(command, stdin=subprocess.PIPE) as encoder:
+        try:
+            for path in rgb_paths:
+                with open(path, "rb") as raw:
+                    shutil.copyfileobj(raw, encoder.stdin, length=1024 * 1024)
+        finally:
+            encoder.stdin.close()
+        if encoder.wait():
+            raise RuntimeError("%s: video encoding failed" % take.key)
     shutil.rmtree(seg, ignore_errors=True)
     os.remove(os.path.join(d, "wlist.txt"))
     n = contact(take.key)
+    if n != take.f:
+        raise RuntimeError("%s: encoded %d frames, expected %d" % (take.key, n, take.f))
+    if expected != provenance(take, w, h):
+        raise RuntimeError("The game binary changed during capture; rerender this take.")
+    with open(manifest_path, "w") as stream:
+        json.dump(dict(capture=expected, video_sha256=file_hash(mp4),
+                       audio_sha256=file_hash(wav)), stream, indent=2)
     # Mean luma, printed because a contact sheet hides it: a shot fired from
     # the shaded side of a wall comes in 2.7x darker than the reel and nothing
     # else in the loop says so out loud.
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", mp4, "-vf",
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-threads", ENCODER_THREADS,
+                        "-filter_threads", FILTER_THREADS, "-i", mp4, "-vf",
                         "signalstats,metadata=print:key=lavfi.signalstats.YAVG",
                         "-f", "null", "-"], capture_output=True, text=True).stderr
     ys = [float(x.split("=")[1]) for x in r.split()
@@ -530,13 +645,14 @@ def clip_paths(key):
 
 
 def clip_frames(key):
-    return int(subprocess.run(
+    result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
          "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
-         clip_paths(key)[0]], capture_output=True, text=True).stdout.strip() or 0)
+         clip_paths(key)[0]], capture_output=True, text=True, check=True)
+    return int(result.stdout.strip() or 0)
 
 
-def plan_edit(spec, fps):
+def plan_edit(spec, fps, require_media=True):
     """Turn the beat-authored shot list into an absolute timeline.
 
     Each entry: {clip, in_f, beats, speed} — `beats` is the cut's length on
@@ -546,21 +662,33 @@ def plan_edit(spec, fps):
     on-beat as the first. `in_f` omitted = continue where the previous entry
     of the same clip left off (a speed RAMP is two entries).
     """
-    spb = 60.0 / spec["bpm"]
+    bpm = float(spec["bpm"])
+    if not math.isfinite(bpm) or bpm <= 0 or not isinstance(fps, int) or fps <= 0:
+        raise ValueError("BPM and output FPS must be positive")
+    spb = 60.0 / bpm
     shots = [s for s in spec["shots"] if not s.get("skip")]
+    if not shots:
+        raise ValueError("screenplay has no active shots")
     have, last_out = {}, {}
     plan, t, target = [], 0.0, 0.0
     for s in shots:
-        n = have.setdefault(s["clip"], clip_frames(s["clip"]))
+        key = s["clip"]
+        if key not in have:
+            have[key] = clip_frames(key) if require_media else take_of(key).f
+        n = have[key]
         fac = float(s.get("speed", 1))
-        target += s["beats"] * spb
+        beats = float(s["beats"])
+        if not math.isfinite(fac) or fac <= 0 or not math.isfinite(beats) or beats <= 0:
+            raise ValueError("%s: speed and beats must be positive finite numbers" % key)
+        target += beats * spb
         dur = round((target - t) * fps) / fps          # cumulative quantize
         in_f = s.get("in_f", last_out.get(s["clip"], 0))
+        if not isinstance(in_f, int) or in_f < 0 or dur <= 0:
+            raise ValueError("%s: invalid source frame or sub-frame cut duration" % key)
         out_f = in_f + int(round(dur * TICK / fac))
-        if n and out_f > n:
-            print("  ! %s out_f %d > %d frames — clamped" % (s["clip"], out_f, n))
-            out_f = n
-            dur = (out_f - in_f) / TICK * fac
+        if out_f <= in_f or out_f > n:
+            raise ValueError("%s: source range %d..%d exceeds %d frames; extend the take or shorten the cut"
+                             % (key, in_f, out_f, n))
         last_out[s["clip"]] = out_f
         plan.append(dict(s, in_f=in_f, out_f=out_f, t0=t, dur=dur, factor=fac))
         t += dur
@@ -570,9 +698,12 @@ def plan_edit(spec, fps):
 def cut(specpath, out=None, fps=60, preview=False):
     spec = json.load(open(specpath))
     out = out or os.path.join(ROOT, spec.get("out", "trailer.mp4"))
-    w, h = spec.get("w", 1920), spec.get("h", 1080)
+    w, h = spec.get("w", 1280), spec.get("h", 720)
+    if any(not isinstance(value, int) or value <= 0 or value % 2 for value in (w, h)):
+        raise ValueError("screenplay width and height must be positive even integers")
     if preview:
         w, h, out = w // 2, h // 2, os.path.join(ROOT, "preview.mp4")
+    require_clips(list(dict.fromkeys(s["clip"] for s in spec["shots"] if not s.get("skip"))))
     plan, total = plan_edit(spec, fps)
     n = len(plan)
 
@@ -593,10 +724,11 @@ def cut(specpath, out=None, fps=60, preview=False):
                 asp = "atempo=%.4f," % (1.0 / fac)
             g = p.get("gain_db", 0.0)
             f.append("[%d:a]atrim=start=%.6f:end=%.6f,asetpts=PTS-STARTPTS,%s%s"
+                     "apad,atrim=duration=%.6f,"
                      "afade=t=in:st=0:d=0.02,afade=t=out:st=%.3f:d=0.03[a%d]"
                      % (ai, p["in_f"] / TICK, p["out_f"] / TICK, asp,
                         "volume=%.1fdB," % g if g else "",
-                        max(0.0, p["dur"] - 0.03), i))
+                        p["dur"], max(0.0, p["dur"] - 0.03), i))
             al.append("[a%d]" % i)
         return f, al
 
@@ -610,7 +742,7 @@ def cut(specpath, out=None, fps=60, preview=False):
             args += ["-i", clip_paths(p["clip"])[1]]
         args += ["-filter_complex", ";".join(f), "-map", "[afin]",
                  "-f", "null", "-"]
-        r = subprocess.run(args, capture_output=True, text=True).stderr
+        r = subprocess.run(ffmpeg_threads(args), capture_output=True, text=True, check=True).stderr
         j = json.loads(r[r.rindex("{"):r.rindex("}") + 1])
         return float(j["input_i"])
 
@@ -633,6 +765,10 @@ def cut(specpath, out=None, fps=60, preview=False):
             vf += "tblend=all_mode=average,framestep=2,"
         else:
             vf += "fps=%d," % fps
+        # Source rounding and tblend may remove one endpoint frame. Every cut
+        # still occupies its exact authored number of output frames.
+        vf += "tpad=stop_mode=clone:stop_duration=%.6f,trim=end_frame=%d,setpts=N/(%d*TB)," \
+              % (2.0 / fps, round(p["dur"] * fps), fps)
         # `zoom` crops BEFORE it scales: the same number frames the same crop
         # whatever the source resolution. `pos` [cx, cy] moves the crop's
         # centre (fractions, default centre) — how a macro shot loses the
@@ -669,6 +805,7 @@ def cut(specpath, out=None, fps=60, preview=False):
     args += ["-filter_complex", ";".join(f),
              "-map", "[vfin]", "-map", "[afin]",
              "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+             "-r", str(fps), "-fps_mode", "cfr",
              "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
              "-shortest", out]
     sh(args)
@@ -680,32 +817,110 @@ def cut(specpath, out=None, fps=60, preview=False):
     return out
 
 
+def gif_shot_palettes(spec, source, out, temporary, w, fps, colors, bayer):
+    """One stable palette per clip, including all of its final edit ranges.
+
+    Repeated clips share their palette so the dunes loop and scope speed
+    ramp cannot change color at a cut. Gifsicle merges local color tables
+    losslessly; passing GIFs through a generic pal8 conversion would replace
+    them with a fixed low-quality palette.
+    """
+    if not shutil.which("gifsicle"):
+        raise RuntimeError("gif_palette: shot requires gifsicle; install it or select global")
+    plan, duration = plan_edit(spec, fps, require_media=False)
+    groups, ranges = {}, []
+    for p in plan:
+        start = round(p["t0"] * fps)
+        stop = start + round(p["dur"] * fps)
+        ranges.append((p["clip"], start, stop))
+        groups.setdefault(p["clip"], []).append((start, stop))
+    palettes = {}
+    for index, (key, spans) in enumerate(groups.items()):
+        palette = os.path.join(temporary, "palette-%02d.png" % index)
+        selected = "+".join("between(n,%d,%d)" % (start, stop - 1)
+                            for start, stop in spans)
+        sh(["ffmpeg", "-y", "-loglevel", "error", "-i", source,
+            "-vf", "select='%s',scale=%d:-1:flags=lanczos,"
+                   "palettegen=max_colors=%d:stats_mode=full" % (selected, w, colors),
+            "-frames:v", "1", palette])
+        palettes[key] = palette
+    segments = []
+    for index, (key, start, stop) in enumerate(ranges):
+        segment = os.path.join(temporary, "cut-%02d.gif" % index)
+        vf = "trim=start_frame=%d:end_frame=%d,setpts=PTS-STARTPTS,scale=%d:-1:flags=lanczos" \
+             % (start, stop, w)
+        sh(["ffmpeg", "-y", "-loglevel", "error", "-i", source,
+            "-i", palettes[key], "-filter_complex", vf + "[v];[v][1:v]"
+            "paletteuse=dither=bayer:bayer_scale=%d:diff_mode=rectangle" % bayer,
+            "-r", str(fps), "-fps_mode", "cfr", "-loop", "0", segment])
+        segments.append(segment)
+    sh(["gifsicle", "--merge", "--loopcount=0", "-O3", "--optimize=keep-empty",
+        "--output", out] + segments)
+    if spec.get("gif_lossy", 0):
+        optimized = os.path.join(temporary, "optimized.gif")
+        sh(["gifsicle", "-O3", "--optimize=keep-empty",
+            "--lossy=%d" % spec["gif_lossy"], out, "--output", optimized])
+        out = optimized
+    # Optimization may change rectangle sizes and local tables, but every
+    # authored frame and delay must survive into the delivered animation.
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames:format=duration", "-of", "json", out],
+        capture_output=True, text=True, check=True)
+    measured = json.loads(result.stdout)
+    frames = int(measured["streams"][0]["nb_read_frames"])
+    actual_duration = float(measured["format"]["duration"])
+    if frames != round(duration * fps) or abs(actual_duration - duration) > 1.0 / fps + 1e-6:
+        raise RuntimeError("merged GIF timing differs from the screenplay; run review")
+    print("  %d stable clip palettes, %d cuts, %d verified frames" %
+          (len(palettes), len(segments), frames))
+    return out
+
+
 def gif(specpath, out, w=640, fps=18, colors=96, bayer=5):
     """Assemble a spec exactly as `cut` does, then encode a README GIF.
-    96 colours / 18 fps / coarse bayer dither are SIZE decisions measured on
-    this footage (error-diffusion re-noises every pixel every frame and
-    doubles the file). `fade_out: 0` in a GIF spec is load-bearing: a looping
-    GIF that fades flashes black once a loop."""
-    # ...and the SPEC may pin them, because the palette is part of the edit rather than
-    # of the command: a banner whose cut changes changes how hard it compresses, and the
-    # number that keeps it under the README's weight budget belongs next to the cut it
-    # belongs to, not in a shell history. 2026-08-25: the weapon-pass re-cut needed 72
-    # to land where the old cut sat at 96.
+    The screenplay owns width, frame rate, palette size and Bayer strength.
+    `gif_palette: shot` uses stable clip palettes and requires gifsicle;
+    `global` uses one palette for the entire edit. `fade_out: 0` avoids a
+    black flash at the loop boundary."""
     with open(specpath) as fh:
         _sp = json.load(fh)
     fps = _sp.get("gif_fps", fps)
     colors = _sp.get("gif_colors", colors)
-    tmp = os.path.join(CACHE, ".gif_src.mp4")
-    cut(specpath, out=tmp, fps=fps)
-    pal = os.path.join(CACHE, ".gif_pal.png")
-    vf = "fps=%d,scale=%d:-1:flags=lanczos" % (fps, w)
-    sh(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp, "-vf",
-        vf + ",palettegen=max_colors=%d:stats_mode=diff" % colors, pal])
-    sh(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp, "-i", pal,
-        "-lavfi", vf + "[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=%d:"
-        "diff_mode=rectangle" % bayer, "-loop", "0", out])
-    os.remove(tmp)
-    os.remove(pal)
+    w = _sp.get("gif_width", w)
+    bayer = _sp.get("gif_bayer", bayer)
+    mode = _sp.get("gif_palette", "global")
+    if not isinstance(w, int) or w <= 0 or not isinstance(colors, int) or not 4 <= colors <= 256:
+        raise ValueError("GIF width must be positive and palette size must be 4..256")
+    if not isinstance(bayer, int) or not 0 <= bayer <= 5:
+        raise ValueError("GIF Bayer strength must be an integer in 0..5")
+    if mode not in ("shot", "global"):
+        raise ValueError("gif_palette must be shot or global")
+    lossiness = _sp.get("gif_lossy", 0)
+    if not isinstance(lossiness, int) or lossiness < 0:
+        raise ValueError("gif_lossy must be a nonnegative integer")
+    if lossiness and mode != "shot":
+        raise ValueError("gif_lossy requires gif_palette: shot")
+    if mode == "shot" and not shutil.which("gifsicle"):
+        raise RuntimeError("gif_palette: shot requires gifsicle; install it or select global")
+    os.makedirs(CACHE, exist_ok=True)
+    # Separate scratch paths let preview edits coexist. Shared-host media
+    # indexers can briefly retain a file; cleanup must not discard a good GIF.
+    with tempfile.TemporaryDirectory(prefix="gif-", dir=CACHE,
+                                     ignore_cleanup_errors=True) as temporary:
+        tmp, pal = (os.path.join(temporary, name) for name in ("source.mp4", "palette.png"))
+        encoded = os.path.join(temporary, "finished.gif")
+        cut(specpath, out=tmp, fps=fps)
+        if mode == "shot":
+            encoded = gif_shot_palettes(_sp, tmp, encoded, temporary, w, fps, colors, bayer)
+        else:
+            vf = "fps=%d,scale=%d:-1:flags=lanczos" % (fps, w)
+            sh(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp, "-vf",
+                vf + ",palettegen=max_colors=%d:stats_mode=full" % colors, pal])
+            sh(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp, "-i", pal,
+                "-lavfi", vf + "[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=%d:"
+                "diff_mode=rectangle" % bayer, "-loop", "0", encoded])
+        replace_media(encoded, out)
     print("gif -> %s  %.1f MB" % (out, os.path.getsize(out) / 1e6))
     return out
 
@@ -720,35 +935,11 @@ sys.path.insert(0, MEDIA)
 sys.modules.setdefault("media", sys.modules[__name__])
 
 
-def die(msg):
-    print("media.py: %s" % msg, file=sys.stderr)
-    sys.exit(1)
-
-
-# --- the still recipes -----------------------------------------------------
-# Two controlled gameplay stills: a real opponent, normal weapon handling,
-# collision and effects, with deterministic positions and lighting. The warm
-# dunes frame shows the AR at 10.5 m; the forest frame puts a target 15 m away
-# inside the SR optic. Both retain the live player's HUD.
-#
-# A rendered warm frame before firing supplies the viewmodel muzzle anchor.
-# The intermediate render follows recoil, so the final tracer remains joined
-# to the visible barrel. No long unattended fight can kill the camera player.
-# The SR's 205-count downward input counters its 4.5-degree shot recoil and
-# keeps the struck opponent centred in the optic.
+# --- stills select frames from the trailer's shared staging -----------------
+# These are native game PNGs, losslessly recompressed with no trailer grade.
 STILLS = {
-    "fight.png": (59, "showfps off; biome dunes; bots 1; fraglimit 1000; wait 3; "
-                  "botfreeze on; puppet on; puppet warp -6.1 -11.25; "
-                  "puppet face -167; puppet ready 1; puppet ads 1; "
-                  "warp -8.5 0 -1; weapon ar; sun 18 145; wait 90; aimbot; "
-                  "shot {tmp}; +fire; wait 1; shot {tmp}; wait 1; "
-                  "shot media/fight.png"),
-    "scope.png": (4, "showfps off; biome forest; bots 1; fraglimit 1000; wait 3; "
-                  "botfreeze on; puppet on; puppet warp -5 -20; "
-                  "puppet face 180; puppet ready 1; puppet ads 1; "
-                  "warp -5 0 -5; weapon sr; sun 36 155; +ads; wait 130; "
-                  "aim -5 1.2 -20; shot {tmp}; +fire; wait 1; look 0 205; "
-                  "shot {tmp}; wait 1; shot media/scope.png"),
+    "fight.png": ("quarry_crossfire", 103),
+    "scope.png": ("frost_scope", 118),
 }
 
 
@@ -762,9 +953,11 @@ def sanity():
         die("no runnable binary at %s — run `make build/game` first" % GAME)
     if not os.path.exists(SPEC):
         die("missing screenplay %s" % SPEC)
-    src = os.path.join(REPO, "code", "game.c")
-    if os.path.exists(src) and os.path.getmtime(src) > os.path.getmtime(GAME):
-        print("WARNING: code/game.c is newer than build/game — the media "
+    sources = [os.path.join(directory, name)
+               for directory, _, names in os.walk(os.path.join(REPO, "code"))
+               for name in names if name.endswith((".c", ".inc"))]
+    if any(os.path.getmtime(src) > os.path.getmtime(GAME) for src in sources):
+        print("WARNING: game sources are newer than build/game — the media "
               "would capture a STALE build. `touch code/game.c && make "
               "build/game` and check a gcc line actually ran (clock skew).")
 
@@ -772,6 +965,8 @@ def sanity():
 def clips_of_spec():
     seen, out = set(), []
     for sh in json.load(open(SPEC))["shots"]:
+        if sh.get("skip"):
+            continue
         if sh["clip"] not in seen:
             seen.add(sh["clip"])
             out.append(sh["clip"])
@@ -795,18 +990,89 @@ def recompress(path):
 
 
 def stills():
-    for name, (seed, script) in STILLS.items():
-        cfg = os.path.join(tempfile.gettempdir(), "media-%d.cfg" % os.getpid())
-        script = script.format(tmp=os.path.join(tempfile.gettempdir(),
-                                                "media-warm.png"))
-        r = subprocess.run([GAME, "--seed", str(seed), "--config", cfg,
-                            "--w", "1280", "--h", "720", "--do", script],
-                           cwd=REPO)
-        out = os.path.join(MEDIA, name)
-        if r.returncode != 0 or not os.path.exists(out):
-            die("%s was not written" % name)
+    os.makedirs(CACHE, exist_ok=True)
+    binary_hash = file_hash(GAME)
+    for name, (key, frame) in STILLS.items():
+        take = take_of(key)
+        if not 0 <= frame < take.f:
+            raise ValueError("%s: frame %d is outside %s" % (name, frame, key))
+        w, h = capture_settings(take)
+        take.timeline = take.timeline[:frame + 1]
+        with tempfile.TemporaryDirectory(prefix="still-", dir=CACHE,
+                                         ignore_cleanup_errors=True) as temporary:
+            os.mkdir(os.path.join(temporary, "probe"))
+            _cfg(temporary, take.fov)
+            with open(os.path.join(temporary, "script.txt"), "w") as stream:
+                stream.write(take.script_probe([frame]))
+            with open(os.path.join(CACHE, "still-" + key + ".log"), "w") as log:
+                subprocess.run([GAME, "--seed", str(take.seed), "--config", "t.cfg",
+                                "--w", str(w), "--h", str(h), "--script", "script.txt"],
+                               cwd=temporary, env=dict(os.environ, LP_NUM_THREADS="8"),
+                               stdout=log, stderr=subprocess.STDOUT, check=True)
+            captured = os.path.join(temporary, "probe", "p%04d.png" % frame)
+            if not os.path.exists(captured):
+                die("%s was not written" % name)
+            if file_hash(GAME) != binary_hash:
+                raise RuntimeError("The game binary changed during capture; rerun stills.")
+            out = os.path.join(MEDIA, name)
+            shutil.move(captured, out)
         recompress(out)
-        print("  %-12s %5.1f kB" % (name, os.path.getsize(out) / 1024.0))
+        print("  %-12s %dx%d %5.1f kB — %s frame %d" %
+              (name, w, h, os.path.getsize(out) / 1024.0, key, frame))
+
+
+def review():
+    """Inspect the delivered GIF, independent of its intermediate clip cache."""
+    source = os.path.join(MEDIA, "hero.gif")
+    output = os.path.join(REPO, "screenshots", "trailer-review")
+    os.makedirs(output, exist_ok=True)
+    with open(SPEC) as stream:
+        spec = json.load(stream)
+    fps = spec.get("gif_fps", 18)
+    plan, duration = plan_edit(spec, fps, require_media=False)
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,nb_read_frames,duration:format=duration,size",
+        "-of", "json", source], capture_output=True, text=True, check=True)
+    measured = json.loads(result.stdout)
+    stream, container = measured["streams"][0], measured["format"]
+    actual_duration = float(container["duration"])
+    planned_frames, actual_frames = round(duration * fps), int(stream["nb_read_frames"])
+    samples = max(1, math.ceil(actual_duration * 2))
+    cols, rows = min(4, samples), math.ceil(samples / 4)
+    sheet = os.path.join(output, "final-sheet.png")
+    sh(["ffmpeg", "-y", "-loglevel", "error", "-ignore_loop", "1", "-i", source,
+        "-vf", "fps=2,scale=416:-1:flags=lanczos,tile=%dx%d" % (cols, rows),
+        "-frames:v", "1", sheet])
+    expected_width = spec.get("gif_width", 832)
+    expected_height = round(expected_width * spec.get("h", 720) / spec.get("w", 1280))
+    mismatches = []
+    if planned_frames != actual_frames:
+        mismatches.append("frames %d != %d" % (actual_frames, planned_frames))
+    if (stream["width"], stream["height"]) != (expected_width, expected_height):
+        mismatches.append("dimensions %dx%d != %dx%d" %
+                          (stream["width"], stream["height"], expected_width, expected_height))
+    if abs(actual_duration - duration) > 1.0 / fps + 1e-6:
+        mismatches.append("duration %.3f != %.3f" % (actual_duration, duration))
+    report = dict(source="media/hero.gif", sha256=file_hash(source),
+                  screenplay_sha256=file_hash(SPEC),
+                  planned=dict(frames=planned_frames, duration=duration, fps=fps,
+                               width=expected_width, height=expected_height, cuts=plan),
+                  actual=dict(frames=actual_frames, duration=actual_duration,
+                              width=stream["width"], height=stream["height"],
+                              bytes=int(container["size"])),
+                  frames_match=planned_frames == actual_frames, mismatches=mismatches,
+                  contact_sheet=dict(file="final-sheet.png", samples_per_second=2,
+                                     columns=cols, rows=rows))
+    with open(os.path.join(output, "final-report.json"), "w") as file:
+        json.dump(report, file, indent=2)
+        file.write("\n")
+    print("review -> %s\n  %dx%d, %.3fs, %d/%d frames, %.2f MB" %
+          (sheet, stream["width"], stream["height"], actual_duration,
+           actual_frames, planned_frames, int(container["size"]) / 1e6))
+    if mismatches:
+        raise ValueError("final GIF differs from screenplay: " + "; ".join(mismatches))
+    return report
 
 
 def render_clips(keys):
@@ -835,14 +1101,9 @@ def check():
     print("game        %s" % GAME)
     print("screenplay  %s" % SPEC)
     for c in clips_of_spec():
-        p = os.path.join(CLIPS, c, c + ".mp4")
-        if not os.path.exists(p):
-            print("  %-16s NOT RENDERED" % c)
-        elif os.path.getmtime(p) < os.path.getmtime(GAME):
-            print("  %-16s STALE (older than build/game)" % c)
-        else:
-            print("  %-16s ok" % c)
-    for t in ("ffmpeg", "convert"):
+        problem = cache_status(c)
+        print("  %-16s %s" % (c, problem or "ok (content verified)"))
+    for t in ("ffmpeg", "ffprobe", "convert", "gifsicle"):
         print("%-11s %s" % (t, shutil.which(t) or "MISSING"))
 
 
@@ -854,11 +1115,23 @@ def main():
     verb = args[0] if args else "all"
     if verb == "check":
         return check()
+    if verb == "review":
+        return review()
     if verb == "list":
         for k, fn in shots.SHOTS.items():
             t = fn()
             print("  %-15s %4d f  %5.2f s  %s"
                   % (k, t.f, t.f / TICK, t.notes))
+        with open(SPEC) as stream:
+            spec = json.load(stream)
+        fps = spec.get("gif_fps", 18)
+        plan, total = plan_edit(spec, fps, require_media=False)
+        print("\nscreenplay: %d cuts, %.3f seconds, %d frames at %d fps" %
+              (len(plan), total, round(total * fps), fps))
+        for p in plan:
+            print("  %6.3f..%-6.3f %-18s source %4d..%-4d stretch %.3g" %
+                  (p["t0"], p["t0"] + p["dur"], p["clip"],
+                   p["in_f"], p["out_f"], p["factor"]))
         return
     if verb == "probe":
         if len(args) < 2:

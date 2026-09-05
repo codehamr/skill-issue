@@ -1,56 +1,89 @@
 {
-  "_": "media/hero.gif \u2014 THE SCREENPLAY (media/scene.json). v5, 2026-08-25. \u2014 GOLD stage (seed 59, sun 6.5). EXACTLY TWO sniper scenes and no more: (1) the tracked headshot THROUGH the scope with the spark burst (one continuous take, speed-ramped into the shot), (2) the SAME kill from outside in slow4x with shooter AND target in frame. The AR ADS scene is the CALM version (dot waits, two taps, drop in view). The wall-slide runs longer from a camera set further back, the shooter released almost on the lane axis so his misses stitch the wall BEHIND the slider; the cut ends before the four hits that eventually stop him (first phit at src ~98).",
+  "_": "Six biomes, one movement-driven loop. Dunes frame 59 at the end flows directly into frame 60 at the beginning. Warm slide, green jump, wet duel, snow hunt and impact, industrial counterfire, emerald aurora. All action and effects are captured from the game. Speed is duration stretch: 2 means half-speed. No fades to black; retain the full 16:9 biome skyline.",
   "out": ".cache/hero_src.mp4",
-  "w": 1920,
-  "h": 1080,
-  "bpm": 126,
-  "grade": "crop=iw:ih/1.32:0:(ih-oh)*0.35,eq=contrast=1.08:saturation=1.12:gamma=0.985,unsharp=3:3:0.35",
+  "w": 1280,
+  "h": 720,
+  "bpm": 120,
+  "grade": "eq=contrast=1.035:saturation=1.10:gamma=1.015,unsharp=3:3:0.25",
   "fade_out": 0,
-  "gif_colors": 96,
-  "gif_fps": 18,
+  "gif_width": 832,
+  "gif_colors": 160,
+  "gif_fps": 20,
   "shots": [
     {
-      "clip": "gold_run",
+      "clip": "dunes_slide",
       "in_f": 60,
-      "beats": 1.25,
-      "speed": 1
+      "beats": 3,
+      "speed": 1.25,
+      "hit": "Slide hook; same take closes the loop"
     },
     {
-      "clip": "gold_fight",
-      "in_f": 50,
-      "beats": 2.5,
-      "speed": 1
-    },
-    {
-      "clip": "gold_wallslide",
-      "in_f": 16,
-      "beats": 2.75,
-      "speed": 2
-    },
-    {
-      "clip": "gold_lean",
-      "in_f": 96,
-      "beats": 2.0,
-      "speed": 1
-    },
-    {
-      "clip": "gold_scope",
-      "in_f": 235,
-      "beats": 1.0,
+      "clip": "forest_jump",
+      "in_f": 18,
+      "beats": 3.5,
       "speed": 1,
-      "zoom": 1.5
+      "hit": "Jump and landing against the trees"
     },
     {
-      "clip": "gold_scope",
-      "beats": 1.75,
-      "speed": 3,
-      "zoom": 1.5
+      "clip": "marsh_duel",
+      "in_f": 0,
+      "beats": 3.25,
+      "speed": 1,
+      "hit": "Reflective ground, two AR taps, clear drop"
     },
     {
-      "clip": "gold_impact",
-      "in_f": 284,
-      "beats": 3.0,
-      "speed": 4
+      "clip": "frost_run",
+      "in_f": 0,
+      "beats": 2.5,
+      "speed": 1,
+      "hit": "Snow and conifers establish the hunt"
+    },
+    {
+      "clip": "frost_scope",
+      "in_f": 60,
+      "beats": 1,
+      "speed": 1,
+      "zoom": 1.38,
+      "hit": "Track into the sniper shot"
+    },
+    {
+      "clip": "frost_scope",
+      "beats": 1,
+      "speed": 2,
+      "zoom": 1.38,
+      "hit": "Impact through the glass"
+    },
+    {
+      "clip": "frost_impact",
+      "in_f": 120,
+      "beats": 2.5,
+      "speed": 2.5,
+      "hit": "Same impact outside, sparks into the snow"
+    },
+    {
+      "clip": "quarry_crossfire",
+      "in_f": 0,
+      "beats": 3.5,
+      "speed": 1,
+      "hit": "Live incoming fire, dodge, countershot"
+    },
+    {
+      "clip": "aurora_hunt",
+      "in_f": 0,
+      "beats": 4.5,
+      "speed": 1,
+      "hit": "Aurora reveal; a new arena awaits",
+      "grade": "drawtext=font='DejaVu Sans':text='SKILL ISSUE':fontsize=58:fontcolor=white:shadowcolor=black@0.45:shadowx=2:shadowy=2:x=48:y=h-138,drawtext=font='DejaVu Sans':text='NEW ARENA. EVERY MATCH.':fontsize=22:fontcolor=white:shadowcolor=black@0.45:shadowx=1:shadowy=1:x=51:y=h-65"
+    },
+    {
+      "clip": "dunes_slide",
+      "in_f": 0,
+      "beats": 1,
+      "speed": 1,
+      "hit": "Continuous approach into the opening slide"
     }
-  ]
+  ],
+  "gif_palette": "shot",
+  "gif_bayer": 4,
+  "gif_lossy": 40
 }
