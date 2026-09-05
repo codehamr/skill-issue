@@ -326,7 +326,7 @@ typedef struct {
   int   vsync;
   int   fps_cap;             // frame limiter, 0 = off
   int   show_fps;
-  int   msaa;                // MSAA samples: 0 (off), 2, 4 or 8
+  int   msaa;                // requested MSAA samples: 0 (FXAA), 2, 4 or 8
   int   ssao;                // screen-space ambient occlusion, 1 = on
   int   ssr;                 // screen-space reflections in standing water, 1 = on
   int   fullscreen;          // borderless fullscreen, 1 = on

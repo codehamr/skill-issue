@@ -996,6 +996,7 @@ static void world_upload(void) {
 static void renderer_init(int width, int height) {
   R.width = width;
   R.height = height;
+  msaa_probe();
   R.scope_size = height * 2 / 3;
   if (R.scope_size < 768) R.scope_size = 768;
   if (R.scope_size > 1536) R.scope_size = 1536;

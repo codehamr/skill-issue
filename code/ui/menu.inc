@@ -6,12 +6,13 @@
 // RESET rows cannot cross-confirm each other; ui_arm_take is the one
 // chokepoint, and nav_move clears it. QUIT and LEAVE MATCH are NOT on that
 // list — both are one press, each argued at its own tile in ui/settings.inc.
-// SETTINGS splits GAME | VIDEO behind the CONTROLS sub-select, and the VIDEO
-// page's PRESET is DERIVED from the seven graphics keys rather than stored:
-// GFX_PRESET's HIGH row IS config_defaults' picture, cycling writes the whole
-// group, and CUSTOM is a reading the row can never write.
+// SETTINGS splits GAME | VIDEO behind the shared sub-select. VIDEO offers a
+// quality profile, AA and shadows; the profile owns AO, reflections, glow and
+// dust. Film look is independent. Profiles compare effective AA so equivalent
+// requests stay one choice on devices that round their sample counts.
+// CUSTOM is derived from the six quality keys and is never written as a profile.
 // uistat cannot name the settings sub-page: it sees it only as the focus-row
-// count (8 on GAME, 15 on VIDEO), so a row added to either page moves that
+// count (8 on GAME, 11 on VIDEO), so a row added to either page moves that
 // number and the proof's expectation moves with it.
 // =============================================================================
 static float ui_page_binds_kb (float px, float pw, float y, int click, float cx, float cy);
@@ -337,28 +338,23 @@ static float ui_page_binds_kb(float px, float pw, float y, int click, float cx, 
   return y;
 }
 
-// The graphics group as ONE choice. The seven keys below are what a picture costs;
-// LOW/MEDIUM/HIGH name three points on that curve so a player who does not want to
-// learn what "screen-space reflections" are can still trade fidelity for frames.
-// HIGH IS config_defaults' OWN PICTURE — an untouched install reads HIGH and renders
-// exactly what it always rendered; if these two ever disagree, config_defaults wins
-// and this table is the defect.
-typedef struct { int msaa, shadows, ssao, ssr, bloom, dust, grain; } gfx_preset_t;
+// Quality profiles own render cost. Film grain/vignette, brightness and FOV are
+// independent picture preferences, preserved when the profile changes. HIGH
+// matches config_defaults; device-equivalent AA requests match the same profile.
+typedef struct { int msaa, shadows, ssao, ssr, bloom, dust; } gfx_preset_t;
 static const gfx_preset_t GFX_PRESET[3] = {
-  {0, 1, 0, 0, 0, 0, 0},   // LOW
-  {2, 1, 1, 0, 1, 1, 0},   // MEDIUM
-  {8, 2, 1, 1, 1, 1, 1},   // HIGH
+  {0, 1, 0, 0, 0, 0},   // PERFORMANCE
+  {2, 1, 1, 0, 1, 1},   // BALANCED
+  {8, 2, 1, 1, 1, 1},   // HIGH
 };
 
-// DERIVED, NEVER STORED: the seven keys are the truth and the row's label is a
-// reading of them, so a hand-edited config.cfg or a single row moved on this very
-// page is answered on the next frame by CUSTOM instead of by a stale name. There is
-// no `preset` config key for the same reason — it could only ever disagree.
+// A hand-edited quality key or a manual override reads CUSTOM. Merely viewing
+// the menu never normalizes or overwrites the user's config.
 static int gfx_preset_index(void) {
   for (int i = 0; i < 3; i++) { const gfx_preset_t *g = &GFX_PRESET[i];
-    if (g_cfg.msaa == g->msaa && g_cfg.shadows == g->shadows && g_cfg.ssao == g->ssao &&
-        g_cfg.ssr == g->ssr && g_cfg.bloom == g->bloom && g_cfg.dust == g->dust &&
-        g_cfg.grain == g->grain) return i; }
+    if (msaa_effective(g_cfg.msaa) == msaa_effective(g->msaa) &&
+        g_cfg.shadows == g->shadows && g_cfg.ssao == g->ssao &&
+        g_cfg.ssr == g->ssr && g_cfg.bloom == g->bloom && g_cfg.dust == g->dust) return i; }
   return 3;
 }
 
@@ -439,8 +435,7 @@ static float ui_page_settings_video(float px, float pw, float y, int click,
   char buf[16];
   ui_section("DISPLAY", px, pw, y);
   y += 14;
-  // How the frame is presented and framed, not what it costs to draw: none of
-  // these four rides the preset's curve, so none of them belongs under QUALITY.
+  // Presentation settings remain independent of render quality.
   if (ui_toggle("FULLSCREEN", &g_cfg.fullscreen, px, pw, y, click, cx, cy))
     platform_fullscreen_changed();
   y += 15;
@@ -482,60 +477,62 @@ static float ui_page_settings_video(float px, float pw, float y, int click,
   ui_text(buf, px + 324 - ui_text_width(buf, 1), y + 3, 1, C_DIM, 1);
   y += 15;
 
-  // Step 1 selects "%.0f", which prints identically to the old "%d",(int) for the
-  // integral values roundf leaves behind.
-  { param_def_t fd = {"", "FOV", 100.0f, 60.0f, 120.0f, 1.0f};
-    y = ui_param_row(&fd, &g_cfg.fov, DRAG_FOV, px, y, click, cx, cy); }
-
   y += 4;
   ui_section("QUALITY", px, pw, y);
   y += 14;
   {
-    // CUSTOM IS A READING, NEVER A WRITING. It is offered as a fourth option only
-    // while it is the truth, so the cycle can never park on a state it cannot
-    // produce and LEFT from LOW still reaches HIGH. Forward off CUSTOM lands on
-    // LOW — (3 + 1) % 4. The chip is measured over the options actually OFFERED,
-    // so it grows a couple of px while CUSTOM is one of them and shrinks back when
-    // the state matches a preset again — the typeface is proportional (only the
-    // digits are tabular), so equal glyph counts prove nothing.
-    static const char *const PRESET_OPTS[4] = {"LOW", "MEDIUM", "HIGH", "CUSTOM"};
+    // CUSTOM is displayed only for manual settings. Cycling always applies a
+    // profile: forward from CUSTOM reaches PERFORMANCE, backward reaches HIGH.
+    static const char *const PRESET_OPTS[4] = {"PERFORMANCE", "BALANCED", "HIGH", "CUSTOM"};
     int pi = gfx_preset_index();
-    if (ui_cycle("PRESET", PRESET_OPTS, pi == 3 ? 4 : 3, &pi,
+    if (ui_cycle("PROFILE", PRESET_OPTS, pi == 3 ? 4 : 3, &pi,
                  px, pw, y, click, cx, cy)) {
       const gfx_preset_t *g = &GFX_PRESET[pi];
       g_cfg.msaa = g->msaa; g_cfg.shadows = g->shadows; g_cfg.ssao = g->ssao;
       g_cfg.ssr  = g->ssr;  g_cfg.bloom   = g->bloom;   g_cfg.dust = g->dust;
-      g_cfg.grain = g->grain;
     }
     y += 15;
   }
-  // MSAA applies on the next frame via the lazy rebuild in msaa_update.
-  static const char *const MSAA_OPTS[] = {"OFF", "2X", "4X", "8X"};
-  int mi = g_cfg.msaa >= 8 ? 3 : g_cfg.msaa >= 4 ? 2 : g_cfg.msaa >= 2 ? 1 : 0;
-  if (ui_cycle("ANTI-ALIAS", MSAA_OPTS, 4, &mi, px, pw, y, click, cx, cy))
-    g_cfg.msaa = mi ? 1 << mi : 0;
+  // Offer one row value per actual sample count. The request stays a portable
+  // config value; existing aliases remain untouched until the player interacts.
+  {
+    char labels[4][24];
+    const char *opts[4] = {"FXAA"};
+    int requests[4] = {0}, samples[4] = {0}, n = 1, mi = 0;
+    for (int i = 1; i < 4; i++) {
+      int actual = R.msaa_samples[i], seen = 0;
+      for (int j = 0; j < n; j++) if (samples[j] == actual) {
+        seen = 1;
+        // Save the named level when available, rather than a rounded alias,
+        // so a chosen 4x stays a 4x request if the config moves to another GPU.
+        if (actual == (1 << i)) requests[j] = 1 << i;
+      }
+      if (seen) continue;
+      samples[n] = actual;
+      requests[n] = 1 << i;
+      snprintf(labels[n], sizeof labels[n], "MSAA %dX", actual);
+      opts[n] = labels[n];
+      n++;
+    }
+    for (int i = 0; i < n; i++)
+      if (samples[i] == msaa_effective(g_cfg.msaa)) mi = i;
+    if (ui_cycle("ANTI-ALIAS", opts, n, &mi, px, pw, y, click, cx, cy))
+      g_cfg.msaa = requests[mi];
+  }
   y += 15;
   // Three states, not a flag: the map's SIZE is the middle rung, so the row writes
   // g_cfg.shadows directly and shadow_update rebuilds the map on the next frame.
-  static const char *const SHADOW_OPTS[3] = {"OFF", "LOW", "HIGH"};
+  static const char *const SHADOW_OPTS[3] = {"OFF", "NORMAL", "HIGH"};
   ui_cycle("SHADOWS", SHADOW_OPTS, 3, &g_cfg.shadows, px, pw, y, click, cx, cy);
   y += 15;
-  // Read per frame by rf_ao_pass / rf_ssr_pass; nothing to rebuild.
-  ui_toggle("AMBIENT OCCLUSION", &g_cfg.ssao, px, pw, y, click, cx, cy);
-  y += 15;
-  ui_toggle("REFLECTIONS", &g_cfg.ssr, px, pw, y, click, cx, cy);
-  y += 15;
-  // One switch over the whole glare pass — the bloom chain AND the sun shafts it
-  // composites with. They are one look; two rows would let a player build a picture
-  // nobody designed.
-  ui_toggle("GLOW", &g_cfg.bloom, px, pw, y, click, cx, cy);
-  y += 15;
-  ui_toggle("DUST", &g_cfg.dust, px, pw, y, click, cx, cy);
-  y += 15;
-  // Grain and the vignette it belongs to, likewise: the vignette exists to carry
-  // the grain's edge, so it leaves with it.
-  ui_toggle("FILM GRAIN", &g_cfg.grain, px, pw, y, click, cx, cy);
-  y += 15;
+  ui_text("PROFILE SETS LIGHTING AND ATMOSPHERE.", px + 16, y + 2, 0.8f, C_DIM, 1);
+  y += 12;
+
+  y += 4;
+  ui_section("PICTURE", px, pw, y);
+  y += 14;
+  { param_def_t fd = {"", "FOV", 100.0f, 60.0f, 120.0f, 1.0f};
+    y = ui_param_row(&fd, &g_cfg.fov, DRAG_FOV, px, y, click, cx, cy); }
   {
     // Stored 0.5..1.5, shown 50..150 % — VOLUME's pattern. WRITTEN BACK ONLY WHEN
     // THE ROW MOVED: 100 * 0.01f is not 1.0f in float, so an unconditional assign
@@ -546,6 +543,11 @@ static float ui_page_settings_video(float px, float pw, float y, int click,
     y = ui_param_row(&bd, &pct, DRAG_BRIGHT, px, y, click, cx, cy);
     if (pct != pct0) g_cfg.brightness = pct * 0.01f;
   }
+  static const char *const LOOK_OPTS[2] = {"CLEAR", "FILMIC"};
+  ui_cycle("LOOK", LOOK_OPTS, 2, &g_cfg.grain, px, pw, y, click, cx, cy);
+  y += 15;
+  ui_text("FILMIC ADDS GRAIN AND DARKER CORNERS.", px + 16, y + 2, 0.8f, C_DIM, 1);
+  y += 12;
   return y;
 }
 
@@ -898,10 +900,8 @@ static void msaa_update(void) {
   R.msaa_cfg = g_cfg.msaa;
   R.msaa_w = R.width;
   R.msaa_h = R.height;
-  if (!g_cfg.msaa) return;
-  GLint max_samples = 1;
-  glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
-  GLsizei n = g_cfg.msaa < max_samples ? g_cfg.msaa : max_samples;
+  GLsizei n = msaa_effective(g_cfg.msaa);
+  if (!n) return;
   glGenFramebuffers(1, &R.msaa_fbo);
   glBindFramebuffer(GL_FRAMEBUFFER, R.msaa_fbo);
   glGenRenderbuffers(2, R.msaa_rb);

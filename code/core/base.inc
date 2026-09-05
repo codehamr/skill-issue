@@ -40,6 +40,7 @@ typedef struct __GLsync *GLsync;
 #define GL_READ_FRAMEBUFFER     0x8CA8
 #define GL_DRAW_FRAMEBUFFER     0x8CA9
 #define GL_MAX_SAMPLES          0x8D57
+#define GL_RENDERBUFFER_SAMPLES 0x8CAB
 #define GL_CLAMP_TO_EDGE        0x812F
 #define GL_R8                   0x8229
 #define GL_RED_CORE             0x1903
@@ -114,6 +115,7 @@ typedef struct __GLsync *GLsync;
   X(void,   glGenRenderbuffers, (GLsizei, GLuint *)) \
   X(void,   glBindRenderbuffer, (GLenum, GLuint)) \
   X(void,   glRenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei)) \
+  X(void,   glGetRenderbufferParameteriv, (GLenum, GLenum, GLint *)) \
   X(void,   glFramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint)) \
   X(void,   glFramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint)) \
   X(GLenum, glCheckFramebufferStatus, (GLenum)) \

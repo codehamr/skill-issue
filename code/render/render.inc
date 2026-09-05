@@ -356,6 +356,7 @@ typedef struct {
   GLuint msaa_fbo, msaa_rb[2];      // multisampled scene target, msaa_fbo 0 = MSAA off
   int    frame_resolved;            // this frame's resolve has happened; see msaa_resolve
   int    msaa_cfg, msaa_w, msaa_h;  // setting/size the MSAA target was built for
+  int    msaa_samples[4];           // actual samples for requests 0/2/4/8; 0 = FXAA
   GLuint blur_fbo[2], blur_tex[2];  // quarter-res ping-pong: the frosted menu
   GLuint prog_blur;                 // dual-Kawase tap (see ui_menu_backdrop)
   GLint  u_blur_tex, u_blur_px;
@@ -405,6 +406,44 @@ typedef struct {
 } renderer_t;
 
 static renderer_t R;
+
+// Probe the scene's color/depth pair once per context. GL may round a request up
+// as well as cap it: 2x and 8x can both produce 4x. The menu and renderer share
+// this mapping so each offered AA level changes the picture's sample count.
+static void msaa_probe(void) {
+  memset(R.msaa_samples, 0, sizeof R.msaa_samples);
+  GLint limit = 0;
+  glGetIntegerv(GL_MAX_SAMPLES, &limit);
+  if (limit < 2) return;
+  GLuint fbo, rb[2];
+  glGenFramebuffers(1, &fbo);
+  glGenRenderbuffers(2, rb);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  for (int i = 1; i < 4; i++) {
+    int request = 1 << i;
+    int samples = request < limit ? request : limit;
+    GLint color = 0, depth = 0;
+    glBindRenderbuffer(GL_RENDERBUFFER, rb[0]);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, 8, 8);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &color);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb[0]);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb[1]);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT24, 8, 8);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &depth);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb[1]);
+    if (color >= 2 && color == depth &&
+        glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+      R.msaa_samples[i] = color;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, R.present_fbo);
+  glBindRenderbuffer(GL_RENDERBUFFER, 0);
+  glDeleteFramebuffers(1, &fbo);
+  glDeleteRenderbuffers(2, rb);
+}
+
+static int msaa_effective(int request) {
+  return R.msaa_samples[request >= 8 ? 3 : request >= 4 ? 2 : request >= 2 ? 1 : 0];
+}
 
 // THE SUN SHADOW MAP, built here and nowhere else — the renderer's init calls this
 // for the first build and the frame calls it again, so the SHADOWS setting takes

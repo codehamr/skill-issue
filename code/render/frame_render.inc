@@ -810,12 +810,6 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
   glBindTexture(GL_TEXTURE_2D, R.font_tex);
   if (hud_on) {
   ui_begin();
-  if (g_cfg.show_fps) {
-    char text[16];
-    snprintf(text, sizeof text, "%d FPS", fps);
-    float tx = g_ui_vw - ui_text_width_tr(text, 0.7f, 0.6f) - 7;
-    ui_text_sh(text, tx, 6, 0.7f, TXT_REG, 0.6f, C4(C_HAZE, 0.7f));
-  }
   if (!g_menu_open && !cam_free && !g_vmorb.on) {
     float ccx = g_ui_vw * 0.5f, ccy = g_ui_vh * 0.5f;
     int in_play = p->alive && !g_match.over;
@@ -1091,6 +1085,13 @@ static void rf_hud_pass(const player_t *p, const frame_cam_t *c, int fps,
   // The frosted backdrop exists to seat a panel over a FROZEN world.
   if (g_menu_open && session_pauses() && !g_home) ui_menu_backdrop();
   if (g_menu_open) ui_menu();
+  // Draw above menu backdrops, using this frame's SHOW FPS toggle state.
+  if (g_cfg.show_fps && (hud_on || g_menu_open)) {
+    char text[16];
+    snprintf(text, sizeof text, "%d FPS", fps);
+    float tx = g_ui_vw - ui_text_width_tr(text, 0.7f, 0.6f) - 7;
+    ui_text_sh(text, tx, 6, 0.7f, TXT_REG, 0.6f, C4(C_HAZE, 0.7f));
+  }
   ui_flush();
 }
 

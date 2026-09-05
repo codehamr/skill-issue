@@ -2123,9 +2123,9 @@ static void cmd_homeui(sim_ctx_t *s) {
   int focus_ok = before.page == UI_PAGE_ROOT && before.menu && before.home &&
                  before.focus == 0 && before.nfocus == 5 && !before.padmode;
   // The shipped binary is stamped with YYYY-MM-DD plus a seven-character commit. Its
-  // longer footer peaks at 1374 vertices here; `dev/unknown` is only 1332 and must not
-  // define a release gate. The shadowed readout stays within the stamped baseline.
-  const int vertex_budget = 1374;
+  // footer and the shadowed 120 FPS counter peak at 1446 vertices; `dev/unknown`
+  // uses 1404. The counter contributes 72 vertices to both measured builds.
+  const int vertex_budget = 1446;
   int budget_ok = g_ui_peak <= vertex_budget && g_ui_drops == 0;
   int scratch_ok = harness_scratch_release(HARNESS_SCRATCH_HOMEUI);
   int ok = read_ok && scratch_ok && layout_ok && fit_ok && caption_ok && hover_delta == 0 &&
