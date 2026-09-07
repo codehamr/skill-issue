@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "values": {
+    "ar_ads_fov": "80",
+    "ar_ads_time": "180",
+    "ar_hip_spread": "0.899999976",
+    "ar_recoil_side": "0.0799999982",
+    "ar_recoil_up": "0.300000012",
+    "ar_rpm": "750",
+    "gun_action_spread": "2.5",
+    "gun_recenter": "30",
+    "mv_air_ctl_pct": "30",
+    "mv_crouch_speed": "2.5",
+    "mv_ground_response_ms": "200",
+    "mv_jump_height": "1.20000005",
+    "mv_run_speed": "6.5",
+    "mv_slide_boost_x": "2.5",
+    "mv_slide_len": "10",
+    "pad_as_bubble": "2.5",
+    "pad_as_dist": "80",
+    "pad_as_friction": "1",
+    "sr_ads_fov": "100",
+    "sr_ads_time": "80",
+    "sr_hip_spread": "2.5",
+    "sr_recoil_side": "0",
+    "sr_recoil_up": "4.5",
+    "sr_rpm": "1000"
+  }
+}

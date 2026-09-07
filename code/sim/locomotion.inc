@@ -1,0 +1,152 @@
+// =============================================================================
+// sim/locomotion.inc  —  mv_*: the one set of movement primitives (walk,
+// steer, air, slide, jump) for player, bots and puppet alike.
+// Proof: parity (24 rows through shared code), trace. One TU: included once
+// by game.c, in definition order — moving a definition out is a semantic
+// change.
+// Contract: difficulty carries no movement numbers. Any second copy of a
+// speed constant is a bug by definition. mv_locomote, the single dispatcher
+// over these primitives, lives in sim/combat.inc.
+// =============================================================================
+// ---------------------------------------------------------------------------
+// Locomotion, shared by the player and by every bot. There is exactly ONE set of
+// movement numbers in this game and these helpers are it.
+
+// Ground move: one response time for both taking and releasing intent.
+static void mv_walk(v3 *vel, float wx, float wz, float wlen, float max_speed) {
+  float alpha = mv_alpha(g_sim_mv[MV_RESPONSE_MS]);
+  vel->x += (wx * max_speed - vel->x) * alpha;
+  vel->z += (wz * max_speed - vel->z) * alpha;
+  if (wlen < 1e-5f && vel->x * vel->x + vel->z * vel->z < 1e-4f)
+    vel->x = vel->z = 0;  // full stop: no perpetual micro-drift
+}
+
+// Take-off speed. The half-tick term compensates the discrete Euler integration
+// so the apex lands on JUMP HEIGHT instead of ~3% short.
+static float mv_jump_speed(void) {
+  return sqrtf(2.0f * GRAVITY * g_sim_mv[MV_JUMP_H]) + 0.5f * GRAVITY * TICK_DT;
+}
+
+// Slide launch speed: SLIDE BOOST is a multiplier on run speed, so top speed and
+// boost stay orthogonal knobs.
+static float mv_slide_boost(void) {
+  return g_sim_mv[MV_SLIDE_BOOST] * g_sim_mv[MV_RUN];
+}
+
+// The slide's settle threshold, and the exit predicate built on it.
+static float mv_slide_end_speed(void) {
+  return g_sim_mv[MV_CROUCH_SP] * SLIDE_END_SPEED;
+}
+static int mv_slide_should_end(int grounded, int hold, float sp2d) {
+  return !hold || !grounded || sp2d < mv_slide_end_speed();
+}
+
+// Rotate the horizontal velocity toward the intent at CONSTANT speed — the
+// slide's carve and the above-run-speed air redirect are the same operation, and
+// were two copies of it. `rate_k` scales the turn rate (1 for a slide, AIR
+// CONTROL's fraction in the air), which is the only thing that ever differed.
+static void mv_steer(v3 *vel, float sp, float wx, float wz, float rate_k) {
+  float t = f_clamp(rate_k * SLIDE_STEER_RATE * TICK_DT, 0, 1);
+  float dx = vel->x / sp * (1 - t) + wx * t;
+  float dz = vel->z / sp * (1 - t) + wz * t;
+  float dl = sqrtf(dx * dx + dz * dz);
+  if (dl > 1e-5f) {
+    vel->x = dx / dl * sp;
+    vel->z = dz / dl * sp;
+  }
+}
+
+// Slide launch: take the shared boost, keeping any speed already above it (a slide may
+// not SLOW you down).
+static float mv_slide_launch(v3 *vel, float sp2d) {
+  float boost = mv_slide_boost();
+  float boosted = boost > sp2d ? boost : sp2d;
+  vel->x *= boosted / sp2d;
+  vel->z *= boosted / sp2d;
+  return boosted;
+}
+
+// One tick of a slide: decay sized so a boosted slide carries SLIDE LENGTH metres
+// before settling at the crouch-speed end threshold (an exponential glide from v0 down
+// to ve at rate k covers (v0-ve)/k metres).
+static float mv_slide_step(v3 *vel, float sp, float wx, float wz, float wlen) {
+  const float *mv = g_sim_mv;
+  float v0 = mv_slide_boost();
+  float ve = mv_slide_end_speed();
+  float k = (v0 - ve > 0.1f * v0 ? v0 - ve : 0.1f * v0) / mv[MV_SLIDE_LEN];
+  float drop = sp * k * TICK_DT;
+  float ns = sp - drop > 0 ? sp - drop : 0;
+  if (sp > 1e-5f) {
+    vel->x *= ns / sp;
+    vel->z *= ns / sp;
+  }
+  if (wlen > 1e-5f && ns > 0.01f) mv_steer(vel, ns, wx, wz, 1.0f);
+  return ns;
+}
+
+// AIR CONTROL is the fraction of ground authority kept while airborne.
+static void mv_air(v3 *vel, float wx, float wz, float wlen, float sp2d) {
+  const float *mv = g_sim_mv;
+  if (wlen <= 1e-5f || mv[MV_AIR_CTL] <= 0) return;
+  float ctl = mv[MV_AIR_CTL] * 0.01f;
+  if (sp2d <= mv[MV_RUN]) {
+    float alpha = mv_alpha(mv[MV_RESPONSE_MS]) * ctl;
+    vel->x += (wx * mv[MV_RUN] - vel->x) * alpha;
+    vel->z += (wz * mv[MV_RUN] - vel->z) * alpha;
+  } else {
+    mv_steer(vel, sp2d, wx, wz, ctl);
+  }
+}
+
+// Shared physical lean: speed attenuation, anticipatory clearance and the hard
+// wall clamp are identical for a player and an AI-controlled body.
+static float mv_lean(v3 origin, v3 velocity, float yaw, int enabled, float want,
+                      float *input, float *clearance) {
+  float sp = sqrtf(velocity.x * velocity.x + velocity.z * velocity.z);
+  float run = g_sim_mv[MV_RUN] > 0.1f ? g_sim_mv[MV_RUN] : 0.1f;
+  want *= 1.0f - f_clamp((sp / run - LEAN_SPD_LO) / (LEAN_SPD_HI - LEAN_SPD_LO),
+                         0.0f, 1.0f);
+  if (!enabled) want = 0.0f;
+  float rate = fabsf(want) > fabsf(*input) ? LEAN_IN_RATE : LEAN_OUT_RATE;
+  *input += (want - *input) * ease_k(rate);
+
+  // TWO probes, and the pair is the whole design. `now` is the hard constraint — the
+  // eye may never be nearer than LEAN_MARGIN to a solid, applied as a floor after the
+  // easing rather than through it. `ahead` is the warning: the same ray from where the
+  // eye will be in LEAN_LOOK seconds, which lets the ease finish before the wall
+  // arrives.
+  float clr_now = 1.0f, clr_ahead = 1.0f;
+  if (fabsf(*input) > 1e-4f) {
+    float dist = fabsf(lean_eye_off(*input));
+    float s = *input > 0 ? 1.0f : -1.0f;
+    v3 o = origin;
+    v3 d = {{cosf(yaw) * s, 0, sinf(yaw) * s}};
+    v3 ah = {{o.x + velocity.x * LEAN_LOOK, o.y, o.z + velocity.z * LEAN_LOOK}};
+    float ax = ah.x - o.x, az = ah.z - o.z, al = sqrtf(ax * ax + az * az);
+    if (al > LEAN_LOOK_MAX) {          // sprinting must not anticipate a wall
+      ah.x = o.x + ax * LEAN_LOOK_MAX / al;   // two rooms early
+      ah.z = o.z + az * LEAN_LOOK_MAX / al;
+    }
+    // BOTH probes cast at TWO heights: the base eye AND the eye at the full lean's own
+    // drop (the arc lowers it up to 0.091 m).
+    float oy2 = o.y - lean_eye_drop(fabsf(*input));
+    float bn = dist, ba = dist;
+    for (int i = 0; i < g_num_solids; i++) {
+      v3 n;
+      for (int hgt = 0; hgt < 2; hgt++) {
+        v3 oh = o, ahh = ah;
+        if (hgt) { oh.y = oy2; ahh.y = oy2; }
+        float t = ray_aabb(oh, d, g_solids[i].min, g_solids[i].max, &n);
+        if (t > 0 && t - LEAN_MARGIN < bn) bn = t - LEAN_MARGIN;
+        t = ray_aabb(ahh, d, g_solids[i].min, g_solids[i].max, &n);
+        if (t > 0 && t - LEAN_MARGIN < ba) ba = t - LEAN_MARGIN;
+      }
+    }
+    clr_now = (bn > 0 ? bn : 0.0f) / dist;
+    clr_ahead = (ba > 0 ? ba : 0.0f) / dist;
+  }
+  float want_clr = fminf(clr_now, clr_ahead);
+  *clearance += (want_clr - *clearance) * ease_k(LEAN_CLR_RATE);
+  if (*clearance > clr_now) *clearance = clr_now;
+  return (*input) * f_clamp(*clearance, 0.0f, 1.0f);
+}

@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "groups": {
+    "mv": [
+      {
+        "enum": "MV_RUN",
+        "key": "mv_run_speed",
+        "label": "RUN SPEED",
+        "lo": "2.0",
+        "hi": "14.0",
+        "step": "0.1"
+      },
+      {
+        "enum": "MV_CROUCH_SP",
+        "key": "mv_crouch_speed",
+        "label": "CROUCH SPEED",
+        "lo": "0.5",
+        "hi": "6.0",
+        "step": "0.1"
+      },
+      {
+        "enum": "MV_RESPONSE_MS",
+        "key": "mv_ground_response_ms",
+        "label": "GROUND RESPONSE",
+        "lo": "30.0",
+        "hi": "600.0",
+        "step": "10.0"
+      },
+      {
+        "enum": "MV_JUMP_H",
+        "key": "mv_jump_height",
+        "label": "JUMP HEIGHT",
+        "lo": "0.3",
+        "hi": "3.0",
+        "step": "0.1"
+      },
+      {
+        "enum": "MV_AIR_CTL",
+        "key": "mv_air_ctl_pct",
+        "label": "AIR CONTROL",
+        "lo": "0.0",
+        "hi": "100.0",
+        "step": "5.0"
+      },
+      {
+        "enum": "MV_SLIDE_BOOST",
+        "key": "mv_slide_boost_x",
+        "label": "SLIDE BOOST",
+        "lo": "1.0",
+        "hi": "5.0",
+        "step": "0.1"
+      },
+      {
+        "enum": "MV_SLIDE_LEN",
+        "key": "mv_slide_len",
+        "label": "SLIDE LENGTH",
+        "lo": "2.0",
+        "hi": "20.0",
+        "step": "0.5"
+      }
+    ],
+    "gp": [
+      {
+        "enum": "GP_ACTION_SPREAD",
+        "key": "gun_action_spread",
+        "label": "JUMP / SLIDE",
+        "lo": "0.0",
+        "hi": "6.0",
+        "step": "0.1"
+      },
+      {
+        "enum": "GP_RECENTER",
+        "key": "gun_recenter",
+        "label": "RECENTER",
+        "lo": "0.0",
+        "hi": "30.0",
+        "step": "0.5"
+      }
+    ],
+    "wp": [
+      {
+        "enum": "WP_RPM",
+        "key": "rpm",
+        "label": "FIRE RATE",
+        "lo": "40.0",
+        "hi": "1000.0",
+        "step": "10.0"
+      },
+      {
+        "enum": "WP_RECOIL_UP",
+        "key": "recoil_up",
+        "label": "RECOIL UP",
+        "lo": "0.0",
+        "hi": "8.0",
+        "step": "0.05"
+      },
+      {
+        "enum": "WP_RECOIL_SIDE",
+        "key": "recoil_side",
+        "label": "RECOIL SIDE",
+        "lo": "0.0",
+        "hi": "1.0",
+        "step": "0.01"
+      },
+      {
+        "enum": "WP_HIP_SPREAD",
+        "key": "hip_spread",
+        "label": "HIP SPREAD",
+        "lo": "0.0",
+        "hi": "4.0",
+        "step": "0.05"
+      },
+      {
+        "enum": "WP_ADS_MS",
+        "key": "ads_time",
+        "label": "ADS TIME",
+        "lo": "40.0",
+        "hi": "500.0",
+        "step": "10.0"
+      },
+      {
+        "enum": "WP_ADS_FOV",
+        "key": "ads_fov",
+        "label": "ADS FOV",
+        "lo": "40.0",
+        "hi": "100.0",
+        "step": "1.0"
+      }
+    ],
+    "pad": [
+      {
+        "enum": "PAD_AS_FRIC",
+        "key": "pad_as_friction",
+        "label": "FRICTION",
+        "lo": "0.05",
+        "hi": "1.00",
+        "step": "0.05"
+      },
+      {
+        "enum": "PAD_AS_BUBBLE",
+        "key": "pad_as_bubble",
+        "label": "BUBBLE",
+        "lo": "1.0",
+        "hi": "15.0",
+        "step": "0.5"
+      },
+      {
+        "enum": "PAD_AS_DIST",
+        "key": "pad_as_dist",
+        "label": "DIST",
+        "lo": "5.0",
+        "hi": "80.0",
+        "step": "1.0"
+      }
+    ]
+  },
+  "weapons": [
+    {
+      "enum": "WPN_AR",
+      "prefix": "ar"
+    },
+    {
+      "enum": "WPN_SR",
+      "prefix": "sr"
+    }
+  ],
+  "aliases": {},
+  "retired_weapon": [
+    "kick_up",
+    "kick_side",
+    "recover_ms",
+    "move_spread",
+    "heat",
+    "punch",
+    "sway",
+    "ads_ms",
+    "ads_zoom",
+    "hip_recoil",
+    "move_recoil"
+  ],
+  "retired": [
+    "recoil_view",
+    "mv_fov_kick",
+    "mv_accel_ms",
+    "mv_stop_ms"
+  ]
+}
