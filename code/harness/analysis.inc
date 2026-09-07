@@ -384,6 +384,7 @@ static void usage(void) {
        "                     live clamp=0 (death is reported separately)\n"
        "  decorcheck         emitted crown coverage, authored supports and capacity\n"
        "  mapcheck N         arenas: coplanar/capacity + through-brick-opening rays\n"
+       "  boundarycheck N    forest cuts: clear lanes, shots, slides/jumps without clamp\n"
        "  parity             24 player-vs-bot gameplay rows, ok/MISMATCH each\n"
        "  botsuppress        authoritative near-pass/impact and bounded response proof\n"
        "  bottactics         routes, tactical decisions and physical/network lean proof\n"

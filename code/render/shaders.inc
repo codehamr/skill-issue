@@ -43,6 +43,7 @@
 // signed offset from this value, and the granular floor field reads it back to decide
 // where loose sand exists at all.
 #define WORLD_GROUND_R 0.86f   // dry dusty floor: a wide, weak sheen at grazing
+#define WORLD_ROCK_TAG -2.25f  // bedrock finish; separate from foliage and gloves
 #define GLSL_ENV \
   /* Smooth value noise, SHARED. It lives here rather than in WORLD_FS because
      the sky pass needs the same function for its cloud layer, and two shaders
@@ -825,6 +826,7 @@ static const char *WORLD_FS =
   // A negative authored roughness is the zero-width wall-finish tag carried by
   // generated ruins. The BRDF always sees its magnitude.
   "  bool wall_finish = vMat.x < 0.0 && vMat.x > -1.0;\n"
+  "  bool rock_finish = abs(vMat.x - (" GLSL_NUM(WORLD_ROCK_TAG) ")) < 0.01;\n"
   "  bool glove = vMat.x < -1.5 && vMat.x > -2.0;\n"
   "  float base_rough = glove ? 0.72 : (vMat.x < -1.0 ? 0.88 : abs(vMat.x));\n"
   "  float rough, surf_h = 0.5;\n"
@@ -853,6 +855,22 @@ static const char *WORLD_FS =
   "    rough = mix(rough, 0.88 + cap * 0.035\n"
   "                      + (plaster - 0.5) * 0.035, 0.42);\n"
   "    surf_h = mix(surf_h, mix(weather, plaster, 0.35), 0.36);\n"
+  "  }\n"
+  // Quarry strata follow world height across adjoining cut faces. Broad damp
+  // seams and moss remain legible in motion without fine repeating cracks.
+  "  if (rock_finish && uDetail > 0.0) {\n"
+  "    float fold = vnoise2(vWorld.xz * 0.19 + vec2(5.7, 12.3));\n"
+  "    vec2 bed = vec2(cp2.x * 0.32, vWorld.y * 0.85 + cp2.x * 0.09);\n"
+  "    vec2 cell = floor(bed), q = fract(bed);\n"
+  "    float facet = vhash3(cell + vec2(step(q.x, q.y) * 37.0, 9.2)).z;\n"
+  "    float strata = vnoise2(vec2(cp2.x * 0.32, vWorld.y * 1.7 + fold));\n"
+  "    float seam = smoothstep(0.27, 0.36, strata);\n"
+  "    float damp = vnoise2(vec2(cp2.x * 0.65, vWorld.y * 0.17));\n"
+  "    float moss = smoothstep(0.48, 0.72, damp + 0.16 * exp(-vWorld.y * 0.55));\n"
+  "    alb *= 0.80 + strata * 0.25 + seam * 0.05 + (facet - 0.5) * 0.20;\n"
+  "    alb = mix(alb, alb * vec3(0.67, 0.85, 0.48), moss * 0.55);\n"
+  "    surf_h = mix(surf_h, strata, 0.65);\n"
+  "    rough = mix(0.94, 0.79, moss);\n"
   "  }\n"
   // PROCEDURAL RELIEF FROM THE MATERIAL FIELD ALREADY IN REGISTERS. The broad
   // concrete variation above is not only pigment: aggregate and worn render leave
@@ -954,7 +972,7 @@ static const char *WORLD_FS =
   "    alb *= 1.0 + (gh - 0.5) * 0.085 + br * 0.040 * bore;\n"
   "  }\n"
   // Geometric specular antialiasing.
-  "  if (uDetail > 0.0 && !wall_finish && abs(n.y) < 0.5) {\n"  // vertical faces: panel seams
+  "  if (uDetail > 0.0 && !wall_finish && !rock_finish && abs(n.y) < 0.5) {\n"  // vertical faces: panel seams
   "    float sc = abs(n.x) > 0.5 ? vWorld.z : vWorld.x;\n"
   "    float sf = abs(fract(sc / 3.0) - 0.5) * 3.0;\n"
   "    float sm = 1.0 - smoothstep(0.02, 0.05, sf);\n"

@@ -1,7 +1,7 @@
 // =============================================================================
 // world/map.inc  —  arena generator: map_generate, sun_build, mood_build,
 // sig_build, wall damage (breaks/breaches/crenellation/rubble).
-// Proof: map, sun, mood, mapcheck. One TU: included once by game.c, in
+// Proof: map, sun, mood, mapcheck, boundarycheck. One TU: included once by game.c, in
 // definition order — moving a definition out is a semantic change.
 // Contract: the sun and the mood are MAP STATE, hashed off the seed and
 // never drawn from g_rng; mapcheck must read 0 coplanar same-facing faces
@@ -13,6 +13,12 @@
 // ---------------------------------------------------------------------------
 
 #define ARENA_HALF   24.0f
+#define FOREST_TRUNK_H 3.2f
+#define QUARRY_DEPTH 8.0f
+// Even the highest permitted jump from a grove trunk stays below the cut.
+#define QUARRY_CUT_MIN (FOREST_TRUNK_H + MV_DEF[MV_JUMP_H].hi + 0.2f)
+#define QUARRY_CUT_MAX (QUARRY_CUT_MIN + 1.6f)
+#define QUARRY_RIM_RISE 4.4f
 // Raised from 96 with the wall-damage pass: a broken wall is up to four abutting pieces
 // plus three rubble blocks where it used to be one box, and all of them are real cover
 // that has to be in the collision set. int16 carries the solid index on the wire
@@ -24,7 +30,7 @@
 // is presentation metadata for shading and impact sound, a full int with no ABI-
 // dependent trailing padding. net_world_hash explicitly stops before it;
 // proof fixtures that omit it get SOLID_CONCRETE through zero-init.
-enum { SOLID_CONCRETE, SOLID_WALL };
+enum { SOLID_CONCRETE, SOLID_WALL, SOLID_ROCK };
 typedef struct { v3 min, max, color; int pen, mat; } solid_t;
 
 static solid_t g_solids_all[SRV_LOBBIES][MAX_SOLIDS];
@@ -55,11 +61,16 @@ static void map_add_mat(v3 mn, v3 mx, v3 col, int mat) {
   if (g_num_solids > at) g_solids[at].mat = mat;
 }
 
-// Perimeter = 4 wall bases + 4 accent bands, always solids 0..7.
-#define PERIM_SOLIDS 8
+// Boundary solids precede cover; quarry cuts have more sections than masonry.
 // Wall-hugging corridor kept free of cover: guaranteed rotation routes and
 // four long sniper sightlines, one per wall.
 #define RING_W 4.5f
+
+static int map_perim_count(void) {
+  int n = 0;
+  while (n < g_num_solids && !g_solids[n].pen) n++;
+  return n;
+}
 
 static int map_box_free(v3 mn, v3 mx, float gap) {
   // Reject boxes near either spawn zone (the map is 180-deg rotationally
@@ -70,7 +81,7 @@ static int map_box_free(v3 mn, v3 mx, float gap) {
     if (mx.x > SPAWN_POS.x - 4 && mn.x < SPAWN_POS.x + 4 &&
         mx.z > sz - 4 && mn.z < sz + 4) return 0;
   }
-  for (int i = PERIM_SOLIDS; i < g_num_solids; i++) {
+  for (int i = map_perim_count(); i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
     if (mx.x > s->min.x - gap && mn.x < s->max.x + gap &&
         mx.z > s->min.z - gap && mn.z < s->max.z + gap &&
@@ -300,8 +311,10 @@ static void sun_set(float elev_deg, float azi_rad) {
   S->disc = 0.8f + 25.2f * f_smoothstep(0.13f, 0.58f, se);
   S->cloud = 0.26f;   // sun_build re-draws this per map; this is the default
   float tan_e = se / sqrtf(fmaxf(1.0f - se * se, 1.0e-4f));
-  float smear = fminf(SUN_CAST_H / fmaxf(tan_e, 0.10f), 34.0f);
-  S->sh_half = ARENA_HALF * 1.06f + smear * 0.5f;
+  float cast_h = g_biome.kind == BIOME_FOREST ? QUARRY_CUT_MAX + QUARRY_RIM_RISE : SUN_CAST_H;
+  float smear = fminf(cast_h / fmaxf(tan_e, 0.10f), 34.0f);
+  S->sh_half = ARENA_HALF * 1.06f + smear * 0.5f +
+               (g_biome.kind == BIOME_FOREST ? QUARRY_DEPTH : 0.0f);
   S->sh_depth = 2.2f * S->sh_half + 40.0f;
   v3 dh = v3_norm((v3){{S->dir.x, 0.0f, S->dir.z}});
   S->sh_centre = (v3){{-dh.x * smear * 0.5f, 1.6f, -dh.z * smear * 0.5f}};
@@ -366,7 +379,7 @@ static void map_lights_build(void) {
     float base = 2.75f;
     if (pair == 2) {
       float best = 1e9f;
-      for (int i = 8; i < g_num_solids; i++) {
+      for (int i = map_perim_count(); i < g_num_solids; i++) {
         const solid_t *q = &g_solids[i];
         float x = (q->min.x + q->max.x) * 0.5f;
         float z = (q->min.z + q->max.z) * 0.5f;
@@ -979,8 +992,33 @@ static uint64_t rng_gun_seed(uint32_t seed, int h) {
          (uint64_t)h * 0x9E3779B97F4A7C15u;
 }
 
-static void map_gen_shell(void) {
+static void map_gen_shell(uint32_t seed) {
   const float H = ARENA_HALF, WT = 0.6f, WH = 3.2f, BH = 2.75f;
+  if (g_biome.kind == BIOME_FOREST) {
+    // The clearing occupies a cut quarry floor. Eight metres of bedrock
+    // explains the impermeable boundary; its sheer inner faces keep the full
+    // rotation lane clear. Opposite cuts match, including their height.
+    // A private stream preserves every interior solid and gameplay RNG.
+    uint64_t st = (uint64_t)(seed ^ 0x51A7E123u) * 2654435761u + 1;
+    const float outer = H + QUARRY_DEPTH;
+    for (int axis = 0; axis < 2; axis++) {
+      float reach = axis ? H : outer;
+      float lo = -reach;
+      for (int part = 0; part < 6; part++) {
+        float hi = part == 5 ? reach : -reach + (float)(part + 1) * reach / 3.0f +
+                                       rng_rangef(&st, -1.4f, 1.4f);
+        float height = rng_rangef(&st, QUARRY_CUT_MIN, QUARRY_CUT_MAX);
+        v3 stone = v3_lerp(g_theme.wall, (v3){{0.60f,0.59f,0.55f}}, 0.65f);
+        v3 col = v3_scale(stone, rng_rangef(&st, 0.87f, 0.96f));
+        v3 mn = axis ? (v3){{H, 0, lo}} : (v3){{lo, 0, -outer}};
+        v3 mx = axis ? (v3){{outer, height, hi}} : (v3){{hi, height, -H}};
+        map_add_sym_mat(mn, mx, col, SOLID_ROCK);
+        lo = hi;
+      }
+    }
+    for (int i = 0; i < g_num_solids; i++) g_solids[i].pen = 0;
+    return;
+  }
   v3 wc = g_theme.wall;
   map_add((v3){{-H - WT, 0, -H - WT}}, (v3){{H + WT, BH, -H}}, wc);
   map_add((v3){{-H - WT, 0, H}},       (v3){{H + WT, BH, H + WT}}, wc);
@@ -1278,7 +1316,7 @@ static void map_gen_forest(uint32_t seed) {
       float z = rng_rangef(&st, 2.0f, limit);
       if (x * x + z * z < 64.0f) continue;
       v3 mn = {{x - 0.16f, 0.0f, z - 0.16f}};
-      v3 mx = {{x + 0.16f, 3.2f, z + 0.16f}};
+      v3 mx = {{x + 0.16f, FOREST_TRUNK_H, z + 0.16f}};
       // The generous gap also keeps canopy edges away from climbable cover;
       // map_sym_free enforces both spawn exclusions for the complete pair.
       if (!map_sym_free(mn, mx, 1.8f)) continue;
@@ -1311,7 +1349,7 @@ static void map_generate(uint32_t seed) {
     g_wind_ang = (float)(wh >> 8) * (1.0f / 16777216.0f) * (2.0f * F_PI);
   }
 
-  map_gen_shell();
+  map_gen_shell(seed);
   map_gen_landmark();
   map_gen_walls();
   map_gen_crates();

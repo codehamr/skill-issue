@@ -925,8 +925,41 @@ static void dec_grove_tree(const solid_t *s, int pair, float sg) {
 // mistaken for cover, and a tree whose long shadow is a bare post's is the
 // headless-shadow defect wearing bark. Branches are 40+ mm across, over the
 // shadow map's own texel floor; the sub-texel twigs live in the decor pass.
+// Uncut shoulders rise behind the sheer collision faces. Their complete
+// footprint stays outside the playable square, with their bases buried in
+// solid bedrock. They cast with the quarry instead of floating in the sky pass.
+static void dec_quarry_rim(void) {
+  if (g_biome.kind != BIOME_FOREST) return;
+  mat_set(WORLD_ROCK_TAG, 0.0f);
+  for (int i = 0; i < g_num_solids; i += 2) {
+    const solid_t *s = &g_solids[i];
+    if (s->mat != SOLID_ROCK || s->pen) continue;
+    int axis = s->min.x >= ARENA_HALF;
+    float lo = axis ? s->min.z : s->min.x;
+    float hi = axis ? s->max.z : s->max.x;
+    int count = (int)ceilf((hi - lo) / 7.0f);
+    uint64_t st = (uint64_t)scat_h(0xC117u, (uint32_t)i, 0, 0) * 2654435761u + 1;
+    for (int j = 0; j < count; j++) {
+      float u = lo + ((float)j + 0.5f) * (hi - lo) / (float)count;
+      float w = (hi - lo) / (float)count * rng_rangef(&st, 0.58f, 0.75f);
+      float rise = rng_rangef(&st, 2.8f, QUARRY_RIM_RISE);
+      // Depth stagger prevents overlapping shoulders from sharing a face
+      // plane; every uncut corner still lies inside the bedrock footprint.
+      float out = ARENA_HALF + rng_rangef(&st, 3.55f, 3.90f);
+      float y = s->max.y + rise - 3.0f;
+      v3 c = axis ? (v3){{out, y, u}} : (v3){{u, y, -out}};
+      v3 col = v3_lerp(s->color, g_theme.ground, rng_rangef(&st, 0.15f, 0.42f));
+      uint32_t cuts = rng_next(&st) | 0xA0u;
+      for (int twin = 0; twin < 2; twin++)
+        dec_rock(c, axis ? 3.5f : w, 3.0f, axis ? w : 3.5f,
+                 0, 0, cuts, 0.32f, 0, col, twin ? -1.0f : 1.0f);
+    }
+  }
+}
+
 static void mesh_cast_extra(void) {
-  if (g_meta.bould[0] < 0 && g_meta.tree[0] < 0 && g_meta.ngrove == 0) return;
+  if (g_meta.bould[0] < 0 && g_meta.tree[0] < 0 && g_meta.ngrove == 0 &&
+      g_biome.kind != BIOME_FOREST) return;
   int save_floats = g_scene_floats, save_want = g_scene_want;
   int save_peak = g_scene_peak;
   long save_drops = g_scene_drops;
@@ -957,6 +990,7 @@ static void mesh_cast_extra(void) {
   mat_set(0.90f, 0.0f);
   for (int i = 0; i < g_meta.ngrove; i++)
     dec_grove_tree(&g_solids[g_meta.grove[i]], i / 2, i & 1 ? -1.0f : 1.0f);
+  dec_quarry_rim();
   int n = g_scene_floats;
   int cap = (int)(sizeof g_mesh / sizeof g_mesh[0]);
   if (g_mesh_floats + n > cap) n = cap - g_mesh_floats;
@@ -1137,9 +1171,16 @@ static void mesh_large_scenery(void) {
   v3 tangent = {{-radial.z, 0, radial.x}};
   v3 c = v3_scale(radial, r);
   int kind = (int)(rng_next(&st) % 5u);
-  if (g_biome.kind == BIOME_FOREST) kind = 4;
   if (g_biome.kind == BIOME_NIGHT) kind = (scat_h(0xE110u, 1, 2, 3) & 1u) ? 1 : 3;
-  for (int t = 0; t < 2; t++) {
+  if (g_biome.kind == BIOME_FOREST) {
+    // Different working remnants on opposite sides replace compass paint:
+    // a reservoir on the south rim, a low pump station to the north.
+    dec_backdrop_building((v3){{-12,0,43}}, (v3){{0,0,1}}, (v3){{1,0,0}},
+                         16.0f, 5.4f, 3.2f, 1, st, 1.0f);
+    dec_backdrop_building((v3){{14,0,-43}}, (v3){{0,0,-1}}, (v3){{-1,0,0}},
+                         13.5f, 6.0f, 3.8f, 0, st, 1.0f);
+  }
+  for (int t = 0; t < 2 && g_biome.kind != BIOME_FOREST; t++) {
     float sg = t ? -1.0f : 1.0f;
     dec_backdrop_building(c, radial, tangent, h, wx, wz, kind, st, sg);
     if (g_biome.kind == BIOME_DUNES) {
@@ -1153,7 +1194,7 @@ static void mesh_large_scenery(void) {
 
   int forest = g_biome.forest > 0.5f, frost = g_biome.snow > 0.5f;
   int marsh = g_biome.kind == BIOME_MARSH;
-  int nt = forest ? 14 : frost ? 12 : marsh ? 7 : g_biome.kind == BIOME_DUNES ? 0 : 3;
+  int nt = forest ? 16 : frost ? 12 : marsh ? 7 : g_biome.kind == BIOME_DUNES ? 0 : 3;
   mat_set(0.91f, 0.0f);
   for (int j = 0; j < nt; j++) {
     uint64_t ts = (uint64_t)scat_h(0x7AEEu, (uint32_t)j, 7, 9) * 2654435761u + 1;
@@ -1162,10 +1203,10 @@ static void mesh_large_scenery(void) {
     int cluster = j < (nt + 1) / 2 ? 0 : 1;
     float a = ang + 0.74f + (float)cluster * 1.65f + rng_rangef(&ts, -0.40f, 0.40f);
     float rad = rng_rangef(&ts, forest ? 39.0f : 45.0f, 77.0f);
-    float ht = rng_rangef(&ts, forest ? 10.0f : 8.0f, forest ? 19.0f : 17.0f);
+    float ht = rng_rangef(&ts, forest ? 15.0f : 8.0f, forest ? 24.0f : 17.0f);
     if ((forest || frost || marsh) && j % 4 == 0) {
       rad = rng_rangef(&ts, 34.0f, 42.0f);
-      ht = rng_rangef(&ts, 5.5f, 8.0f);
+      ht = rng_rangef(&ts, forest ? 10.0f : 5.5f, forest ? 14.0f : 8.0f);
     }
     rad = fmaxf(rad, (ARENA_HALF + 3.5f) / fmaxf(fabsf(cosf(a)), fabsf(sinf(a))));
     v3 at = {{cosf(a) * rad, -0.4f, sinf(a) * rad}};
@@ -1187,6 +1228,45 @@ static void mesh_large_scenery(void) {
   g_mesh_drops += g_scene_drops - save_drops;
   g_scene_peak = save_peak; g_scene_drops = save_drops;
   g_scene_dirty = 1;
+}
+
+// Exposed roots belong to the upper cut, away from headroom. Small fallen
+// stones at its foot stay below ankle height and leave the rotation lane open.
+static void dec_quarry_growth(void) {
+  if (g_biome.kind != BIOME_FOREST) return;
+  for (int i = 0; i < g_num_solids; i += 2) {
+    const solid_t *s = &g_solids[i];
+    if (s->mat != SOLID_ROCK || s->pen) continue;
+    int axis = s->min.x >= ARENA_HALF;
+    v3 normal = axis ? (v3){{1,0,0}} : (v3){{0,0,-1}};
+    v3 tangent = axis ? (v3){{0,0,1}} : (v3){{1,0,0}};
+    float lo = axis ? s->min.z : s->min.x;
+    float hi = axis ? s->max.z : s->max.x;
+    uint64_t seed = (uint64_t)scat_h(0xA007u, (uint32_t)i, 0, 0) * 2654435761u + 1;
+    for (int twin = 0; twin < 2; twin++) {
+      float sg = twin ? -1.0f : 1.0f;
+      uint64_t st = seed;
+      float u = f_clamp((lo + hi) * 0.5f, -ARENA_HALF + 1.2f, ARENA_HALF - 1.2f);
+      v3 c = v3_add(v3_scale(normal, ARENA_HALF + 0.015f), v3_scale(tangent, u));
+      mat_set(0.93f, 0.0f);
+      v3 wood = {{0.29f,0.26f,0.20f}};
+      for (int root = 0; root < 2; root++) {
+        v3 a = v3_add(c, v3_scale(tangent, rng_rangef(&st, -0.75f, 0.75f)));
+        a.y = s->max.y + 0.015f;
+        v3 b = v3_add(a, v3_scale(tangent, rng_rangef(&st, -0.30f, 0.30f)));
+        b.y -= rng_rangef(&st, 0.35f, 0.65f);
+        v3 d = v3_add(b, v3_scale(tangent, rng_rangef(&st, -0.35f, 0.35f)));
+        d.y -= rng_rangef(&st, 0.35f, 0.65f);
+        dec_stick(a, b, 0.045f, wood, sg);
+        dec_stick(b, d, 0.024f, wood, sg);
+      }
+      for (int stone = 0; stone < 3; stone++) {
+        v3 p = v3_add(c, v3_scale(tangent, rng_rangef(&st, -1.4f, 1.4f)));
+        p = v3_sub(p, v3_scale(normal, rng_rangef(&st, 0.10f, 0.65f)));
+        dec_pebble(p, rng_rangef(&st, 0.045f, 0.085f), &st, s->color, sg);
+      }
+    }
+  }
 }
 
 static void mesh_decor(void) {
@@ -1281,6 +1361,7 @@ static void mesh_decor(void) {
       }
     }
   scat_emit();
+  dec_quarry_growth();
 
   // What a dead tree sheds: a few fallen sticks at each trunk's base — the
   // ground story that ties the crown to the floor without any aerial twigs.

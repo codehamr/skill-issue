@@ -632,7 +632,9 @@ static void scat_plan(void) {
   g_scat_ms = (float)(clock() - t0) * (1000.0f / (float)CLOCKS_PER_SEC);
 }
 
-#define DECOR_MAX_VERTS 49152
+// Static scenery includes quarry shoulders, rooted rims and distant woodland.
+// Keep headroom above the dense forest census without a per-frame allocation.
+#define DECOR_MAX_VERTS 57344
 static float g_mesh[(MAX_SOLIDS * 36 + GROUND_VERTS + DECOR_MAX_VERTS) * VERT_FLOATS];
 static int   g_mesh_floats;
 static long  g_mesh_drops;
@@ -940,7 +942,8 @@ static void mesh_build(void) {
     // takes abs() for the BRDF and uses the sign for the quiet plaster finish
     // on generated wall pieces. The vertex layout stays at 12 floats and
     // concrete/crates remain untouched.
-    mat_set(s->mat == SOLID_WALL ? -WORLD_SOLID_R : WORLD_SOLID_R, 0.0f);
+    mat_set(s->mat == SOLID_ROCK ? WORLD_ROCK_TAG :
+            s->mat == SOLID_WALL ? -WORLD_SOLID_R : WORLD_SOLID_R, 0.0f);
     v3 mn = s->min, mx = s->max, c = s->color;
     // +x -x +y -y +z -z faces, wound counter-clockwise from outside.
     mesh_quad((v3){{mx.x,mn.y,mn.z}},(v3){{mx.x,mx.y,mn.z}},(v3){{mx.x,mx.y,mx.z}},(v3){{mx.x,mn.y,mx.z}},(v3){{1,0,0}},c);

@@ -43,6 +43,7 @@
 #             finite nondegenerate meshes, overflow and unchanged sim ownership
 #   weatherproof: seed distribution, deterministic bounded samples, rain roof
 #             exclusion, unchanged gameplay RNGs and delayed thunder with map resets
+#   boundarycheck: quarry lanes, shot stops, unclamped run/slide/jump and complete mesh capacity
 # Also prints the glibc floor for the log — a rise excludes whole distros, so
 # it is worth seeing even though it is not gated here.
 set -eu
@@ -762,6 +763,7 @@ gate_command filmtrackproof "filmtrackproof" '^filmtrackproof summary cases=13 s
 gate_command filmcueproof "filmcueproof" '^filmcueproof summary cases=22 ok$'
 
 gate_command decorcheck "decorcheck" '^decorcheck trees=2560 tips=14792 buildings=240 controls=10 peak=720 state=same fail=0 ok$'
+gate_command boundarycheck "boundarycheck 128" '^boundarycheck maps=128 rays=23040 routes=3072 contacts=22528 meshes=128 peak_verts=[0-9]+ fail=0 ok$'
 decor_small_rows="$(grep -Ec '^decorcheck small=1728 floating=0 worst=(0[.]000000/){8}0[.]000000$' "$TMPD/decorcheck.log" || true)"
 [ "$decor_small_rows" = 1 ] || {
   say "GATE decorcheck missing grounded small-piece census"; fail=1;

@@ -4494,6 +4494,121 @@ static void cmd_mixdown(sim_ctx_t *s) {
   free(mix);
 }
 
+// Exercise real collision without arena_clamp: a hidden clamp must not mask
+// an opening, a snag at a cut seam, or a boundary which bullets can cross.
+static void cmd_boundarycheck(sim_ctx_t *s) {
+  (void)s;
+  long maps = next_n();
+  if (maps < 1) maps = 1;
+  int force0 = g_biome_force;
+  uint32_t seed0 = g_map_seed;
+  uint64_t rng0 = g_rng, bot0 = g_rng_bot, gun0[8];
+  memcpy(gun0, g_rng_gun, sizeof gun0);
+  float high_mv[MV_COUNT];
+  memcpy(high_mv, g_sim_mv, sizeof high_mv);
+  high_mv[MV_JUMP_H] = MV_DEF[MV_JUMP_H].hi;
+  const float *mv0 = g_sim_mv;
+  g_sim_mv = high_mv;
+  float high_jump = mv_jump_speed();
+  g_sim_mv = mv0;
+  long rays = 0, routes = 0, contacts = 0, fail = 0;
+  int meshes = 0, mesh_peak = 0;
+  g_biome_force = BIOME_FOREST;
+  for (long map = 0; map < maps; map++) {
+    map_generate(g_map_seed);
+    // Build the complete static world, not only its collision boxes. Dense
+    // foliage seeds must leave room for the cut, shoulders and ground detail.
+    long drops = g_mesh_drops, invalid = g_decor_invalid;
+    mesh_build();
+    fail += g_mesh_drops != drops || g_decor_invalid != invalid;
+    int verts = g_mesh_floats / VERT_FLOATS;
+    if (verts > mesh_peak) mesh_peak = verts;
+    meshes++;
+    float takeoff = 0.0f;
+    for (int i = map_perim_count(); i < g_num_solids; i++)
+      takeoff = fmaxf(takeoff, g_solids[i].max.y);
+    for (int side = 0; side < 4; side++) {
+      int axis = side < 2 ? 0 : 2, along = axis == 0 ? 2 : 0;
+      float sign = side & 1 ? -1.0f : 1.0f;
+      v3 outward = {{0,0,0}}; outward.e[axis] = sign;
+      // Sample both ends of every lane and its full width, independently
+      // of the generator's segment positions and its number of sections.
+      for (int step = -22; step <= 22; step++) {
+        v3 eye = {{0,EYE_STAND,0}};
+        eye.e[axis] = sign * (ARENA_HALF - 1.0f);
+        eye.e[along] = (float)step;
+        v3 normal; int solid = -1;
+        float d = trace_world(eye, outward, &normal, &solid);
+        fail += fabsf(d - 1.0f) > 0.001f || solid < 0 ||
+                (solid >= 0 && (g_solids[solid].pen || g_solids[solid].mat != SOLID_ROCK));
+        rays++;
+        for (int lane = 0; lane <= 6; lane++) {
+          v3 p = eye; p.y = 0;
+          float inset = PLAYER_RADIUS + 0.01f +
+                        (RING_W - 2.0f * PLAYER_RADIUS - 0.02f) * (float)lane / 6.0f;
+          p.e[axis] = sign * (ARENA_HALF - inset);
+          fail += !aabb_fits(p, PLAYER_RADIUS, HEIGHT_STAND);
+        }
+      }
+      for (int mode = 0; mode < 3; mode++) for (int reverse = 0; reverse < 2; reverse++) {
+        float dir = reverse ? -1.0f : 1.0f;
+        v3 p = {{0,0,0}}, vel = {{0,0,0}};
+        p.e[axis] = sign * (ARENA_HALF - PLAYER_RADIUS - 0.01f);
+        p.e[along] = -21.0f * dir;
+        vel.e[along] = dir * (mode == 1 ? mv_slide_boost() : g_sim_mv[MV_RUN]);
+        if (mode == 2) vel.y = mv_jump_speed();
+        int grounded = mode != 2;
+        int sliding = mode == 1;
+        for (int tick = 0; tick < 1200 && p.e[along] * dir < 21.0f; tick++) {
+          v3 wish = {{0,0,0}}; wish.e[along] = dir;
+          float speed = fabsf(vel.e[along]);
+          if (sliding && mv_slide_should_end(grounded, 1, speed)) sliding = 0;
+          if (sliding)
+            mv_slide_step(&vel, speed, wish.x, wish.z, 1.0f);
+          else mv_walk(&vel, wish.x, wish.z, 1.0f, g_sim_mv[MV_RUN]);
+          float expected = p.e[along] + vel.e[along] * TICK_DT;
+          vel.y -= GRAVITY * TICK_DT;
+          ent_move(&p, &vel, &grounded, mode == 1 ? HEIGHT_CROUCH : HEIGHT_STAND);
+          fail += fabsf(p.e[along] - expected) > 0.001f ||
+                  fabsf(p.e[axis] - sign * (ARENA_HALF - PLAYER_RADIUS - 0.01f)) > 0.001f;
+        }
+        fail += p.e[along] * dir < 21.0f;
+        routes++;
+      }
+      // A standing rush, slide and full jump must hit the visible face and
+      // settle inside it using collision alone, including at every seam.
+      for (int step = -20; step <= 20; step += 4) for (int mode = 0; mode < 4; mode++) {
+        v3 p = {{0,0,0}}, vel = v3_scale(outward, mode == 1 ? mv_slide_boost() : g_sim_mv[MV_RUN]);
+        p.e[axis] = sign * (ARENA_HALF - 1.0f); p.e[along] = (float)step;
+        if (mode == 2) vel.y = mv_jump_speed();
+        if (mode == 3) {
+          // The most conservative launch: highest actual cover, maximum
+          // authored jump, and boosted speed right beside the boundary.
+          vel = v3_scale(outward, mv_slide_boost());
+          vel.y = high_jump; p.y = takeoff;
+        }
+        int grounded = mode < 2;
+        for (int tick = 0; tick < 180; tick++) {
+          mv_walk(&vel, outward.x, outward.z, 1.0f, g_sim_mv[MV_RUN]);
+          vel.y -= GRAVITY * TICK_DT;
+          ent_move(&p, &vel, &grounded, mode == 1 ? HEIGHT_CROUCH : HEIGHT_STAND);
+          fail += p.e[axis] * sign > ARENA_HALF - PLAYER_RADIUS + 0.001f;
+        }
+        fail += fabsf(p.e[axis] * sign - (ARENA_HALF - PLAYER_RADIUS)) > 0.001f || !grounded;
+        contacts++;
+      }
+    }
+    if (fail) { printf("boundarycheck witness seed=%u fail=%ld\n", g_map_seed, fail); break; }
+    g_map_seed = map_seed_next(g_map_seed);
+  }
+  g_biome_force = force0; g_map_seed = seed0; map_generate(seed0);
+  g_rng = rng0; g_rng_bot = bot0; memcpy(g_rng_gun, gun0, sizeof gun0);
+  g_world_dirty = 1;
+  printf("boundarycheck maps=%ld rays=%ld routes=%ld contacts=%ld meshes=%d peak_verts=%d fail=%ld %s\n",
+         maps, rays, routes, contacts, meshes, mesh_peak, fail, fail ? "FAIL" : "ok");
+  if (fail) exit(1);
+}
+
 static void cmd_mapcheck(sim_ctx_t *s) {
   (void)s;
   // The world's version of figcheck, and nothing covered it before: two solids
@@ -4577,6 +4692,7 @@ static void cmd_mapcheck(sim_ctx_t *s) {
 static void cmd_feedbackproof(sim_ctx_t *s) { (void)s; feedbackproof(); }
 
 static const script_cmd_t SCRIPT_CMDS[] = {
+  {"boundarycheck", cmd_boundarycheck},
   {"weatherproof", cmd_weatherproof},
   {"feedbackproof", cmd_feedbackproof},
   {"decorcheck", cmd_decorcheck}, {"framepace", cmd_framepace},

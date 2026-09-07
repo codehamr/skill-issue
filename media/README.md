@@ -68,6 +68,10 @@ and checked privately before their publication group replaces the previous pair.
 - `media.py` captures, validates and assembles; `verify.py` owns decoded
   waveform, frame and synchronization checks. `biomes.py` independently
   generates the wider environment gallery.
+- `boundaries.py` captures the forest quarry at player height across natural
+  clear, mist, rain and sunshower seeds. `--before build/SESSION/game-before`
+  adds matching pre-change views. PNGs, recipes, budgets and hashes go to
+  `screenshots/forest-boundaries/`; each image uses a fresh config.
 
 ```sh
 python3 media/media.py list

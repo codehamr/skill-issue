@@ -31,8 +31,11 @@ Nobody can build map knowledge. That is the point. Nothing ships as an asset eit
 The arena, both weapons, the soldiers and every sound are built in code instead of
 loaded from a file. What carries over between matches is your aim and your movement.
 
-**Different places, different light.** Desert ruins, wet industrial yards, forest
-clearings and snowfields share the same angular style. Night arenas mix stars and
+**Different places, different light.** Desert ruins, wet industrial yards, overgrown
+quarries and snowfields share the same angular style. Forest arenas sit below solid
+rock cuts, with exposed roots, wooded shoulders and a reservoir and pump station
+above the rim. The open routes around the perimeter stay clear for slides and jumps.
+Night arenas mix stars and
 moonlight with warm lamps, cool floodlights and red watch lights; winter nights can
 bring aurora. Broken masonry has real stepped openings, and forest trunks are solid.
 Geometry, materials and lighting are generated in code. Each map seed also picks
@@ -60,7 +63,8 @@ NEW ARENA starts again immediately; Escape returns to your current match.
 The bots hear you, remember you and react to nearby fire, so it works solo too.
 
 Local captures are collected in [the screenshot gallery](screenshots/index.html),
-including [procedural environments and weather](screenshots/2026-09-07-procedural-weather/index.html).
+including [forest boundaries before and after](screenshots/forest-boundaries/index.html)
+and [procedural environments and weather](screenshots/2026-09-07-procedural-weather/index.html).
 The [soldier review](docs/soldier.md) documents the model and animation checks.
 
 ## Multiplayer
