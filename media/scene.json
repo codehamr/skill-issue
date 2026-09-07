@@ -1,8 +1,8 @@
 {
   "_": "Text-free real-game action loop: low slide, reactive firefights, diagonal leap, manual scope correction and the same impact outside. Source frame 59 flows into frame 60 at the loop. Speed stretches duration; 2 is half-speed.",
   "out": ".cache/hero_src.mp4",
-  "w": 1280,
-  "h": 720,
+  "w": 1920,
+  "h": 1080,
   "bpm": 120,
   "grade": "unsharp=3:3:0.25",
   "fade_out": 0,

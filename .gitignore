@@ -1,4 +1,5 @@
 build/
+/.build.lock
 .worktrees/
 screenshots/
 .superpowers/
@@ -15,6 +16,7 @@ tools/*
 !tools/split-check.sh
 !tools/tuning.py
 !tools/build-game.py
+!tools/trailer.py
 !tools/defaults-gate.py
 !tools/net-gate.py
 # Runtime files the server container writes next to docker-compose.yaml —

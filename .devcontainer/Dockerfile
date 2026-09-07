@@ -14,7 +14,7 @@ RUN apt-get update \
       procps \
       gcc-mingw-w64-x86-64 \
       python3 \
-      ffmpeg \
+      ffmpeg gifsicle \
       fonts-dejavu-core \
       imagemagick \
       openssh-client \

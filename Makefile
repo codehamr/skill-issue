@@ -1,6 +1,6 @@
 # One C23 translation unit, three artifacts from the same source:
 #   build/game.exe    Windows x86_64 release, cross-compiled with MinGW-w64.
-#   build/game-x86_64 Linux x86_64 release for publication and make deploy.
+#   build/game-x86_64 Linux x86_64 release for publication.
 #   build/game        host-native Linux play and headless harness.
 # Linux play uses X11/EGL; --do/--script uses a surfaceless EGL framebuffer.
 # Query the actual renderer before interpreting timings. XInput2, RandR and
@@ -11,6 +11,17 @@
 # GPU passes have separate timing owners. LTO reaches the single compile/link
 # command. Treat optimization flags as artifact identity: compare matched
 # flags for pose/pixel A/B and re-run relevant proofs when changing a profile.
+
+# Clear an interactive terminal once, before any recipe (also under make -j).
+# $(shell ...) captures stdout, so use the inherited terminal on stderr.
+# Nested Make calls preserve the outer command's output.
+ifeq ($(MAKELEVEL),0)
+ifeq ($(MAKE_RESTARTS),)
+MAKE_CLEAR := $(shell if [ -t 2 ]; then clear >&2 2>/dev/null || :; fi)
+endif
+endif
+BUILD_STARTED := $(shell python3 -c 'import time; print(time.monotonic())')
+
 OPT      := -O3 -ffast-math -funroll-loops -flto=auto
 # The Windows release targets x86-64-v2, without requiring AVX2 or FMA.
 # Keep this target-specific ISA choice out of the native Linux flags.
@@ -52,10 +63,7 @@ endif
 # They remain separate artifacts even on x86_64. Use make build/game to iterate
 # without a Linux cross-compiler on another host architecture.
 all: build/game.exe build/game build/game-x86_64
-
-# game.c is the ordered module map. The host transaction hashes all code inputs,
-# including these fragments, before deciding whether an artifact can be reused.
-INC := $(wildcard code/*/*.inc)
+	@python3 -c 'import time; elapsed = time.monotonic() - $(BUILD_STARTED); hours, remainder = divmod(int(elapsed), 3600); minutes, seconds = divmod(remainder, 60); print("build: elapsed %02d:%02d:%02d (%.1f s)" % (hours, minutes, seconds, elapsed))'
 
 # Application icon + VERSIONINFO (Windows only): windres compiles game.rc
 # (which embeds icon.ico) into an object file linked alongside the single C
@@ -69,7 +77,7 @@ GAME_REQUESTS = $(filter $(GAME_ARTIFACTS),$(MAKECMDGOALS))
 ifeq ($(strip $(MAKECMDGOALS)),)
 GAME_REQUESTS += build/game build/game.exe build/game-x86_64
 endif
-ifneq ($(filter all,$(MAKECMDGOALS)),)
+ifneq ($(filter all rebuild,$(MAKECMDGOALS)),)
 GAME_REQUESTS += build/game build/game.exe build/game-x86_64
 endif
 ifneq ($(filter asan-gate,$(MAKECMDGOALS)),)
@@ -77,9 +85,6 @@ GAME_REQUESTS += build/game-asan
 endif
 ifneq ($(filter warning-gate,$(MAKECMDGOALS)),)
 GAME_REQUESTS += build/game-warning-linux.o build/game-warning-windows.o
-endif
-ifneq ($(filter deploy,$(MAKECMDGOALS)),)
-GAME_REQUESTS += $(DEPLOY_BIN)
 endif
 export LIN_CC X86_CC WIN_CC WIN_RES LIN_CFLAGS WIN_CFLAGS LIN_LIBS WIN_LIBS BUILD_VERSION BUILD_COMMIT
 ifneq ($(origin TUNING_SOURCE),undefined)
@@ -97,10 +102,7 @@ endif
 .PHONY: game-build warning-gate defaults-gate
 # --always-make is an explicit compile request; ordinary checks preserve mtimes.
 game-build:
-	python3 tools/build-game.py $(if $(findstring B,$(firstword $(MAKEFLAGS))),--force) $(sort $(GAME_REQUESTS))
-ifneq ($(filter clean,$(MAKECMDGOALS)),)
-game-build: clean
-endif
+	python3 tools/build-game.py $(if $(filter rebuild,$(MAKECMDGOALS)),--rebuild) $(if $(findstring B,$(firstword $(MAKEFLAGS))),--force) $(sort $(GAME_REQUESTS))
 $(GAME_ARTIFACTS): game-build
 	@:
 warning-gate: build/game-warning-linux.o build/game-warning-windows.o
@@ -125,22 +127,6 @@ asan-gate: build/game-asan
 	ASAN_OPTIONS=detect_leaks=0 ./build/game-asan --seed 1337 --config "$$(mktemp -u)" --do "fraglimit 1000; bots 20; skill hard; wait 1200; parity; figcheck 1; mapcheck 20" >/dev/null
 	ASAN_OPTIONS=detect_leaks=0 ./build/game-asan --seed 42 --config "$$(mktemp -u)" --do "bottactics; netloss; defaultsproof; spstart; bots 50; skill hard; fraglimit off; wait 1200; appframe 12 12; budget" >/dev/null
 	@echo "asan-gate: OK"
-
-# Copy the SHIPPABLE Linux build to the handheld's home directory and make it
-# runnable there. `handheld` is an ssh config Host entry, which comes from the
-# Windows host's ~/.ssh mounted by .devcontainer/devcontainer.json — so the key
-# and the address live in one place instead of being repeated here.
-#
-# The guard accepts only x86_64 ELF machine bytes before copying to this device.
-# A host-native ARM64 harness cannot be deployed through this target.
-DEPLOY_HOST ?= handheld
-DEPLOY_BIN  ?= build/game-x86_64
-
-deploy: $(DEPLOY_BIN)
-	@test "$$(od -An -tx1 -j18 -N2 $(DEPLOY_BIN) | tr -d ' ')" = "3e00" || \
-	  { echo "$(DEPLOY_BIN) is not x86_64 — refusing to deploy"; exit 1; }
-	scp $(DEPLOY_BIN) $(DEPLOY_HOST):game
-	ssh $(DEPLOY_HOST) chmod +x game
 
 # ---------------------------------------------------------------------------
 # Dedicated server operations: server-up syncs docker-compose.yaml and docker/
@@ -188,19 +174,22 @@ server-delete:
 loc:
 	@find code -name '*.c' -o -name '*.h' -o -name '*.inc' | sort | xargs wc -l
 
-# Remove known artifacts under the build transaction lock. Preserve the build/
-# directory, its filesystem attributes, canonical source, caches and other runs.
-clean:
-	python3 tools/build-game.py --clean
+# Delete the entire build/ tree, including configs, caches and test evidence,
+# then compile all three game binaries in one locked transaction.
+rebuild: all
+
+# Fresh native compilation, fresh captures, GIF + Full HD MP4, total elapsed time.
+# The driver times both compilation and generation and preserves failure status.
+trailer:
+	python3 -u tools/trailer.py
 
 # History-rewriting maintainer operation; never part of build or verification.
 init:
-	clear
 	git reset $$(git commit-tree -S HEAD^{tree} -m "init")
 	git push --force origin main
 	@echo "Git history reset to single 'init' commit"
 
-.PHONY: all clean deploy init loc server-up server-down server-stats server-logs server-reset server-delete asan-gate
+.PHONY: all rebuild trailer init loc server-up server-down server-stats server-logs server-reset server-delete asan-gate
 
 # Pipe/ioctl fixtures exercise the Linux pump without opening real devices.
 .PHONY: pad-native-gate

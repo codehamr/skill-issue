@@ -40,8 +40,11 @@ Night arenas mix stars and
 moonlight with warm lamps, cool floodlights and red watch lights; winter nights can
 bring aurora. Broken masonry has real stepped openings, and forest trunks are solid.
 Geometry, materials and lighting are generated in code. Each map seed also picks
-clear skies, mist, wind-driven rain, a storm with lightning and delayed thunder,
-or a sunshower that can bring a rainbow. Weather follows the seed automatically.
+clear skies, warm haze, clouds, fog, rain, storms or a sunshower with a rainbow.
+Match Settings offers biome, time of day and weather, each defaulting to RANDOM.
+Choices apply to the next local arena and persist; random favors daylight and
+golden light, with dry deserts and occasional nights. Online, the server owns
+the shared environment.
 
 **Two guns, everyone gets both.** An automatic rifle and a bolt sniper that kills with a
 single body hit. Both are hitscan. No loadouts, no battle pass. Rounds cross up to 1.2 m
@@ -58,14 +61,15 @@ farmed, you got farmed. The title of the game is the diagnosis.
 
 **Straight into a match.** There is a live firefight behind the start screen while you
 read it. Press SINGLEPLAYER to start a fresh arena with keyboard or pad. MATCH SETTINGS
-lets you choose 1–50 bots, their difficulty and a frag limit of 5–100, followed by OFF
-for unlimited play. These rules apply to your next new arena.
+lets you choose 1–50 bots, their difficulty, a frag limit of 5–100 or OFF,
+plus biome, time of day and weather. Each environment choice starts on RANDOM.
+These preferences apply to your next new arena.
 NEW ARENA starts again immediately; Escape returns to your current match.
 The bots hear you, remember you and react to nearby fire, so it works solo too.
 
 Local captures are collected in [the screenshot gallery](screenshots/index.html),
 including [natural boundaries before and after](screenshots/natural-boundaries/index.html)
-and [procedural environments and weather](screenshots/2026-09-07-procedural-weather/index.html).
+and [environment choices and weather](screenshots/environment-settings/index.html).
 The [soldier review](docs/soldier.md) documents the model and animation checks.
 
 ## Multiplayer
@@ -78,6 +82,11 @@ badges the humans, not the bots.
 
 Quick Join lands on a small server I run and pay for myself. No promises it stays smooth if
 a crowd shows up. That is fine. Anyone can host with any Linux copy.
+
+Server owners can choose the shared environment with, for example,
+`--server --biome dunes --time golden --weather haze`. Each option also accepts
+`random`; `--help` lists the choices. Environment settings travel with arena
+snapshots, so server and clients need matching protocol-14 builds.
 
 ## Why this exists
 

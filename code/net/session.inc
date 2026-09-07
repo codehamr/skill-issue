@@ -287,12 +287,13 @@ static void net_srv_packet(const unsigned char *b, int n, uint32_t ip, uint16_t 
     // ACCEPT carries the match's SIM TUNING(light): the client must predict with the
     // SERVER's movement and weapon tables, not its own preferences — a differing mv_run
     // is a permanent standing rubber-band.
-    unsigned char out[168]; np_wr w = {out, sizeof out, 0, 0};
+    unsigned char out[20 + 4 * (MV_COUNT + GP_COUNT + WPN_COUNT * WP_COUNT)]; np_wr w = {out, sizeof out, 0, 0};
     np_w16(&w, NET_PROTO); np_w8(&w, NP_ACCEPT);
     np_w8(&w, (uint8_t)ent_of_human(g_conns[conn].human));
     np_w8(&w, (uint8_t)g_lobby);          // WHICH arena, and
     np_w8(&w, (uint8_t)g_srv.lobbies);    // how many this process runs
     np_w32(&w, g_map_seed);
+    np_w16(&w, environment_pack(g_environment));
     np_w32(&w, net_world_hash());
     np_w32(&w, g_conns[conn].token);
     for (int i = 0; i < MV_COUNT; i++) np_wf(&w, g_cfg.mv[i]);
@@ -895,10 +896,11 @@ static void net_cl_replay(player_t *p, int h, uint32_t li) {
 static void net_cl_snapshot(const unsigned char *b, int n) {
   uint32_t st, li, wh, sd;
   uint8_t qd = 0;
+  environment_t options;
   net_ent_t es[MAX_ENTS];
   net_ev_t  evs[NET_EV_SNAP_MAX];
   int full = 0, nev = 0;
-  int cnt = net_snapshot_read(b, (size_t)n, &st, &li, &wh, &sd, &qd, es, MAX_ENTS,
+  int cnt = net_snapshot_read(b, (size_t)n, &st, &li, &wh, &sd, &options, &qd, es, MAX_ENTS,
                               &full, evs, NET_EV_SNAP_MAX, &nev);
   if (cnt < 0) return;
   // Signed-difference like every other monotone-counter compare in this layer (ev ack,
@@ -917,7 +919,8 @@ static void net_cl_snapshot(const unsigned char *b, int n) {
   // same way the join does — if the two disagree after regenerating from the
   // server's own seed, the two builds do not agree on the generator, and the join
   // says refuse rather than play a divergent map.
-  if (sd != g_map_seed) {
+  if (sd != g_map_seed || environment_pack(options) != environment_pack(g_environment)) {
+    g_environment = options;
     map_generate(sd); g_map_seed = sd;
     g_world_dirty = 1;
   }
@@ -1261,14 +1264,18 @@ static int net_cl_poll(void) {
       int me = np_r8(&r);
       int lob = np_r8(&r), lobn = np_r8(&r);
       uint32_t seed = np_r32(&r);
+      environment_t options;
+      int environment_valid = environment_unpack(np_r16(&r), &options);
       uint32_t world = np_r32(&r);
       uint32_t token = np_r32(&r);
       // The id the server hands out is an INDEX into g_players for the rest of the
       // session (human_of_ent), so it is validated once, here, at the only place it
       // enters the process.
-      if (me >= MAX_ENTS || human_of_ent(me) < 0) {
+      if (r.bad || !environment_valid || n != 20 + 4 * (MV_COUNT + GP_COUNT + WPN_COUNT * WP_COUNT) ||
+          me >= MAX_ENTS || human_of_ent(me) < 0) {
         g_cl.reject = NR_PROTO; g_cl.state = NC_FAILED; return 0;
       }
+      g_environment = options;
       map_generate(seed); g_map_seed = seed;  // adopt the server's arena
       // A DIVERGENT ARENA IS REFUSED, NOT PLAYED. Both sides generate
       // the map from the seed, so the hashes agree unless the generators do

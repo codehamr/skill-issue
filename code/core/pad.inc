@@ -346,6 +346,7 @@ typedef struct {
   int   sp_bots;             // saved next-arena opponents, range in SP_BOTS_DEF
   int   sp_diff;             // saved next-arena difficulty: 0 easy, 1 normal, 2 hard
   int   sp_frag;             // saved next-arena frag limit, range in SP_FRAG_DEF
+  environment_t environment; // saved choices for the next arena; zero is random
   char  name[12];            // player name; glyph policy lives in name_glyph
   int   third_person;        // camera: 0 = first person, 1 = shoulder cam
   int   devmode;             // show the DEV tab; hard-gated by DEV_MENU, def 0
@@ -373,6 +374,8 @@ typedef struct {
 } config_t;
 
 static config_t g_cfg;
+static environment_t g_environment_all[SRV_LOBBIES];
+#define g_environment (g_environment_all[g_lobby])
 static char     g_cfg_path[512];
 
 // Saved preferences select the NEXT local arena. Active rules belong to a
@@ -384,6 +387,7 @@ static unsigned char g_sp_rules_ready[SRV_LOBBIES];
 static void sp_rules_from_saved(void) {
   g_sp_rules_all[g_lobby] = (sp_rules_t){g_cfg.sp_bots,g_cfg.sp_diff,g_cfg.sp_frag};
   g_sp_rules_ready[g_lobby] = 1;
+  g_environment = g_cfg.environment;
 }
 static sp_rules_t *sp_rules(void) {
   if (!g_sp_rules_ready[g_lobby]) sp_rules_from_saved();
@@ -512,6 +516,9 @@ static void config_emit(FILE *f, const config_t *c) {
   fprintf(f, "%s %.2f\n", VOL_DEF.key, (double)c->vol);
   fprintf(f, "sp_bots %d\nsp_difficulty %d\nsp_fraglimit %d\nplayer_name %s\n",
           c->sp_bots, c->sp_diff, c->sp_frag, c->name);
+  fprintf(f, "sp_biome %s\nsp_time %s\nsp_weather %s\n",
+          ENV_BIOME_KEYS[c->environment.biome], ENV_TIME_KEYS[c->environment.time],
+          ENV_WEATHER_KEYS[c->environment.weather]);
     // COUPLING: tele_id_persisted() re-reads this file for "tele_id %u" to check
     // the id landed. RENAMING THIS KEY DISABLES TELEMETRY. Rename both together.
   fprintf(f, "mp_host %s\nmp_port %d\nupdate_url %s\nupdate_check %d\n"
@@ -757,6 +764,13 @@ static void config_load_or_create(const char *path, config_t *c) {
       // sp_diff is a ui_cycle enum, not a slider, so it has no param_def_t.
       else if (key[3] == 'd') c->sp_diff = parse_int(val, c->sp_diff, 0, 2);
       else                    c->sp_frag = sp_frag_normalize(parse_long(val, c->sp_frag));
+    }
+    else if (!strcmp(key, "sp_biome") || !strcmp(key, "sp_time") || !strcmp(key, "sp_weather")) {
+      int *dst = key[3] == 'b' ? &c->environment.biome : key[3] == 't' ? &c->environment.time : &c->environment.weather;
+      const char *const *keys = key[3] == 'b' ? ENV_BIOME_KEYS : key[3] == 't' ? ENV_TIME_KEYS : ENV_WEATHER_KEYS;
+      int count = key[3] == 'b' ? BIOME_COUNT : key[3] == 't' ? TIME_COUNT : WEATHER_KIND_COUNT;
+      int v = environment_option(val, keys, count);
+      if (v >= 0) *dst = v;
     }
     else if (!strcmp(key, "player_name")) {
       int n = 0;

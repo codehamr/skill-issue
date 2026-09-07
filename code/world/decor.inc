@@ -1144,7 +1144,7 @@ static void mesh_large_scenery(void) {
   v3 tangent = {{-radial.z, 0, radial.x}};
   v3 c = v3_scale(radial, r);
   int kind = (int)(rng_next(&st) % 5u);
-  if (g_biome.kind == BIOME_NIGHT) kind = (scat_h(0xE110u, 1, 2, 3) & 1u) ? 1 : 3;
+  if ((g_biome.kind == BIOME_MARSH && g_biome.night > 0.5f)) kind = (scat_h(0xE110u, 1, 2, 3) & 1u) ? 1 : 3;
   if (g_biome.kind == BIOME_FOREST) {
     // Different working remnants on opposite sides replace compass paint:
     // a reservoir on the south rim, a low pump station to the north.

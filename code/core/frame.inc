@@ -1028,6 +1028,7 @@ static void local_session_cleanup(void) {
 }
 static void leave_match(void) {
   local_session_cleanup();
+  sp_rules_from_saved();
   match_scores_clear();
   match_restart();
   audio_session_reset();

@@ -28,7 +28,8 @@
 // discard that field for bots and would draw a different target, so require the
 // matching presentation semantics even though the record size is unchanged.
 // The 50-slot local bot range also moves the high human entity ids to 51+.
-#define NET_PROTO 13
+// 14: ACCEPT and snapshots carry the authoritative arena environment choices.
+#define NET_PROTO 14
 // Floor on an UNVERIFIED request, so the answer to one is always smaller than the
 // request was and the responder cannot be pointed at a forged source address:
 // NET_CONNECT_MIN 16 against the 7-byte COOKIE reply.
@@ -430,9 +431,11 @@ static int net_ent_decode(np_rd *r, net_ent_t *e) {
 // The wire identity contains a 4-byte seed and a 4-byte hash.
 static uint32_t net_world_hash(void) {
   // Each arena reuses its collision hash while its seed and solid count match.
-  static struct { uint32_t hash, seed; int count, valid; } cache[SRV_LOBBIES];
+  static struct { uint32_t hash, seed, generation; uint16_t environment; int count, valid; } cache[SRV_LOBBIES];
   if (cache[g_lobby].valid && cache[g_lobby].seed == g_map_seed &&
-      cache[g_lobby].count == g_num_solids) return cache[g_lobby].hash;
+      cache[g_lobby].count == g_num_solids &&
+      cache[g_lobby].generation == g_map_generation &&
+      cache[g_lobby].environment == environment_pack(g_environment)) return cache[g_lobby].hash;
   uint32_t h = 2166136261u;
   // The historical authoritative record ends immediately before `mat`.
   // Hash each record separately: the render tag widens the live stride, so one
@@ -451,7 +454,10 @@ static uint32_t net_world_hash(void) {
       h = (h ^ p[i]) * 16777619u;
   }
   h = (h ^ (uint32_t)g_num_solids) * 16777619u;
+  h = (h ^ environment_pack(g_environment)) * 16777619u;
   cache[g_lobby].hash = h; cache[g_lobby].seed = g_map_seed;
+  cache[g_lobby].generation = g_map_generation;
+  cache[g_lobby].environment = environment_pack(g_environment);
   cache[g_lobby].count = g_num_solids; cache[g_lobby].valid = 1;
   return h;
 }

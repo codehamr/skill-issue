@@ -193,6 +193,7 @@ static int g_server;
 // 1 <= idle_s <= 120 are CHECKED at startup.
 static struct {   // consumed by the Linux server half only
   int port, cap_bots, cap_public, skill, fraglimit, lobbies;
+  int biome, time, weather; // environment choices, zero is random
   int bot_fill;        // bots top a populated arena up to this (net_bot_target)
   int idle_s;          // drop a silent conn after this many seconds (net_srv_poll)
   long ticks;          // 0 = run forever; N = exit after N ticks (test/RSS runs)
@@ -246,4 +247,32 @@ static const param_def_t SP_FRAG_DEF = {"sp_fraglimit", "FRAG LIMIT", 10, 5, SP_
 static int sp_frag_normalize(long n) {
   if (n == 0 || n > SP_FRAG_MAX) return 0;
   return n < (long)SP_FRAG_DEF.lo ? (int)SP_FRAG_DEF.lo : (int)n;
+}
+
+// Environment option indices are shared by config, match UI and the wire.
+// Zero means random; explicit choices use their resolved enum plus one.
+typedef enum { BIOME_QUARRY, BIOME_DUNES, BIOME_MARSH, BIOME_FOREST,
+               BIOME_FROST, BIOME_COUNT } biome_kind_t;
+typedef enum { TIME_DAY, TIME_GOLDEN, TIME_SUNSET, TIME_NIGHT, TIME_COUNT } time_kind_t;
+typedef enum { WEATHER_CLEAR, WEATHER_HAZE, WEATHER_CLOUDY, WEATHER_MIST,
+               WEATHER_RAIN, WEATHER_STORM, WEATHER_SUNSHOWER, WEATHER_KIND_COUNT } weather_kind_t;
+typedef struct { int biome, time, weather; } environment_t;
+static const char *const ENV_BIOME_OPTS[] = {"RANDOM", "QUARRY", "DESERT", "MARSH", "FOREST", "SNOW"};
+static const char *const ENV_TIME_OPTS[] = {"RANDOM", "DAY", "GOLDEN HOUR", "SUNSET", "NIGHT"};
+static const char *const ENV_WEATHER_OPTS[] = {"RANDOM", "CLEAR", "LIGHT HAZE", "CLOUDY", "FOG", "RAIN", "STORM", "SUNSHOWER"};
+static const char *const ENV_BIOME_KEYS[] = {"random", "quarry", "dunes", "marsh", "forest", "frost"};
+static const char *const ENV_TIME_KEYS[] = {"random", "day", "golden", "sunset", "night"};
+static const char *const ENV_WEATHER_KEYS[] = {"random", "clear", "haze", "cloudy", "fog", "rain", "storm", "sunshower"};
+static int environment_option(const char *s, const char *const *keys, int count) {
+  for (int i = 0; i <= count; i++) if (!strcmp(s, keys[i])) return i;
+  return -1;
+}
+static uint16_t environment_pack(environment_t e) {
+  return (uint16_t)(e.biome | e.time << 4 | e.weather << 8);
+}
+static int environment_unpack(uint16_t bits, environment_t *e) {
+  environment_t v = {bits & 15, (bits >> 4) & 15, bits >> 8};
+  if (v.biome > BIOME_COUNT || v.time > TIME_COUNT || v.weather > WEATHER_KIND_COUNT) return 0;
+  *e = v;
+  return 1;
 }

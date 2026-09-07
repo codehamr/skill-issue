@@ -56,6 +56,8 @@ static int     g_num_solids_all[SRV_LOBBIES];
 // startup time).
 static uint32_t g_map_seed_all[SRV_LOBBIES];
 #define g_map_seed (g_map_seed_all[g_lobby])
+static uint32_t g_map_generation_all[SRV_LOBBIES];
+#define g_map_generation (g_map_generation_all[g_lobby])
 static int      g_world_dirty_all[SRV_LOBBIES];
 #define g_world_dirty (g_world_dirty_all[g_lobby])
 
@@ -188,12 +190,47 @@ static theme_t g_theme_all[SRV_LOBBIES];
 // Biome state is independent of the layout RNG and belongs to each server lobby.
 // Surface families remain the three shared material algorithms; biome palettes,
 // weather and vegetation layer on top of those algorithms.
-typedef enum { BIOME_QUARRY, BIOME_DUNES, BIOME_MARSH, BIOME_FOREST,
-               BIOME_FROST, BIOME_NIGHT } biome_kind_t;
 typedef struct { int kind; float night, snow, forest, aurora; } biome_t;
 static biome_t g_biome_all[SRV_LOBBIES];
 #define g_biome (g_biome_all[g_lobby])
-static int g_biome_force = -1;
+// Independent hashes keep environment choices out of layout and bot RNGs.
+static uint32_t environment_hash(uint32_t seed, uint32_t salt) {
+  uint32_t h = seed ^ salt;
+  h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+  return h;
+}
+static environment_t environment_resolve(uint32_t seed, environment_t options) {
+  uint32_t h = seed * 2246822519u + 0xB10Eu;
+  h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+  unsigned b = h % 100u;
+  environment_t e = {.biome = b < 20 ? BIOME_FROST : b < 50 ? BIOME_DUNES :
+                      b < 62 ? BIOME_QUARRY : b < 70 ? BIOME_MARSH : BIOME_FOREST};
+  if (options.biome) e.biome = options.biome - 1;
+  unsigned t = environment_hash(seed, 0x71AEu) % 100u;
+  int desert = e.biome == BIOME_DUNES;
+  e.time = t < (desert ? 40u : 52u) ? TIME_DAY : t < 82u ? TIME_GOLDEN :
+           t < (desert ? 96u : 94u) ? TIME_SUNSET : TIME_NIGHT;
+  if (options.time) e.time = options.time - 1;
+  // Per-biome cumulative weights: dry desert air, occasional forest/marsh fog,
+  // and rare storms. Clear weather and thin haze keep direct light readable.
+  static const unsigned char cumulative[BIOME_COUNT][WEATHER_KIND_COUNT] = {
+    {58,78,87,91,97,99,100}, {63,90,95,96,98,99,100},
+    {42,62,76,88,96,99,100}, {52,73,84,92,97,99,100},
+    {61,78,90,95,98,99,100}
+  };
+  unsigned w = environment_hash(seed, 0xa511e9b3u) % 100u;
+  e.weather = WEATHER_CLEAR;
+  while (w >= cumulative[e.biome][e.weather]) e.weather++;
+  if (options.weather) e.weather = options.weather - 1;
+  // A sunshower needs direct sunlight; random night weather remains dry here.
+  if (!options.weather && e.time == TIME_NIGHT && e.weather == WEATHER_SUNSHOWER)
+    e.weather = WEATHER_CLEAR;
+  return e;
+}
+static weather_kind_t weather_kind_from_seed(uint32_t seed) {
+  return (weather_kind_t)environment_resolve(seed, g_environment).weather;
+}
+static weather_kind_t weather_kind(void) { return weather_kind_from_seed(g_map_seed); }
 static int biome_natural(void) {
   return g_biome.kind == BIOME_FOREST || g_biome.kind == BIOME_DUNES ||
          g_biome.kind == BIOME_FROST;
@@ -252,8 +289,6 @@ static sun_t g_sun_all[SRV_LOBBIES];
 // Below this the extinction model runs out and the shadows stop landing on the
 // arena at all: at 6 degrees a 4.6 m wall throws 44 m of shadow, which is most
 // of the floor. It is a floor on the DRAW, not a clamp inside the model.
-#define SUN_ELEV_MIN   6.5f
-#define SUN_ELEV_MAX   54.0f
 
 // Rayleigh + aerosol optical depth at unit air mass, and the radiance above it
 // all. NOT invented: the three taus are the ones that reproduce the light rig
@@ -292,11 +327,10 @@ static void sun_build(uint32_t seed) {
   uint32_t h2 = h * 2246822519u + 1u;
   h2 ^= h2 >> 13; h2 *= 3266489917u; h2 ^= h2 >> 16;
   float az = (float)(h2 >> 8) * (1.0f / 16777216.0f) * (2.0f * F_PI);
-  // u^1.5 leans the draw toward the low sun WITHOUT pinning it there: about
-  // two arenas in five come up under 20 degrees, i.e. golden hour, and the
-  // rest spread over the afternoon. A uniform draw gave a flat afternoon most
-  // of the time, which is the one look this whole pass exists to escape.
-  float ed = SUN_ELEV_MIN + (SUN_ELEV_MAX - SUN_ELEV_MIN) * u * sqrtf(u);
+  environment_t e = environment_resolve(seed, g_environment);
+  static const float low[TIME_COUNT] = {28.0f, 14.0f, 9.0f, 28.0f};
+  static const float high[TIME_COUNT] = {64.0f, 21.0f, 12.0f, 45.0f};
+  float ed = low[e.time] + (high[e.time] - low[e.time]) * u;
   sun_set(ed, az);
   // The weather is its own draw off the same hash: a clear arena and a
   // banded one are different places under the same sun, and coupling the two
@@ -329,6 +363,10 @@ static void sun_set(float elev_deg, float azi_rad) {
                        (v3){{0.255f, 0.205f, 0.265f}}, dusk);
   S->sky_gnd = v3_lerp((v3){{0.36f, 0.33f, 0.29f}},
                        (v3){{0.085f, 0.072f, 0.082f}}, dusk);
+  // Sunlit sand returns warm diffuse light into the long evening shadows.
+  // Keep the cool sky above it: the whole world must not become an orange wash.
+  if (g_biome.kind == BIOME_DUNES && g_biome.night < 0.5f)
+    S->sky_gnd = v3_lerp(S->sky_gnd, (v3){{0.30f, 0.235f, 0.17f}}, dusk * 0.65f);
   // EYE ADAPTATION, AND ONLY PARTLY. A low sun delivers a third of the light,
   // and a frame that simply goes a third as bright is a frame the player
   // cannot fight in. The 0.55 exponent gives back most of the stop but not
@@ -364,27 +402,16 @@ static void sun_set(float elev_deg, float azi_rad) {
   biome_night_light();
 }
 
-// Seed selection gives seven readable treatments, with frost offered both by
-// daylight and under aurora. The harness override uses this same constructor.
+// Biome, daylight and weather are independent saved choices, resolved together
+// from the arena seed. Night is a time of day; snow at night carries aurora.
 static void biome_build(uint32_t seed) {
-  uint32_t h = seed * 2246822519u + 0xB10Eu;
-  h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
-  int kind = g_theme.surf == SURF_SAND ? BIOME_DUNES
-           : g_theme.surf == SURF_WET ? BIOME_MARSH : BIOME_QUARRY;
-  unsigned draw = h % 6u;
-  if (draw == 2u) kind = BIOME_FOREST;
-  if (draw == 3u || draw == 4u) kind = BIOME_FROST;
-  if (draw == 5u) kind = BIOME_NIGHT;
-  int night = kind == BIOME_NIGHT || (kind == BIOME_FROST && draw == 4u);
-  if (g_biome_force >= 0) {
-    kind = g_biome_force == 6 ? BIOME_FROST : g_biome_force;
-    night = g_biome_force == 6 || kind == BIOME_NIGHT;
-  }
+  environment_t e = environment_resolve(seed, g_environment);
+  int kind = e.biome, night = e.time == TIME_NIGHT;
   g_biome = (biome_t){kind, (float)night, kind == BIOME_FROST,
                       kind == BIOME_FOREST, kind == BIOME_FROST && night};
   if (kind == BIOME_DUNES) g_theme = THEMES[2];
   if (kind == BIOME_QUARRY) g_theme = THEMES[0];
-  if (kind == BIOME_MARSH || kind == BIOME_NIGHT) g_theme = THEMES[1];
+  if (kind == BIOME_MARSH) g_theme = THEMES[1];
   if (kind == BIOME_FOREST) {
     g_theme = THEMES[0];
     g_theme.ground = (v3){{0.39f, 0.43f, 0.30f}};
@@ -402,12 +429,8 @@ static void biome_build(uint32_t seed) {
     g_theme.band_s = (v3){{0.56f, 0.33f, 0.26f}};
   }
   sun_build(seed);
-  if (night) {
-    float az = atan2f(g_sun.dir.x, -g_sun.dir.z);
-    sun_set(28.0f + (float)(h % 18u), az);
-  } else if (kind == BIOME_FOREST) {
-    g_sun.cloud = 0.34f;
-  }
+  if (kind == BIOME_FOREST && !night) g_sun.cloud = 0.28f;
+
 }
 
 // A fixed three-pair rig makes pools of light with unlit routes between them.
@@ -1404,6 +1427,7 @@ static void map_gen_forest(uint32_t seed) {
 }
 
 static void map_generate(uint32_t seed) {
+  g_map_generation++;
   g_rng = (uint64_t)seed * 2654435761u + 1;
   for (int h = 0; h < (int)(sizeof g_rng_gun / sizeof g_rng_gun[0]); h++)
     g_rng_gun[h] = rng_gun_seed(seed, h);

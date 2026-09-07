@@ -826,6 +826,7 @@ static size_t net_snapshot_build(unsigned char *buf, size_t cap, uint32_t last_i
   // match end the server simulated one world and streamed it to clients still colliding
   // against another.
   np_w32(&w, g_map_seed);
+  np_w16(&w, environment_pack(g_environment));
   // This client's input-queue depth at broadcast time: the client's
   // clock nudge holds it at NET_QDEPTH_TARGET instead of letting drift and
   // jitter walk it into the backlog trim (a trim discards moves the client
@@ -870,17 +871,20 @@ static size_t net_snapshot_build(unsigned char *buf, size_t cap, uint32_t last_i
 // Decode a snapshot into a caller array (the client's interpolation source).
 static int net_snapshot_read(const unsigned char *buf, size_t len, uint32_t *server_tick,
                              uint32_t *last_input_tick, uint32_t *world,
-                             uint32_t *seed, uint8_t *qdepth,
+                             uint32_t *seed, environment_t *environment, uint8_t *qdepth,
                              net_ent_t *out, int out_cap, int *complete,
                              net_ev_t *evs, int ev_cap, int *ev_cnt) {
   np_rd r = {buf, len, 0, 0};
   if (np_r16(&r) != NET_PROTO) return -1;
   if (np_r8(&r) != NP_SNAPSHOT) return -1;
   uint32_t st = np_r32(&r), li = np_r32(&r), wh = np_r32(&r), sd = np_r32(&r);
+  environment_t options;
+  if (!environment_unpack(np_r16(&r), &options)) return -1;
   uint8_t qd = np_r8(&r);
   int cnt = np_r8(&r);
   if (r.bad) return -1;
   if (qdepth) *qdepth = qd;
+  if (environment) *environment = options;
   if (cnt > out_cap) cnt = out_cap;        // never write past the caller array
   int got = 0;
   for (int i = 0; i < cnt; i++) {

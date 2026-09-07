@@ -426,16 +426,35 @@ class Gate:
         self.invoke(tree, env, "game")
         self.check("compiler-identity-rebuilt", json.loads(manifest.read_bytes())["fingerprint"] != fingerprint)
         # The real Make graph must call the transaction once for the full goal
-        # set, including -j, clean bootstrap, warning and sanitizer artifacts.
+        # set, including -j, full rebuild, warning and sanitizer artifacts.
         overrides = [key + "=" + env[key] for key in ("LIN_CC", "X86_CC", "WIN_CC", "WIN_RES")]
-        for goals in (["clean"], ["-j", "clean", "all", "build/game-asan", "warning-gate"],
+        for goals in (["rebuild"], ["-j", "rebuild", "all", "build/game-asan", "warning-gate"],
                       ["-B", "build/game"], ["build/game.res.o"]):
+            discarded = tree / "build/nested/.old-evidence"
+            discarded.parent.mkdir(exist_ok=True)
+            discarded.write_text("discard on rebuild")
+            source.write_text("devmode 1\nmv_run_speed 8\n")
+            prior_canonical = canonical_path.read_bytes()
             result = subprocess.run(["make", *goals, *overrides], cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             (self.out / ("make-" + "-".join(goals).replace("/", "_") + ".log")).write_bytes(result.stdout)
             self.check("make-goals-" + "-".join(goals), result.returncode == 0)
+            if "rebuild" in goals:
+                self.check("rebuild-removes-entire-tree-" + "-".join(goals), not discarded.exists() and not source.exists())
+                self.check("rebuild-retains-canonical-" + "-".join(goals), canonical_path.read_bytes() == prior_canonical)
+                last = json.loads((tree / "build/tuning/last-selection.json").read_bytes())
+                self.check("rebuild-compiles-every-request-" + "-".join(goals), set(last["rebuilt"]) == set(last["artifacts"]))
+                if goals == ["rebuild"]:
+                    self.check("rebuild-three-shipping-targets", set(last["artifacts"]) == {"game", "game-x86_64", "game.exe"})
             if "all" in goals:
                 last = json.loads((tree / "build/tuning/last-selection.json").read_bytes())
                 self.check("make-parallel-one-six-artifact-snapshot", set(last["artifacts"]) == set(all_targets))
+        for retired in ("clean", "deploy"):
+            result = subprocess.run(["make", "-n", retired], cwd=tree, env=env, capture_output=True)
+            self.check("removed-target-" + retired, result.returncode != 0)
+        source.unlink(missing_ok=True)
+        before = self.state(tree)
+        self.invoke(tree, env, "--rebuild", ok=False)
+        self.check("rebuild-without-targets-preserves-tree", self.state(tree) == before)
         # Populate an old timestamp-based pyc, then change source bytes while
         # preserving both length and mtime. The new stricter limit MUST execute.
         tuning_source = tree / "tools/tuning.py"
@@ -452,6 +471,8 @@ class Gate:
         tuning_source.write_bytes(original)
         os.utime(tuning_source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
         self.concurrent_controls(tree, env)
+        self.rebuild_controls(tree, env)
+        self.trailer_controls(tree, env, overrides)
 
     def concurrent_controls(self, tree, env):
         (tree / "one.cfg").write_text("devmode 1\nmv_run_speed 10\n")
@@ -477,6 +498,92 @@ class Gate:
             self.check("interrupted-build-fails", interrupted.wait() != 0)
         self.check("interrupted-build-preserves-outputs", self.state(tree) == prior)
 
+    def rebuild_cleanup_controls(self):
+        module = build_module("build_game_remove")
+        root = self.out / "rebuild-cleanup"
+        (root / "build/nested").mkdir(parents=True)
+        marker = root / "build/nested/.keep"
+        marker.write_text("discard")
+        previous = Path.cwd()
+        original = shutil.rmtree
+        calls = []
+        def transient(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError("injected host indexer handle")
+            return original(path)
+        try:
+            os.chdir(root)
+            with patch("shutil.rmtree", side_effect=transient), patch("time.sleep"):
+                module.remove_build()
+            self.check("rebuild-transient-denial-retried", len(calls) == 2 and not Path("build").exists())
+            Path("build").mkdir()
+            with patch("shutil.rmtree", side_effect=PermissionError("persistent denial")) as denied, patch("time.sleep"):
+                try:
+                    module.remove_build()
+                except PermissionError:
+                    self.check("rebuild-persistent-denial-fails", denied.call_count == 20 and Path("build").exists())
+                else:
+                    self.check("rebuild-persistent-denial-fails", False)
+        finally:
+            os.chdir(previous)
+
+    def rebuild_controls(self, tree, env):
+        sentinel = tree / "build/nested/.sentinel"
+        sentinel.parent.mkdir(exist_ok=True)
+        sentinel.write_text("old evidence")
+        external = tree / "external"
+        external.mkdir()
+        (external / "keep").write_text("outside build")
+        (tree / "build/external-link").symlink_to(external, target_is_directory=True)
+        (tree / "control.json").write_text('{"barrier":"rebuild-compile"}')
+        command = [sys.executable, "tools/build-game.py"]
+        with (self.out / "rebuild-active.log").open("wb") as first_log, (self.out / "rebuild-waiter.log").open("wb") as second_log:
+            first = subprocess.Popen(command + ["--force", "game"], cwd=tree, env=env, stdout=first_log, stderr=subprocess.STDOUT)
+            self.barrier(tree / "rebuild-compile.ready", first)
+            lock = (tree / ".build.lock").stat().st_ino
+            second = subprocess.Popen(command + ["--rebuild", "game", "game.exe", "game-x86_64"], cwd=tree, env=env, stdout=second_log, stderr=subprocess.STDOUT)
+            try:
+                time.sleep(.2)
+                self.check("rebuild-waits-for-active-compiler", second.poll() is None and sentinel.exists())
+            finally:
+                (tree / "rebuild-compile.go").write_text("go")
+                first_status, second_status = first.wait(), second.wait()
+            self.check("rebuild-after-active-compile-success", first_status == second_status == 0)
+        self.check("rebuild-lock-inode-survives", (tree / ".build.lock").stat().st_ino == lock)
+        self.check("rebuild-discards-nested-hidden-files", not sentinel.exists())
+        self.check("rebuild-does-not-follow-symlink", (external / "keep").read_text() == "outside build")
+        (tree / "control.json").unlink()
+
+    def trailer_controls(self, tree, env, overrides):
+        media = tree / "media"
+        media.mkdir()
+        (media / "media.py").write_text(
+            "import json,pathlib,sys\n"
+            "pathlib.Path('media-invocation.json').write_text(json.dumps(sys.argv[1:]))\n"
+            "sys.exit(23 if pathlib.Path('media-fail').exists() else 0)\n")
+        command = ["make", "trailer", *overrides]
+        def run(label):
+            result = subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True)
+            (self.out / (label + ".log")).write_text(result.stdout + result.stderr)
+            self.check(label + "-elapsed", "trailer: elapsed " in result.stdout)
+            return result
+        result = run("trailer-success")
+        self.check("trailer-success-status", result.returncode == 0 and "OK" in result.stdout)
+        self.check("trailer-fresh-all-outputs", json.loads((tree / "media-invocation.json").read_text()) == ["all", "--fresh"])
+        last = json.loads((tree / "build/tuning/last-selection.json").read_text())
+        self.check("trailer-forces-native-compile", last["rebuilt"] == ["game"])
+        (tree / "media-fail").touch()
+        result = run("trailer-media-failure")
+        self.check("trailer-media-failure-propagates", result.returncode != 0 and "FAILED" in result.stdout)
+        (tree / "media-invocation.json").unlink()
+        (tree / "control.json").write_text('{"fail":true}')
+        result = run("trailer-compile-failure")
+        self.check("trailer-compile-failure-stops-media", result.returncode != 0 and not (tree / "media-invocation.json").exists())
+        (tree / "control.json").unlink()
+        dry = subprocess.run(["make", "-n", "trailer", *overrides], cwd=tree, env=env, capture_output=True)
+        self.check("trailer-dry-run-does-not-render", dry.returncode == 0 and not (tree / "media-invocation.json").exists())
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -489,6 +596,7 @@ def main():
     try:
         gate.parser_controls()
         gate.publication_cleanup_controls()
+        gate.rebuild_cleanup_controls()
         gate.transaction_controls()
     finally:
         (out / "results.json").write_text(json.dumps(gate.rows, indent=2) + "\n")

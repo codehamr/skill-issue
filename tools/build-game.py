@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 # Import source bytes explicitly: timestamp/size-valid __pycache__ entries must
 # never execute stale parser code while the fingerprint hashes a newer source.
@@ -264,31 +265,49 @@ def transaction(args):
           " rebuilt=" + ",".join(selection["rebuilt"]), flush=True)
 
 
+def remove_build():
+    """Remove build/ while the caller holds the repository build lock."""
+    build = Path("build")
+    # Host indexers can briefly retain files or an already empty folder.
+    # Retry under the same lock; a persistent denial aborts the rebuild.
+    for attempt in range(20):
+        try:
+            if build.is_symlink():
+                build.unlink()
+            elif build.exists():
+                shutil.rmtree(build)
+            break
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.25)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="delete all of build/ before compiling the requested targets")
     parser.add_argument("targets", nargs="*")
     args = parser.parse_args()
-    Path("build/tuning").mkdir(parents=True, exist_ok=True)
+    if not args.targets:
+        raise TuningError("no requested game artifacts")
     # Ordinary signals unwind temporary files; a killed compiler never publishes
     # its partial output. Subsequent invocations also ignore unfinished temp dirs.
     def stop(signum, frame):
         raise TuningError("build interrupted by signal " + str(signum))
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    with open("build/tuning/build.lock", "a+b") as lock:
+    # The lock survives deletion of build/. Waiters must always lock the same
+    # inode, including a rebuild queued behind an ordinary compilation.
+    with open(".build.lock", "a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if args.clean:
-            if args.targets or args.source:
-                raise TuningError("clean is a separate transaction")
-            for name in ("game", "game.exe", "game-x86_64", "game-asan", "game.res.o",
-                         "game-warning-linux.o", "game-warning-windows.o"):
-                (Path("build") / name).unlink(missing_ok=True)
-            print("tuning: game artifacts cleaned; canonical source retained")
-        else:
-            transaction(args)
+        if args.rebuild:
+            remove_build()
+            print("tuning: build/ removed; rebuilding from scratch", flush=True)
+        Path("build/tuning").mkdir(parents=True, exist_ok=True)
+        transaction(args)
 
 
 if __name__ == "__main__":

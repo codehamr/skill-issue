@@ -612,6 +612,18 @@ static float ui_page_match(float px, float pw, float y, int click, float cx, flo
       y = ui_param_row(&SP_FRAG_DEF, &v, DRAG_FRAG, px, y, click, cx, cy);
       g_cfg.sp_frag = sp_frag_normalize((long)v);
     }
+    y += 5;
+    ui_section("ENVIRONMENT", px, pw, y);
+    y += 14;
+    ui_cycle("BIOME", ENV_BIOME_OPTS, BIOME_COUNT + 1, &g_cfg.environment.biome, px, pw, y, click, cx, cy);
+    y += 15;
+    ui_cycle("TIME OF DAY", ENV_TIME_OPTS, TIME_COUNT + 1, &g_cfg.environment.time, px, pw, y, click, cx, cy);
+    y += 15;
+    ui_cycle("WEATHER", ENV_WEATHER_OPTS, WEATHER_KIND_COUNT + 1, &g_cfg.environment.weather, px, pw, y, click, cx, cy);
+    y += 19;
+    ui_text(g_online ? "ONLINE ENVIRONMENT IS SET BY THE SERVER" : "RANDOM PICKS AGAIN FOR EACH NEW ARENA",
+            px + 16, y, 0.75f, C_HAZE, 1);
+    y += 13;
   return y;
 }
 

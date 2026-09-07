@@ -71,9 +71,18 @@ def main():
     entries, cards = [], []
     for shot in SHOTS:
         views = []
+        biome = "dunes" if shot["key"] == "09-dunes" else "frost" if shot["key"] == "10-frost" else "forest"
+        time = "night" if shot["key"] == "10-frost" else "day"
+        weather = ("clear", "fog", "rain", "storm", "sunshower")[shot["weather"]]
+        current_weather = ("clear", "haze", "cloudy", "fog", "rain", "storm", "sunshower").index(weather)
         for version, executable in binaries:
             fingerprint = digest(executable)
-            entry = capture(dict(shot, key=shot["key"] + "-" + version), executable,
+            settings = dict(shot, key=shot["key"] + "-" + version)
+            if version == "after":
+                settings.update(environment=f"{biome} {time} {weather}", weather=current_weather)
+            else:
+                settings["validate_weather"] = False
+            entry = capture(settings, executable,
                             output, args.width, args.height)
             if digest(executable) != fingerprint:
                 raise RuntimeError("Binary changed during boundary capture")
@@ -84,7 +93,7 @@ def main():
                          f'width="{args.width}" height="{args.height}" loading="lazy" '
                          f'alt="{html.escape(shot["title"])} – {label}"></a>'
                          f'<figcaption><h2>{label} · {html.escape(shot["title"])}</h2>'
-                         f'<p>{html.escape(shot["caption"]) if version == "after" else "Gleicher Seed, gleiche Kamera und Konfiguration vor dem Umbau."}</p>'
+                         f'<p>{html.escape(shot["caption"]) if version == "after" else "Gleicher Seed und gleiche Kamera; Umgebung des Vergleichsbuilds."}</p>'
                          f'<p class="meta">Seed {shot["seed"]} · '
                          f'<a href="recipes/{entry["key"]}.script">Rezept</a> · '
                          f'<a href="logs/{entry["key"]}.log">Protokoll</a></p></figcaption></figure>')
@@ -97,7 +106,7 @@ def main():
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         '<title>Natürliche Levelgrenzen · Skill Issue</title><style>' + STYLE + '</style>'
         '<main><header><h1>Die Landschaft gibt den Rand vor.</h1>'
-        '<p>Spielaufnahmen mit natürlichen Seeds. Die meisten Ansichten zeigen die Welt aus '
+        '<p>Spielaufnahmen mit dokumentierten Seeds und Umgebungsoptionen. Die meisten Ansichten zeigen die Welt aus '
         '1,62 Metern Höhe; zwei Übersichten prüfen die Konturen von oben.</p></header>'
         '<section class="grid">' + ''.join(cards) + '</section><footer>'
         '<a href="manifest.json">Build, Seeds und Bild-Hashes</a></footer></main></html>',

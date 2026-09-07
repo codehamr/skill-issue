@@ -16,6 +16,7 @@ Sound in hero.mp4 comes from the game itself.
     ./media/media.py probe K N  # N framing stills for shot K, no video —
                                 #   THE authoring loop; then read
                                 #   .cache/clips/K/probe.log (the event log)
+    --fresh                     # all/gif/mp4: discard clip and stage caches first
     --skip-render               # gif/mp4: assemble from cached clips (ONLY for
                                 #   iterating on the EDIT — after a look change
                                 #   the banner would mix two builds)
@@ -449,8 +450,11 @@ def replace_media(source, destination):
 
 
 def capture_settings(take):
-    w, h = take.res or (1280, 720)
-    return w, h
+    if take.res:
+        return take.res
+    with open(SPEC) as stream:
+        spec = json.load(stream)
+    return spec["w"], spec["h"]
 
 
 def provenance(take, w=None, h=None):
@@ -591,8 +595,8 @@ def render(take, w=None, h=None, quiet=False):
         "-i", os.path.join(d, "wlist.txt"), "-c", "copy", wav])
     command = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", "%dx%d" % (w, h), "-framerate", "120", "-i", "pipe:0",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
-        "-threads", ENCODER_THREADS, "-pix_fmt", "yuv420p", mp4]
+        "-c:v", "libx264rgb", "-preset", "veryfast", "-crf", "0",
+        "-threads", ENCODER_THREADS, "-pix_fmt", "rgb24", mp4]
     with subprocess.Popen(command, stdin=subprocess.PIPE) as encoder:
         try:
             for path in rgb_paths:
@@ -937,7 +941,7 @@ def cut(specpath, out=None, fps=60, preview=False):
             cx, cy = p.get("pos", (0.5, 0.5))
             vf += "crop=iw/%.5f:ih/%.5f:(iw-ow)*%.4f:(ih-oh)*%.4f," \
                   % (p["zoom"], p["zoom"], cx, cy)
-        vf += "scale=%d:%d," % (w, h)
+        vf += "scale=%d:%d:flags=lanczos," % (w, h)
         for g in (spec.get("grade"), p.get("grade")):
             if g:
                 vf += g + ","
@@ -968,9 +972,10 @@ def cut(specpath, out=None, fps=60, preview=False):
         args += ["-i", mp4, "-i", wav]
     args += ["-filter_complex", ";".join(f),
              "-map", "[venc]", "-map", "[aenc]",
-             "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-threads", ENCODER_THREADS,
+             "-c:v", "libx264", "-preset", "slow", "-crf", "14", "-threads", ENCODER_THREADS,
+             "-pix_fmt", "yuv420p",
              "-r", str(fps), "-fps_mode", "cfr",
-             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+             "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart",
              "-shortest", out,
              "-map", "[aref]", "-c:a", "pcm_f32le", "-ar", "48000", "-ac", "2",
              out + ".audio-reference.wav",
@@ -1381,12 +1386,15 @@ def main():
     if "--help" in flags:
         print(__doc__)
         return
-    unknown = [flag for flag in flags if flag != "--skip-render"]
+    unknown = [flag for flag in flags if flag not in ("--skip-render", "--fresh")]
     if unknown:
         raise ValueError("unknown media flags: " + ", ".join(unknown))
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     skip = "--skip-render" in sys.argv
+    fresh = "--fresh" in sys.argv
     verb = args[0] if args else "all"
+    if fresh and (skip or verb not in ("all", "gif", "mp4")):
+        raise ValueError("--fresh requires all, gif or mp4 without --skip-render")
     if skip and verb not in ("all", "gif", "mp4"):
         raise ValueError("--skip-render only applies to all, gif or mp4")
     if verb == "check":
@@ -1432,6 +1440,12 @@ def main():
         return render_clips(args[1:] or clips_of_spec())
     if verb not in ("all", "stills", "gif", "mp4"):
         die("unknown verb %r — see the docstring" % verb)
+    if fresh:
+        build_identity()
+        for directory in (CLIPS, STAGES):
+            if os.path.exists(directory):
+                shutil.rmtree(directory)
+        _stages.clear()
     sanity()
     if verb in ("all", "stills"):
         stills()

@@ -27,7 +27,7 @@ def dunes_slide():
     t = Take("dunes_slide", 59, fov=76,
              notes="DUNES / low sand slide with a passing camera; loop at frame 60")
     t.open()
-    t.setup("biome dunes", "sun 28 145")
+    t.setup("environment dunes golden haze", "sun 18 80")
     t.puppet(-4, 19, 90, speed=5.8, move=(1, 0), ready=False)
     t.setup("warp -20 0 -20", "wait 30")
     t.mark("approach")
@@ -50,7 +50,7 @@ def forest_break():
     t = Take("forest_break", 4, fov=82,
              notes="FOREST / diagonal leap across incoming fire, close landing")
     t.open()
-    t.setup("biome forest", "sun 34 145")
+    t.setup("environment forest day clear", "sun 34 145")
     t.puppet(-4, 17, 135, speed=5.7, move=(0.8, 0.6))
     t.setup("warp -8 0 22", "weapon ar", "aim -0.5 0.4 20", "wait 20")
     t.mark("break")
@@ -75,7 +75,7 @@ def marsh_duel():
     t = Take("marsh_duel", 13, fov=88,
              notes="MARSH / late acquisition, short bursts, strafe reversal, recoil recovery")
     t.open()
-    t.setup("biome marsh", "sun 32 145")
+    t.setup("environment marsh day clear", "sun 32 145")
     t.puppet(7, 6, 135, speed=1.6, move=(-1, 0))
     t.setup("puppet ads 1", "warp 11.5 0 10", "weapon ar", "wait 36",
             "aim 6.9 1.05 6")
@@ -101,9 +101,10 @@ def marsh_duel():
 @shot
 def frost_scope():
     """A human scope acquisition: late drag, small overrun, correction, shot."""
-    t = Take("frost_scope", 22, hud=True, res=(1600, 900), fov=90,
+    t = Take("frost_scope", 22, hud=True, res=(2880, 1620), fov=90,
              notes="FROST / scope arrives off target, corrects to torso, shot at frame 120")
     t.open()
+    t.setup("environment frost day clear")
     t.puppet(12, 9, 145, speed=1.1, move=(0, -1))
     t.setup("puppet ads 1", "warp 17 0 15", "weapon sr", "wait 40",
             "aim 13.0 1.15 8.5")
@@ -130,7 +131,7 @@ def quarry_crossfire():
     t = Take("quarry_crossfire", 2, fov=88,
              notes="QUARRY / live incoming fire, A-D dodge, body burst and lean")
     t.open(bots=1, freeze=False, skill="hard")
-    t.setup("sun 30 145", "puppet on", "puppet warp 9 9", "puppet off",
+    t.setup("environment quarry day clear", "sun 30 145", "puppet on", "puppet warp 9 9", "puppet off",
             "warp 13 0 15", "aim 9.5 1.0 9")
     t.mark("challenge")
     fire(t)
@@ -161,6 +162,7 @@ def aurora_push():
     t = Take("aurora_push", 28, fov=94,
              notes="AURORA / sprint into slide, hipfire with the outpost and sky in view")
     t.open()
+    t.setup("environment frost night clear")
     t.puppet(10, -5, 155, speed=1.6, move=(-1, 0))
     t.setup("warp 15 0 -17", "weapon ar", "aim 8 1.2 -6", "+forward", "wait 36")
     t.mark("rush")

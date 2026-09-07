@@ -1841,7 +1841,7 @@ static size_t netrecoil_snapshot(unsigned char *buf, size_t cap, uint32_t st,
   np_wr w = {buf, cap, 0, 0};
   np_w16(&w, NET_PROTO); np_w8(&w, NP_SNAPSHOT);
   np_w32(&w, st); np_w32(&w, li);
-  np_w32(&w, net_world_hash()); np_w32(&w, g_map_seed); np_w8(&w, 0);
+  np_w32(&w, net_world_hash()); np_w32(&w, g_map_seed); np_w16(&w, environment_pack(g_environment)); np_w8(&w, 0);
   np_w8(&w, 2);
   net_ent_encode(&w, mine);
   net_ent_encode(&w, remote);
@@ -2079,7 +2079,7 @@ static size_t netdeath_snapshot(unsigned char *buf, size_t cap, uint32_t st,
   np_wr w = {buf, cap, 0, 0};
   np_w16(&w, NET_PROTO); np_w8(&w, NP_SNAPSHOT);
   np_w32(&w, st); np_w32(&w, li);
-  np_w32(&w, net_world_hash()); np_w32(&w, g_map_seed); np_w8(&w, 0);
+  np_w32(&w, net_world_hash()); np_w32(&w, g_map_seed); np_w16(&w, environment_pack(g_environment)); np_w8(&w, 0);
   np_w8(&w, 1);
   net_ent_encode(&w, ent);
   np_w8(&w, 0);
@@ -2515,7 +2515,7 @@ static void netfuzz_proof(void) {
     // g_bots) — both used to be outside this battery entirely.
     uint32_t fst, fli, fwh, fsd; uint8_t fqd; int ffull, fnev = 0;
     net_ent_t fents[MAX_ENTS]; net_ev_t fevs[NET_EV_SNAP_MAX];
-    int fcnt = net_snapshot_read(buf, (size_t)len, &fst, &fli, &fwh, &fsd,
+    int fcnt = net_snapshot_read(buf, (size_t)len, &fst, &fli, &fwh, &fsd, NULL,
                                  &fqd, fents, MAX_ENTS, &ffull,
                                  fevs, NET_EV_SNAP_MAX, &fnev);
     for (int k = 0; k < fcnt; k++)
@@ -2572,6 +2572,7 @@ static void defaults_fill_tuning(config_t *c, float fraction) {
 }
 static void defaults_case_config(int *fail) {
   config_t canonical = config_defaults(), actual = canonical;
+  defaults_expect(!environment_pack(canonical.environment), "environment-defaults-random", fail);
   defaults_expect(!canonical.devmode && strlen(TUNING_SHA) == 64 &&
       strlen(TUNING_SCHEMA_SHA) == 64, "first-install-canonical-identity", fail);
   int tables = 1;
@@ -2582,6 +2583,7 @@ static void defaults_case_config(int *fail) {
   for (int i = PAD_AS_FRIC; i <= PAD_AS_DIST; i++) tables &= actual.pad[i] == PAD_DEF[i].def;
   defaults_expect(tables, "startup-table-owner", fail);
   defaults_fill_tuning(&actual, 0.31415926f);
+  actual.environment = (environment_t){BIOME_DUNES + 1, TIME_GOLDEN + 1, WEATHER_HAZE + 1};
   actual.sense = 1.731f; actual.fps_cap = 241; actual.devmode = 1;
   snprintf(actual.name, sizeof actual.name, "CUSTOM");
   for (int group = 0; group < 3; group++) {
@@ -2615,6 +2617,7 @@ static void defaults_case_config(int *fail) {
   int hashed = native_profile_hash(path, before);
   config_load_or_create(path, &loaded);
   defaults_expect(defaults_tuning_equal(&loaded, &actual) &&
+      environment_pack(loaded.environment) == environment_pack(actual.environment) &&
       loaded.sense == actual.sense && loaded.fps_cap == actual.fps_cap &&
       !loaded.devmode && !strcmp(loaded.name, actual.name), "emission-nine-digit-runtime-override", fail);
   defaults_expect(hashed && native_profile_hash(path, after) && !strcmp(before, after),
@@ -2726,11 +2729,12 @@ static int defaults_accept(int server, uint16_t port, const config_t *tuning, ui
   out = (np_wr){packet, sizeof packet, 0, 0};
   np_w16(&out, NET_PROTO); np_w8(&out, NP_ACCEPT);
   np_w8(&out, 0); np_w8(&out, 0); np_w8(&out, 1);
-  np_w32(&out, seed); np_w32(&out, net_world_hash()); np_w32(&out, 0x12345678u);
+  np_w32(&out, seed); np_w16(&out, environment_pack(g_environment)); np_w32(&out, net_world_hash()); np_w32(&out, 0x12345678u);
   for (int i = 0; i < MV_COUNT; i++) np_wf(&out, tuning->mv[i]);
   for (int i = 0; i < GP_COUNT; i++) np_wf(&out, tuning->gun[i]);
   for (int w = 0; w < WPN_COUNT; w++)
     for (int i = 0; i < WP_COUNT; i++) np_wf(&out, tuning->wp[w][i]);
+  g_environment = g_cfg.environment;
   return !out.bad && net_udp_send(server, peer_ip, peer_port, packet, (int)out.at) == (int)out.at &&
       defaults_poll_state(NC_PLAYING);
 }
@@ -2746,7 +2750,7 @@ static int defaults_first_snapshot(int server) {
   unsigned char packet[2048]; np_wr out = {packet, sizeof packet, 0, 0};
   np_w16(&out, NET_PROTO); np_w8(&out, NP_SNAPSHOT);
   np_w32(&out, 10); np_w32(&out, 0);
-  np_w32(&out, net_world_hash()); np_w32(&out, g_map_seed); np_w8(&out, 0);
+  np_w32(&out, net_world_hash()); np_w32(&out, g_map_seed); np_w16(&out, environment_pack(g_environment)); np_w8(&out, 0);
   np_w8(&out, 1); net_ent_encode(&out, &entity); np_w8(&out, 0);
   struct sockaddr_in address = {0}; socklen_t size = sizeof address;
   if (getsockname(g_cl.fd, (struct sockaddr *)&address, &size) != 0 || out.bad ||
@@ -2789,6 +2793,7 @@ static void defaults_case_authority(int *fail) {
   static proof_world_t world;
   proof_world_save(&world);
   config_t local_saved = g_cfg, canonical = config_defaults();
+  environment_t environment_saved = g_environment;
   uint32_t seed = g_map_seed;
   typeof(g_pad) pad_saved = g_pad;
   typeof(g_human_name) names_saved;
@@ -2830,6 +2835,7 @@ static void defaults_case_authority(int *fail) {
   if (server >= 0) net_udp_close(server);
   config_t again = config_defaults();
   defaults_expect(defaults_tuning_equal(&again, &canonical), "server-never-rewrites-canonical", fail);
+  g_environment = environment_saved;
   map_generate(seed); g_map_seed = seed;
   g_cfg = local_saved; g_pad = pad_saved;
   memcpy(g_human_name, names_saved, sizeof names_saved);
@@ -3862,7 +3868,7 @@ static void feedback_events(void) {
 static size_t feedback_snapshot(unsigned char *buf,size_t cap,uint32_t st,
                                 uint8_t spawn,const event_t *events,int count,uint32_t first_id) {
   np_wr w={buf,cap,0,0};np_w16(&w,NET_PROTO);np_w8(&w,NP_SNAPSHOT);
-  np_w32(&w,st);np_w32(&w,100);np_w32(&w,net_world_hash());np_w32(&w,g_map_seed);np_w8(&w,0);
+  np_w32(&w,st);np_w32(&w,100);np_w32(&w,net_world_hash());np_w32(&w,g_map_seed);np_w16(&w,environment_pack(g_environment));np_w8(&w,0);
   np_w8(&w,3);net_ent_t entity;
   net_ent_from_live(&entity,g_local_ent);entity.spawn_seq=spawn;net_ent_encode(&w,&entity);
   for(int i=1;i<=2;i++){net_ent_from_live(&entity,i);net_ent_encode(&w,&entity);}

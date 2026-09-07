@@ -53,6 +53,7 @@ static int server_main(uint32_t seed) {
   g_cfg.sp_bots = net_bot_target(0, g_srv.bot_fill, g_srv.cap_bots);
   g_cfg.sp_diff = g_srv.skill < 0 ? 0 : g_srv.skill > 2 ? 2 : g_srv.skill;
   g_cfg.sp_frag = g_srv.fraglimit;
+  g_cfg.environment = (environment_t){g_srv.biome, g_srv.time, g_srv.weather};
   signal(SIGINT, srv_sig);
   signal(SIGTERM, srv_sig);
   // EVERY ARENA IS BROUGHT UP THE SAME WAY, through the one shared entry point.
@@ -199,6 +200,13 @@ int main(int argc, char **argv) {
     else if (arg && !strcmp(a, "--lobbies"))    g_srv.lobbies = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--skill"))      g_srv.skill = atoi(argv[++i]);
     else if (arg && !strcmp(a, "--fraglimit"))  g_srv.fraglimit = atoi(argv[++i]);
+    else if (arg && (!strcmp(a, "--biome") || !strcmp(a, "--time") || !strcmp(a, "--weather"))) {
+      int *dst = a[2] == 'b' ? &g_srv.biome : a[2] == 't' ? &g_srv.time : &g_srv.weather;
+      const char *const *keys = a[2] == 'b' ? ENV_BIOME_KEYS : a[2] == 't' ? ENV_TIME_KEYS : ENV_WEATHER_KEYS;
+      int count = a[2] == 'b' ? BIOME_COUNT : a[2] == 't' ? TIME_COUNT : WEATHER_KIND_COUNT;
+      *dst = environment_option(argv[++i], keys, count);
+      if (*dst < 0) { fprintf(stderr, "invalid %s choice: %s\n", a, argv[i]); return 1; }
+    }
     else if (arg && !strcmp(a, "--ticks"))      g_srv.ticks = atol(argv[++i]);
     else if (!strcmp(a, "--net-debug"))         g_net_debug = 1;  // server.log: one
                                                 // line per trim/skip, see decl

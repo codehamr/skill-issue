@@ -574,28 +574,6 @@ static float v3_luma(v3 c) {
   return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
 }
 
-// The shared map seed selects the same weather on server and clients without
-// a config value, mutable override or draw from a gameplay RNG stream.
-typedef enum {
-  WEATHER_CLEAR, WEATHER_MIST, WEATHER_RAIN, WEATHER_STORM,
-  WEATHER_SUNSHOWER, WEATHER_KIND_COUNT
-} weather_kind_t;
-static weather_kind_t weather_kind_from_seed(uint32_t seed) {
-  uint32_t h = seed ^ 0xa511e9b3u;
-  h ^= h >> 16; h *= 0x7feb352du;
-  h ^= h >> 15; h *= 0x846ca68bu;
-  h ^= h >> 16;
-  unsigned bucket = h % 100u;
-  if (bucket < 50u) return WEATHER_CLEAR;
-  if (bucket < 68u) return WEATHER_MIST;
-  if (bucket < 88u) return WEATHER_RAIN;
-  if (bucket < 96u) return WEATHER_STORM;
-  return WEATHER_SUNSHOWER;
-}
-static weather_kind_t weather_kind(void) {
-  return weather_kind_from_seed(g_map_seed);
-}
-
 // Presentation weather samples the simulation clock without changing map,
 // movement or collision state. Clear weather is the most frequent preset.
 typedef struct { float rain, fog, overcast, wind, flash, rainbow; } weather_t;
@@ -611,6 +589,8 @@ static weather_t weather_sample(void) {
   float gust = 0.72f + 0.20f * sinf(tm * 0.73f) + 0.08f * sinf(tm * 1.91f);
   weather_kind_t kind = weather_kind();
   switch (kind) {
+  case WEATHER_HAZE: w = (weather_t){.fog = 0.16f, .wind = 0.7f}; break;
+  case WEATHER_CLOUDY: w = (weather_t){.overcast = 0.38f, .wind = 1.1f}; break;
   case WEATHER_MIST: w = (weather_t){.fog = 1.15f, .overcast = 0.24f, .wind = 0.4f}; break;
   case WEATHER_RAIN: w = (weather_t){.rain = 0.64f, .fog = 0.36f, .overcast = 0.62f, .wind = 2.3f}; break;
   case WEATHER_STORM: w = (weather_t){.rain = 1.0f, .fog = 0.56f, .overcast = 0.88f, .wind = 5.5f}; break;
@@ -618,6 +598,7 @@ static weather_t weather_sample(void) {
                          .wind = 1.2f, .rainbow = 1.0f}; break;
   default: break;
   }
+  if (g_biome.night > 0.5f) w.rainbow = 0;
   w.wind *= gust;
   w.rain *= 0.86f + 0.14f * gust;
   if (kind == WEATHER_STORM) {
@@ -666,7 +647,8 @@ static void rig_upload(const lightloc_t *L) {
   glUniform1f(L->expo, S->exposure);
   glUniform1f(L->disc, S->disc);
   v3 at = atmo_tint();
-  at = v3_lerp(at, (v3){{0.88f, 0.98f, 1.08f}}, f_clamp(w.fog, 0.0f, 1.0f));
+  if (weather_kind() != WEATHER_HAZE)
+    at = v3_lerp(at, (v3){{0.88f, 0.98f, 1.08f}}, f_clamp(w.fog, 0.0f, 1.0f));
   glUniform4f(L->atmo, at.x, at.y, at.z, atmo_haze() + w.fog);
   // The two halves of haze_rad that are constant for the whole draw, folded
   // here so the fragment shader does not rebuild them three times a pixel.

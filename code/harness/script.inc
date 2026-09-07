@@ -625,6 +625,10 @@ static void cmd_weatherproof(sim_ctx_t *s) {
   uint32_t seed0 = g_map_seed;
   uint64_t rng0 = g_rng, bot0 = g_rng_bot, audio0 = g_rng_audio, vfx0 = g_rng_vfx;
   typeof(g_rng_gun) gun0; memcpy(gun0, g_rng_gun, sizeof gun0);
+  environment_t environment0 = g_environment;
+  biome_t biome0 = g_biome;
+  g_environment = (environment_t){BIOME_QUARRY + 1, TIME_DAY + 1, 0};
+  g_biome.night = 0;
   int fail = 0, samples = 0, roof_cases = 0, vertices = 0;
   uint32_t seeds[WEATHER_KIND_COUNT];
   int counts[WEATHER_KIND_COUNT] = {0};
@@ -635,8 +639,8 @@ static void cmd_weatherproof(sim_ctx_t *s) {
     counts[kind]++;
     chain = map_seed_next(chain);
   }
-  const int count_minimum[] = {4500, 1300, 1500, 400, 150};
-  const int count_maximum[] = {5500, 2300, 2500, 1200, 700};
+  const int count_minimum[] = {5000, 1500, 500, 150, 300, 50, 20};
+  const int count_maximum[] = {6500, 2500, 1300, 700, 900, 400, 250};
   for (int mode = 0; mode < WEATHER_KIND_COUNT; mode++) {
     fail |= counts[mode] < count_minimum[mode] || counts[mode] > count_maximum[mode];
     seeds[mode] = weatherproof_seed((weather_kind_t)mode, 0);
@@ -648,18 +652,18 @@ static void cmd_weatherproof(sim_ctx_t *s) {
       fail |= memcmp(&a, &b, sizeof a) != 0;
       for (size_t j = 0; j < sizeof values / sizeof values[0]; j++)
         fail |= f_is_nonfinite(values[j]) || values[j] < 0.0f || values[j] > maximum[j];
-      fail |= mode < 2 && a.rain != 0.0f;
-      fail |= mode != 3 && a.flash != 0.0f;
-      fail |= mode != 4 && a.rainbow != 0.0f;
+      fail |= mode < WEATHER_RAIN && a.rain != 0.0f;
+      fail |= mode != WEATHER_STORM && a.flash != 0.0f;
+      fail |= mode != WEATHER_SUNSHOWER && a.rainbow != 0.0f;
       samples++;
     }
   }
-  printf("weatherproof seeds=10000 counts=%d/%d/%d/%d/%d deterministic=1 %s\n",
-         counts[0], counts[1], counts[2], counts[3], counts[4], fail ? "FAIL" : "ok");
+  printf("weatherproof seeds=10000 counts=%d/%d/%d/%d/%d/%d/%d deterministic=1 %s\n",
+         counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], fail ? "FAIL" : "ok");
   // A large roof intercepts every rain column before it can enter the
   // shelter. The open control must emit near-ground drops at identical ticks.
   const long ticks[] = {0, 1, 17, 120, 543, 550, 633, 1199, 2399};
-  for (int mode = 2; mode <= 4; mode++)
+  for (int mode = WEATHER_RAIN; mode <= WEATHER_SUNSHOWER; mode++)
     for (size_t t = 0; t < sizeof ticks / sizeof ticks[0]; t++) {
       g_map_seed = seeds[mode]; g_tick = ticks[t]; g_num_solids = 0;
       scene_reset(); fx_weather_build((v3){{0.0f, 1.62f, 0.0f}});
@@ -699,7 +703,8 @@ static void cmd_weatherproof(sim_ctx_t *s) {
   g_scene_cast_floats = scene_state[6]; g_weather_rain_drops = scene_state[7];
   g_weather_rain_sheltered = scene_state[8]; g_scene_drops = drops0;
   memcpy(g_schunk, chunks, sizeof chunks);
-  printf("weatherproof modes=5 samples=%d roof_cases=%d checked_vertices=%d neutral=%d %s\n",
+  g_environment = environment0; g_biome = biome0;
+  printf("weatherproof modes=7 samples=%d roof_cases=%d checked_vertices=%d neutral=%d %s\n",
          samples, roof_cases, vertices, neutral, fail ? "FAIL" : "ok");
   if (fail) exit(1);
 }
@@ -708,16 +713,37 @@ static void cmd_biome(sim_ctx_t *s) {
   (void)s;
   char *a = take_tok();
   int change = 0;
-  if (a && !strcmp(a, "off")) { g_biome_force = -1; change = 1; }
-  else if (a) {
-    for (int i = 0; i < 7; i++)
-      if (!strcmp(a, BIOME_NAMES[i])) { g_biome_force = i; change = 1; break; }
+  if (a && (!strcmp(a, "off") || !strcmp(a, "random"))) {
+    g_environment.biome = g_environment.time = 0; change = 1;
+  } else if (a) {
+    for (int i = 0; i < 7; i++) if (!strcmp(a, BIOME_NAMES[i])) {
+      g_environment.biome = (i == 5 ? BIOME_MARSH : i == 6 ? BIOME_FROST : i) + 1;
+      g_environment.time = (i >= 5 ? TIME_NIGHT : TIME_DAY) + 1;
+      change = 1; break;
+    }
     if (!change) g_tok_pushback = a;
   }
   if (change) { map_generate(g_map_seed); g_world_dirty = 1; }
   printf("biome kind=%s night=%.0f snow=%.0f forest=%.0f aurora=%.0f lights=%d\n",
          BIOME_NAMES[g_biome.kind], (double)g_biome.night, (double)g_biome.snow,
          (double)g_biome.forest, (double)g_biome.aurora, g_map_light_n);
+}
+
+static void cmd_environment(sim_ctx_t *s) {
+  (void)s;
+  char *b = take_tok(), *t = b ? take_tok() : NULL, *w = t ? take_tok() : NULL;
+  if (b) {
+    environment_t e = {environment_option(b, ENV_BIOME_KEYS, BIOME_COUNT),
+                      t ? environment_option(t, ENV_TIME_KEYS, TIME_COUNT) : -1,
+                      w ? environment_option(w, ENV_WEATHER_KEYS, WEATHER_KIND_COUNT) : -1};
+    if (e.biome < 0 || e.time < 0 || e.weather < 0) fatal("environment: need biome time weather (or random)");
+    g_environment = e;
+    map_generate(g_map_seed); g_world_dirty = 1;
+  }
+  environment_t e = environment_resolve(g_map_seed, g_environment);
+  printf("environment biome=%s time=%s weather=%s options=%u\n",
+         ENV_BIOME_KEYS[e.biome + 1], ENV_TIME_KEYS[e.time + 1], ENV_WEATHER_KEYS[e.weather + 1],
+         environment_pack(g_environment));
 }
 
 static void cmd_map(sim_ctx_t *s) {
@@ -3074,9 +3100,9 @@ static void cmd_netpredict(sim_ctx_t *s) {
   net_ev_t ea[NET_EV_SNAP_MAX], eb[NET_EV_SNAP_MAX];
   uint32_t st, li, wh;
   int nea = 0, neb = 0;
-  int na = net_snapshot_read(snap, len, &st, &li, &wh, NULL, NULL, a, MAX_ENTS,
+  int na = net_snapshot_read(snap, len, &st, &li, &wh, NULL, NULL, NULL, a, MAX_ENTS,
                              NULL, ea, NET_EV_SNAP_MAX, &nea);
-  int nb = net_snapshot_read(snap, len, NULL, NULL, NULL, NULL, NULL, b, MAX_ENTS,
+  int nb = net_snapshot_read(snap, len, NULL, NULL, NULL, NULL, NULL, NULL, b, MAX_ENTS,
                              NULL, eb, NET_EV_SNAP_MAX, &neb);
   float worst_mm = 0.0f;
   int mism = na != nb, live = 0;
@@ -3576,7 +3602,7 @@ static int spstart_late_accept(uint32_t seed, int *sender) {
   unsigned char packet[512]; np_wr w = {packet, sizeof packet, 0, 0};
   np_w16(&w, NET_PROTO); np_w8(&w, NP_ACCEPT);
   np_w8(&w, (uint8_t)ent_of_human(2)); np_w8(&w, 0); np_w8(&w, 1);
-  np_w32(&w, late_seed); np_w32(&w, world); np_w32(&w, 17);
+  np_w32(&w, late_seed); np_w16(&w, environment_pack(g_environment)); np_w32(&w, world); np_w32(&w, 17);
   for (int i = 0; i < MV_COUNT; i++) np_wf(&w, g_cfg.mv[i]);
   for (int i = 0; i < GP_COUNT; i++) np_wf(&w, g_cfg.gun[i]);
   for (int wp = 0; wp < WPN_COUNT; wp++)
@@ -4499,7 +4525,7 @@ static void cmd_mixdown(sim_ctx_t *s) {
 static void cmd_boundarycheck(sim_ctx_t *s) {
   (void)s;
   long maps = next_n(); if (maps < 1) maps = 1;
-  int force0 = g_biome_force;
+  environment_t environment0 = g_environment;
   uint32_t seed0 = g_map_seed;
   uint64_t rng0 = g_rng, bot0 = g_rng_bot, gun0[8];
   memcpy(gun0, g_rng_gun, sizeof gun0);
@@ -4512,7 +4538,7 @@ static void cmd_boundarycheck(sim_ctx_t *s) {
   #define BANK_CHECK(test) do { if (test) { fail++; if (fail <= 8) printf("boundarycheck assertion line=%d seed=%u\n", __LINE__, g_map_seed); } } while (0)
   const int biomes[] = {BIOME_FOREST, BIOME_DUNES, BIOME_FROST};
   for (long map = 0; map < maps; map++) {
-    g_biome_force = biomes[map % 3]; map_generate(g_map_seed);
+    g_environment.biome = biomes[map % 3] + 1; map_generate(g_map_seed);
     long drops = g_mesh_drops, invalid = g_decor_invalid;
     mesh_build();
     BANK_CHECK(g_mesh_drops != drops || g_decor_invalid != invalid);
@@ -4624,11 +4650,168 @@ static void cmd_boundarycheck(sim_ctx_t *s) {
     if (fail) { printf("boundarycheck witness seed=%u biome=%d fail=%ld\n", g_map_seed, g_biome.kind, fail); break; }
     g_map_seed = map_seed_next(g_map_seed);
   }
-  g_biome_force = force0; map_generate(seed0);
+  g_environment = environment0; map_generate(seed0);
   g_rng = rng0; g_rng_bot = bot0; memcpy(g_rng_gun, gun0, sizeof gun0); g_world_dirty = 1;
   printf("boundarycheck maps=%ld rays=%ld routes=%ld contacts=%ld tangents=%ld meshes=%d peak_verts=%d fail=%ld %s\n",
          maps, rays, routes, contacts, tangents, meshes, mesh_peak, fail, fail ? "FAIL" : "ok");
   #undef BANK_CHECK
+  if (fail) exit(1);
+}
+
+// Match choices are saved intent. Real UI/frame and UDP paths must publish
+// them only at arena boundaries, without replacing local saved preferences.
+static void cmd_environmentcheck(sim_ctx_t *s) {
+  int fail = 0, combinations = 0, wire_cases = 0;
+  #define ENV_CHECK(ok) do { if (!(ok)) { printf("environmentcheck line=%d FAIL\n", __LINE__); fail++; } } while (0)
+  config_t cfg0 = g_cfg;
+  environment_t env0 = g_environment;
+  uint32_t seed0 = g_map_seed;
+  uint64_t rng0 = g_rng;
+  static proof_world_t world0;
+  proof_world_save(&world0);
+  recoil_save_globals();
+  uint64_t bot0 = g_rng_bot, audio0 = g_rng_audio, vfx0 = g_rng_vfx;
+  int biomes[BIOME_COUNT] = {0}, times[TIME_COUNT] = {0};
+  int desert = 0, desert_dry = 0, sunny = 0;
+  uint32_t chain = 0;
+  for (int i = 0; i < 100000; i++, chain = map_seed_next(chain)) {
+    environment_t a = environment_resolve(chain, (environment_t){0});
+    environment_t b = environment_resolve(chain, (environment_t){0});
+    ENV_CHECK(environment_pack(a) == environment_pack(b));
+    biomes[a.biome]++; times[a.time]++;
+    sunny += a.time != TIME_NIGHT && a.weather <= WEATHER_HAZE;
+    if (a.biome == BIOME_DUNES) { desert++; desert_dry += a.weather < WEATHER_RAIN; }
+  }
+  ENV_CHECK(biomes[BIOME_DUNES] > 28000 && biomes[BIOME_DUNES] < 32000);
+  ENV_CHECK(biomes[BIOME_FOREST] > 28000 && biomes[BIOME_FOREST] < 32000);
+  ENV_CHECK(times[TIME_NIGHT] > 4000 && times[TIME_NIGHT] < 6500);
+  ENV_CHECK(desert_dry * 100 > desert * 94 && sunny > 72000);
+  ENV_CHECK(rng0 == g_rng && bot0 == g_rng_bot && audio0 == g_rng_audio && vfx0 == g_rng_vfx);
+  printf("environmentcheck distribution=100000 biomes=%d/%d/%d/%d/%d time=%d/%d/%d/%d sunny=%d desert_dry=%d/%d\n",
+         biomes[0], biomes[1], biomes[2], biomes[3], biomes[4], times[0], times[1], times[2], times[3], sunny, desert_dry, desert);
+  for (unsigned bits = 0; bits <= UINT16_MAX; bits++) {
+    environment_t e;
+    int valid = environment_unpack((uint16_t)bits, &e);
+    if (valid) { ENV_CHECK(environment_pack(e) == bits); wire_cases++; }
+  }
+  ENV_CHECK(wire_cases == (BIOME_COUNT + 1) * (TIME_COUNT + 1) * (WEATHER_KIND_COUNT + 1));
+  static solid_t reference[MAX_SOLIDS];
+  for (int biome = 0; biome < BIOME_COUNT; biome++) {
+    int solid_count = 0;
+    for (int time = 0; time < TIME_COUNT; time++) for (int weather = 0; weather < WEATHER_KIND_COUNT; weather++) {
+      g_environment = (environment_t){biome + 1, time + 1, weather + 1};
+      environment_t e = environment_resolve(seed0, g_environment);
+      ENV_CHECK(e.biome == biome && e.time == time && e.weather == weather);
+      map_generate(seed0);
+      if (!time && !weather) { solid_count = g_num_solids; memcpy(reference, g_solids, sizeof reference); }
+      ENV_CHECK(g_num_solids == solid_count && !memcmp(reference, g_solids, (size_t)solid_count * sizeof(solid_t)));
+      ENV_CHECK(g_biome.kind == biome && (g_biome.night > 0.5f) == (time == TIME_NIGHT));
+      ENV_CHECK(weather_kind() == (weather_kind_t)weather && !f_is_nonfinite(g_sun.exposure));
+      ENV_CHECK(g_sun.dir.y > 0 && g_sun.sh_half > ARENA_HALF);
+      if (time == TIME_NIGHT) ENV_CHECK(g_sun.disc == 0 && g_map_light_n > 0);
+      else ENV_CHECK(g_sun.disc > 0 && g_map_light_n == 0);
+      combinations++;
+    }
+  }
+  // Another lobby's options cannot leak into the active arena.
+  int lobby0 = g_lobby;
+  int other = (g_lobby + 1) % SRV_LOBBIES;
+  environment_t other0 = g_environment_all[other], active = g_environment;
+  g_lobby = other; g_environment = (environment_t){0};
+  g_lobby = lobby0;
+  ENV_CHECK(environment_pack(g_environment) == environment_pack(active));
+  g_environment_all[other] = other0;
+  g_environment = env0; map_generate(seed0);
+  g_cfg.environment = (environment_t){0};
+  int ephemeral0 = g_cfg_ephemeral; g_cfg_ephemeral = 1;
+  ui_open_menu(); ui_route(UI_PAGE_MATCH);
+  g_ui_cx = g_ui_cy = -40; g_ui_mdown = 0;
+  harness_uiframe(s);
+  uint32_t world_hash = net_world_hash();
+  int widgets = 0;
+  for (int row = 0; row < 3; row++) {
+    int count = row == 0 ? BIOME_COUNT : row == 1 ? TIME_COUNT : WEATHER_KIND_COUNT;
+    int *value = row == 0 ? &g_cfg.environment.biome : row == 1 ? &g_cfg.environment.time : &g_cfg.environment.weather;
+    g_ui_focus = 3 + row;
+    for (int i = 1; i <= count + 1; i++) {
+      g_nav_kbd = 1; nav_push(NAV_RIGHT); harness_uiframe(s);
+      ENV_CHECK(*value == i % (count + 1)); widgets++;
+      ENV_CHECK(g_map_seed == seed0 && net_world_hash() == world_hash &&
+                environment_pack(g_environment) == environment_pack(env0));
+    }
+    g_nav_kbd = 1; nav_push(NAV_LEFT); harness_uiframe(s);
+    ENV_CHECK(*value == count); widgets++;
+  }
+  environment_t desired = {BIOME_DUNES + 1, TIME_GOLDEN + 1, WEATHER_HAZE + 1};
+  g_cfg.environment = desired;
+  sp_request_new_arena();
+  app_t app = {0}; frame_input_t neutral = {0};
+  app_frame(&app, local_player(), TICK_DT, &neutral);
+  ENV_CHECK(g_map_seed == map_seed_next(seed0) && !g_menu_open &&
+            environment_pack(g_environment) == environment_pack(desired));
+  uint32_t next_seed = g_map_seed;
+  sp_request_new_arena(); app_frame(&app, local_player(), TICK_DT, &neutral);
+  ENV_CHECK(g_map_seed == map_seed_next(next_seed) &&
+            environment_pack(g_environment) == environment_pack(desired));
+  g_cfg.environment = (environment_t){0};
+  sp_request_new_arena(); app_frame(&app, local_player(), TICK_DT, &neutral);
+  ENV_CHECK(!environment_pack(g_environment));
+  // A real handshake must override contrary local preferences without saving
+  // the server's choices. Snapshots repeat the recipe across rematches.
+  g_cfg.environment = (environment_t){BIOME_FOREST + 1, TIME_NIGHT + 1, WEATHER_RAIN + 1};
+  environment_t local = g_cfg.environment;
+  g_environment = desired;
+  memset(&g_cl, 0, sizeof g_cl); g_cl.fd = -1;
+  int server = net_udp_open(0);
+  struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  socklen_t length = sizeof address;
+  int opened = server >= 0 && bind(server, (struct sockaddr *)&address, length) == 0 &&
+      getsockname(server, (struct sockaddr *)&address, &length) == 0;
+  ENV_CHECK(opened);
+  if (opened) {
+    int joined = defaults_accept(server, ntohs(address.sin_port), &g_cfg, seed0);
+    ENV_CHECK(joined);
+    if (joined) {
+      ENV_CHECK(environment_pack(g_environment) == environment_pack(desired) &&
+                environment_pack(g_cfg.environment) == environment_pack(local));
+      ENV_CHECK(defaults_first_snapshot(server));
+      for (int rematch = 0; rematch < 2; rematch++) {
+        environment_t previous = g_environment;
+        uint32_t previous_seed = g_map_seed;
+        g_environment = rematch ? (environment_t){0} : local;
+        uint32_t server_seed = rematch ? map_seed_next(previous_seed) : previous_seed;
+        g_map_seed = server_seed; map_generate(server_seed);
+        uint32_t expected_hash = net_world_hash();
+        environment_t expected = g_environment;
+        g_tick = 20 + rematch;
+        unsigned char packet[2048];
+        size_t size = net_snapshot_build(packet, sizeof packet, 0, UINT32_MAX, 0);
+        ENV_CHECK(size > 23);
+        g_environment = previous; g_map_seed = previous_seed; map_generate(previous_seed);
+        net_cl_snapshot(packet, (int)size);
+        ENV_CHECK(g_cl.state == NC_PLAYING && g_map_seed == server_seed && net_world_hash() == expected_hash &&
+                  environment_pack(g_environment) == environment_pack(expected) &&
+                  environment_pack(g_cfg.environment) == environment_pack(local));
+        packet[20] = 255; // invalid authoritative weather choice
+        net_cl_snapshot(packet, (int)size);
+        net_cl_snapshot(packet, 19); // truncated environment header
+        ENV_CHECK(g_cl.state == NC_PLAYING && net_world_hash() == expected_hash &&
+                  environment_pack(g_environment) == environment_pack(expected));
+      }
+    }
+    net_cl_disconnect(); net_udp_close(server);
+  }
+  // Leaving online play restores local choices at the new local arena boundary.
+  leave_match();
+  ENV_CHECK(environment_pack(g_environment) == environment_pack(local));
+  g_cfg = cfg0; g_cfg_ephemeral = ephemeral0;
+  g_environment = env0; g_map_seed = seed0; map_generate(seed0);
+  g_rng = rng0;
+  recoil_restore_globals(); proof_world_restore(&world0);
+  g_menu_open = 0; g_home = 0; g_world_dirty = 1;
+  printf("environmentcheck combinations=%d wire=%d widgets=%d deferred=1 arenas=3 authority=join-rematch-leave fail=%d %s\n",
+         combinations, wire_cases, widgets, fail, fail ? "FAIL" : "ok");
+  #undef ENV_CHECK
   if (fail) exit(1);
 }
 
@@ -4736,7 +4919,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"wpn", cmd_wpn}, {"bot", cmd_bot}, {"match", cmd_match}, {"map", cmd_map},
   {"lean", cmd_lean}, {"cfg", cmd_cfg}, {"budget", cmd_budget},
   {"netstat", cmd_netstat}, {"updinfo", cmd_updinfo}, {"updcheck", cmd_updcheck},
-  {"sun", cmd_sun}, {"biome", cmd_biome}, {"mood", cmd_mood}, {"scat", cmd_scat}, {"uistat", cmd_uistat},
+  {"sun", cmd_sun}, {"biome", cmd_biome}, {"environment", cmd_environment}, {"environmentcheck", cmd_environmentcheck}, {"mood", cmd_mood}, {"scat", cmd_scat}, {"uistat", cmd_uistat},
   {"vmsight", cmd_vmsight}, {"vmscope", cmd_vmscope}, {"parity", cmd_parity},
   {"rag", cmd_rag}, {"ragsoak", cmd_ragsoak}, {"ragx", cmd_ragx},
   {"figv", cmd_figv}, {"figcheck", cmd_figcheck}, {"kine", cmd_kine},

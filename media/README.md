@@ -1,18 +1,17 @@
 # Trailer kit
 
 The local capture entry point is [`screenshots/index.html`](../screenshots/index.html).
-The [procedural environment and weather gallery](../screenshots/2026-09-07-procedural-weather/index.html)
-keeps its capture recipes and evidence with the images. Every arena is generated
-procedurally. Weather is selected automatically from the shared map seed; there
-is no weather menu or configuration override. Reusing a seed reproduces the
-weather preset, while the simulation tick determines its current motion and
-lightning phase.
+The [environment and Match Settings gallery](../screenshots/environment-settings/index.html)
+keeps its capture recipes and evidence with the images. Biome, time of day and
+weather are independent match choices, each defaulting to RANDOM. Choices are
+saved for the next local arena; online, clients use the server's recipe. Random
+choices are deterministic per seed and favor clear days, golden light and dry deserts.
 
-Run `python3 media/weather.py` after building the game to capture ten 1600×900
-images, including all five natural weather presets, a three-frame lightning
-sequence and Match Settings. `--only 07-lightning` repeats a single view from
-the same build. The generator validates the weather from the game's map dump,
-checks the build's source hashes and preserves PNGs, scripts, logs and a manifest.
+Run `python3 media/weather.py` after building the game to capture twelve 1600×900
+images: the same desert by day, golden hour and sunset, all seven weather kinds,
+night, and real menu navigation. `--only 10-match-settings` repeats the selected
+settings view. Recipes explicitly record every choice, validate the weather from
+the game dump, check build hashes and retain untouched PNGs, scripts and logs.
 
 `hero.gif` is the README trailer. `hero.mp4` is the same edit at 60 fps with
 captured game sound. `fight.png` and `scope.png` share the trailer's staging.
@@ -30,32 +29,42 @@ The full 16:9 frame keeps the terrain and skyline visible.
 
 ## Rebuild
 
-Requires `build/game`, Python 3, FFmpeg/FFprobe with libx264, and
+Requires the native game toolchain, Python 3, FFmpeg/FFprobe with libx264/libx264rgb, and
 Gifsicle for palette-preserving GIF assembly. On Debian the additional tools
 are `ffmpeg gifsicle`. ImageMagick is optional for lossless PNG
 compression. No external Python packages are needed.
 
 ```sh
-make build/game
-python3 media/media.py check
-python3 media/media.py                 # all captures, stills, GIF and MP4
+make trailer                         # fresh native build, captures, GIF and MP4
 ./tools/split-check.sh
 ```
 
-The prerequisite check verifies the completed native build transaction, current
+`make trailer` forces compilation of `build/game`, discards the clip and stage
+caches, and regenerates every take, both stills, `hero.gif` and `hero.mp4`. It
+prints total wall time, including compilation, even if a step fails. Prior final
+GIF/MP4 files are replaced only after the new outputs pass verification.
+`make rebuild` instead deletes the entire `build/` folder, including local configs
+and test evidence, and builds all three game binaries. There is no `make clean`.
+
+`python3 media/media.py check` verifies the completed native build transaction, current
 source and tuning content, required tools and valid recipes. It accepts absent
 or stale clip caches because a normal build regenerates them; cached edits
 require every recorded content hash to match.
 The renderer uses a fresh config for every take. Source footage is 120 fps,
-1280×720, with a 1600×900 optic take. The default GIF is 832×468 at 20 fps. Each clip gets its own 160-colour
+1920×1080, with a 2880×1620 optic take so its crop still resolves Full HD.
+Intermediate clips use lossless RGB H.264, preserving pixels before the final encode.
+The default GIF is 832×468 at 20 fps. Each clip gets its own 160-colour
 palette; repeated clip sections share that palette, including the loop seam.
 This keeps aurora gradients from competing with snow and sand for colours.
 `gif_bayer` controls ordered dithering; smaller values soften colour steps
 but increase texture and file size. `gif_lossy: 40` adds a reviewed Gifsicle
 compression pass; set it to `0` for lossless assembly of the palettized frames.
 Caches and event logs live under `media/.cache/`; review captures live under
-ignored `screenshots/`. The MP4 is also ignored by Git. It retains H.264 slow CRF 18 at 60 fps,
-AAC stereo at 192 kbit/s and faststart. Both requested final outputs are encoded
+ignored `screenshots/`. The MP4 is also ignored by Git. It uses 1920×1080 H.264
+slow CRF 14 at 60 fps,
+AAC stereo at 320 kbit/s and faststart. Video bitrate varies with scene complexity
+to retain quality; final yuv420p keeps playback compatible with common players.
+Both requested final outputs are encoded
 and checked privately before their publication group replaces the previous pair.
 
 ## Author and review
