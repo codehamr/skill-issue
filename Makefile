@@ -129,25 +129,24 @@ asan-gate: build/game-asan
 	@echo "asan-gate: OK"
 
 # ---------------------------------------------------------------------------
-# Dedicated server operations: server-up syncs docker-compose.yaml and docker/
+# Dedicated server operations: server-up syncs the deployment files in server/
 # to SERVER_DIR on SERVER_HOST. The container bootstraps and updates the Linux
 # release; .env overrides inline defaults and is copied only when present.
 # The compose/entrypoint comments own runtime operations. server-delete removes
 # the deployment directory, including accumulated logs and statistics.
--include .env
+-include server/.env
 SERVER_HOST ?= vps
 SERVER_DIR  ?= skill-issue
-# Empty-but-set SERVER_DIR in .env beats the `?=` and would make
+# Empty-but-set SERVER_DIR in server/.env beats the `?=` and would make
 # server-delete's rm -rf into "$$HOME/" — refuse it first.
 SERVER_DIR_OK = @test -n "$(SERVER_DIR)" || { echo "SERVER_DIR is empty — refusing"; exit 1; }
 
 server-up:        # sync + (re)create; idempotent
 	$(SERVER_DIR_OK)
-	ssh -n $(SERVER_HOST) 'mkdir -p $(SERVER_DIR)/docker'
-	scp -q docker-compose.yaml $(SERVER_HOST):$(SERVER_DIR)/
-	scp -q docker/Dockerfile docker/entrypoint.sh docker/report.awk \
-	       $(SERVER_HOST):$(SERVER_DIR)/docker/
-	@if [ -f .env ]; then scp -q .env $(SERVER_HOST):$(SERVER_DIR)/; fi
+	ssh -n $(SERVER_HOST) 'mkdir -p $(SERVER_DIR)'
+	scp -q server/docker-compose.yaml server/Dockerfile server/.dockerignore \
+	       server/entrypoint.sh server/report.awk $(SERVER_HOST):$(SERVER_DIR)/
+	@if [ -f server/.env ]; then scp -q server/.env $(SERVER_HOST):$(SERVER_DIR)/; fi
 	ssh -n $(SERVER_HOST) 'cd $(SERVER_DIR) && docker compose up -d --build'
 server-down:      # stop + remove the container; files stay, server-up resumes
 	ssh -n $(SERVER_HOST) 'cd $(SERVER_DIR) && docker compose down'
@@ -172,16 +171,16 @@ server-delete:
 
 # Count source lines under code/ only; isolated copies elsewhere do not count.
 loc:
-	@find code -name '*.c' -o -name '*.h' -o -name '*.inc' | sort | xargs wc -l
+	@rg --files code -g '*.c' -g '*.h' -g '*.inc' | sort | xargs wc -l
 
 # Delete the entire build/ tree, including configs, caches and test evidence,
 # then compile all three game binaries in one locked transaction.
 rebuild: all
 
-# Fresh native compilation, fresh captures, GIF + Full HD MP4, total elapsed time.
-# The driver times both compilation and generation and preserves failure status.
-trailer:
-	python3 -u tools/trailer.py
+# Verify/rebuild the native binary, then capture all media from scratch.
+# The driver includes the build check in elapsed time and preserves failures.
+media:
+	python3 -u media/build.py
 
 # History-rewriting maintainer operation; never part of build or verification.
 init:
@@ -189,7 +188,7 @@ init:
 	git push --force origin main
 	@echo "Git history reset to single 'init' commit"
 
-.PHONY: all rebuild trailer init loc server-up server-down server-stats server-logs server-reset server-delete asan-gate
+.PHONY: all rebuild media init loc server-up server-down server-stats server-logs server-reset server-delete asan-gate
 
 # Pipe/ioctl fixtures exercise the Linux pump without opening real devices.
 .PHONY: pad-native-gate

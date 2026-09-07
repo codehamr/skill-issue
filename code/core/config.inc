@@ -253,15 +253,15 @@ static int sp_frag_normalize(long n) {
 // Zero means random; explicit choices use their resolved enum plus one.
 typedef enum { BIOME_QUARRY, BIOME_DUNES, BIOME_MARSH, BIOME_FOREST,
                BIOME_FROST, BIOME_COUNT } biome_kind_t;
-typedef enum { TIME_DAY, TIME_GOLDEN, TIME_SUNSET, TIME_NIGHT, TIME_COUNT } time_kind_t;
+typedef enum { TIME_DAY, TIME_SUNSET, TIME_NIGHT, TIME_COUNT } time_kind_t;
 typedef enum { WEATHER_CLEAR, WEATHER_HAZE, WEATHER_CLOUDY, WEATHER_MIST,
                WEATHER_RAIN, WEATHER_STORM, WEATHER_SUNSHOWER, WEATHER_KIND_COUNT } weather_kind_t;
 typedef struct { int biome, time, weather; } environment_t;
 static const char *const ENV_BIOME_OPTS[] = {"RANDOM", "QUARRY", "DESERT", "MARSH", "FOREST", "SNOW"};
-static const char *const ENV_TIME_OPTS[] = {"RANDOM", "DAY", "GOLDEN HOUR", "SUNSET", "NIGHT"};
+static const char *const ENV_TIME_OPTS[] = {"RANDOM", "DAY", "SUNSET", "NIGHT"};
 static const char *const ENV_WEATHER_OPTS[] = {"RANDOM", "CLEAR", "LIGHT HAZE", "CLOUDY", "FOG", "RAIN", "STORM", "SUNSHOWER"};
 static const char *const ENV_BIOME_KEYS[] = {"random", "quarry", "dunes", "marsh", "forest", "frost"};
-static const char *const ENV_TIME_KEYS[] = {"random", "day", "golden", "sunset", "night"};
+static const char *const ENV_TIME_KEYS[] = {"random", "day", "sunset", "night"};
 static const char *const ENV_WEATHER_KEYS[] = {"random", "clear", "haze", "cloudy", "fog", "rain", "storm", "sunshower"};
 static int environment_option(const char *s, const char *const *keys, int count) {
   for (int i = 0; i <= count; i++) if (!strcmp(s, keys[i])) return i;

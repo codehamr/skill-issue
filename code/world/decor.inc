@@ -958,12 +958,6 @@ static void mesh_cast_extra(void) {
   mat_set(0.90f, 0.0f);
   for (int i = 0; i < g_meta.ngrove; i++)
     dec_grove_tree(&g_solids[g_meta.grove[i]], i / 2, i & 1 ? -1.0f : 1.0f);
-  if (g_biome.kind == BIOME_FOREST) for (int i = 0; i < map_perim_count(); i += 3) {
-    const solid_t *s = &g_solids[i];
-    v3 at = v3_lerp(s->bank[4], s->bank[5], 0.48f); at.y -= 0.12f;
-    uint64_t st = (uint64_t)scat_h(0xBEEFu, (uint32_t)i, 0, 0) * 2654435761u + 1;
-    dec_backdrop_tree(at, rng_rangef(&st, 4.5f, 8.0f), i % 2, st, 1);
-  }
   int n = g_scene_floats;
   int cap = (int)(sizeof g_mesh / sizeof g_mesh[0]);
   if (g_mesh_floats + n > cap) n = cap - g_mesh_floats;
@@ -1187,12 +1181,6 @@ static void mesh_large_scenery(void) {
     for (int t = 0; t < 2; t++) {
       float sg = t ? -1.0f : 1.0f;
       v3 rooted = at;
-      if (map_has_banks()) {
-        v3 normal; int solid = -1;
-        v3 above = {{at.x*sg, BANK_MAX_H + 1, at.z*sg}};
-        float down = trace_world(above, (v3){{0,-1,0}}, &normal, &solid);
-        if (solid >= 0 && g_solids[solid].mat == SOLID_BANK) rooted.y = above.y - down - 0.15f;
-      }
       dec_backdrop_tree(rooted, ht, pine, ts, sg);
     }
   }
@@ -1210,53 +1198,6 @@ static void mesh_large_scenery(void) {
   g_mesh_drops += g_scene_drops - save_drops;
   g_scene_peak = save_peak; g_scene_drops = save_drops;
   g_scene_dirty = 1;
-}
-
-// Vegetation follows the actual bank face. Roots drape down its incline;
-// ankle-high stones soften the foot without blocking the rotation lane.
-static void dec_bank_growth(void) {
-  if (g_biome.kind != BIOME_FOREST) return;
-  for (int i = 0; i < map_perim_count(); i++) {
-    const solid_t *s = &g_solids[i];
-    if (s->mat != SOLID_BANK) continue;
-    uint64_t st = (uint64_t)scat_h(0xA007u, (uint32_t)i, 0, 0) * 2654435761u + 1;
-    v3 tangent = v3_norm(v3_sub(s->bank[1], s->bank[0]));
-    mat_set(0.93f, 0.0f);
-    v3 wood = {{0.29f,0.26f,0.20f}};
-    for (int root = 0; root < (i % 3 == 0 ? 2 : 0); root++) {
-      float along = rng_rangef(&st, 0.18f, 0.82f);
-      v3 top = v3_lerp(s->bank[4], s->bank[5], along);
-      v3 knee = v3_lerp(s->bank[2], s->bank[3], along);
-      v3 a = v3_lerp(knee, top, 0.96f);
-      v3 b = v3_lerp(knee, top, 0.78f), c = v3_lerp(knee, top, 0.55f);
-      b = v3_add(b, v3_scale(tangent, rng_rangef(&st, -0.28f, 0.28f)));
-      a = v3_sub(a, v3_scale(s->bank_n, 0.018f));
-      b = v3_sub(b, v3_scale(s->bank_n, 0.018f));
-      c = v3_sub(c, v3_scale(s->bank_n, 0.018f));
-      dec_stick(a, b, 0.045f, wood, 1);
-      dec_stick(b, c, 0.025f, wood, 1);
-    }
-    for (int patch = 0; patch < 3; patch++) {
-      float along = rng_rangef(&st, 0.02f, 0.98f);
-      v3 knee = v3_lerp(s->bank[2], s->bank[3], along);
-      v3 top = v3_lerp(s->bank[4], s->bank[5], along);
-      v3 at = v3_lerp(knee, top, rng_rangef(&st, 0.1f, 0.95f));
-      at.y += 0.025f;
-      dec_tuft(at, rng_rangef(&st, 0.28f, 0.55f), wind_dir(), 0.2f,
-               (v3){{0.30f,0.43f,0.20f}}, 1, &st, 5);
-      for (int leaf = 0; leaf < 5; leaf++) {
-        float ang = rng_rangef(&st, 0, 2*F_PI);
-        v3 dir = v3_norm((v3){{cosf(ang), rng_rangef(&st, 0.3f, 1), sinf(ang)}});
-        dec_leaf(at, dir, rng_rangef(&st, 0.35f, 0.65f), 0.10f,
-                 (v3){{0.24f,0.39f,0.16f}}, 1);
-      }
-    }
-    for (int stone = 0; stone < 4; stone++) {
-      v3 at = v3_lerp(s->bank[0], s->bank[1], rng_rangef(&st, 0.08f, 0.92f));
-      at = v3_sub(at, v3_scale(s->bank_n, rng_rangef(&st, 0.12f, 0.75f)));
-      dec_pebble(at, rng_rangef(&st, 0.045f, 0.085f), &st, s->color, 1);
-    }
-  }
 }
 
 static void mesh_decor(void) {
@@ -1351,7 +1292,6 @@ static void mesh_decor(void) {
       }
     }
   scat_emit();
-  dec_bank_growth();
 
   // What a dead tree sheds: a few fallen sticks at each trunk's base — the
   // ground story that ties the crown to the floor without any aerial twigs.

@@ -1,5 +1,5 @@
 {
-  "_": "Text-free real-game action loop: low slide, reactive firefights, diagonal leap, manual scope correction and the same impact outside. Source frame 59 flows into frame 60 at the loop. Speed stretches duration; 2 is half-speed.",
+  "_": "Thirty-second real-game journey: sunset movement hook, rain duel, forest leap, live counterfire, corrected scope and impact, sunshower run, sunset flank, storm, aurora and continuous slide loop. Speeds stretch source time; 2 is half speed.",
   "out": ".cache/hero_src.mp4",
   "w": 1920,
   "h": 1080,
@@ -13,80 +13,88 @@
     {
       "clip": "dunes_slide",
       "in_f": 60,
-      "beats": 2,
-      "speed": 1.25,
-      "hit": "Immediate low slide hook"
+      "beats": 3.0,
+      "speed": 1.25
     },
     {
       "clip": "marsh_duel",
       "in_f": 0,
-      "beats": 2.7,
-      "speed": 1,
-      "hit": "Visible miss, correction and strafe reversal"
+      "beats": 4.8,
+      "speed": 1
     },
     {
       "clip": "forest_break",
       "in_f": 12,
-      "beats": 1.8,
-      "speed": 1.25,
-      "hit": "Diagonal airborne break through incoming fire"
+      "beats": 3.6,
+      "speed": 1.5
     },
     {
       "clip": "quarry_crossfire",
       "in_f": 0,
-      "beats": 3.3,
-      "speed": 1,
-      "hit": "Live return fire and two directional dodges"
+      "beats": 7.6,
+      "speed": 1
     },
     {
       "clip": "frost_scope",
       "in_f": 12,
       "beats": 1.8,
       "speed": 1,
-      "zoom": 1.38,
-      "hit": "Unsettled scope acquire and correction"
+      "zoom": 1.38
     },
     {
       "clip": "frost_scope",
+      "in_f": 120,
       "beats": 0.8,
       "speed": 2,
-      "zoom": 1.38,
-      "hit": "Sniper recoil punctuates the cut"
+      "zoom": 1.38
     },
     {
       "clip": "frost_impact",
       "in_f": 120,
-      "beats": 1.1,
-      "speed": 2,
-      "hit": "Same impact from outside"
+      "beats": 1.8,
+      "speed": 1.5
     },
     {
-      "clip": "quarry_crossfire",
-      "in_f": 235,
-      "beats": 1.3,
-      "speed": 1,
-      "hit": "Tactile magazine seat"
+      "clip": "forest_run",
+      "in_f": 0,
+      "beats": 8.4,
+      "speed": 1
+    },
+    {
+      "clip": "dunes_flank",
+      "in_f": 0,
+      "beats": 7.6,
+      "speed": 1
+    },
+    {
+      "clip": "storm_crossfire",
+      "in_f": 0,
+      "beats": 8.2,
+      "speed": 1
     },
     {
       "clip": "aurora_push",
       "in_f": 0,
-      "beats": 2.8,
-      "speed": 1,
-      "hit": "Night slide into hipfire"
+      "beats": 4.2,
+      "speed": 1.5
+    },
+    {
+      "clip": "aurora_run",
+      "in_f": 0,
+      "beats": 6.0,
+      "speed": 1.1
     },
     {
       "clip": "forest_break",
-      "in_f": 98,
-      "beats": 0.6,
-      "speed": 1,
-      "hit": "Close landing punctuation"
+      "in_f": 100,
+      "beats": 1.2,
+      "speed": 1.5
     },
     {
       "clip": "dunes_slide",
       "in_f": 0,
-      "beats": 1,
-      "speed": 1,
-      "hit": "Continuous run into opening slide"
+      "beats": 1.0,
+      "speed": 1
     }
   ],
   "gif_palette": "shot",

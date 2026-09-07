@@ -29,7 +29,7 @@
 // matching presentation semantics even though the record size is unchanged.
 // The 50-slot local bot range also moves the high human entity ids to 51+.
 // 14: ACCEPT and snapshots carry the authoritative arena environment choices.
-#define NET_PROTO 14
+#define NET_PROTO 15
 // Floor on an UNVERIFIED request, so the answer to one is always smaller than the
 // request was and the responder cannot be pointed at a forged source address:
 // NET_CONNECT_MIN 16 against the 7-byte COOKIE reply.
@@ -191,7 +191,7 @@ static int net_tele_parse(const unsigned char *b, int n, net_tele_t *t) {
     int c = np_r8(&r);
     // SPACE and '=' are excluded on purpose, not by accident: this string is printed
     // into server.log, whose grammar is space-separated key=value and is a CONTRACT with
-    // docker/report.awk.
+    // server/report.awk.
     t->ver[i] = (char)((c > 0x20 && c <= 0x7e && c != '=') ? c : (c ? '?' : 0));
   }
   t->ver[12] = 0;
@@ -439,18 +439,12 @@ static uint32_t net_world_hash(void) {
   uint32_t h = 2166136261u;
   // The historical authoritative record ends immediately before `mat`.
   // Hash each record separately: the render tag widens the live stride, so one
-  // contiguous prefix would mix record tails with later records. Bank shape
-  // data is hashed separately below; changing its vertices changes identity.
+  // contiguous prefix would mix record tails with later records.
   _Static_assert(__builtin_offsetof(solid_t, mat) == 40,
                  "solid_t authoritative wire prefix changed");
   for (int s = 0; s < g_num_solids; s++) {
     const unsigned char *p = (const unsigned char *)&g_solids[s];
     for (size_t i = 0; i < __builtin_offsetof(solid_t, mat); i++)
-      h = (h ^ p[i]) * 16777619u;
-  }
-  for (int s = 0; s < g_num_solids; s++) if (g_solids[s].mat == SOLID_BANK) {
-    const unsigned char *p = (const unsigned char *)&g_solids[s].bank;
-    for (size_t i = 0; i < sizeof(solid_t) - __builtin_offsetof(solid_t, bank); i++)
       h = (h ^ p[i]) * 16777619u;
   }
   h = (h ^ (uint32_t)g_num_solids) * 16777619u;
@@ -576,10 +570,6 @@ static int aabb_fits(v3 pos, float radius, float height) {
   v3 mx = {{pos.x + radius, pos.y + height, pos.z + radius}};
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
-    if (s->mat == SOLID_BANK) {
-      if (pos.y < fminf(s->bank[4].y, s->bank[5].y) && bank_distance(s, pos, radius) > 0.0001f) return 0;
-      continue;
-    }
     if (mx.x > s->min.x && mn.x < s->max.x &&
         mx.y > s->min.y && mn.y < s->max.y &&
         mx.z > s->min.z && mn.z < s->max.z) return 0;
@@ -605,7 +595,6 @@ static void move_axis(v3 *pos, v3 *vel, int *grounded, int axis,
   float ext[3] = {radius, height, radius};
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
-    if (s->mat == SOLID_BANK) continue;
     v3 mn = {{pos->x - radius, pos->y, pos->z - radius}};
     v3 mx = {{pos->x + radius, pos->y + height, pos->z + radius}};
     if (!(mx.x > s->min.x && mn.x < s->max.x &&
@@ -628,38 +617,15 @@ static void move_axis(v3 *pos, v3 *vel, int *grounded, int axis,
   }
 }
 
-// Resolve in the horizontal contact plane after the complete XYZ step.
-// Remove only outward velocity, retaining tangential momentum at diagonal
-// faces. Gravity draws an airborne body back down and inward along the slope.
-static void bank_resolve(v3 *pos, v3 *vel) {
-  if (!map_has_banks()) return;
-  for (int pass = 0; pass < 3; pass++) {
-    int touched = 0;
-    for (int i = 0; i < map_perim_count(); i++) {
-      const solid_t *s = &g_solids[i];
-      if (pos->y >= fminf(s->bank[4].y, s->bank[5].y)) continue;
-      float distance = bank_distance(s, *pos, PLAYER_RADIUS);
-      if (distance <= 0) continue;
-      *pos = v3_sub(*pos, v3_scale(s->bank_n, distance + 0.00001f));
-      float outward = v3_dot(*vel, s->bank_n);
-      if (outward > 0) *vel = v3_sub(*vel, v3_scale(s->bank_n, outward));
-      touched = 1;
-    }
-    if (!touched) break;
-  }
-}
-
 // One tick of the collision sweep for ANY entity.
 static void ent_move(v3 *pos, v3 *vel, int *grounded, float height) {
   move_axis(pos, vel, grounded, 0, PLAYER_RADIUS, height, TICK_DT);
   move_axis(pos, vel, grounded, 2, PLAYER_RADIUS, height, TICK_DT);
   move_axis(pos, vel, grounded, 1, PLAYER_RADIUS, height, TICK_DT);
-  bank_resolve(pos, vel);
 }
 
 // Keep an entity inside the arena.
 static void arena_clamp(v3 *pos) {
-  if (map_has_banks()) { v3 velocity = {{0,0,0}}; bank_resolve(pos, &velocity); return; }
   pos->x = f_clamp(pos->x, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
   pos->z = f_clamp(pos->z, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
 }

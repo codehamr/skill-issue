@@ -347,12 +347,9 @@ static void mark_stamp(v3 at, v3 n, int solid) {
     aom = n.y > 0.5f ? hi : n.y < -0.5f ? lo
         : h > 1e-4f ? lo + (hi - lo) * f_clamp((at.y - mn.y) / h, 0.0f, 1.0f)
         : lo;
-    if (g_solids[solid].mat == SOLID_BANK) {
-      surf = bank_colour(&g_solids[solid], at); aom = 1; rough = 0.91f;
-    }
   } else {                                  // the arena floor is its own plane
-    mn = (v3){{-map_half(), 0.0f, -map_half()}};
-    mx = (v3){{ map_half(), 0.0f,  map_half()}};
+    mn = (v3){{-ARENA_HALF, 0.0f, -ARENA_HALF}};
+    mx = (v3){{ ARENA_HALF, 0.0f,  ARENA_HALF}};
     // Narrow wall contact is screen-space; the coarse ground vertex grid keeps
     // impact marks at neutral AO so it cannot stamp triangular skirts into them.
     surf = g_theme.ground; aom = 1.0f;

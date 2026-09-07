@@ -179,6 +179,10 @@ def mp4(path, width, height, frames, fps, reference_path=None, witnesses=None, v
             int(video["nb_read_frames"]) != frames or sound["channels"] != 2 or
             int(sound["sample_rate"]) != AUDIO_HZ):
         raise ValueError("decoded MP4 codec/dimensions/frames/stereo format mismatch")
+    if (width, height, fps) != (1920, 1080, 60) or video.get("pix_fmt") != "yuv420p":
+        raise ValueError("hero.mp4 must be compatible Full HD at 60 fps")
+    if int(video.get("bit_rate", 0)) < 20_000_000 or int(sound.get("bit_rate", 0)) < 256_000:
+        raise ValueError("hero.mp4 video or audio bitrate is below the delivery floor")
     result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                              "-show_frames", "-show_entries", "frame=best_effort_timestamp_time",
                              "-of", "json", path], capture_output=True, text=True, check=True)
@@ -230,6 +234,7 @@ def mp4(path, width, height, frames, fps, reference_path=None, witnesses=None, v
                 row.update(visual_delay_witness(pictures, actual_pictures,
                                                min(frames - 1, max(0, round(at * fps)))))
     return dict(width=width, height=height, frames=frames, fps=fps,
+                video_bitrate=int(video["bit_rate"]), audio_bitrate=int(sound["bit_rate"]),
                 decoded_audio_seconds=seconds, decoded_padding_frames=round((seconds - frames / fps) * AUDIO_HZ),
                 peak=peak, rms=rms,
                 source_limit_seconds=SOURCE_CUE_LIMIT, encode_limit_seconds=ENCODE_CUE_LIMIT,

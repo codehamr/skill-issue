@@ -472,7 +472,7 @@ class Gate:
         os.utime(tuning_source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
         self.concurrent_controls(tree, env)
         self.rebuild_controls(tree, env)
-        self.trailer_controls(tree, env, overrides)
+        self.media_controls(tree, env, overrides)
 
     def concurrent_controls(self, tree, env):
         (tree / "one.cfg").write_text("devmode 1\nmv_run_speed 10\n")
@@ -555,34 +555,36 @@ class Gate:
         self.check("rebuild-does-not-follow-symlink", (external / "keep").read_text() == "outside build")
         (tree / "control.json").unlink()
 
-    def trailer_controls(self, tree, env, overrides):
+    def media_controls(self, tree, env, overrides):
         media = tree / "media"
         media.mkdir()
+        shutil.copy2(Path("media/build.py").resolve(), media / "build.py")
         (media / "media.py").write_text(
             "import json,pathlib,sys\n"
             "pathlib.Path('media-invocation.json').write_text(json.dumps(sys.argv[1:]))\n"
             "sys.exit(23 if pathlib.Path('media-fail').exists() else 0)\n")
-        command = ["make", "trailer", *overrides]
+        command = ["make", "media", *overrides]
         def run(label):
             result = subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True)
             (self.out / (label + ".log")).write_text(result.stdout + result.stderr)
-            self.check(label + "-elapsed", "trailer: elapsed " in result.stdout)
+            self.check(label + "-elapsed", "media: elapsed " in result.stdout)
             return result
-        result = run("trailer-success")
-        self.check("trailer-success-status", result.returncode == 0 and "OK" in result.stdout)
-        self.check("trailer-fresh-all-outputs", json.loads((tree / "media-invocation.json").read_text()) == ["all", "--fresh"])
+        result = run("media-success")
+        self.check("media-success-status", result.returncode == 0 and "OK" in result.stdout)
+        self.check("media-fresh-all-outputs", json.loads((tree / "media-invocation.json").read_text()) == ["all", "--fresh"])
         last = json.loads((tree / "build/tuning/last-selection.json").read_text())
-        self.check("trailer-forces-native-compile", last["rebuilt"] == ["game"])
+        self.check("media-reuses-verified-native-build", last["rebuilt"] == [])
         (tree / "media-fail").touch()
-        result = run("trailer-media-failure")
-        self.check("trailer-media-failure-propagates", result.returncode != 0 and "FAILED" in result.stdout)
+        result = run("media-media-failure")
+        self.check("media-media-failure-propagates", result.returncode != 0 and "FAILED" in result.stdout)
         (tree / "media-invocation.json").unlink()
+        (tree / "code/game.c").write_text("// changed before compiler failure\n")
         (tree / "control.json").write_text('{"fail":true}')
-        result = run("trailer-compile-failure")
-        self.check("trailer-compile-failure-stops-media", result.returncode != 0 and not (tree / "media-invocation.json").exists())
+        result = run("media-compile-failure")
+        self.check("media-compile-failure-stops-media", result.returncode != 0 and not (tree / "media-invocation.json").exists())
         (tree / "control.json").unlink()
-        dry = subprocess.run(["make", "-n", "trailer", *overrides], cwd=tree, env=env, capture_output=True)
-        self.check("trailer-dry-run-does-not-render", dry.returncode == 0 and not (tree / "media-invocation.json").exists())
+        dry = subprocess.run(["make", "-n", "media", *overrides], cwd=tree, env=env, capture_output=True)
+        self.check("media-dry-run-does-not-render", dry.returncode == 0 and not (tree / "media-invocation.json").exists())
 
 
 def main():

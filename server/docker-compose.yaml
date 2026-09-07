@@ -1,0 +1,41 @@
+# The complete server/ contents deploy into ~/skill-issue on the server box.
+# make server-up syncs them; `docker compose up -d` in that directory is
+# a running, self-updating public server — no checkout, no compiler, no .env.
+# Every knob below carries its default inline (${VAR:-default}); to override
+# one, put a .env next to this file — needed only for deviations, never for
+# operation. The folder itself is the state: server.log and stats.txt appear
+# next to this file, the binary under data/. Ops targets live in the Makefile.
+services:
+  game:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: skill-issue-server
+    init: true
+    restart: unless-stopped
+    # Set PUID/PGID to the bind-mounted folder owner for editable state files.
+    # The defaults are UID/GID zero. Capabilities, privilege escalation and
+    # root filesystem writes are restricted by the options below.
+    user: "${PUID:-0}:${PGID:-0}"
+    ports:
+      - "${GAME_PORT:-31415}:${GAME_PORT:-31415}/udp"
+    environment:
+      PORT:             ${GAME_PORT:-31415}
+      LOBBIES:          ${GAME_LOBBIES:-16}
+      CAP_PUBLIC:       ${GAME_CAP_PUBLIC:-4}
+      CAP_BOTS:         ${GAME_CAP_BOTS:-1}
+      SKILL:            ${GAME_SKILL:-1}
+      FRAGLIMIT:        ${GAME_FRAGLIMIT:-12}
+      UPDATE_URL:       ${UPDATE_URL:-https://github.com/codehamr/skill-issue/releases/latest/download}
+      UPDATE_INTERVAL:  ${UPDATE_INTERVAL:-300}
+      UPDATE_MAX_DEFER: ${UPDATE_MAX_DEFER:-3600}
+    volumes:
+      - .:/srv
+      # Dev override: run a local build instead of the release, updates off.
+      # - ../build/game-x86_64:/local/game:ro
+    read_only: true          # rootfs; state lives in /srv and scratch in /tmp
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+# Published UDP must retain client source addresses for cookie and per-host
+# admission accounting. Verify that behavior on the deployment network.

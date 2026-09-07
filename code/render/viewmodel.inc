@@ -836,7 +836,10 @@ static void sky_pass(float yaw, float pitch, float roll, float fovy, float aspec
   { v3 sxz = v3_norm((v3){{g_sun.dir.x, 0.0f, g_sun.dir.z}});
     glUniform2f(R.u_sky_sunxz, sxz.x, sxz.z); }
   glUniform1f(R.u_sky_cov, weather_cloud());
-  glUniform1f(R.u_sky_time, (float)g_tick / 120.0f);
+  glUniform1f(R.u_sky_time, (float)g_tick / TICK_HZ);
+  meteor_t meteor = meteor_sample(g_map_seed, g_tick, g_biome.night > 0.5f);
+  glUniform4f(R.u_sky_meteor, meteor.hx, meteor.hy, meteor.tx, meteor.ty);
+  glUniform2f(R.u_sky_meteor_shape, meteor.width, meteor.light);
   { float dk; v3 rp = ridge_params(&dk);
     glUniform4f(R.u_sky_ridge, rp.x, rp.y, rp.z, dk); }
   glUniform3f(R.u_sky_fwd, sf.x, sf.y, sf.z);

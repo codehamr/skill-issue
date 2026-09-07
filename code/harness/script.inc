@@ -660,6 +660,28 @@ static void cmd_weatherproof(sim_ctx_t *s) {
   }
   printf("weatherproof seeds=10000 counts=%d/%d/%d/%d/%d/%d/%d deterministic=1 %s\n",
          counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], fail ? "FAIL" : "ok");
+  int meteor_ticks = 0, thin = 0, thick = 0;
+  for (int seed = 0; seed < 20; seed++) for (long tick = 0; tick < 9600; tick++) {
+    meteor_t a = meteor_sample((uint32_t)seed, tick, 1);
+    meteor_t b = meteor_sample((uint32_t)seed, tick, 1);
+    meteor_t day = meteor_sample((uint32_t)seed, tick, 0);
+    fail |= memcmp(&a, &b, sizeof a) != 0 || day.light != 0;
+    float values[] = {a.hx, a.hy, a.tx, a.ty, a.width, a.light};
+    for (int v = 0; v < 6; v++) fail |= f_is_nonfinite(values[v]);
+    fail |= a.width < 0 || a.width > 0.00186f || a.light < 0 || a.light > 2.61f;
+    if (a.light > 0) {
+      if (a.light > 0.5f && ((!thin && a.width < 0.0006f) || (!thick && a.width > 0.0012f)))
+        printf("meteor witness seed=%d tick=%ld head=%.6f/%.6f width=%.6f light=%.3f\n",
+               seed, tick, a.hx, a.hy, a.width, a.light);
+      meteor_ticks++;
+      thin += a.light > 0.5f && a.width < 0.0006f;
+      thick += a.light > 0.5f && a.width > 0.0012f;
+      fail |= a.hx * a.hx + a.hy * a.hy > 0.8f;
+    }
+  }
+  fail |= meteor_ticks < 4000 || meteor_ticks > 13000 || !thin || !thick;
+  printf("weatherproof meteors samples=192000 active=%d thin=%d thick=%d day=0 %s\n",
+         meteor_ticks, thin, thick, fail ? "FAIL" : "ok");
   // A large roof intercepts every rain column before it can enter the
   // shelter. The open control must emit near-ground drops at identical ticks.
   const long ticks[] = {0, 1, 17, 120, 543, 550, 633, 1199, 2399};
@@ -4529,123 +4551,87 @@ static void cmd_boundarycheck(sim_ctx_t *s) {
   uint32_t seed0 = g_map_seed;
   uint64_t rng0 = g_rng, bot0 = g_rng_bot, gun0[8];
   memcpy(gun0, g_rng_gun, sizeof gun0);
-  float high_mv[MV_COUNT]; memcpy(high_mv, g_sim_mv, sizeof high_mv);
-  high_mv[MV_JUMP_H] = MV_DEF[MV_JUMP_H].hi;
-  const float *mv0 = g_sim_mv; g_sim_mv = high_mv;
-  float high_jump = mv_jump_speed(); g_sim_mv = mv0;
   long rays = 0, routes = 0, contacts = 0, tangents = 0, fail = 0;
   int meshes = 0, mesh_peak = 0;
-  #define BANK_CHECK(test) do { if (test) { fail++; if (fail <= 8) printf("boundarycheck assertion line=%d seed=%u\n", __LINE__, g_map_seed); } } while (0)
-  const int biomes[] = {BIOME_FOREST, BIOME_DUNES, BIOME_FROST};
+  #define BOUND_CHECK(test) do { if (test) { fail++; if (fail <= 8) printf("boundarycheck assertion line=%d seed=%u\n", __LINE__, g_map_seed); } } while (0)
   for (long map = 0; map < maps; map++) {
-    g_environment.biome = biomes[map % 3] + 1; map_generate(g_map_seed);
+    g_environment.biome = (int)(map % BIOME_COUNT) + 1; map_generate(g_map_seed);
     long drops = g_mesh_drops, invalid = g_decor_invalid;
     mesh_build();
-    BANK_CHECK(g_mesh_drops != drops || g_decor_invalid != invalid);
+    BOUND_CHECK(g_mesh_drops != drops || g_decor_invalid != invalid);
     int verts = g_mesh_floats / VERT_FLOATS;
     if (verts > mesh_peak) mesh_peak = verts;
     meshes++;
-    BANK_CHECK(map_perim_count() != BANK_SIDES || !aabb_fits(SPAWN_POS, PLAYER_RADIUS, HEIGHT_STAND));
-    v3 way[BANK_SIDES];
-    float takeoff = 0;
-    for (int i = map_perim_count(); i < g_num_solids; i++) takeoff = fmaxf(takeoff, g_solids[i].max.y);
-    for (int i = 0; i < BANK_SIDES; i++) {
-      const solid_t *bank = &g_solids[i], *next = &g_solids[(i + 1) % BANK_SIDES];
-      BANK_CHECK(bank->mat != SOLID_BANK || bank->pen);
-      BANK_CHECK(v3_len(v3_sub(bank->bank[1], next->bank[0])) > 0.0001f ||
-              v3_len(v3_sub(bank->bank[5], next->bank[4])) > 0.0001f);
-      BANK_CHECK(fminf(bank->bank[4].y, bank->bank[5].y) <= takeoff + MV_DEF[MV_JUMP_H].hi);
-      // Every emitted triangle is finite, nondegenerate and faces out of
-      // its closed prism. Each local edge must occur once in each direction.
-      int edges[BANK_VERTS][BANK_VERTS] = {{0}};
-      v3 centre = {{0,0,0}};
-      for (int v = 0; v < BANK_VERTS; v++) centre = v3_add(centre, v3_scale(bank->bank[v], 1.0f/BANK_VERTS));
-      for (int t = 0; t < BANK_TRI_COUNT; t++) {
-        v3 a = bank->bank[BANK_TRIS[t][0]], b = bank->bank[BANK_TRIS[t][1]], c = bank->bank[BANK_TRIS[t][2]];
-        v3 n = v3_cross(v3_sub(b,a), v3_sub(c,a));
-        BANK_CHECK(f_is_nonfinite(v3_dot(n,n)) || v3_dot(n,n) < 0.0001f || v3_dot(n,v3_sub(a,centre)) <= 0);
-        for (int e = 0; e < 3; e++) edges[BANK_TRIS[t][e]][BANK_TRIS[t][(e+1)%3]]++;
-      }
-      for (int a = 0; a < BANK_VERTS; a++) for (int b = a + 1; b < BANK_VERTS; b++)
-        BANK_CHECK(edges[a][b] != edges[b][a] || edges[a][b] > 1);
-      // Press into a diagonal face with live slide momentum. Its tangent
-      // component must survive contact in both directions, to millimetres.
-      for (int reverse = 0; reverse < 2; reverse++) {
-        v3 foot = v3_lerp(bank->bank[0], bank->bank[1], 0.5f);
-        v3 tangent = v3_scale(v3_norm(v3_sub(bank->bank[1], bank->bank[0])), reverse ? -1 : 1);
-        float radius = PLAYER_RADIUS * (fabsf(bank->bank_n.x) + fabsf(bank->bank_n.z));
-        v3 p = v3_sub(foot, v3_scale(bank->bank_n, radius + 0.001f));
-        v3 before = p, vel = v3_add(v3_scale(tangent, mv_slide_boost()), v3_scale(bank->bank_n, 3));
-        int grounded = 1;
-        ent_move(&p, &vel, &grounded, HEIGHT_CROUCH);
-        BANK_CHECK(fabsf(v3_dot(vel, tangent) - mv_slide_boost()) > 0.001f ||
-                   fabsf(v3_dot(v3_sub(p,before), tangent) - mv_slide_boost()*TICK_DT) > 0.001f);
-        tangents++;
-      }
-      way[i] = v3_scale(bank->bank[0], 0.95f);
-      // Witnesses come from the rendered surface, not the collision plane.
-      for (int step = 0; step <= 4; step++) {
-        float along = (float)step / 4;
-        v3 foot = v3_lerp(bank->bank[0], bank->bank[1], along);
-        v3 knee = v3_lerp(bank->bank[2], bank->bank[3], along);
-        v3 crest = v3_lerp(bank->bank[4], bank->bank[5], along);
-        for (int elevation = 0; elevation < 2; elevation++) {
-          v3 point = elevation ? v3_lerp(knee, crest, 0.8f) : v3_lerp(foot, knee, EYE_STAND/BANK_KNEE_H);
-          v3 eye = v3_sub(point, v3_scale(bank->bank_n, 1.0f));
-          v3 normal; int solid = -1;
-          float hit = trace_world(eye, bank->bank_n, &normal, &solid);
-          if (fabsf(hit - 1) > 0.002f && fail < 8) printf("bank ray i=%d sample=%d elev=%d hit=%.6f solid=%d n=%.3f %.3f %.3f\n", i, step, elevation, hit, solid, normal.x, normal.y, normal.z);
-          BANK_CHECK(fabsf(hit - 1.0f) > 0.002f || solid < 0 ||
-                  (solid >= 0 && g_solids[solid].mat != SOLID_BANK) || v3_dot(normal, bank->bank_n) > -0.3f);
-          rays++;
-        }
-        for (int lane = 0; lane < 5; lane++) {
-          // Radial insets also move away from both faces at shared vertices.
-          v3 p = v3_scale(foot, 1.0f - (0.8f + 0.8f*lane)/v3_len(foot));
-          BANK_CHECK(!aabb_fits(p, PLAYER_RADIUS, HEIGHT_STAND));
-        }
+    BOUND_CHECK(map_perim_count() != 8 || !aabb_fits(SPAWN_POS, PLAYER_RADIUS, HEIGHT_STAND));
+    // The perimeter is low visible masonry. Elevated jumps still obey the
+    // same explicit arena bounds used by live players, bots and corpses.
+    for (int i = 0; i < map_perim_count(); i++)
+      BOUND_CHECK(g_solids[i].pen || g_solids[i].max.y > ARENA_WALL_H + 0.001f);
+    for (int axis = 0; axis < 3; axis += 2) for (int sign = -1; sign <= 1; sign += 2) {
+      v3 out = {{0,0,0}}; out.e[axis] = (float)sign;
+      v3 tangent = {{out.z,0,-out.x}};
+      for (int step = -4; step <= 4; step++) {
+        float along = (ARENA_HALF - 0.4f) * (float)step / 4;
+        v3 foot = v3_add(v3_scale(out, ARENA_HALF), v3_scale(tangent, along));
+        v3 eye = v3_sub(foot, out); eye.y = EYE_STAND;
+        v3 normal = {{0,0,0}}; int solid = -1;
+        float hit = trace_world(eye, out, &normal, &solid);
+        BOUND_CHECK(fabsf(hit - 1) > 0.002f || solid < 0 ||
+                    (solid >= 0 && g_solids[solid].pen) || v3_dot(normal, out) > -0.99f);
+        BOUND_CHECK(pen_span((v3){{foot.x, EYE_STAND, foot.z}}, out) >= 0);
+        eye.y = ARENA_WALL_H + 0.02f;
+        BOUND_CHECK(trace_world(eye, out, &normal, &solid) < GUN_RANGE);
+        rays += 2;
         for (int mode = 0; mode < 4; mode++) {
-          v3 p = v3_scale(foot, 0.94f), out = v3_norm(foot);
+          v3 p = v3_sub(foot, v3_scale(out, PLAYER_RADIUS + 0.05f));
           v3 vel = v3_scale(out, mode == 1 ? mv_slide_boost() : g_sim_mv[MV_RUN]);
           int grounded = mode < 2;
           if (mode == 2) vel.y = mv_jump_speed();
-          if (mode == 3) { p.y = takeoff; vel.y = high_jump; }
+          if (mode == 3) { p.y = FOREST_TRUNK_H; vel.y = sqrtf(2 * GRAVITY * MV_DEF[MV_JUMP_H].hi); }
           for (int tick = 0; tick < 210; tick++) {
             mv_walk(&vel, out.x, out.z, 1, g_sim_mv[MV_RUN]);
-            vel.y -= GRAVITY*TICK_DT;
+            vel.y -= GRAVITY * TICK_DT;
             ent_move(&p, &vel, &grounded, mode == 1 ? HEIGHT_CROUCH : HEIGHT_STAND);
-            BANK_CHECK(!aabb_fits(p, PLAYER_RADIUS - 0.001f, HEIGHT_CROUCH));
+            arena_clamp(&p);
+            BOUND_CHECK(fabsf(p.x) > ARENA_HALF - PLAYER_RADIUS + 0.001f ||
+                        fabsf(p.z) > ARENA_HALF - PLAYER_RADIUS + 0.001f ||
+                        !aabb_fits(p, PLAYER_RADIUS - 0.001f, HEIGHT_CROUCH));
           }
-          float contact = -1e9f;
-          for (int face = 0; face < BANK_SIDES; face++)
-            contact = fmaxf(contact, bank_distance(&g_solids[face], p, PLAYER_RADIUS));
-          BANK_CHECK(!grounded || p.y > 0.001f || fabsf(contact) > 0.002f);
+          BOUND_CHECK(!grounded || fabsf(v3_dot(p, out) - (ARENA_HALF - PLAYER_RADIUS)) > 0.002f);
           contacts++;
         }
       }
+      for (int reverse = -1; reverse <= 1; reverse += 2) {
+        v3 p = v3_scale(out, ARENA_HALF - PLAYER_RADIUS - 0.001f);
+        v3 vel = v3_add(v3_scale(tangent, mv_slide_boost() * reverse), v3_scale(out, 3));
+        int grounded = 1;
+        ent_move(&p, &vel, &grounded, HEIGHT_CROUCH);
+        BOUND_CHECK(fabsf(v3_dot(vel, tangent) - mv_slide_boost() * reverse) > 0.001f);
+        tangents++;
+      }
     }
-    // Full circuits exercise all seams in both directions, with live walk,
-    // slide decay and jumping. A stuck mover cannot pass a distance-only test.
+    float lane = ARENA_HALF - RING_W * 0.5f;
+    const v3 way[] = {{{-lane,0,-lane}}, {{lane,0,-lane}}, {{lane,0,lane}}, {{-lane,0,lane}}};
     for (int mode = 0; mode < 3; mode++) for (int reverse = 0; reverse < 2; reverse++) {
       v3 p = way[0], vel = {{0,0,0}};
       int reached = 0, grounded = 1, sliding = mode == 1;
       if (mode == 2) { vel.y = mv_jump_speed(); grounded = 0; }
-      for (int tick = 0; tick < 5000 && reached < BANK_SIDES; tick++) {
-        int target = reverse ? (BANK_SIDES - 1 - reached) : (reached + 1) % BANK_SIDES;
+      for (int tick = 0; tick < 5000 && reached < 4; tick++) {
+        int target = reverse ? 3 - reached : (reached + 1) % 4;
         v3 delta = v3_sub(way[target], p); delta.y = 0;
         float distance = v3_len(delta);
         if (distance < 0.35f) { reached++; continue; }
-        v3 wish = v3_scale(delta, 1.0f/distance);
-        float speed = sqrtf(vel.x*vel.x + vel.z*vel.z);
+        v3 wish = v3_scale(delta, 1.0f / distance);
+        float speed = sqrtf(vel.x * vel.x + vel.z * vel.z);
         if (tick == 0 && sliding) { vel = v3_scale(wish, mv_slide_boost()); speed = mv_slide_boost(); }
         if (sliding && mv_slide_should_end(grounded, 1, speed)) sliding = 0;
         if (sliding) mv_slide_step(&vel, speed, wish.x, wish.z, 1);
         else mv_walk(&vel, wish.x, wish.z, 1, g_sim_mv[MV_RUN]);
-        vel.y -= GRAVITY*TICK_DT;
+        vel.y -= GRAVITY * TICK_DT;
         ent_move(&p, &vel, &grounded, mode == 1 ? HEIGHT_CROUCH : HEIGHT_STAND);
-        BANK_CHECK(!aabb_fits(p, PLAYER_RADIUS - 0.001f, HEIGHT_CROUCH));
+        BOUND_CHECK(!aabb_fits(p, PLAYER_RADIUS - 0.001f, HEIGHT_CROUCH));
       }
-      BANK_CHECK(reached != BANK_SIDES); routes++;
+      BOUND_CHECK(reached != 4); routes++;
     }
     if (fail) { printf("boundarycheck witness seed=%u biome=%d fail=%ld\n", g_map_seed, g_biome.kind, fail); break; }
     g_map_seed = map_seed_next(g_map_seed);
@@ -4654,7 +4640,7 @@ static void cmd_boundarycheck(sim_ctx_t *s) {
   g_rng = rng0; g_rng_bot = bot0; memcpy(g_rng_gun, gun0, sizeof gun0); g_world_dirty = 1;
   printf("boundarycheck maps=%ld rays=%ld routes=%ld contacts=%ld tangents=%ld meshes=%d peak_verts=%d fail=%ld %s\n",
          maps, rays, routes, contacts, tangents, meshes, mesh_peak, fail, fail ? "FAIL" : "ok");
-  #undef BANK_CHECK
+  #undef BOUND_CHECK
   if (fail) exit(1);
 }
 
@@ -4687,8 +4673,8 @@ static void cmd_environmentcheck(sim_ctx_t *s) {
   ENV_CHECK(times[TIME_NIGHT] > 4000 && times[TIME_NIGHT] < 6500);
   ENV_CHECK(desert_dry * 100 > desert * 94 && sunny > 72000);
   ENV_CHECK(rng0 == g_rng && bot0 == g_rng_bot && audio0 == g_rng_audio && vfx0 == g_rng_vfx);
-  printf("environmentcheck distribution=100000 biomes=%d/%d/%d/%d/%d time=%d/%d/%d/%d sunny=%d desert_dry=%d/%d\n",
-         biomes[0], biomes[1], biomes[2], biomes[3], biomes[4], times[0], times[1], times[2], times[3], sunny, desert_dry, desert);
+  printf("environmentcheck distribution=100000 biomes=%d/%d/%d/%d/%d time=%d/%d/%d sunny=%d desert_dry=%d/%d\n",
+         biomes[0], biomes[1], biomes[2], biomes[3], biomes[4], times[0], times[1], times[2], sunny, desert_dry, desert);
   for (unsigned bits = 0; bits <= UINT16_MAX; bits++) {
     environment_t e;
     int valid = environment_unpack((uint16_t)bits, &e);
@@ -4742,7 +4728,7 @@ static void cmd_environmentcheck(sim_ctx_t *s) {
     g_nav_kbd = 1; nav_push(NAV_LEFT); harness_uiframe(s);
     ENV_CHECK(*value == count); widgets++;
   }
-  environment_t desired = {BIOME_DUNES + 1, TIME_GOLDEN + 1, WEATHER_HAZE + 1};
+  environment_t desired = {BIOME_DUNES + 1, TIME_SUNSET + 1, WEATHER_HAZE + 1};
   g_cfg.environment = desired;
   sp_request_new_arena();
   app_t app = {0}; frame_input_t neutral = {0};
@@ -4863,7 +4849,6 @@ static void cmd_mapcheck(sim_ctx_t *s) {
     for (int i = 0; i < g_num_solids; i++)
       for (int j = i + 1; j < g_num_solids; j++) {
         const solid_t *A = &g_solids[i], *B = &g_solids[j];
-        if (A->mat == SOLID_BANK || B->mat == SOLID_BANK) continue;
         const float *amn = A->min.e, *amx = A->max.e;
         const float *bmn = B->min.e, *bmx = B->max.e;
         for (int a = 0; a < 3; a++) {

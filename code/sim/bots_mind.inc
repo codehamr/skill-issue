@@ -224,12 +224,6 @@ static float rag_support_eps(v3 p, float eps) {
   float y = 0.0f;
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
-    if (s->mat == SOLID_BANK) {
-      v3 normal, above = p; above.y += eps;
-      float d = ray_solid(above, (v3){{0,-1,0}}, i, &normal);
-      if (d >= 0 && above.y - d > y) y = above.y - d;
-      continue;
-    }
     if (p.x < s->min.x || p.x > s->max.x || p.z < s->min.z || p.z > s->max.z)
       continue;
     if (s->max.y <= p.y + eps && s->max.y > y) y = s->max.y;
@@ -317,7 +311,6 @@ static void rag_step(rag_t *r, v3 *pos) {
       // flickering.
       for (int i = 0; i < g_num_solids; i++) {
         const solid_t *sd = &g_solids[i];
-        if (sd->mat == SOLID_BANK) continue;
         if (fabsf(sd->max.y - pos->y) > 0.05f) continue;
         if (pos->x < sd->min.x - PLAYER_RADIUS || pos->x > sd->max.x + PLAYER_RADIUS ||
             pos->z < sd->min.z - PLAYER_RADIUS || pos->z > sd->max.z + PLAYER_RADIUS)
@@ -436,7 +429,7 @@ static const bot_skill_t BOT_SKILL[3] = {
 
 #define BOT_NAV_SIDE 96
 #define BOT_NAV_CELLS (BOT_NAV_SIDE * BOT_NAV_SIDE)
-#define BOT_NAV_STEP (2.0f * map_half() / BOT_NAV_SIDE)
+#define BOT_NAV_STEP (2.0f * ARENA_HALF / BOT_NAV_SIDE)
 #define BOT_NAV_PATH 192
 typedef enum { BOT_DUEL, BOT_ADVANCE, BOT_FLANK, BOT_RETREAT } bot_tactic_t;
 
@@ -648,7 +641,7 @@ static void bot_hear_update(bot_t *b, int bi) {
 }
 
 // Server observability: ONE function feeds both the server's 10 s stdout digest (the
-// container's entrypoint tees stdout into server.log and docker/report.awk renders it
+// container's entrypoint tees stdout into server.log and server/report.awk renders it
 // into stats.txt — that file is the whole monitoring story) and the `netstat` proof
 // command — the one-copy rule applied to observability, and the reason a hanging
 // instance is diagnosable at all.
@@ -1030,8 +1023,8 @@ static v3 spawn_spot(int self) {
   v3 best = {{0, 0, sh >= 0 ? 18.0f - 2.0f * (float)sh : -12.0f}};
   float best_d = -1.0f;
   for (int i = 0; i < 40; i++) {
-    v3 c = {{rng_rangef(&g_rng_bot, -map_half() + 2, map_half() - 2), 0,
-             rng_rangef(&g_rng_bot, -map_half() + 2, map_half() - 2)}};
+    v3 c = {{rng_rangef(&g_rng_bot, -ARENA_HALF + 2, ARENA_HALF - 2), 0,
+             rng_rangef(&g_rng_bot, -ARENA_HALF + 2, ARENA_HALF - 2)}};
     if (!aabb_fits(c, PLAYER_RADIUS, HEIGHT_STAND)) continue;
     float d = 1e9f;
     ENT_FOREACH(e) {
@@ -1421,7 +1414,7 @@ static int los_blocked(v3 o, v3 d, float lim) {
     float t = -o.y / d.y;
     if (t > 0 && t < lim) {
       float hx = o.x + d.x * t, hz = o.z + d.z * t;
-      if (hx > -map_half() && hx < map_half() && hz > -map_half() && hz < map_half())
+      if (hx > -ARENA_HALF && hx < ARENA_HALF && hz > -ARENA_HALF && hz < ARENA_HALF)
         return 1;
     }
   }

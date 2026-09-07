@@ -9,21 +9,13 @@ screenshots/
 .codehamr/
 .pi/
 post/
-tools/*
-!tools/ci-proofs.sh
-!tools/byte-gate.sh
-!tools/mapgen-sweep.sh
-!tools/split-check.sh
-!tools/tuning.py
-!tools/build-game.py
-!tools/trailer.py
-!tools/defaults-gate.py
-!tools/net-gate.py
 # Runtime files the server container writes next to docker-compose.yaml —
 # only relevant when someone runs the compose file inside a checkout.
-/server.log
-/stats.txt
-/data/
+/server/server.log
+/server/stats.txt
+/server/stats.txt.new
+/server/data/
+tools/.*/
 media/.cache/
 CLAUDE.md
 AGENTS.md
@@ -40,6 +32,4 @@ opencode.json
 node_modules/
 tmp.md
 
-!tools/pad-native-gate.c
-!tools/pad-native-gate.py
 !docs/handheld-input.md

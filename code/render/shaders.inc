@@ -1416,6 +1416,22 @@ static const char *SKY_FS =
   "  vec3 tint = mix(vec3(0.59, 0.73, 1.0), vec3(1.0, 0.85, 0.64), rnd.x * rnd.x);\n"
   "  return tint * (point * bright * smoothstep(0.035, 0.24, d.y));\n"
   "}\n"
+  // Antialiased, tapered streaks sit behind the same clouds as the stars.
+  "uniform vec4 uMeteor;\n"
+  "uniform vec2 uMeteorShape;\n"
+  "vec3 night_meteor(vec3 d){\n"
+  "  if (uMeteorShape.y <= 0.001) return vec3(0.0);\n"
+  "  vec2 p = d.xz / (1.0 + max(d.y, 0.0));\n"
+  "  vec2 path = uMeteor.xy - uMeteor.zw;\n"
+  "  float along = clamp(dot(p - uMeteor.zw, path) / dot(path, path), 0.0, 1.0);\n"
+  "  float distance = length(p - mix(uMeteor.zw, uMeteor.xy, along));\n"
+  "  float aa = max(length(fwidth(p)) * 0.5, 0.0001);\n"
+  "  float width = uMeteorShape.x * (0.15 + along * 0.85);\n"
+  "  float streak = 1.0 - smoothstep(max(width - aa, 0.0), width + aa, distance);\n"
+  "  streak *= min(1.0, width / aa) * along * along;\n"
+  "  return mix(vec3(0.35, 0.55, 1.0), vec3(0.95, 0.97, 1.0), along)\n"
+  "         * streak * uMeteorShape.y * smoothstep(0.08, 0.22, d.y);\n"
+  "}\n"
   // Two thin curtains on the northern hemisphere. Low-frequency bends and
   // vertical striations share one slowly moving field; the lower hem and upper
   // falloff both fade smoothly. The bounded analytic bands need no raymarch.
@@ -1522,7 +1538,7 @@ static const char *SKY_FS =
   "  vec3 c = sky_env(dir, 1.0 - uBiome.x);\n"
   "  float up = dir.y;\n"
   "  if (uBiome.x > 0.01 && up > 0.0) {\n"
-  "    c += uBiome.x * (night_stars(dir) + night_moon(dir));\n"
+  "    c += uBiome.x * (night_stars(dir) + night_moon(dir) + night_meteor(dir));\n"
   "    if (uBiome.w > 0.01) c += night_aurora(dir) * uBiome.w;\n"
   "  }\n"
   "  if (up < 0.12 && uRidge.y > 0.0) {\n"

@@ -43,7 +43,7 @@
 #             finite nondegenerate meshes, overflow and unchanged sim ownership
 #   weatherproof: seed distribution, deterministic bounded samples, rain roof
 #             exclusion, unchanged gameplay RNGs and delayed thunder with map resets
-#   boundarycheck: forest/dunes/frost prisms, shot surfaces, full unclamped circuits, jumps and mesh capacity
+#   boundarycheck: five square biomes, low shot surfaces, full circuits, jumps and mesh capacity
 # Also prints the glibc floor for the log — a rise excludes whole distros, so
 # it is worth seeing even though it is not gated here.
 set -eu
@@ -152,7 +152,7 @@ gate_command() {
 # The figure sweeps and viewmodel contact proofs run concurrently into
 # independent config/log/status files. Grading remains sequential below.
 # Supported figure contact censuses use the industrial control seed 2. Seed 1337 is
-# a natural snow map: terrain edits alter its bot spawn/path, changing the
+# a snow map: terrain edits alter its bot spawn/path, changing the
 # measured poses even when the soldier mesh is unchanged. World-dependent
 # movement remains covered by boundarycheck, naturalcheck and the bot proofs.
 FIG_SEED=1337
@@ -305,10 +305,10 @@ say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 # sleeve roots, elbows and pelvis-frame pouch from the gait release. Model-only
 # near is unchanged except SR far's removed forearm/pouch tangent. The integrated
 # near changes are boot/shin contacts; every topology class stays zero. Evidence:
-# build/player-polish-20260906/ci-{before,model-final,after}/ and docs/player-polish.md.
+# build/player-polish-20260906/ci-{before,model-final,after}/ (archived evidence).
 # The native reference for 8 m is retained in
 # build/player-natural-20260906/ci-before/: AR k=12 near75/cross100 and SR
-# near84/cross157, with all five hard topology classes zero. See docs/player-natural.md.
+# near84/cross157, with all five hard topology classes zero.
 # Natural model: matched O3 baseline/model-only/integrated censuses are retained
 # under build/player-natural-20260906/ci-{before,model,integrated}. The yoke
 # removes trap contacts; the thinner curved straps enter their shirt/vest roots.
@@ -316,10 +316,10 @@ say "info figcheck SR near=$SR_NEAR cross=$SR_CROSS"
 # 962 additional bootcuff/bootlace witnesses are the attached cross-laces, not
 # folded shaft faces. Boot/shin crossings fall 376->5; the wider instep joins
 # the shaft more deeply. Near changes after model isolation are hand/carry poses.
-# Topology stays zero in all ten sweeps; docs/player-natural.md records limits.
+# Topology stays zero in all ten sweeps.
 WANT_AR_NEAR="72 72 76 71 63"
-# The soldier refresh is reviewed in docs/soldier.md, with complete
-# native AArch64 and emulated x86_64 sweeps from the actual release executables.
+# The soldier references come from complete native AArch64 and emulated
+# x86_64 sweeps of the release executables.
 # Deeper sleeve/yoke roots close the visible shoulder seam; attached shirt/strap
 # contacts change while all hard topology and forbidden grip classes stay zero.
 # AR maxima agree on both measured architectures. Unsupported ELFs retain
@@ -771,7 +771,8 @@ gate_command botsuppress "botsuppress" '^botsuppress summary cases=46 failed=0 a
 gate_command recoil "recoil" '^recoil ok$'
 gate_command spstart "spstart" '^spstart summary cases=18 result=1 late_accept=3 audio_races=2 ok$'
 gate_command audiocheck "audiocheck" '^audiocheck summary catalogue=20 lifecycle=13 ok$'
-gate_command environmentcheck "environmentcheck" '^environmentcheck combinations=140 wire=240 widgets=22 deferred=1 arenas=3 authority=join-rematch-leave fail=0 ok$'
+# Five biomes x three times x seven weather kinds; wire enums include RANDOM.
+gate_command environmentcheck "environmentcheck" '^environmentcheck combinations=105 wire=192 widgets=21 deferred=1 arenas=3 authority=join-rematch-leave fail=0 ok$'
 gate_command weatherproof "weatherproof" '^weatherproof modes=7 samples=33600 roof_cases=27 checked_vertices=[0-9]+ neutral=1 ok$'
 gate_command acousticcheck "acousticcheck" '^acousticcheck summary geometry=4 segments=15 materials=3 rates=4 sim_rng=unchanged ok$'
 gate_command feedbackproof "feedbackproof" '^feedbackproof cases=212 failed=0 ok$'
@@ -779,7 +780,9 @@ gate_command filmtrackproof "filmtrackproof" '^filmtrackproof summary cases=13 s
 gate_command filmcueproof "filmcueproof" '^filmcueproof summary cases=22 ok$'
 
 gate_command decorcheck "decorcheck" '^decorcheck trees=2560 tips=14792 buildings=240 controls=10 peak=720 state=same fail=0 ok$'
-gate_command boundarycheck "boundarycheck 128" '^boundarycheck maps=128 rays=30720 routes=768 contacts=61440 tangents=6144 meshes=128 peak_verts=[0-9]+ fail=0 ok$'
+# 128 maps x 4 walls x 9 positions x 2 ray heights; four contact modes.
+# Tangents exercise both directions on each wall, circuits retain all six modes.
+gate_command boundarycheck "boundarycheck 128" '^boundarycheck maps=128 rays=9216 routes=768 contacts=18432 tangents=1024 meshes=128 peak_verts=[0-9]+ fail=0 ok$'
 decor_small_rows="$(grep -Ec '^decorcheck small=1728 floating=0 worst=(0[.]000000/){8}0[.]000000$' "$TMPD/decorcheck.log" || true)"
 [ "$decor_small_rows" = 1 ] || {
   say "GATE decorcheck missing grounded small-piece census"; fail=1;

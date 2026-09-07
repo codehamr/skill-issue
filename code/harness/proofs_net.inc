@@ -2583,7 +2583,7 @@ static void defaults_case_config(int *fail) {
   for (int i = PAD_AS_FRIC; i <= PAD_AS_DIST; i++) tables &= actual.pad[i] == PAD_DEF[i].def;
   defaults_expect(tables, "startup-table-owner", fail);
   defaults_fill_tuning(&actual, 0.31415926f);
-  actual.environment = (environment_t){BIOME_DUNES + 1, TIME_GOLDEN + 1, WEATHER_HAZE + 1};
+  actual.environment = (environment_t){BIOME_DUNES + 1, TIME_SUNSET + 1, WEATHER_HAZE + 1};
   actual.sense = 1.731f; actual.fps_cap = 241; actual.devmode = 1;
   snprintf(actual.name, sizeof actual.name, "CUSTOM");
   for (int group = 0; group < 3; group++) {

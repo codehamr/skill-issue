@@ -27,7 +27,7 @@ def dunes_slide():
     t = Take("dunes_slide", 59, fov=76,
              notes="DUNES / low sand slide with a passing camera; loop at frame 60")
     t.open()
-    t.setup("environment dunes golden haze", "sun 18 80")
+    t.setup("environment dunes sunset haze", "sun 18 80")
     t.puppet(-4, 19, 90, speed=5.8, move=(1, 0), ready=False)
     t.setup("warp -20 0 -20", "wait 30")
     t.mark("approach")
@@ -75,7 +75,7 @@ def marsh_duel():
     t = Take("marsh_duel", 13, fov=88,
              notes="MARSH / late acquisition, short bursts, strafe reversal, recoil recovery")
     t.open()
-    t.setup("environment marsh day clear", "sun 32 145")
+    t.setup("environment marsh day rain", "sun 32 145")
     t.puppet(7, 6, 135, speed=1.6, move=(-1, 0))
     t.setup("puppet ads 1", "warp 11.5 0 10", "weapon ar", "wait 36",
             "aim 6.9 1.05 6")
@@ -94,7 +94,10 @@ def marsh_duel():
     t.pan(0.3, -13.0, 0.2, kind="linear")
     t.cue("-fire", "-right", "-ads")
     t.pan(0.24, 4.0, 0.5, kind="out")
-    t.sway(0.25, 0.3, 0.13)
+    t.cue("+back", "+reload").run(1).cue("-reload")
+    t.pan(0.45, 6.0, -1.0, kind="out")
+    t.cue("-back")
+    t.sway(1.0, 0.3, 0.13)
     return t
 
 
@@ -104,7 +107,7 @@ def frost_scope():
     t = Take("frost_scope", 22, hud=True, res=(2880, 1620), fov=90,
              notes="FROST / scope arrives off target, corrects to torso, shot at frame 120")
     t.open()
-    t.setup("environment frost day clear")
+    t.setup("environment frost day cloudy")
     t.puppet(12, 9, 145, speed=1.1, move=(0, -1))
     t.setup("puppet ads 1", "warp 17 0 15", "weapon sr", "wait 40",
             "aim 13.0 1.15 8.5")
@@ -192,4 +195,96 @@ def frost_impact():
         at = (12.0 - 0.4 * settle, 1.22 - 0.6 * settle, 7.45 - 0.5 * settle)
         yaw, pitch = look(eye, at)
         commands.append("cam %.4f %.4f %.4f %.5f %.5f" % (*eye, yaw, pitch))
+    return t
+
+
+@shot
+def forest_run():
+    """A continuous run, leap and slide across a sunlit forest lane."""
+    t = Take("forest_run", 7, fov=84,
+             notes="FOREST / a travelling shoulder-height lens follows jump into slide, sunshower")
+    t.open()
+    t.setup("environment forest day sunshower", "sun 32 145")
+    t.puppet(-14, 20, 90, speed=5.4, move=(1, 0), ready=False)
+    t.setup("warp -20 0 -20", "wait 16")
+    for frame in range(504):
+        if frame == 108:
+            t.cue("puppet jump")
+            t.mark("leap")
+        if frame == 235:
+            t.cue("puppet slide")
+            t.mark("slide")
+        a = frame / 503
+        t.cambot((lerp(1.5, -1.0, a), lerp(1.45, 0.75, a), 3.0),
+                 look_h=lerp(1.0, 0.70, a)).run(1)
+    return t
+
+
+@shot
+def dunes_flank():
+    """An open sunset lane, jump, then a close manual burst from the landing."""
+    t = Take("dunes_flank", 59, fov=94,
+             notes="DUNES / first-person flank, landing and imperfect hipfire at sunset")
+    t.open()
+    t.setup("environment dunes sunset clear", "sun 13 290")
+    t.puppet(4, 19, 270, speed=1.3, move=(-1, 0))
+    t.setup("warp -12 0 20", "weapon ar", "aim 5 1.1 19", "wait 24")
+    t.cue("+forward")
+    t.pan(0.55, -2.0, 1.0, kind="out")
+    t.cue("+jump").run(1).cue("-jump")
+    t.pan(0.65, 3.0, -0.6, kind="inout")
+    t.cue("-forward", "+left")
+    t.pan(0.35, 12.0, -0.4, kind="out")
+    t.cue("+fire")
+    t.pan(0.38, 8.0, -1.3, kind="linear")
+    t.cue("-fire", "-left", "+ads")
+    t.pan(0.3, -2.6, 0.9, kind="out")
+    t.cue("+fire")
+    t.pan(0.3, 0.9, -0.5, kind="linear")
+    t.cue("-fire", "-ads", "+reload").run(1).cue("-reload")
+    t.pan(0.5, 8.0, 0.5, kind="out")
+    t.sway(1.5, 0.3, 0.1)
+    return t
+
+
+@shot
+def storm_crossfire():
+    """Live counterfire and a lean into the next burst under storm clouds."""
+    t = Take("storm_crossfire", 43, fov=90,
+             notes="MARSH / live opponent, rain, dodge, lean and reload")
+    t.open(bots=1, freeze=False, skill="easy")
+    t.setup("environment marsh day storm", "puppet on", "puppet warp 4 20",
+            "puppet off", "warp -5 0 20", "aim 4 1.0 20")
+    t.cue("+forward")
+    t.pan(0.35, 2.2, 0.6, kind="out")
+    t.cue("-forward", "+left", "+ads", "+fire")
+    t.pan(0.35, -3.0, -1.1, kind="linear")
+    t.cue("-fire", "-left", "+right")
+    t.pan(0.32, 4.5, 0.8, kind="out")
+    t.cue("+fire")
+    t.pan(0.25, -1.1, -1.0, kind="linear")
+    t.cue("-fire", "-right", "+lean_left")
+    t.pan(0.35, -5.0, 0.6, kind="out")
+    t.cue("+fire")
+    t.pan(0.32, 3.0, -0.9, kind="linear")
+    t.cue("-fire", "-lean_left", "-ads", "+back", "+reload").run(1).cue("-reload")
+    t.pan(0.6, 8.0, -1.5, kind="out")
+    t.cue("-back")
+    t.sway(1.9, 0.4, 0.13)
+    return t
+
+
+@shot
+def aurora_run():
+    """The final night sprint opens onto the mountains before the sand loop."""
+    t = Take("aurora_run", 28, fov=84,
+             notes="FROST / low tracking shot, moonlit snow and aurora beyond the wall")
+    t.open()
+    t.setup("environment frost night clear")
+    t.puppet(12, -20, 270, speed=5.2, move=(-1, 0), ready=False)
+    t.setup("warp 20 0 20", "wait 30")
+    for frame in range(336):
+        if frame == 120:
+            t.cue("puppet slide")
+        t.cambot((1.5, 0.8, -4.5), look_h=0.75).run(1)
     return t

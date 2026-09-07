@@ -358,7 +358,7 @@ typedef struct {
   GLuint scope_fbo, scope_tex, scope_depth;  // picture-in-picture scope target
   int    scope_size;
   GLint  u_sky_fwd, u_sky_right, u_sky_up, u_sky_tan, u_sky_wind, u_sky_cov;
-  GLint  u_sky_sunxz, u_sky_ridge, u_sky_time;
+  GLint  u_sky_sunxz, u_sky_ridge, u_sky_time, u_sky_meteor, u_sky_meteor_shape;
   GLuint vao_world, vbo_world, vao_hud, vbo_hud, vao_sky, font_tex;
   GLuint vao_scene, vbo_scene;   // per-frame dynamic 3D batch (bot, VFX, gun)
   int    world_verts;
@@ -609,6 +609,35 @@ static weather_t weather_sample(void) {
   }
   return w;
 }
+// A sparse night event sampled from seed and tick alone. At most one streak
+// lives in an eight-second slot; neither render cadence nor gameplay RNG is used.
+typedef struct { float hx, hy, tx, ty, width, light; } meteor_t;
+static meteor_t meteor_sample(uint32_t seed, long tick, int night) {
+  meteor_t m = {0};
+  if (!night || tick < 0) return m;
+  uint32_t slot = (uint32_t)(tick / 960);
+  uint64_t st = (uint64_t)environment_hash(seed, slot ^ 0x57A2u) * 2654435761u + 1;
+  if (rng_next(&st) % 100u >= 65u) return m;
+  int onset = 60 + (int)(rng_next(&st) % 720u);
+  float life = rng_rangef(&st, 0.35f, 0.85f);
+  float age = (float)(tick % 960 - onset) / TICK_HZ;
+  if (age < 0 || age >= life) return m;
+  float heading = rng_rangef(&st, 0, 2 * F_PI);
+  float radius = rng_rangef(&st, 0.22f, 0.60f);
+  float angle = heading + rng_rangef(&st, -1.15f, 1.15f);
+  float speed = rng_rangef(&st, 0.16f, 0.30f);
+  float length = rng_rangef(&st, 0.025f, 0.10f);
+  float dx = cosf(angle), dy = sinf(angle);
+  m.hx = cosf(heading) * radius + dx * age * speed;
+  m.hy = sinf(heading) * radius + dy * age * speed;
+  m.tx = m.hx - dx * length; m.ty = m.hy - dy * length;
+  float size = rng_rangef(&st, 0, 1);
+  m.width = 0.00035f + size * size * 0.0015f;
+  m.light = (0.8f + size * 1.8f) * f_smoothstep(0, 0.06f, age) *
+            (1 - f_smoothstep(life * 0.45f, life, age));
+  return m;
+}
+
 static float weather_cloud(void) {
   weather_t w = weather_sample();
   return fmaxf(g_sun.cloud, w.overcast * 0.84f + w.rain * 0.16f);
@@ -844,7 +873,7 @@ static float ao_at(float y) {
 // 1.0 m the stamps read. 13824 static verts, zero fragment cost, never casts
 // — and the "4608 triangles" note at the cast latch is exact again.
 #define GROUND_CELLS 48
-#define GROUND_STEP  (2.0f * map_half() / (float)GROUND_CELLS)
+#define GROUND_STEP  (2.0f * ARENA_HALF / (float)GROUND_CELLS)
 #define GROUND_VERTS (GROUND_CELLS * GROUND_CELLS * 6)
 
 // What the floor is MADE OF at one point. Contact darkness is deliberately not

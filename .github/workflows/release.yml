@@ -1,7 +1,7 @@
 # Build and gate the two release artifacts before publishing on pushes to main.
 # The release job replaces the latest release; clients retain their local .old
 # recovery copy. A single date travels from BUILD_VERSION to SHA256SUMS.
-# Asset names must match UPD_ASSETS and docker/entrypoint.sh exactly.
+# Asset names must match UPD_ASSETS and server/entrypoint.sh exactly.
 name: Release
 on:
   push:

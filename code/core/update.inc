@@ -104,7 +104,7 @@ static void sha256_hex(sha256_t *s, char out[65]) {
 // ONE table, not an #ifdef expression: update_asset_name() picks its own row and
 // updinfo prints the WHOLE table for a manual cross-check. The names are LITERAL
 // and share no pattern on purpose — they are a contract with the release
-// workflow's `mv` lines and docker/entrypoint.sh's ASSET, and a name a reader can
+// workflow's `mv` lines and server/entrypoint.sh's ASSET, and a name a reader can
 // only match EXACTLY (upd_compare rule 3) is one a clever format string can never
 // silently shift. A rename is therefore three edits, and the row order is the one
 // upd_own_asset() indexes.

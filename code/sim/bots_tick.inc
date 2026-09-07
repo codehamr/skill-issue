@@ -58,7 +58,7 @@ static int bot_tactical_plan(bot_t *b, v3 threat, float distance) {
   toward = v3_scale(toward, 1.0f / range);
   for (int i = 0; i < count; i++) {
     v3 point = candidates[i];
-    if (fabsf(point.x) > map_half() - 1 || fabsf(point.z) > map_half() - 1) continue;
+    if (fabsf(point.x) > ARENA_HALF - 1 || fabsf(point.z) > ARENA_HALF - 1) continue;
     v3 travel = v3_sub(point, b->pos);
     float length = v3_len(travel);
     if (length < 1.2f || length > 9.0f || !bot_walk_clear(b->pos, point)) continue;
@@ -447,8 +447,8 @@ static void bot_arm_patrol(bot_t *b, float *want_yaw_p, float *wx_p,
     float dist = sqrtf(dx * dx + dz * dz);
     if (dist < 0.8f || b->stuck > 60) {
       for (int i = 0; i < 16; i++) {
-        v3 c = {{rng_rangef(&g_rng_bot, -map_half() + 2, map_half() - 2), 0,
-                 rng_rangef(&g_rng_bot, -map_half() + 2, map_half() - 2)}};
+        v3 c = {{rng_rangef(&g_rng_bot, -ARENA_HALF + 2, ARENA_HALF - 2), 0,
+                 rng_rangef(&g_rng_bot, -ARENA_HALF + 2, ARENA_HALF - 2)}};
         float tx = c.x - b->pos.x, tz = c.z - b->pos.z;
         if (tx * tx + tz * tz < 64.0f) continue;  // wander legs are >=8 m
         if (!aabb_fits(c, PLAYER_RADIUS, HEIGHT_STAND)) continue;
@@ -729,14 +729,6 @@ static void bot_tick(int bi) {
     float bh_ = b->crouch ? HEIGHT_CROUCH : HEIGHT_STAND;
     for (int i = 0; i < g_num_solids; i++) {
       const solid_t *sd = &g_solids[i];
-      if (sd->mat == SOLID_BANK) {
-        float distance = -bank_distance(sd, b->pos, PLAYER_RADIUS);
-        if (distance < BOT_WALL_BAND) {
-          float into = wx * sd->bank_n.x + wz * sd->bank_n.z;
-          if (into > 0) { wx -= sd->bank_n.x * into; wz -= sd->bank_n.z * into; }
-        }
-        continue;
-      }
       // Only solids this body actually shares height with — a bot standing ON a
       // platform is inside it in plan view and must not be shoved off its own
       // footing. 0.2 m of lift is the step the locomotion already swallows.

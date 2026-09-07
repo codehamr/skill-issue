@@ -5,8 +5,8 @@ Exact pixels also depend on the graphics driver and encoder versions.
 Sound in hero.mp4 comes from the game itself.
 
     ./media/media.py            # everything: stills + clip re-render + gif + mp4
-    ./media/media.py stills     # fight.png + scope.png only            (~2 min)
-    ./media/media.py gif        # re-render the scene clips + hero.gif  (~10 min)
+    ./media/media.py stills     # fight.png + scope.png only
+    ./media/media.py gif        # re-render the scene clips + hero.gif
     ./media/media.py mp4        # re-render + hero.mp4 (game sound);
                                 #   `mp4 --skip-render` right after `gif`
     ./media/media.py check      # strict tools/recipes/build gate; reports cache state
@@ -16,7 +16,7 @@ Sound in hero.mp4 comes from the game itself.
     ./media/media.py probe K N  # N framing stills for shot K, no video —
                                 #   THE authoring loop; then read
                                 #   .cache/clips/K/probe.log (the event log)
-    --fresh                     # all/gif/mp4: discard clip and stage caches first
+    --fresh                     # all/gif/mp4: discard clip caches first
     --skip-render               # gif/mp4: assemble from cached clips (ONLY for
                                 #   iterating on the EDIT — after a look change
                                 #   the banner would mix two builds)
@@ -42,10 +42,9 @@ import hashlib, json, math, os, re, shutil, subprocess, random, time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 GAME = os.path.join(os.path.dirname(ROOT), "build", "game")
 # Everything regenerable hides in .cache/ — the media folder itself stays the
-# four assets plus the kit (media.py, scene.json, shots.py).
+# four assets plus their capture, edit and verification sources.
 CACHE = os.path.join(ROOT, ".cache")
 CLIPS = os.path.join(CACHE, "clips")
-STAGES = os.path.join(CACHE, "stages")
 TICK = 120.0
 ENCODER_THREADS = "8"
 TRACKING_VERSION = "pose-face-v1-180dps-1200dps2-100x70mm"
@@ -102,74 +101,6 @@ def orbit_eye(center, radius, height, deg):
             center[2] + radius * math.cos(a))
 
 
-# ---------------------------------------------------------------------------
-# the stage, as data — dumped from the game itself (`--do map`) and cached,
-# so a shot's collision/LOS checks can never drift from the sim's own set.
-# ---------------------------------------------------------------------------
-class Stage:
-    def __init__(self, seed):
-        self.seed = seed
-        os.makedirs(STAGES, exist_ok=True)
-        p = os.path.join(STAGES, "s%d.json" % seed)
-        binary_hash = file_hash(GAME)
-        try:
-            with open(p) as stream:
-                d = json.load(stream)
-        except (OSError, ValueError):
-            d = {}
-        if d.get("binary_sha256") != binary_hash:
-            with tempfile.TemporaryDirectory(prefix="map-", dir=STAGES) as temporary:
-                r = subprocess.run([GAME, "--seed", str(seed), "--config",
-                                    os.path.join(temporary, "fresh.cfg"), "--do", "map"],
-                                   capture_output=True, text=True, check=True).stdout
-            theme = re.search(r"theme=(\w+)", r).group(1)
-            solids = [tuple(float(x) for x in m.groups())
-                      for m in re.finditer(r"solid \d+ min=\((\S+) (\S+) (\S+)\)"
-                                           r" max=\((\S+) (\S+) (\S+)\)", r)]
-            d = dict(theme=theme, solids=solids, binary_sha256=binary_hash)
-            with open(p, "w") as stream:
-                json.dump(d, stream)
-        self.theme, self.solids = d["theme"], [tuple(s) for s in d["solids"]]
-
-    def blocker(self, a, b):
-        """Index of the first solid the segment a->b enters, or None."""
-        d = tuple(y - x for x, y in zip(a, b))
-        for i, s in enumerate(self.solids):
-            lo, hi = s[0:3], s[3:6]
-            t0, t1 = 0.0, 1.0
-            for k in range(3):
-                if abs(d[k]) < 1e-9:
-                    if a[k] < lo[k] or a[k] > hi[k]:
-                        t0 = 2.0
-                        break
-                    continue
-                u, v = (lo[k] - a[k]) / d[k], (hi[k] - a[k]) / d[k]
-                t0, t1 = max(t0, min(u, v)), min(t1, max(u, v))
-            if t0 <= t1:
-                return i
-        return None
-
-    def inside(self, p, pad=0.0):
-        """The solid p sits in — a camera inside geometry films its inside."""
-        for i, s in enumerate(self.solids):
-            if (s[0] - pad <= p[0] <= s[3] + pad and s[1] - pad <= p[1] <= s[4] + pad
-                    and s[2] - pad <= p[2] <= s[5] + pad):
-                return i
-        return None
-
-
-_stages = {}
-
-
-def stage_of(seed):
-    if seed not in _stages:
-        _stages[seed] = Stage(seed)
-    return _stages[seed]
-
-
-# ---------------------------------------------------------------------------
-# the take builder
-# ---------------------------------------------------------------------------
 class Take:
     def __init__(self, key, seed, hud=False, notes="", res=None, fov=None):
         # `fov` narrows the LENS for one shot (the game plays at 100, which is
@@ -374,7 +305,7 @@ class Take:
         return self.run(self.sec(s))
 
     # -- script emission --------------------------------------------------------
-    def script(self, seg_dir="seg"):
+    def script(self, seg_dir="seg", video_path=None):
         out = list(self.pre) + ["filmtrack log 1", "audiotrace begin"]
         segs, i, n = [], 0, len(self.timeline)
         while i < n:
@@ -385,8 +316,8 @@ class Take:
             i += k
         for j, (cmds, k) in enumerate(segs):
             out += cmds
-            out.append("capture %s/s%04d.rgb %s/s%04d.wav 120 %d"
-                       % (seg_dir, j, seg_dir, j, k))
+            out.append("capture %s %s/s%04d.wav 120 %d"
+                       % (video_path or seg_dir + "/capture.rgb", seg_dir, j, k))
         out += ["audiotail tail.wav", "filmtrack stat", "audiotrace write cues.jsonl", "audiotrace end"]
         return "\n".join(out) + "\n"
 
@@ -428,7 +359,7 @@ def ffmpeg_threads(cmd):
            "-filter_complex_threads", FILTER_THREADS]
     for arg in cmd[1:]:
         if arg == "-i":
-            out += ["-threads", ENCODER_THREADS]
+            out += ["-threads", "2"]
         out.append(arg)
     return out[:-1] + ["-threads", ENCODER_THREADS, out[-1]]
 
@@ -574,38 +505,58 @@ def render(take, w=None, h=None, quiet=False):
     _cfg(d, take.fov)
     if not quiet:
         print("  render %-13s %dx%d  %d frames" % (take.key, w, h, len(take.timeline)))
-    with open(os.path.join(d, "events.log"), "w") as log:
-        subprocess.run([GAME, "--seed", str(take.seed), "--w", str(w), "--h", str(h),
-                        "--config", "t.cfg", "--script", "script.txt"],
-                       cwd=d, env=dict(os.environ, LP_NUM_THREADS="8"),
-                       stdout=log, stderr=subprocess.STDOUT, check=True)
     mp4 = os.path.join(d, take.key + ".mp4")
     wav = os.path.join(d, take.key + ".wav")
-    rgb_paths = [os.path.join(seg, p) for p in sorted(os.listdir(seg))
-                 if p.endswith(".rgb")]
-    expected_bytes = take.f * w * h * 3
-    if sum(os.path.getsize(p) for p in rgb_paths) != expected_bytes:
-        raise RuntimeError("%s: incomplete raw capture" % take.key)
+    with tempfile.TemporaryDirectory(prefix="skill-issue-pipe-", dir="/tmp") as pipe_dir:
+        # One bounded pipe sends pixels straight to the lossless encoder. Holding
+        # it open across capture segments prevents EOF between authored inputs.
+        fifo = os.path.join(pipe_dir, "capture.rgb")
+        Path(os.path.join(d, "script.txt")).write_text(take.script(video_path=fifo))
+        os.mkfifo(fifo)
+        keeper = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        command = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", "%dx%d" % (w, h), "-framerate", "120", "-i", fifo,
+            "-c:v", "libx264rgb", "-preset", "ultrafast", "-crf", "0",
+            "-threads", ENCODER_THREADS, "-pix_fmt", "rgb24", mp4]
+        try:
+            with subprocess.Popen(command) as encoder:
+                try:
+                    with open(os.path.join(d, "events.log"), "w") as log:
+                        with subprocess.Popen([GAME, "--seed", str(take.seed), "--w", str(w), "--h", str(h),
+                                "--config", "t.cfg", "--script", "script.txt"], cwd=d,
+                                env=dict(os.environ, LP_NUM_THREADS="8"), stdout=log, stderr=subprocess.STDOUT) as game:
+                            try:
+                                while game.poll() is None:
+                                    if encoder.poll() is not None:
+                                        raise RuntimeError("video encoder stopped during capture")
+                                    try:
+                                        game.wait(timeout=1)
+                                    except subprocess.TimeoutExpired:
+                                        pass
+                                if game.returncode:
+                                    raise subprocess.CalledProcessError(game.returncode, game.args)
+                            finally:
+                                if game.poll() is None:
+                                    game.kill()
+                                    game.wait()
+                    os.close(keeper)
+                    keeper = None
+                    if encoder.wait(timeout=60):
+                        raise RuntimeError("%s: video encoding failed" % take.key)
+                finally:
+                    if encoder.poll() is None:
+                        encoder.kill()
+                        encoder.wait()
+        finally:
+            if keeper is not None:
+                os.close(keeper)
     with open(os.path.join(d, "wlist.txt"), "w") as f:
-        for p in sorted(os.listdir(seg)):
-            if p.endswith(".wav"):
-                f.write("file 'seg/%s'\n" % p)
+        for name in sorted(os.listdir(seg)):
+            if name.endswith(".wav"):
+                f.write("file 'seg/%s'\n" % name)
         f.write("file 'tail.wav'\n")
     sh(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
         "-i", os.path.join(d, "wlist.txt"), "-c", "copy", wav])
-    command = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", "%dx%d" % (w, h), "-framerate", "120", "-i", "pipe:0",
-        "-c:v", "libx264rgb", "-preset", "veryfast", "-crf", "0",
-        "-threads", ENCODER_THREADS, "-pix_fmt", "rgb24", mp4]
-    with subprocess.Popen(command, stdin=subprocess.PIPE) as encoder:
-        try:
-            for path in rgb_paths:
-                with open(path, "rb") as raw:
-                    shutil.copyfileobj(raw, encoder.stdin, length=1024 * 1024)
-        finally:
-            encoder.stdin.close()
-        if encoder.wait():
-            raise RuntimeError("%s: video encoding failed" % take.key)
     shutil.rmtree(seg, ignore_errors=True)
     os.remove(os.path.join(d, "wlist.txt"))
     n = contact(take.key)
@@ -620,18 +571,6 @@ def render(take, w=None, h=None, quiet=False):
                        trace_sha256=file_hash(os.path.join(d, "cues.jsonl")),
                        events_sha256=file_hash(os.path.join(d, "events.log")),
                        tail_sha256=file_hash(os.path.join(d, "tail.wav"))), stream, indent=2)
-    # Mean luma, printed because a contact sheet hides it: a shot fired from
-    # the shaded side of a wall comes in 2.7x darker than the reel and nothing
-    # else in the loop says so out loud.
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-threads", ENCODER_THREADS,
-                        "-filter_threads", FILTER_THREADS, "-i", mp4, "-vf",
-                        "signalstats,metadata=print:key=lavfi.signalstats.YAVG",
-                        "-f", "null", "-"], capture_output=True, text=True).stderr
-    ys = [float(x.split("=")[1]) for x in r.split()
-          if x.startswith("lavfi.signalstats.YAVG=")]
-    if ys and not quiet:
-        print("    %-13s %d frames, mean luma %.0f (min %.0f)"
-              % (take.key, n, sum(ys) / len(ys), min(ys)))
     return mp4
 
 
@@ -659,38 +598,18 @@ def probe(take, frames, w=960, h=540):
     return out
 
 
-def contact(key, cols=6, rows=4):
-    """Contact sheet + a still at every mark — the review surface."""
+def contact(key, cols=4, rows=3):
+    """One compact contact sheet; detailed poses stay available through probe."""
     d = os.path.join(CLIPS, key)
     mp4 = os.path.join(d, key + ".mp4")
     n = int(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                            "-count_frames", "-show_entries", "stream=nb_read_frames",
+                            "-show_entries", "stream=nb_frames",
                             "-of", "csv=p=0", mp4], capture_output=True, text=True
                            ).stdout.strip() or 0)
     step = max(1, n // (cols * rows))
     sh(["ffmpeg", "-y", "-loglevel", "error", "-i", mp4, "-vf",
-        "select='not(mod(n,%d))',scale=420:-1,tile=%dx%d" % (step, cols, rows),
+        "select='not(mod(n,%d))',scale=320:-1,tile=%dx%d" % (step, cols, rows),
         "-frames:v", "1", os.path.join(d, "sheet.png")])
-    st = os.path.join(d, "stills")
-    shutil.rmtree(st, ignore_errors=True)
-    os.makedirs(st, exist_ok=True)
-    marks = []
-    fp = os.path.join(d, "frames.txt")
-    if os.path.exists(fp):
-        for line in open(fp):
-            p = line.split(None, 1)
-            if len(p) == 2:
-                marks.append((int(p[0]), p[1].strip()))
-    if not marks:
-        marks = [(int(n * x), "t%02d" % int(x * 100)) for x in (0.05, 0.3, 0.5, 0.7, 0.95)]
-    marks = [(min(max(0, f), max(0, n - 1)), l) for f, l in marks]
-    sel = "+".join("eq(n\\,%d)" % f for f, _ in marks)      # ONE decode pass
-    sh(["ffmpeg", "-y", "-loglevel", "error", "-i", mp4, "-vf",
-        "select='%s'" % sel, "-vsync", "vfr", os.path.join(st, "s%03d.png")])
-    got = sorted(os.listdir(st))
-    for (f, label), src in zip(marks, got):
-        os.rename(os.path.join(st, src),
-                  os.path.join(st, "%04d_%s.png" % (f, re.sub(r"\W+", "_", label))))
     return n
 
 
@@ -859,14 +778,13 @@ def review_mp4(path, spec, plan, duration, fps=60):
                               path + ".video-reference.gray")
 
 
-def cut(specpath, out=None, fps=60, preview=False):
+def cut(specpath, out=None):
+    fps = 60
     spec = json.load(open(specpath))
     out = out or os.path.join(ROOT, spec.get("out", "trailer.mp4"))
     w, h = spec.get("w", 1280), spec.get("h", 720)
     if any(not isinstance(value, int) or value <= 0 or value % 2 for value in (w, h)):
         raise ValueError("screenplay width and height must be positive even integers")
-    if preview:
-        w, h, out = w // 2, h // 2, os.path.join(ROOT, "preview.mp4")
     require_clips(list(dict.fromkeys(s["clip"] for s in spec["shots"] if not s.get("skip"))))
     plan, total = plan_edit(spec, fps)
     n = len(plan)
@@ -972,7 +890,9 @@ def cut(specpath, out=None, fps=60, preview=False):
         args += ["-i", mp4, "-i", wav]
     args += ["-filter_complex", ";".join(f),
              "-map", "[venc]", "-map", "[aenc]",
-             "-c:v", "libx264", "-preset", "slow", "-crf", "14", "-threads", ENCODER_THREADS,
+             "-c:v", "libx264", "-preset", "fast", "-b:v", "24M",
+             "-minrate", "24M", "-maxrate", "24M", "-bufsize", "48M",
+             "-x264-params", "nal-hrd=cbr:force-cfr=1", "-threads", ENCODER_THREADS,
              "-pix_fmt", "yuv420p",
              "-r", str(fps), "-fps_mode", "cfr",
              "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart",
@@ -983,8 +903,6 @@ def cut(specpath, out=None, fps=60, preview=False):
              "-r", str(fps), "-fps_mode", "cfr", "-f", "rawvideo",
              out + ".video-reference.gray"]
     sh(args)
-    checked_spec = dict(spec, w=w, h=h)
-    review_mp4(out, checked_spec, plan, total, fps)
     print("cut -> %s  (%d cuts, %.2fs, %d bpm)" % (out, n, total, spec["bpm"]))
     for p in plan:
         print("  %6.2f  %-13s %5d..%-5d x%-4.3g %5.2fs %s"
@@ -1053,8 +971,8 @@ def gif_shot_palettes(spec, source, out, temporary, w, fps, colors, bayer):
     return out
 
 
-def gif(specpath, out, w=640, fps=18, colors=96, bayer=5):
-    """Assemble a spec exactly as `cut` does, then encode a README GIF.
+def gif(specpath, out, source, w=640, fps=18, colors=96, bayer=5):
+    """Derive the README GIF from the final Full HD edit.
     The screenplay owns width, frame rate, palette size and Bayer strength.
     `gif_palette: shot` uses stable clip palettes and requires gifsicle;
     `global` uses one palette for the entire edit. `fade_out: 0` avoids a
@@ -1086,7 +1004,9 @@ def gif(specpath, out, w=640, fps=18, colors=96, bayer=5):
                                      ignore_cleanup_errors=True) as temporary:
         tmp, pal = (os.path.join(temporary, name) for name in ("source.mp4", "palette.png"))
         encoded = os.path.join(temporary, "finished.gif")
-        cut(specpath, out=tmp, fps=fps)
+        sh(["ffmpeg", "-y", "-v", "error", "-i", source, "-an",
+            "-vf", "fps=%d,scale=%d:-1:flags=lanczos" % (fps, w),
+            "-c:v", "libx264rgb", "-preset", "ultrafast", "-crf", "0", tmp])
         if mode == "shot":
             encoded = gif_shot_palettes(_sp, tmp, encoded, temporary, w, fps, colors, bayer)
         else:
@@ -1129,6 +1049,8 @@ def sanity():
         raise ValueError("no runnable binary at %s; run make build/game" % GAME)
     with open(SPEC) as stream:
         spec = json.load(stream)
+    if (spec.get("w"), spec.get("h")) != (1920, 1080):
+        raise ValueError("hero.mp4 must be Full HD (1920x1080)")
     for key, default in (("w", 1280), ("h", 720), ("gif_width", 832)):
         value = spec.get(key, default)
         if type(value) is not int or value <= 0 or key != "gif_width" and value % 2:
@@ -1204,7 +1126,7 @@ def recompress(path):
     os.replace(tmp, path)
 
 
-def stills():
+def stills(output=MEDIA):
     os.makedirs(CACHE, exist_ok=True)
     binary_hash = file_hash(GAME)
     for name, (key, frame) in STILLS.items():
@@ -1229,7 +1151,7 @@ def stills():
                 die("%s was not written" % name)
             if file_hash(GAME) != binary_hash:
                 raise RuntimeError("The game binary changed during capture; rerun stills.")
-            out = os.path.join(MEDIA, name)
+            out = os.path.join(output, name)
             shutil.move(captured, out)
         recompress(out)
         print("  %-12s %dx%d %5.1f kB — %s frame %d" %
@@ -1239,7 +1161,7 @@ def stills():
 def review():
     """Inspect the delivered GIF, independent of its intermediate clip cache."""
     source = os.path.join(MEDIA, "hero.gif")
-    output = os.path.join(REPO, "screenshots", "trailer-review")
+    output = os.path.join(CACHE, "review")
     os.makedirs(output, exist_ok=True)
     with open(SPEC) as stream:
         spec = json.load(stream)
@@ -1307,19 +1229,19 @@ def publish_media(updates):
                        for source, destination in updates])
 
 
-def build_outputs(want_gif=True, want_mp4=True):
+def build_outputs(want_gif=True, want_mp4=True, want_stills=False):
     os.makedirs(CACHE, exist_ok=True)
     identity = build_identity()
     with tempfile.TemporaryDirectory(prefix=".hero-output-", dir=MEDIA,
                                      ignore_cleanup_errors=True) as temporary:
         updates = []
+        encoded = os.path.join(temporary, "hero.mp4")
+        cut(SPEC, out=encoded)
         if want_gif:
             encoded_gif = os.path.join(temporary, "hero.gif")
-            gif(SPEC, encoded_gif, 832)
+            gif(SPEC, encoded_gif, encoded, 832)
             updates.append((encoded_gif, os.path.join(MEDIA, "hero.gif")))
         if want_mp4:
-            encoded = os.path.join(temporary, "hero.mp4")
-            cut(SPEC, out=encoded)
             spec = json.load(open(SPEC))
             plan, duration = plan_edit(spec, 60)
             report = review_mp4(encoded, spec, plan, duration)
@@ -1335,6 +1257,9 @@ def build_outputs(want_gif=True, want_mp4=True):
                         (reference, os.path.join(CACHE, "hero.audio-reference.wav")),
                         (encoded + ".video-reference.gray", os.path.join(CACHE, "hero.video-reference.gray")),
                         (report_path, os.path.join(CACHE, "mp4-review.json"))]
+        if want_stills:
+            stills(temporary)
+            updates += [(os.path.join(temporary, name), os.path.join(MEDIA, name)) for name in STILLS]
         if build_identity() != identity:
             raise ValueError("build changed while assembling media")
         publish_media(updates)
@@ -1442,19 +1367,18 @@ def main():
         die("unknown verb %r — see the docstring" % verb)
     if fresh:
         build_identity()
-        for directory in (CLIPS, STAGES):
+        for directory in (CLIPS,):
             if os.path.exists(directory):
                 shutil.rmtree(directory)
-        _stages.clear()
     sanity()
-    if verb in ("all", "stills"):
+    if verb == "stills":
         stills()
     if verb in ("all", "gif", "mp4") and not skip:
         print("re-rendering %d clips (the banner must never mix two builds)"
               % len(clips_of_spec()))
         render_clips(clips_of_spec())
     if verb == "all":
-        build_outputs()
+        build_outputs(want_stills=True)
     elif verb == "gif":
         build_gif()
     elif verb == "mp4":

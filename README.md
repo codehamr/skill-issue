@@ -32,19 +32,17 @@ The arena, both weapons, the soldiers and every sound are built in code instead 
 loaded from a file. What carries over between matches is your aim and your movement.
 
 **Different places, different light.** Desert ruins, wet industrial yards, overgrown
-clearings and snowfields share the same angular style. Forest, desert and snow arenas
-follow irregular rounded contours: steep lower banks roll into gentler shoulders,
-with roots, ferns and trees growing on the forest slopes. The open perimeter routes
-follow the terrain and stay clear for slides and jumps.
-Night arenas mix stars and
-moonlight with warm lamps, cool floodlights and red watch lights; winter nights can
-bring aurora. Broken masonry has real stepped openings, and forest trunks are solid.
-Geometry, materials and lighting are generated in code. Each map seed also picks
-clear skies, warm haze, clouds, fog, rain, storms or a sunshower with a rainbow.
-Match Settings offers biome, time of day and weather, each defaulting to RANDOM.
-Choices apply to the next local arena and persist; random favors daylight and
-golden light, with dry deserts and occasional nights. Online, the server owns
-the shared environment.
+clearings and snowfields share the same angular style. Every arena is square, with
+low perimeter walls and clear routes for slides and jumps. Distant mountains,
+open skies and the sunset stay visible above the walls.
+Night arenas mix stars, occasional shooting stars and moonlight with warm lamps,
+cool floodlights and red watch lights; winter nights bring aurora. Broken masonry
+has real stepped openings, and forest trunks are solid. Geometry, materials,
+lighting and weather are generated in code.
+Match Settings offers biome, DAY / SUNSET / NIGHT, and weather, each also offering
+RANDOM. Choices apply to the next local arena and persist. Random favors daylight,
+clear skies and dry deserts, with occasional nights; online, the server owns the
+shared environment.
 
 **Two guns, everyone gets both.** An automatic rifle and a bolt sniper that kills with a
 single body hit. Both are hitscan. No loadouts, no battle pass. Rounds cross up to 1.2 m
@@ -67,11 +65,6 @@ These preferences apply to your next new arena.
 NEW ARENA starts again immediately; Escape returns to your current match.
 The bots hear you, remember you and react to nearby fire, so it works solo too.
 
-Local captures are collected in [the screenshot gallery](screenshots/index.html),
-including [natural boundaries before and after](screenshots/natural-boundaries/index.html)
-and [environment choices and weather](screenshots/environment-settings/index.html).
-The [soldier review](docs/soldier.md) documents the model and animation checks.
-
 ## Multiplayer
 
 The dedicated server uses the same executable, running without a window or audio. It
@@ -84,9 +77,27 @@ Quick Join lands on a small server I run and pay for myself. No promises it stay
 a crowd shows up. That is fine. Anyone can host with any Linux copy.
 
 Server owners can choose the shared environment with, for example,
-`--server --biome dunes --time golden --weather haze`. Each option also accepts
+`--server --biome dunes --time sunset --weather haze`. Each option also accepts
 `random`; `--help` lists the choices. Environment settings travel with arena
-snapshots, so server and clients need matching protocol-14 builds.
+snapshots, so server and clients need matching protocol-15 builds.
+
+Server deployment files and operating instructions live in [server/](server/README.md).
+
+## Build and media
+
+Linux builds require GCC 14+, Make and the EGL, OpenGL and X11 development libraries.
+`make build/game` builds native play and the headless harness; `make` also builds the
+Linux x86_64 and Windows releases, requiring their cross-toolchains where applicable.
+
+`make media` regenerates `media/hero.gif`, `hero.mp4`, `fight.png` and `scope.png`
+from fresh gameplay captures and prints total elapsed time. The 30-second MP4 is
+1920×1080 at 60 fps, with 24 Mbit/s video and captured stereo game audio.
+See [the media guide](media/README.md) for dependencies and authoring commands.
+
+`screenshots/` is a temporary review surface. Tidy it at the end of each prompt:
+keep only a few final results, preferably clear before/after collages. Keep raw
+captures, logs and earlier evidence under `build/`; media generation never reads
+from `screenshots/`.
 
 ## Why this exists
 

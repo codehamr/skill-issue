@@ -770,6 +770,8 @@ static void config_load_or_create(const char *path, config_t *c) {
       const char *const *keys = key[3] == 'b' ? ENV_BIOME_KEYS : key[3] == 't' ? ENV_TIME_KEYS : ENV_WEATHER_KEYS;
       int count = key[3] == 'b' ? BIOME_COUNT : key[3] == 't' ? TIME_COUNT : WEATHER_KIND_COUNT;
       int v = environment_option(val, keys, count);
+      // Migrate the retired saved evening choice to sunset.
+      if (key[3] == 't' && !strcmp(val, "golden")) v = TIME_SUNSET + 1;
       if (v >= 0) *dst = v;
     }
     else if (!strcmp(key, "player_name")) {

@@ -74,14 +74,12 @@ static float scat01(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
 // a wall (rubble dresses nothing), actually tall (not a thin slab), and
 // standing on the ground (a stacked top box would collect debris in mid-air).
 static int scat_host_ok(const solid_t *s) {
-  if (s->mat == SOLID_BANK) return 0;
   return s->max.y >= 0.42f && s->max.y - s->min.y >= 0.42f &&
          s->min.y <= 0.05f;
 }
 
 // 2D distance from a point to a solid's footprint, 0 inside.
 static float scat_box_d(const solid_t *s, float x, float z) {
-  if (s->mat == SOLID_BANK) return fmaxf(0, -bank_distance(s, (v3){{x,0,z}}, 0));
   float dx = fmaxf(fmaxf(s->min.x - x, x - s->max.x), 0.0f);
   float dz = fmaxf(fmaxf(s->min.z - z, z - s->max.z), 0.0f);
   return sqrtf(dx * dx + dz * dz);
@@ -92,7 +90,7 @@ static float scat_box_d(const solid_t *s, float x, float z) {
 // is the coplanar defect in decor form). Symmetric by construction for
 // free-field sites, because the solid set and the spawn boxes are.
 static int scat_free(float x, float z, float r) {
-  float H = map_half();
+  float H = ARENA_HALF;
   if (fabsf(x) > H - 0.30f - r || fabsf(z) > H - 0.30f - r) return 0;
   for (int s = -1; s <= 1; s += 2)
     if (fabsf(x - SPAWN_POS.x) < 4.0f + r &&
@@ -693,7 +691,7 @@ static gvert_t g_gbake[(GROUND_CELLS + 1) * (GROUND_CELLS + 1)];
 // STOPS — the fines under a rock, the dust at a damage foot and the shadow a
 // decor rock cannot cast are all cheaper as pigment than as vertices.
 static void gbake_stamp(v3 p, float r, v3 to, float amt, float ao_amt) {
-  float H = map_half();
+  float H = ARENA_HALF;
   int N = GROUND_CELLS + 1;
   int x0 = (int)((p.x - r + H) / GROUND_STEP), x1 = (int)((p.x + r + H) / GROUND_STEP) + 1;
   int z0 = (int)((p.z - r + H) / GROUND_STEP), z1 = (int)((p.z + r + H) / GROUND_STEP) + 1;
@@ -730,7 +728,7 @@ static void gbake_smear(v3 a, v3 b, float r, v3 to, float amt, float ao_amt) {
 }
 
 static void ground_bake(void) {
-  float H = map_half();
+  float H = ARENA_HALF;
   int N = GROUND_CELLS + 1;
   for (int iz = 0; iz < N; iz++)
     for (int ix = 0; ix < N; ix++) {
@@ -824,8 +822,8 @@ static void mesh_ground_vert(int ix, int iz, v3 base) {
   const gvert_t *g = &g_gbake[iz * (GROUND_CELLS + 1) + ix];
   v3 c = {{base.x * g->tint.x, base.y * g->tint.y, base.z * g->tint.z}};
   float r = g->rough < 0.05f ? 0.05f : g->rough > 1.0f ? 1.0f : g->rough;
-  mesh_vert((v3){{-map_half() + (float)ix * GROUND_STEP, 0.0f,
-                  -map_half() + (float)iz * GROUND_STEP}},
+  mesh_vert((v3){{-ARENA_HALF + (float)ix * GROUND_STEP, 0.0f,
+                  -ARENA_HALF + (float)iz * GROUND_STEP}},
             (v3){{0, 1, 0}}, c, r, 0.0f, g->ao);
 }
 
@@ -920,56 +918,6 @@ static void mesh_lamps(void) {
   mat_set(WORLD_SOLID_R, 0.0f);
 }
 
-// The bank mesh is the shot surface. Subdivision only interpolates its
-// planar faces, allowing broad soil and moss patches without extra ray work.
-static v3 bank_colour(const solid_t *s, v3 at) {
-  float cover = f_smoothstep(0.5f, 6.5f, at.y);
-  float patch = fnoise2(at.x * 0.27f + at.y*0.19f, at.z * 0.27f);
-  v3 cap = g_theme.ground, stone = s->color;
-  if (g_biome.forest > 0.5f) {
-    stone = v3_lerp(stone, (v3){{0.48f,0.45f,0.37f}}, 0.7f);
-    cap = (v3){{0.29f,0.39f,0.19f}};
-    cover = f_clamp(cover * 0.7f + (patch - 0.35f)*1.7f, 0, 1);
-  }
-  if (g_biome.snow > 0.5f) cap = (v3){{0.83f,0.88f,0.91f}};
-  return v3_scale(v3_lerp(stone, cap, cover * 0.85f), 0.93f + 0.14f*patch);
-}
-static void mesh_bank(const solid_t *s) {
-  for (int band = 0; band < 2; band++) {
-    v3 a = s->bank[band*2], b = s->bank[band*2+1];
-    v3 c = s->bank[band*2+2], d = s->bank[band*2+3];
-    int index = (int)(s - g_solids);
-    v3 left = v3_norm(v3_add(s->bank_n, g_solids[(index + BANK_SIDES - 1) % BANK_SIDES].bank_n));
-    v3 right = v3_norm(v3_add(s->bank_n, g_solids[(index + 1) % BANK_SIDES].bank_n));
-    for (int row = 0; row < 3; row++) for (int col = 0; col < 3; col++) {
-      v3 p[4];
-      for (int j = 0; j < 4; j++) {
-        float u = (float)(col + (j & 1))/3, v = (float)(row + (j >> 1))/3;
-        p[j] = v3_lerp(v3_lerp(a,b,u), v3_lerp(c,d,u), v);
-      }
-      const int order[] = {0,1,3,0,3,2};
-      for (int j = 0; j < 6; j++) {
-        v3 at = p[order[j]];
-        float u = (float)(col + (order[j] & 1))/3;
-        v3 normal = v3_scale(v3_lerp(left, right, u), -1);
-        normal.y = s->bank_d * s->bank_k *
-                   (1 + (BANK_SHOULDER - 1) * f_smoothstep(1.5f, 5.2f, at.y));
-        normal = v3_norm(normal);
-        mesh_vert(at, normal, bank_colour(s, at), WORLD_ROCK_TAG, 0, 1);
-      }
-    }
-  }
-  // Side faces meet the neighbouring prism exactly and stay buried.
-  for (int t = 4; t < BANK_EXPOSED_TRIS; t++) {
-    v3 a = s->bank[BANK_TRIS[t][0]], b = s->bank[BANK_TRIS[t][1]], c = s->bank[BANK_TRIS[t][2]];
-    v3 normal = v3_norm(v3_cross(v3_sub(b, a), v3_sub(c, a)));
-    for (int j = 0; j < 3; j++) {
-      v3 at = s->bank[BANK_TRIS[t][j]];
-      mesh_vert(at, normal, bank_colour(s, at), WORLD_ROCK_TAG, 0, 1);
-    }
-  }
-}
-
 static void mesh_build(void) {
   g_mesh_floats = 0;
   v3 ground_col = g_theme.ground;
@@ -984,7 +932,6 @@ static void mesh_build(void) {
   ao_set(0.0f, WORLD_AO_RATE, WORLD_AO_MIN);
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
-    if (s->mat == SOLID_BANK) { mesh_bank(s); continue; }
     // The boulder pair collides as its AABB but RENDERS chamfered (0.04 m —
     // under the wire quantization players already live with); the plain
     // six-quad emit would fight the chamfered copy, so it is skipped here
@@ -1168,6 +1115,8 @@ static void renderer_init(int width, int height) {
   R.u_sky_sunxz = glGetUniformLocation(R.prog_sky, "uSunXZ");
   R.u_sky_ridge = glGetUniformLocation(R.prog_sky, "uRidge");
   R.u_sky_time = glGetUniformLocation(R.prog_sky, "uSkyTime");
+  R.u_sky_meteor = glGetUniformLocation(R.prog_sky, "uMeteor");
+  R.u_sky_meteor_shape = glGetUniformLocation(R.prog_sky, "uMeteorShape");
   R.rig_sky = rig_locs(R.prog_sky);
   glGenVertexArrays(1, &R.vao_sky);  // attribute-less: verts from gl_VertexID
 

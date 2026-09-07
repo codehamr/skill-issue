@@ -1,163 +1,84 @@
-# Trailer kit
+# Game media
 
-The local capture entry point is [`screenshots/index.html`](../screenshots/index.html).
-The [environment and Match Settings gallery](../screenshots/environment-settings/index.html)
-keeps its capture recipes and evidence with the images. Biome, time of day and
-weather are independent match choices, each defaulting to RANDOM. Choices are
-saved for the next local arena; online, clients use the server's recipe. Random
-choices are deterministic per seed and favor clear days, golden light and dry deserts.
+`make media` verifies/builds the native Linux game, captures every take from
+scratch, and replaces `hero.gif`, `hero.mp4`, `fight.png` and `scope.png` together
+after verification. It prints total wall time, including the build check, on
+success or failure. Equal game inputs reuse the verified binary; captures are
+always fresh. Existing final assets survive a failed capture or encode.
 
-Run `python3 media/weather.py` after building the game to capture twelve 1600×900
-images: the same desert by day, golden hour and sunset, all seven weather kinds,
-night, and real menu navigation. `--only 10-match-settings` repeats the selected
-settings view. Recipes explicitly record every choice, validate the weather from
-the game dump, check build hashes and retain untouched PNGs, scripts and logs.
+Requires the Linux game toolchain, Python 3, FFmpeg/FFprobe with libx264 and
+libx264rgb, and Gifsicle. No external Python packages are needed. ImageMagick is
+optional for PNG compression. The comparison gallery additionally uses FFmpeg's
+drawtext filter and a system font.
 
-`hero.gif` is the README trailer. `hero.mp4` is the same edit at 60 fps with
-captured game sound. `fight.png` and `scope.png` share the trailer's staging.
-Every arena, character, movement, tracer and impact comes from the game.
-FFmpeg supplies the cuts, speed changes and light sharpening. The trailer
-contains no titles or text overlays. The game's FILMIC look supplies the contrast, cool shadows, warm
-highlights, glow and grain; the edit adds no second colour grade.
-There are no generated or painted gameplay frames.
+## The edit
 
-The loop alternates a low sand slide, an imperfect wet-ground burst, a
-jump diagonally through incoming rounds, live strafing counterfire, a corrected
-sniper shot and its external impact, a magazine seat, and a night slide into
-hipfire. Short landing and approach inserts return to the opening slide.
-The full 16:9 frame keeps the terrain and skyline visible.
+A 30-second loop moves from a sunset slide into rain and forest combat, live
+counterfire, a corrected sniper shot and its external impact. A forest run and
+jump under a sunshower open the frame again, then a desert flank, storm fight and
+winter night rush lead back into the opening slide. All five biomes appear;
+weather changes at scene cuts. No titles, slogans or painted gameplay frames.
 
-## Rebuild
+Actors use the game's actual movement, collision, recoil, damage and audio.
+Mouse gestures are finite, with acquisition, misses and corrections. Live bots
+supply return fire in the quarry and storm scenes. No target lock runs during
+capture. Setup-only `aim` establishes the view before a take.
 
-Requires the native game toolchain, Python 3, FFmpeg/FFprobe with libx264/libx264rgb, and
-Gifsicle for palette-preserving GIF assembly. On Debian the additional tools
-are `ffmpeg gifsicle`. ImageMagick is optional for lossless PNG
-compression. No external Python packages are needed.
+## Files and delivery
 
-```sh
-make trailer                         # fresh native build, captures, GIF and MP4
-./tools/split-check.sh
-```
+- `build.py` owns the timed fresh build invoked by Make.
+- `shots.py` owns actors, inputs and cameras; one frame is a 120 Hz sim tick.
+- `scene.json` owns cuts at 120 BPM; `in_f` is inclusive, end is exclusive.
+  `speed` stretches time: 2 is half speed. Omitted `in_f` continues that clip.
+- `media.py` captures, edits and publishes; `verify.py` checks decoded output
+  and audiovisual timing. `gallery.py` produces explicit arena comparisons.
 
-`make trailer` forces compilation of `build/game`, discards the clip and stage
-caches, and regenerates every take, both stills, `hero.gif` and `hero.mp4`. It
-prints total wall time, including compilation, even if a step fails. Prior final
-GIF/MP4 files are replaced only after the new outputs pass verification.
-`make rebuild` instead deletes the entire `build/` folder, including local configs
-and test evidence, and builds all three game binaries. There is no `make clean`.
+Capture uses 1920×1080 at 120 fps, with a 2880×1620 scope take so its crop retains
+Full HD detail. A bounded FIFO in the system temporary directory streams pixels
+directly to lossless RGB H.264. There are no raw video files filling the checkout.
+Consecutive capture segments share one game mixer clock; a measured quiet tail
+completes each take.
 
-`python3 media/media.py check` verifies the completed native build transaction, current
-source and tuning content, required tools and valid recipes. It accepts absent
-or stale clip caches because a normal build regenerates them; cached edits
-require every recorded content hash to match.
-The renderer uses a fresh config for every take. Source footage is 120 fps,
-1920×1080, with a 2880×1620 optic take so its crop still resolves Full HD.
-Intermediate clips use lossless RGB H.264, preserving pixels before the final encode.
-The default GIF is 832×468 at 20 fps. Each clip gets its own 160-colour
-palette; repeated clip sections share that palette, including the loop seam.
-This keeps aurora gradients from competing with snow and sand for colours.
-`gif_bayer` controls ordered dithering; smaller values soften colour steps
-but increase texture and file size. `gif_lossy: 40` adds a reviewed Gifsicle
-compression pass; set it to `0` for lossless assembly of the palettized frames.
-Caches and event logs live under `media/.cache/`; review captures live under
-ignored `screenshots/`. The MP4 is also ignored by Git. It uses 1920×1080 H.264
-slow CRF 14 at 60 fps,
-AAC stereo at 320 kbit/s and faststart. Video bitrate varies with scene complexity
-to retain quality; final yuv420p keeps playback compatible with common players.
-Both requested final outputs are encoded
-and checked privately before their publication group replaces the previous pair.
+`hero.mp4` is always 1920×1080, 60 fps, H.264/yuv420p, 24 Mbit/s CBR with a
+48 Mbit buffer, AAC stereo at 48 kHz with a 320 kbit/s target, and faststart. Verification rejects
+video below 20 Mbit/s or audio below 256 kbit/s, missing/empty/clipped sound,
+incorrect frame cadence, and missing or shifted required sound cues.
+`hero.gif` derives from the same completed edit at 832×468/20 fps, with a stable
+160-colour palette per clip and Gifsicle compression. The high-resolution edit
+is assembled once. The two PNGs use the same staging as the trailer.
 
 ## Author and review
 
-- `shots.py` stages cameras, actors and actions. Coordinates are world metres;
-  a timeline frame is one 120 Hz simulation tick.
-- `scene.json` defines cuts in beats at 120 BPM. `speed` stretches duration:
-  `2` is half-speed; `in_f` is inclusive and the computed end is exclusive.
-  Omitting `in_f` continues the preceding section of the same clip.
-- `media.py` captures, validates and assembles; `verify.py` owns decoded
-  waveform, frame and synchronization checks. `biomes.py` independently
-  generates the wider environment gallery.
-- `boundaries.py` captures the forest quarry at player height across natural
-  clear, mist, rain and sunshower seeds. `--before build/SESSION/game-before`
-  adds matching pre-change views. PNGs, recipes, budgets and hashes go to
-  `screenshots/forest-boundaries/`; each image uses a fresh config.
-
 ```sh
+make media
 python3 media/media.py list
-python3 media/media.py probe dunes_slide 8
-python3 media/media.py probe frost_impact 118 120 123 130 145 160 180
-python3 media/media.py render dunes_slide
-python3 media/media.py gif --skip-render
-python3 media/media.py mp4 --skip-render
+python3 media/media.py probe frost_scope 118 120 123 145
+python3 media/media.py render frost_scope frost_impact
+python3 media/media.py all --skip-render
 python3 media/media.py review
-python3 media/media.py stills
+python3 media/gallery.py --before build/SESSION/game-before
 ```
 
-Inspect `media/.cache/clips/KEY/probe.png` and its `probe.log`, then the rendered
-`sheet.png` and `events.log`. A hit effect alone does not prove return fire:
-look for `phit`, `hit` and `kill` events. Fire with a captured `+fire` tick and
-then `-fire`; `tap fire` advances outside capture and can lose its sound.
-Probe frames advance before drawing, matching captured frame indices.
+`check` verifies the native build transaction, tools and recipes; it reports
+stale clip caches without blocking regeneration. `--skip-render` requires matching
+binary, script, resolution, footage and sound hashes. Impossible cut ranges fail.
+`stills` regenerates just the PNGs; `gif` and `mp4` select one trailer output.
 
-Trailer takes use finite authored mouse gestures through `look` / `pan`.
-They acquire the torso, overrun, correct after movement changes, and leave
-physical recoil and spread intact. The source gate rejects `aimbot`, active
-`filmtrack`, and text overlays in trailer recipes. Setup-only `aim` establishes
-the initial view before recording; there is no target lock during capture.
+Inspect `.cache/clips/KEY/probe.png`, `sheet.png` and their logs. `events.log` and
+`cues.jsonl` retain actual fire, hits, deaths and mixer onsets; a visual impact
+alone does not prove return fire. Fire inside capture with `+fire` followed by
+`-fire`, since `tap fire` advances outside it. The source cue tolerance is one
+120 Hz tick; additional encoded drift is limited to one delivered 60 Hz frame.
+The checks compare decoded audio/pictures against retained pre-encode witnesses.
+These are file/mixer checks, not physical speaker latency measurements.
 
-The harness's separate `hold_aim` utility remains available for controlled
-tracking proofs. `filmtrackproof` tests its motion, occlusion and life handling;
-`filmcueproof` checks reload sound cursor timing. Event logging remains enabled
-for manually aimed footage so misses, body hits, incoming fire and actual kills
-can be checked independently of the pictures.
+`review` writes `.cache/review/final-sheet.png` and `final-report.json`. Inspect
+the exported GIF at README size for readability, palette banding and loop pacing.
+The MP4 and cache are ignored by Git. Neither production nor review reads
+`screenshots/`; source inputs are explicit recipes and named clip files.
 
-A take keeps one continuous mixer sample clock across all capture segments.
-`cues.jsonl` records event identity, authored delays, actual source/dry onsets
-and reached reload milestones; an unreached milestone stays null. `tail.wav`
-drains the existing voices without advancing simulation and is appended to
-the source PCM. `events.log` ties these records to actual source events,
-rendered reload poses, face/bore/hit projections and emitted sight centres.
-For buffered events, `source_tick` is their local admission tick; `script_tick`
-is the harness drain step. Local network admission does not recover the
-original server timestamp. Actual source/dry onsets keep the continuous mixer
-sample clock, including any remaining confirmation delay.
-
-`--skip-render` is for changing the edit. It rejects caches whose binary,
-script, lens, resolution or media hashes differ. Impossible cut ranges are
-errors instead of silent clamps. Re-render only the changed takes, then
-assemble again. Source recipes shared by the optic and external impact keep
-the kill synchronized.
-
-## Review the final edit
-
-Review framing probes before full capture, then inspect both exported outputs.
-Use independent motion/aim, edit/readability and audiovisual reviews. Keep their
-findings with the output fingerprints; prior reviews do not certify a new build.
-
-| Axis | Rule carried into the recipes |
-| --- | --- |
-| Hook | Start on the slide; keep the moving figure lit and visible. |
-| Biomes | Preserve trees, mountains, wet reflections and aurora at GIF size. |
-| Readable action | Alternate body-scale movement, corrected torso aim, optics and close impacts. |
-| Human motion | Finite mouse gestures, visible corrections and diagonal crossings; no target locks. |
-| No text | No titles or slogans; crop the optic HUD outside the exported frame. |
-| Pacing | End before respawns and empty frames; retain only the readable part of the impact. |
-| Lighting | Keep the dunes runner out of the perimeter wall's shadow. |
-| Loop | End on source frame 59, resume the same camera/action at frame 60. |
-| Palette | Use clip-specific palettes; share colours across repeated shots to keep the loop stable. |
-| Fidelity | Use the real game effects and recorded sound; preserve source hashes. |
-
-`review` writes `screenshots/trailer-review/final-sheet.png` and a machine-readable
-`final-report.json` with planned and decoded frame counts, dimensions and size,
-plus the delivered MP4 stream and synchronization results. The MP4 checks
-compare decoded audio with the retained pre-AAC master and decoded action
-frames with the pre-encode picture witness. Required cue witnesses cannot be
-missing or unmeasurable. Limits are one 120 Hz source tick for source onset
-and one delivered 60 fps frame for additional edit/encode drift; propagation,
-authored confirmation/reload delays, retiming and AAC padding are explicit.
-These are mixer/output-file witnesses, not physical speaker latency.
-
-Judge the exported GIF at its actual display size. Large contact sheets are
-useful for occlusion and pose checks, but can hide palette banding, unreadable
-targets, flashes and awkward pauses. Keep a pre-change GIF under `screenshots/`
-for visual A/B comparison rather than overwriting the only reference.
+`gallery.py` retains raw before/after PNGs, recipes, logs and hashes in a unique
+`build/media-gallery-*` directory and exports only `screenshots/arenas.png`.
+At the end of each prompt, keep `screenshots/` limited to a few final new results,
+preferably before/after collages. Archive needed raw/earlier evidence under
+`build/`, preserving other sessions' work.
