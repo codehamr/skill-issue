@@ -856,21 +856,13 @@ static const char *WORLD_FS =
   "                      + (plaster - 0.5) * 0.035, 0.42);\n"
   "    surf_h = mix(surf_h, mix(weather, plaster, 0.35), 0.36);\n"
   "  }\n"
-  // Quarry strata follow world height across adjoining cut faces. Broad damp
-  // seams and moss remain legible in motion without fine repeating cracks.
+  // Broad grain follows real sloping stone; its silhouette and facets are
+  // geometry, with vegetation and snow carried in the vertex colours.
   "  if (rock_finish && uDetail > 0.0) {\n"
-  "    float fold = vnoise2(vWorld.xz * 0.19 + vec2(5.7, 12.3));\n"
-  "    vec2 bed = vec2(cp2.x * 0.32, vWorld.y * 0.85 + cp2.x * 0.09);\n"
-  "    vec2 cell = floor(bed), q = fract(bed);\n"
-  "    float facet = vhash3(cell + vec2(step(q.x, q.y) * 37.0, 9.2)).z;\n"
-  "    float strata = vnoise2(vec2(cp2.x * 0.32, vWorld.y * 1.7 + fold));\n"
-  "    float seam = smoothstep(0.27, 0.36, strata);\n"
-  "    float damp = vnoise2(vec2(cp2.x * 0.65, vWorld.y * 0.17));\n"
-  "    float moss = smoothstep(0.48, 0.72, damp + 0.16 * exp(-vWorld.y * 0.55));\n"
-  "    alb *= 0.80 + strata * 0.25 + seam * 0.05 + (facet - 0.5) * 0.20;\n"
-  "    alb = mix(alb, alb * vec3(0.67, 0.85, 0.48), moss * 0.55);\n"
-  "    surf_h = mix(surf_h, strata, 0.65);\n"
-  "    rough = mix(0.94, 0.79, moss);\n"
+  "    float grain = vnoise2(vWorld.xz * 0.43 + vWorld.yy * 0.31);\n"
+  "    alb *= 0.93 + 0.14 * grain;\n"
+  "    surf_h = mix(surf_h, grain, 0.45);\n"
+  "    rough = 0.91;\n"
   "  }\n"
   // PROCEDURAL RELIEF FROM THE MATERIAL FIELD ALREADY IN REGISTERS. The broad
   // concrete variation above is not only pigment: aggregate and worn render leave

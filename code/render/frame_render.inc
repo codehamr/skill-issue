@@ -185,14 +185,14 @@ static frame_cam_t rf_camera(const player_t *p, float alpha,
     v3 sdir = v3_scale(side, 1.0f / slen);
     for (int i = 0; i < g_num_solids; i++) {
       v3 n;
-      float t = ray_aabb(eye, sdir, g_solids[i].min, g_solids[i].max, &n);
+      float t = ray_solid(eye, sdir, i, &n);
       if (t > 0 && t - 0.06f < slen) slen = t - 0.06f;
     }
     v3 pivot = v3_add(eye, v3_scale(sdir, fmaxf(slen, 0.0f)));
     v3 back = v3_scale(fwd, -1.0f);
     for (int i = 0; i < g_num_solids; i++) {
       v3 n;
-      float t = ray_aabb(pivot, back, g_solids[i].min, g_solids[i].max, &n);
+      float t = ray_solid(pivot, back, i, &n);
       if (t > 0 && t - 0.12f < tp_dist) tp_dist = t - 0.12f;
     }
     tp_dist = f_clamp(tp_dist, 0.30f, 2.7f);

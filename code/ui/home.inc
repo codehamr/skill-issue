@@ -198,8 +198,7 @@ static void home_stage(player_t *p) {
       float run = 1e9f;
       for (int q = 0; q < g_num_solids; q++) {
         v3 nq;
-        float t = ray_aabb(v3_add(cor, (v3){{0, 1.0f, 0}}), fwd_,
-                           g_solids[q].min, g_solids[q].max, &nq);
+        float t = ray_solid(v3_add(cor, (v3){{0, 1.0f, 0}}), fwd_, q, &nq);
         if (t > 0.0f && t < run) run = t;
       }
       // GATED AS WELL AS SCORED — the required run-up on pass 0, free on the fallback pass
@@ -403,7 +402,7 @@ static v3 home_uncover(v3 look, v3 pos) {
     float lim = dl;
     for (int i = 0; i < g_num_solids; i++) {
       v3 n;
-      float t = ray_aabb(look, dc, g_solids[i].min, g_solids[i].max, &n);
+      float t = ray_solid(look, dc, i, &n);
       if (t > 0.0f && t - 0.28f < lim) lim = t - 0.28f;
     }
     if (lim > bestr) { bestr = lim; bestp = v3_add(look, v3_scale(dc, lim)); }

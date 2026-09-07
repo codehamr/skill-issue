@@ -925,38 +925,6 @@ static void dec_grove_tree(const solid_t *s, int pair, float sg) {
 // mistaken for cover, and a tree whose long shadow is a bare post's is the
 // headless-shadow defect wearing bark. Branches are 40+ mm across, over the
 // shadow map's own texel floor; the sub-texel twigs live in the decor pass.
-// Uncut shoulders rise behind the sheer collision faces. Their complete
-// footprint stays outside the playable square, with their bases buried in
-// solid bedrock. They cast with the quarry instead of floating in the sky pass.
-static void dec_quarry_rim(void) {
-  if (g_biome.kind != BIOME_FOREST) return;
-  mat_set(WORLD_ROCK_TAG, 0.0f);
-  for (int i = 0; i < g_num_solids; i += 2) {
-    const solid_t *s = &g_solids[i];
-    if (s->mat != SOLID_ROCK || s->pen) continue;
-    int axis = s->min.x >= ARENA_HALF;
-    float lo = axis ? s->min.z : s->min.x;
-    float hi = axis ? s->max.z : s->max.x;
-    int count = (int)ceilf((hi - lo) / 7.0f);
-    uint64_t st = (uint64_t)scat_h(0xC117u, (uint32_t)i, 0, 0) * 2654435761u + 1;
-    for (int j = 0; j < count; j++) {
-      float u = lo + ((float)j + 0.5f) * (hi - lo) / (float)count;
-      float w = (hi - lo) / (float)count * rng_rangef(&st, 0.58f, 0.75f);
-      float rise = rng_rangef(&st, 2.8f, QUARRY_RIM_RISE);
-      // Depth stagger prevents overlapping shoulders from sharing a face
-      // plane; every uncut corner still lies inside the bedrock footprint.
-      float out = ARENA_HALF + rng_rangef(&st, 3.55f, 3.90f);
-      float y = s->max.y + rise - 3.0f;
-      v3 c = axis ? (v3){{out, y, u}} : (v3){{u, y, -out}};
-      v3 col = v3_lerp(s->color, g_theme.ground, rng_rangef(&st, 0.15f, 0.42f));
-      uint32_t cuts = rng_next(&st) | 0xA0u;
-      for (int twin = 0; twin < 2; twin++)
-        dec_rock(c, axis ? 3.5f : w, 3.0f, axis ? w : 3.5f,
-                 0, 0, cuts, 0.32f, 0, col, twin ? -1.0f : 1.0f);
-    }
-  }
-}
-
 static void mesh_cast_extra(void) {
   if (g_meta.bould[0] < 0 && g_meta.tree[0] < 0 && g_meta.ngrove == 0 &&
       g_biome.kind != BIOME_FOREST) return;
@@ -990,7 +958,12 @@ static void mesh_cast_extra(void) {
   mat_set(0.90f, 0.0f);
   for (int i = 0; i < g_meta.ngrove; i++)
     dec_grove_tree(&g_solids[g_meta.grove[i]], i / 2, i & 1 ? -1.0f : 1.0f);
-  dec_quarry_rim();
+  if (g_biome.kind == BIOME_FOREST) for (int i = 0; i < map_perim_count(); i += 3) {
+    const solid_t *s = &g_solids[i];
+    v3 at = v3_lerp(s->bank[4], s->bank[5], 0.48f); at.y -= 0.12f;
+    uint64_t st = (uint64_t)scat_h(0xBEEFu, (uint32_t)i, 0, 0) * 2654435761u + 1;
+    dec_backdrop_tree(at, rng_rangef(&st, 4.5f, 8.0f), i % 2, st, 1);
+  }
   int n = g_scene_floats;
   int cap = (int)(sizeof g_mesh / sizeof g_mesh[0]);
   if (g_mesh_floats + n > cap) n = cap - g_mesh_floats;
@@ -1211,8 +1184,17 @@ static void mesh_large_scenery(void) {
     rad = fmaxf(rad, (ARENA_HALF + 3.5f) / fmaxf(fabsf(cosf(a)), fabsf(sinf(a))));
     v3 at = {{cosf(a) * rad, -0.4f, sinf(a) * rad}};
     int pine = frost || (forest && j % 3 == 0);
-    for (int t = 0; t < 2; t++)
-      dec_backdrop_tree(at, ht, pine, ts, t ? -1.0f : 1.0f);
+    for (int t = 0; t < 2; t++) {
+      float sg = t ? -1.0f : 1.0f;
+      v3 rooted = at;
+      if (map_has_banks()) {
+        v3 normal; int solid = -1;
+        v3 above = {{at.x*sg, BANK_MAX_H + 1, at.z*sg}};
+        float down = trace_world(above, (v3){{0,-1,0}}, &normal, &solid);
+        if (solid >= 0 && g_solids[solid].mat == SOLID_BANK) rooted.y = above.y - down - 0.15f;
+      }
+      dec_backdrop_tree(rooted, ht, pine, ts, sg);
+    }
   }
   mat_set(WORLD_GROUND_R, 0.0f);
   ao_off();
@@ -1230,41 +1212,49 @@ static void mesh_large_scenery(void) {
   g_scene_dirty = 1;
 }
 
-// Exposed roots belong to the upper cut, away from headroom. Small fallen
-// stones at its foot stay below ankle height and leave the rotation lane open.
-static void dec_quarry_growth(void) {
+// Vegetation follows the actual bank face. Roots drape down its incline;
+// ankle-high stones soften the foot without blocking the rotation lane.
+static void dec_bank_growth(void) {
   if (g_biome.kind != BIOME_FOREST) return;
-  for (int i = 0; i < g_num_solids; i += 2) {
+  for (int i = 0; i < map_perim_count(); i++) {
     const solid_t *s = &g_solids[i];
-    if (s->mat != SOLID_ROCK || s->pen) continue;
-    int axis = s->min.x >= ARENA_HALF;
-    v3 normal = axis ? (v3){{1,0,0}} : (v3){{0,0,-1}};
-    v3 tangent = axis ? (v3){{0,0,1}} : (v3){{1,0,0}};
-    float lo = axis ? s->min.z : s->min.x;
-    float hi = axis ? s->max.z : s->max.x;
-    uint64_t seed = (uint64_t)scat_h(0xA007u, (uint32_t)i, 0, 0) * 2654435761u + 1;
-    for (int twin = 0; twin < 2; twin++) {
-      float sg = twin ? -1.0f : 1.0f;
-      uint64_t st = seed;
-      float u = f_clamp((lo + hi) * 0.5f, -ARENA_HALF + 1.2f, ARENA_HALF - 1.2f);
-      v3 c = v3_add(v3_scale(normal, ARENA_HALF + 0.015f), v3_scale(tangent, u));
-      mat_set(0.93f, 0.0f);
-      v3 wood = {{0.29f,0.26f,0.20f}};
-      for (int root = 0; root < 2; root++) {
-        v3 a = v3_add(c, v3_scale(tangent, rng_rangef(&st, -0.75f, 0.75f)));
-        a.y = s->max.y + 0.015f;
-        v3 b = v3_add(a, v3_scale(tangent, rng_rangef(&st, -0.30f, 0.30f)));
-        b.y -= rng_rangef(&st, 0.35f, 0.65f);
-        v3 d = v3_add(b, v3_scale(tangent, rng_rangef(&st, -0.35f, 0.35f)));
-        d.y -= rng_rangef(&st, 0.35f, 0.65f);
-        dec_stick(a, b, 0.045f, wood, sg);
-        dec_stick(b, d, 0.024f, wood, sg);
+    if (s->mat != SOLID_BANK) continue;
+    uint64_t st = (uint64_t)scat_h(0xA007u, (uint32_t)i, 0, 0) * 2654435761u + 1;
+    v3 tangent = v3_norm(v3_sub(s->bank[1], s->bank[0]));
+    mat_set(0.93f, 0.0f);
+    v3 wood = {{0.29f,0.26f,0.20f}};
+    for (int root = 0; root < (i % 3 == 0 ? 2 : 0); root++) {
+      float along = rng_rangef(&st, 0.18f, 0.82f);
+      v3 top = v3_lerp(s->bank[4], s->bank[5], along);
+      v3 knee = v3_lerp(s->bank[2], s->bank[3], along);
+      v3 a = v3_lerp(knee, top, 0.96f);
+      v3 b = v3_lerp(knee, top, 0.78f), c = v3_lerp(knee, top, 0.55f);
+      b = v3_add(b, v3_scale(tangent, rng_rangef(&st, -0.28f, 0.28f)));
+      a = v3_sub(a, v3_scale(s->bank_n, 0.018f));
+      b = v3_sub(b, v3_scale(s->bank_n, 0.018f));
+      c = v3_sub(c, v3_scale(s->bank_n, 0.018f));
+      dec_stick(a, b, 0.045f, wood, 1);
+      dec_stick(b, c, 0.025f, wood, 1);
+    }
+    for (int patch = 0; patch < 3; patch++) {
+      float along = rng_rangef(&st, 0.02f, 0.98f);
+      v3 knee = v3_lerp(s->bank[2], s->bank[3], along);
+      v3 top = v3_lerp(s->bank[4], s->bank[5], along);
+      v3 at = v3_lerp(knee, top, rng_rangef(&st, 0.1f, 0.95f));
+      at.y += 0.025f;
+      dec_tuft(at, rng_rangef(&st, 0.28f, 0.55f), wind_dir(), 0.2f,
+               (v3){{0.30f,0.43f,0.20f}}, 1, &st, 5);
+      for (int leaf = 0; leaf < 5; leaf++) {
+        float ang = rng_rangef(&st, 0, 2*F_PI);
+        v3 dir = v3_norm((v3){{cosf(ang), rng_rangef(&st, 0.3f, 1), sinf(ang)}});
+        dec_leaf(at, dir, rng_rangef(&st, 0.35f, 0.65f), 0.10f,
+                 (v3){{0.24f,0.39f,0.16f}}, 1);
       }
-      for (int stone = 0; stone < 3; stone++) {
-        v3 p = v3_add(c, v3_scale(tangent, rng_rangef(&st, -1.4f, 1.4f)));
-        p = v3_sub(p, v3_scale(normal, rng_rangef(&st, 0.10f, 0.65f)));
-        dec_pebble(p, rng_rangef(&st, 0.045f, 0.085f), &st, s->color, sg);
-      }
+    }
+    for (int stone = 0; stone < 4; stone++) {
+      v3 at = v3_lerp(s->bank[0], s->bank[1], rng_rangef(&st, 0.08f, 0.92f));
+      at = v3_sub(at, v3_scale(s->bank_n, rng_rangef(&st, 0.12f, 0.75f)));
+      dec_pebble(at, rng_rangef(&st, 0.045f, 0.085f), &st, s->color, 1);
     }
   }
 }
@@ -1361,7 +1351,7 @@ static void mesh_decor(void) {
       }
     }
   scat_emit();
-  dec_quarry_growth();
+  dec_bank_growth();
 
   // What a dead tree sheds: a few fallen sticks at each trunk's base — the
   // ground story that ties the crown to the floor without any aerial twigs.

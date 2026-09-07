@@ -1,5 +1,5 @@
 // =============================================================================
-// core/hitscan.inc  —  ray_aabb/trace_world (ray vs AABB + floor), pen_span/
+// core/hitscan.inc  —  ray_aabb/ray_solid/trace_world (boxes, bank prisms and floor), pen_span/
 // PEN_PATH (the penetration path-length search), TICK_HZ/TICK_DT and
 // segment_near (pure bounded segment proximity for acoustics and suppression).
 // Proof: parity, netlagcomp (via ent_trace, see sim/bots_mind.inc). One TU:
@@ -9,7 +9,7 @@
 // falloff, no pen column on wpn_def_t.
 // =============================================================================
 // ---------------------------------------------------------------------------
-// Hitscan — ray vs AABB slab test against the solids plus the arena floor.
+// Hitscan — boxes use slabs; natural banks use their exposed triangles.
 // Returns the nearest hit distance (or GUN_RANGE if nothing) and the face
 // normal, which impact marks and particles align to.
 // ---------------------------------------------------------------------------
@@ -37,6 +37,33 @@ static float ray_aabb(v3 o, v3 d, v3 mn, v3 mx, v3 *nrm) {
   return t0;
 }
 
+static float ray_solid(v3 o, v3 d, int index, v3 *normal) {
+  const solid_t *s = &g_solids[index];
+  float broad = ray_aabb(o, d, s->min, s->max, normal);
+  if (s->mat != SOLID_BANK) return broad;
+  if (broad < 0 && (o.x < s->min.x || o.x > s->max.x ||
+      o.y < s->min.y || o.y > s->max.y || o.z < s->min.z || o.z > s->max.z)) return -1;
+  float best = GUN_RANGE;
+  // Neighbouring side faces are internal to the hillside union.
+  for (int i = 0; i < BANK_EXPOSED_TRIS; i++) {
+    v3 a = s->bank[BANK_TRIS[i][0]], b = s->bank[BANK_TRIS[i][1]], c = s->bank[BANK_TRIS[i][2]];
+    v3 e = v3_sub(b, a), f = v3_sub(c, a), h = v3_cross(d, f);
+    float det = v3_dot(e, h);
+    if (fabsf(det) < 1e-7f) continue;
+    v3 q = v3_sub(o, a);
+    float u = v3_dot(q, h) / det;
+    if (u < -1e-6f || u > 1.000001f) continue;
+    v3 cross = v3_cross(q, e);
+    float v = v3_dot(d, cross) / det;
+    if (v < -1e-6f || u + v > 1.000001f) continue;
+    float t = v3_dot(f, cross) / det;
+    if (t <= 0 || t >= best) continue;
+    best = t; *normal = v3_norm(v3_cross(e, f));
+    if (v3_dot(*normal, d) > 0) *normal = v3_scale(*normal, -1);
+  }
+  return best < GUN_RANGE ? best : -1;
+}
+
 // `solid` (optional) reports WHICH box the ray entered, -1 for the arena floor plane or
 // for nothing at all.
 static float trace_world(v3 o, v3 d, v3 *nrm, int *solid) {
@@ -44,14 +71,14 @@ static float trace_world(v3 o, v3 d, v3 *nrm, int *solid) {
   int si = -1;
   for (int i = 0; i < g_num_solids; i++) {
     v3 n;
-    float t = ray_aabb(o, d, g_solids[i].min, g_solids[i].max, &n);
+    float t = ray_solid(o, d, i, &n);
     if (t > 0 && t < best) { best = t; *nrm = n; si = i; }
   }
   if (d.y < -1e-8f) {  // arena floor plane at y = 0
     float t = -o.y / d.y;
     if (t > 0 && t < best) {
       float hx = o.x + d.x * t, hz = o.z + d.z * t;
-      if (hx > -ARENA_HALF && hx < ARENA_HALF && hz > -ARENA_HALF && hz < ARENA_HALF) {
+      if (hx > -map_half() && hx < map_half() && hz > -map_half() && hz < map_half()) {
         best = t;
         *nrm = (v3){{0, 1, 0}};
         si = -1;                     // a nearer floor un-claims the box
@@ -100,6 +127,13 @@ static float pen_span(v3 o, v3 d) {
     float adv = t;
     for (int i = 0; i < g_num_solids; i++) {
       const solid_t *s = &g_solids[i];
+      if (s->mat == SOLID_BANK) {
+        // Boundary impacts start on the shared mesh. An outward probe in its
+        // footprint cannot penetrate the hillside, regardless of thickness.
+        if (p.y >= 0 && p.y < fminf(s->bank[4].y, s->bank[5].y) &&
+            bank_distance(s, p, 0) > 0) return -1.0f;
+        continue;
+      }
       if (p.x < s->min.x || p.x > s->max.x || p.y < s->min.y ||
           p.y > s->max.y || p.z < s->min.z || p.z > s->max.z) continue;
       if (!s->pen) return -1.0f;

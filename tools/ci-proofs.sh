@@ -43,7 +43,7 @@
 #             finite nondegenerate meshes, overflow and unchanged sim ownership
 #   weatherproof: seed distribution, deterministic bounded samples, rain roof
 #             exclusion, unchanged gameplay RNGs and delayed thunder with map resets
-#   boundarycheck: quarry lanes, shot stops, unclamped run/slide/jump and complete mesh capacity
+#   boundarycheck: forest/dunes/frost prisms, shot surfaces, full unclamped circuits, jumps and mesh capacity
 # Also prints the glibc floor for the log — a rise excludes whole distros, so
 # it is worth seeing even though it is not gated here.
 set -eu
@@ -103,9 +103,9 @@ run() {
 # pre-run. Each job gets its OWN fresh config path (the config is part of the
 # number, and the shared $CFG would race between concurrent jobs).
 spawn() {
-  s_name="$1"; s_script="$2"
+  s_name="$1"; s_script="$2"; s_seed="${3:-1337}"
   (
-    if fresh_config && ( cd "$ROOT" && $RUN "$BIN" --seed 1337 --config "$CFG" \
+    if fresh_config && ( cd "$ROOT" && $RUN "$BIN" --seed "$s_seed" --config "$CFG" \
           --do "$s_script" ) >"$TMPD/$s_name.log" 2>&1
     then echo 0 >"$TMPD/$s_name.status"
     else echo $? >"$TMPD/$s_name.status"; fi
@@ -151,8 +151,14 @@ gate_command() {
 
 # The figure sweeps and viewmodel contact proofs run concurrently into
 # independent config/log/status files. Grading remains sequential below.
+# Supported figure contact censuses use the industrial control seed 2. Seed 1337 is
+# a natural snow map: terrain edits alter its bot spawn/path, changing the
+# measured poses even when the soldier mesh is unchanged. World-dependent
+# movement remains covered by boundarycheck, naturalcheck and the bot proofs.
+FIG_SEED=1337
+case "$ELF" in b700|3e00) FIG_SEED=2 ;; esac
 for wpn in ar sr; do
-  for d in 0 3 8 12 30; do spawn "figcheck-$wpn-$d" "figcheck 60 $d $wpn"; done
+  for d in 0 3 8 12 30; do spawn "figcheck-$wpn-$d" "figcheck 60 $d $wpn" "$FIG_SEED"; done
 done
 spawn vmtrig "vmtrig"
 spawn vmcheck "vmcheck"
@@ -316,9 +322,14 @@ WANT_AR_NEAR="72 72 76 71 63"
 # native AArch64 and emulated x86_64 sweeps from the actual release executables.
 # Deeper sleeve/yoke roots close the visible shoulder seam; attached shirt/strap
 # contacts change while all hard topology and forbidden grip classes stay zero.
-# Both measured architectures have identical maxima; unsupported ELFs retain
-# the older reference rather than borrowing an unmeasured contact census.
-case "$ELF" in b700|3e00) WANT_AR_NEAR="71 71 75 71 61" ;; esac
+# AR maxima agree on both measured architectures. Unsupported ELFs retain
+# the older seed and reference rather than borrowing an unmeasured census.
+# Seed-2 control, reviewed against a native HEAD rebuild with pinned tuning
+# and flags, plus the preserved pre-change x86 executable. Before/after full
+# summaries match at all five distances for both weapons on both supported ELFs.
+# No topology or contact threshold is relaxed. Paired logs and measurements:
+# build/organic-boundary-ki75y5tj/figure-controls-final.json.
+case "$ELF" in b700|3e00) WANT_AR_NEAR="70 70 73 71 63" ;; esac
 [ "$AR_NEAR" = "$WANT_AR_NEAR" ] || {
   say "GATE AR near '$AR_NEAR' != reviewed baseline '$WANT_AR_NEAR'"; fail=1;
 }
@@ -438,7 +449,7 @@ case "$ELF" in b700|3e00) WANT_AR_NEAR="71 71 75 71 61" ;; esac
 # over sixty ticks, with ankle/cuff host contacts redistributed. Both weapons
 # preserve exact upper-body family counts between model-only and integrated runs.
 WANT_AR_CROSS="160 160 155 130 79"
-case "$ELF" in b700|3e00) WANT_AR_CROSS="159 159 155 130 94" ;; esac
+case "$ELF" in b700|3e00) WANT_AR_CROSS="129 129 124 109 74" ;; esac
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -469,11 +480,15 @@ case "$ELF" in b700|3e00) WANT_AR_CROSS="159 159 155 130 94" ;; esac
 # sample takes SR near's k=6 tier 41 -> 40 and SR cross 180/180/121/95 -> 181/181/122/95,
 # with SR aggregates 8681 -> 8705 CROSS and 5427 -> 5425 near inside the existing families.
 WANT_SR_NEAR="93 93 84 55 40"
-case "$ELF" in b700|3e00) WANT_SR_NEAR="92 92 84 55 40" ;; esac
+# Architecture-specific near counts are stable in each paired seed-2 control.
+case "$ELF" in
+  b700) WANT_SR_NEAR="95 95 86 55 42" ;;
+  3e00) WANT_SR_NEAR="94 94 85 55 42" ;;
+esac
 # SR uses the same reviewed sleeve, pouch and gait changes, with its own
 # weapon-aware pose and independently retained sixty-tick family census.
 WANT_SR_CROSS="229 229 211 152 114"
-case "$ELF" in b700|3e00) WANT_SR_CROSS="225 225 207 148 129" ;; esac
+case "$ELF" in b700|3e00) WANT_SR_CROSS="205 205 185 133 104" ;; esac
 [ "$SR_NEAR" = "$WANT_SR_NEAR" ] || {
   say "GATE SR near '$SR_NEAR' != reviewed baseline '$WANT_SR_NEAR'"; fail=1;
 }
@@ -763,7 +778,7 @@ gate_command filmtrackproof "filmtrackproof" '^filmtrackproof summary cases=13 s
 gate_command filmcueproof "filmcueproof" '^filmcueproof summary cases=22 ok$'
 
 gate_command decorcheck "decorcheck" '^decorcheck trees=2560 tips=14792 buildings=240 controls=10 peak=720 state=same fail=0 ok$'
-gate_command boundarycheck "boundarycheck 128" '^boundarycheck maps=128 rays=23040 routes=3072 contacts=22528 meshes=128 peak_verts=[0-9]+ fail=0 ok$'
+gate_command boundarycheck "boundarycheck 128" '^boundarycheck maps=128 rays=30720 routes=768 contacts=61440 tangents=6144 meshes=128 peak_verts=[0-9]+ fail=0 ok$'
 decor_small_rows="$(grep -Ec '^decorcheck small=1728 floating=0 worst=(0[.]000000/){8}0[.]000000$' "$TMPD/decorcheck.log" || true)"
 [ "$decor_small_rows" = 1 ] || {
   say "GATE decorcheck missing grounded small-piece census"; fail=1;

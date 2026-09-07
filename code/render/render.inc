@@ -862,7 +862,7 @@ static float ao_at(float y) {
 // 1.0 m the stamps read. 13824 static verts, zero fragment cost, never casts
 // — and the "4608 triangles" note at the cast latch is exact again.
 #define GROUND_CELLS 48
-#define GROUND_STEP  (2.0f * ARENA_HALF / (float)GROUND_CELLS)
+#define GROUND_STEP  (2.0f * map_half() / (float)GROUND_CELLS)
 #define GROUND_VERTS (GROUND_CELLS * GROUND_CELLS * 6)
 
 // What the floor is MADE OF at one point. Contact darkness is deliberately not

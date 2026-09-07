@@ -41,7 +41,7 @@ SHOTS = (
     dict(key="winter", title="Stiller Winter", seed=22,
          caption="Heller Schnee, unregelmäßige Nadelbäume und ferne Bergzüge verändern den Charakter der Arena.",
          biome=None, sun=None, camera="17 3.0 19 -0.73 0.04"),
-    dict(key="forest", title="Wege im überwachsenen Steinbruch", seed=4,
+    dict(key="forest", title="Wege in der Waldmulde", seed=4,
          caption="Felskanten und bewaldete Schultern begrenzen die Lichtung. Die Außenwege bleiben für schnelle Bewegung offen.",
          biome=None, sun=None, camera="17 2 19 -0.73 0.07"),
     dict(key="undergrowth", title="Farn am feuchten Mauerfuß", seed=13,

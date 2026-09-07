@@ -8,30 +8,43 @@
 // at N=2000.
 // =============================================================================
 // ---------------------------------------------------------------------------
-// Procedural map — seeded arena generation. AABB solids are the collision set
-// AND the render mesh; themes color them.
+// Procedural map — seeded arena generation. Boxes and bank prisms own
+// collision and rendering together; themes color the same geometry.
 // ---------------------------------------------------------------------------
 
 #define ARENA_HALF   24.0f
 #define FOREST_TRUNK_H 3.2f
-#define QUARRY_DEPTH 8.0f
-// Even the highest permitted jump from a grove trunk stays below the cut.
-#define QUARRY_CUT_MIN (FOREST_TRUNK_H + MV_DEF[MV_JUMP_H].hi + 0.2f)
-#define QUARRY_CUT_MAX (QUARRY_CUT_MIN + 1.6f)
-#define QUARRY_RIM_RISE 4.4f
-// Raised from 96 with the wall-damage pass: a broken wall is up to four abutting pieces
-// plus three rubble blocks where it used to be one box, and all of them are real cover
-// that has to be in the collision set. int16 carries the solid index on the wire
-// (net_ev_from_live) and the world hash is over the USED entries, so the ceiling itself
-// is free — what it costs is 16 lobbies x 160 x 44 bytes of server memory.
+#define BANK_SIDES 24
+#define BANK_VERTS 8
+#define BANK_TRI_COUNT 12
+#define BANK_EXPOSED_TRIS 8
+#define BANK_KNEE_H 3.4f
+#define BANK_SHOULDER 2.1f
+#define NATURAL_HALF 32.0f
+#define BANK_MIN_H (FOREST_TRUNK_H + MV_DEF[MV_JUMP_H].hi + 0.6f)
+#define BANK_MAX_H (BANK_MIN_H + 2.4f)
+// Damage fragments and the natural perimeter share this bounded list.
+// Solid indices are int16 on the wire; hashes cover only used records.
 #define MAX_SOLIDS   160
 
-// `pen` = a round may cross this box if its budget stretches that far. `mat`
-// is presentation metadata for shading and impact sound, a full int with no ABI-
-// dependent trailing padding. net_world_hash explicitly stops before it;
-// proof fixtures that omit it get SOLID_CONCRETE through zero-init.
-enum { SOLID_CONCRETE, SOLID_WALL, SOLID_ROCK };
-typedef struct { v3 min, max, color; int pen, mat; } solid_t;
+// `pen` controls bullet penetration. `mat` selects box presentation or the
+// bank shape; omitted fields in box fixtures are zero-initialized. The world
+// hash retains the historical box prefix and includes bank geometry as well.
+enum { SOLID_CONCRETE, SOLID_WALL, SOLID_ROCK, SOLID_BANK };
+// Banks are closed hillside prisms: foot, shoulder, crest and outer foot, each a
+// pair of vertices. Rendering and ray queries consume these exact vertices.
+// Their inner faces bound a convex clearing; horizontal body contact uses
+// the same plane, expanded by the body's square footprint.
+typedef struct {
+  v3 min, max, color;
+  int pen, mat;
+  v3 bank[BANK_VERTS], bank_n;
+  float bank_d, bank_k;
+} solid_t;
+static const unsigned char BANK_TRIS[BANK_TRI_COUNT][3] = {
+  {0,3,2}, {0,1,3}, {2,5,4}, {2,3,5}, {4,7,6}, {4,5,7},
+  {0,7,1}, {0,6,7}, {0,2,4}, {0,4,6}, {1,5,3}, {1,7,5}
+};
 
 static solid_t g_solids_all[SRV_LOBBIES][MAX_SOLIDS];
 #define g_solids (g_solids_all[g_lobby])
@@ -45,6 +58,21 @@ static uint32_t g_map_seed_all[SRV_LOBBIES];
 #define g_map_seed (g_map_seed_all[g_lobby])
 static int      g_world_dirty_all[SRV_LOBBIES];
 #define g_world_dirty (g_world_dirty_all[g_lobby])
+
+static int map_has_banks(void) {
+  return g_num_solids > 0 && g_solids[0].mat == SOLID_BANK;
+}
+static float map_half(void) { return map_has_banks() ? NATURAL_HALF : ARENA_HALF; }
+
+// Positive distance lies beyond the visible inner slope. Feet own the
+// contact on these steep, non-walkable banks; jumping opens space above them.
+static float bank_spread(float y) {
+  return fminf(fmaxf(y, 0), BANK_KNEE_H) + BANK_SHOULDER * fmaxf(0, y - BANK_KNEE_H);
+}
+static float bank_distance(const solid_t *s, v3 p, float radius) {
+  return v3_dot(s->bank_n, p) + radius * (fabsf(s->bank_n.x) + fabsf(s->bank_n.z)) -
+         s->bank_d * (1.0f + s->bank_k * bank_spread(p.y));
+}
 
 static const v3 SPAWN_POS = {{0.0f, 0.0f, 18.0f}};
 
@@ -61,15 +89,25 @@ static void map_add_mat(v3 mn, v3 mx, v3 col, int mat) {
   if (g_num_solids > at) g_solids[at].mat = mat;
 }
 
-// Boundary solids precede cover; quarry cuts have more sections than masonry.
-// Wall-hugging corridor kept free of cover: guaranteed rotation routes and
-// four long sniper sightlines, one per wall.
+// Boundary solids precede cover. A continuous clear rotation lane follows
+// the actual contour, including where natural banks round off the corners.
 #define RING_W 4.5f
 
 static int map_perim_count(void) {
   int n = 0;
   while (n < g_num_solids && !g_solids[n].pen) n++;
   return n;
+}
+
+static int map_bank_free(v3 mn, v3 mx, float gap) {
+  for (int i = 0; i < map_perim_count(); i++) {
+    const solid_t *s = &g_solids[i];
+    if (s->mat != SOLID_BANK) continue;
+    v3 corner = {{s->bank_n.x > 0 ? mx.x : mn.x, 0,
+                  s->bank_n.z > 0 ? mx.z : mn.z}};
+    if (bank_distance(s, corner, 0) > -gap) return 0;
+  }
+  return 1;
 }
 
 static int map_box_free(v3 mn, v3 mx, float gap) {
@@ -81,6 +119,7 @@ static int map_box_free(v3 mn, v3 mx, float gap) {
     if (mx.x > SPAWN_POS.x - 4 && mn.x < SPAWN_POS.x + 4 &&
         mx.z > sz - 4 && mn.z < sz + 4) return 0;
   }
+  if (!map_bank_free(mn, mx, RING_W + 0.15f)) return 0;
   for (int i = map_perim_count(); i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
     if (mx.x > s->min.x - gap && mn.x < s->max.x + gap &&
@@ -155,6 +194,10 @@ typedef struct { int kind; float night, snow, forest, aurora; } biome_t;
 static biome_t g_biome_all[SRV_LOBBIES];
 #define g_biome (g_biome_all[g_lobby])
 static int g_biome_force = -1;
+static int biome_natural(void) {
+  return g_biome.kind == BIOME_FOREST || g_biome.kind == BIOME_DUNES ||
+         g_biome.kind == BIOME_FROST;
+}
 [[maybe_unused]] static const char *BIOME_NAMES[] = {"quarry", "dunes", "marsh", "forest",
                                     "frost", "night", "aurora"};
 #define MAP_LIGHT_MAX 6
@@ -311,10 +354,10 @@ static void sun_set(float elev_deg, float azi_rad) {
   S->disc = 0.8f + 25.2f * f_smoothstep(0.13f, 0.58f, se);
   S->cloud = 0.26f;   // sun_build re-draws this per map; this is the default
   float tan_e = se / sqrtf(fmaxf(1.0f - se * se, 1.0e-4f));
-  float cast_h = g_biome.kind == BIOME_FOREST ? QUARRY_CUT_MAX + QUARRY_RIM_RISE : SUN_CAST_H;
+  float cast_h = biome_natural() ? BANK_MAX_H + 8.0f : SUN_CAST_H;
   float smear = fminf(cast_h / fmaxf(tan_e, 0.10f), 34.0f);
   S->sh_half = ARENA_HALF * 1.06f + smear * 0.5f +
-               (g_biome.kind == BIOME_FOREST ? QUARRY_DEPTH : 0.0f);
+               (biome_natural() ? 16.0f : 0.0f);
   S->sh_depth = 2.2f * S->sh_half + 40.0f;
   v3 dh = v3_norm((v3){{S->dir.x, 0.0f, S->dir.z}});
   S->sh_centre = (v3){{-dh.x * smear * 0.5f, 1.6f, -dh.z * smear * 0.5f}};
@@ -377,6 +420,10 @@ static void map_lights_build(void) {
     v3 p = pair == 0 ? (v3){{-15.0f, 5.4f, ARENA_HALF + 0.12f}}
                     : (v3){{ARENA_HALF + 0.12f, 5.7f, 8.0f}};
     float base = 2.75f;
+    if (map_has_banks() && pair < 2) {
+      base = 0.0f;
+      p = pair == 0 ? (v3){{-10, 5.4f, 20}} : (v3){{20, 5.7f, 6}};
+    }
     if (pair == 2) {
       float best = 1e9f;
       for (int i = map_perim_count(); i < g_num_solids; i++) {
@@ -994,29 +1041,52 @@ static uint64_t rng_gun_seed(uint32_t seed, int h) {
 
 static void map_gen_shell(uint32_t seed) {
   const float H = ARENA_HALF, WT = 0.6f, WH = 3.2f, BH = 2.75f;
-  if (g_biome.kind == BIOME_FOREST) {
-    // The clearing occupies a cut quarry floor. Eight metres of bedrock
-    // explains the impermeable boundary; its sheer inner faces keep the full
-    // rotation lane clear. Opposite cuts match, including their height.
-    // A private stream preserves every interior solid and gameplay RNG.
+  if (biome_natural()) {
+    // Smooth low-frequency support distances give a convex, off-centre
+    // footprint. Its corners stay rounded and its silhouette varies by seed.
+    // This stream never consumes cover, bot or weapon randomness.
     uint64_t st = (uint64_t)(seed ^ 0x51A7E123u) * 2654435761u + 1;
-    const float outer = H + QUARRY_DEPTH;
-    for (int axis = 0; axis < 2; axis++) {
-      float reach = axis ? H : outer;
-      float lo = -reach;
-      for (int part = 0; part < 6; part++) {
-        float hi = part == 5 ? reach : -reach + (float)(part + 1) * reach / 3.0f +
-                                       rng_rangef(&st, -1.4f, 1.4f);
-        float height = rng_rangef(&st, QUARRY_CUT_MIN, QUARRY_CUT_MAX);
-        v3 stone = v3_lerp(g_theme.wall, (v3){{0.60f,0.59f,0.55f}}, 0.65f);
-        v3 col = v3_scale(stone, rng_rangef(&st, 0.87f, 0.96f));
-        v3 mn = axis ? (v3){{H, 0, lo}} : (v3){{lo, 0, -outer}};
-        v3 mx = axis ? (v3){{outer, height, hi}} : (v3){{hi, height, -H}};
-        map_add_sym_mat(mn, mx, col, SOLID_ROCK);
-        lo = hi;
+    v3 normals[BANK_SIDES], foot[BANK_SIDES], crest[BANK_SIDES];
+    float support[BANK_SIDES];
+    float phase = rng_rangef(&st, 0, 2 * F_PI);
+    float skew = rng_rangef(&st, 0, 2 * F_PI);
+    float bend = rng_rangef(&st, 0, 2 * F_PI);
+    float k = rng_rangef(&st, 0.027f, 0.037f);
+    float oval = rng_rangef(&st, 1.0f, 2.1f);
+    for (int i = 0; i < BANK_SIDES; i++) {
+      float a = (float)i * (2 * F_PI / BANK_SIDES);
+      normals[i] = (v3){{cosf(a), 0, sinf(a)}};
+      support[i] = 26.3f + oval * cosf(2*a + phase) +
+                   0.6f * cosf(3*a + bend) + 0.22f * cosf(4*a - phase) +
+                   1.1f * cosf(a + skew);
+    }
+    for (int i = 0; i < BANK_SIDES; i++) {
+      int prev = (i + BANK_SIDES - 1) % BANK_SIDES;
+      v3 a = normals[prev], b = normals[i];
+      float det = a.x*b.z - b.x*a.z;
+      foot[i] = (v3){{(support[prev]*b.z - support[i]*a.z)/det, 0,
+                      (a.x*support[i] - b.x*support[prev])/det}};
+      float h = BANK_MIN_H + rng_rangef(&st, 0.0f, 2.4f);
+      crest[i] = v3_scale(foot[i], 1.0f + k*bank_spread(h)); crest[i].y = h;
+    }
+    for (int i = 0; i < BANK_SIDES; i++) {
+      int next = (i + 1) % BANK_SIDES;
+      v3 col = v3_lerp(g_theme.wall, g_theme.ground, rng_rangef(&st, 0.30f, 0.65f));
+      map_add_mat((v3){{0,0,0}}, (v3){{0,0,0}}, col, SOLID_BANK);
+      solid_t *s = &g_solids[g_num_solids - 1];
+      s->pen = 0; s->bank_n = normals[i]; s->bank_d = support[i]; s->bank_k = k;
+      s->bank[0] = foot[i]; s->bank[1] = foot[next];
+      s->bank[2] = v3_scale(foot[i], 1.0f + k*BANK_KNEE_H); s->bank[2].y = BANK_KNEE_H;
+      s->bank[3] = v3_scale(foot[next], 1.0f + k*BANK_KNEE_H); s->bank[3].y = BANK_KNEE_H;
+      s->bank[4] = crest[i]; s->bank[5] = crest[next];
+      s->bank[6] = v3_scale(foot[i], 1.9f); s->bank[6].y = -0.4f;
+      s->bank[7] = v3_scale(foot[next], 1.9f); s->bank[7].y = -0.4f;
+      s->min = s->max = s->bank[0];
+      for (int v = 1; v < BANK_VERTS; v++) for (int ax = 0; ax < 3; ax++) {
+        s->min.e[ax] = fminf(s->min.e[ax], s->bank[v].e[ax]);
+        s->max.e[ax] = fmaxf(s->max.e[ax], s->bank[v].e[ax]);
       }
     }
-    for (int i = 0; i < g_num_solids; i++) g_solids[i].pen = 0;
     return;
   }
   v3 wc = g_theme.wall;
@@ -1283,7 +1353,10 @@ static void map_gen_crates(void) {
         // free (rotation routes, the four long sightlines, and every rig that stages
         // there BECAUSE it is cover-free).
         if (smn.x >= -(H - RING_W) && smn.z >= -(H - RING_W) &&
-            smx.x <= H - RING_W && smx.z <= H - RING_W)
+            smx.x <= H - RING_W && smx.z <= H - RING_W &&
+            map_bank_free(smn, smx, RING_W) &&
+            map_bank_free((v3){{-smx.x, smn.y, -smx.z}},
+                          (v3){{-smn.x, smx.y, -smn.z}}, RING_W))
           map_add_sym(smn, smx, col_tint(g_theme.crate_b, 0.93f, 1.07f));
       }
       if (((roll >> 3) & 63) < 28) {  // top box: silhouette variety

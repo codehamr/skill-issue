@@ -136,9 +136,9 @@ static float mv_lean(v3 origin, v3 velocity, float yaw, int enabled, float want,
       for (int hgt = 0; hgt < 2; hgt++) {
         v3 oh = o, ahh = ah;
         if (hgt) { oh.y = oy2; ahh.y = oy2; }
-        float t = ray_aabb(oh, d, g_solids[i].min, g_solids[i].max, &n);
+        float t = ray_solid(oh, d, i, &n);
         if (t > 0 && t - LEAN_MARGIN < bn) bn = t - LEAN_MARGIN;
-        t = ray_aabb(ahh, d, g_solids[i].min, g_solids[i].max, &n);
+        t = ray_solid(ahh, d, i, &n);
         if (t > 0 && t - LEAN_MARGIN < ba) ba = t - LEAN_MARGIN;
       }
     }

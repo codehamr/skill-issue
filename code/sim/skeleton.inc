@@ -577,7 +577,7 @@ static v3 foot_clamp_m(v3 base, v3 tgt, float margin) {
     if (bx1 < s->min.x || bx0 > s->max.x || bz1 < s->min.z || bz0 > s->max.z)
       continue;
     v3 n;
-    float t = ray_aabb(o, d, s->min, s->max, &n);
+    float t = ray_solid(o, d, i, &n);
     if (t > 0 && t - margin < best) best = t - margin;
   }
   if (best < 0) best = 0;
@@ -611,6 +611,7 @@ static int foot_ground_supported(v3 base) {
   if (fabsf(base.y) < 0.04f) return 1;
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
+    if (s->mat == SOLID_BANK) continue;
     if (fabsf(s->max.y - base.y) > 0.04f) continue;
     if (base.x < s->min.x - 0.35f || base.x > s->max.x + 0.35f ||
         base.z < s->min.z - 0.35f || base.z > s->max.z + 0.35f) continue;
@@ -624,6 +625,12 @@ static float foot_ground_y(v3 base, float x, float z) {
   float top = 0.0f;
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
+    if (s->mat == SOLID_BANK) {
+      v3 normal, origin = {{x, base.y + 0.04f, z}};
+      float d = ray_solid(origin, (v3){{0,-1,0}}, i, &normal);
+      if (d > 0 && d <= origin.y && origin.y - d > top) top = origin.y - d;
+      continue;
+    }
     if (x < s->min.x || x > s->max.x || z < s->min.z || z > s->max.z) continue;
     if (s->max.y > base.y + 0.04f) continue;
     if (s->max.y > top) top = s->max.y;
@@ -668,6 +675,22 @@ static lean_foot_sweep_t lean_foot_sweep(v3 from, v3 to, float margin) {
   int n = 0;
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
+    if (s->mat == SOLID_BANK) {
+      // The hillside is the intersection of its steep foot and shallower
+      // shoulder half-spaces. Clip both, including steps across their join.
+      float enter = -1e30f, leave = 1e30f;
+      for (int plane = 0; plane < 2; plane++) {
+        float factor = plane ? BANK_SHOULDER : 1;
+        float start = v3_dot(s->bank_n, o) + margin * (fabsf(s->bank_n.x) + fabsf(s->bank_n.z)) -
+                      s->bank_d * (1 + s->bank_k * (factor*o.y - (factor-1)*BANK_KNEE_H));
+        float direction = v3_dot(s->bank_n, d) - s->bank_d * s->bank_k * factor*d.y;
+        if (fabsf(direction) < 1e-8f) { if (start < 0) leave = -1; }
+        else if (direction > 0) enter = fmaxf(enter, -start/direction);
+        else leave = fminf(leave, -start/direction);
+      }
+      if (enter <= leave && leave >= 0 && enter <= len) { lo[n] = enter; hi[n++] = leave; }
+      continue;
+    }
     float mn[3] = {s->min.x - margin, s->min.y - 1e-3f,
                    s->min.z - margin};
     float mx[3] = {s->max.x + margin, s->max.y + 1e-3f,
@@ -727,6 +750,12 @@ static float ground_drop(v3 p, float maxd) {
   float best = p.y >= 0.0f && p.y < maxd ? p.y : maxd;
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *s = &g_solids[i];
+    if (s->mat == SOLID_BANK) {
+      v3 normal;
+      float d = ray_solid(p, (v3){{0,-1,0}}, i, &normal);
+      if (d >= 0 && d < best) best = d;
+      continue;
+    }
     if (p.x < s->min.x || p.x > s->max.x || p.z < s->min.z || p.z > s->max.z) continue;
     float d = p.y - s->max.y;
     if (d >= -1e-3f && d < best) best = d;

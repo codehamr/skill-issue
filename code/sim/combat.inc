@@ -371,7 +371,7 @@ static int gun_wall_blocked(v3 eye, float yaw, float pitch, const weapon_t *w) {
   float entry = reach;
   for (int i = 0; i < g_num_solids; i++) {
     v3 n;
-    float t = ray_aabb(eye, d, g_solids[i].min, g_solids[i].max, &n);
+    float t = ray_solid(eye, d, i, &n);
     if (t > 0.0f && t < entry) entry = t;
   }
   if (entry >= reach) return 0;
@@ -977,11 +977,11 @@ static uint16_t g_bot_nav_queue[BOT_NAV_CELLS];
 static int16_t g_bot_nav_parent[BOT_NAV_CELLS];
 
 static v3 bot_nav_point(int cell) {
-  return (v3){{-ARENA_HALF + ((float)(cell % BOT_NAV_SIDE) + 0.5f) * BOT_NAV_STEP,
-                0, -ARENA_HALF + ((float)(cell / BOT_NAV_SIDE) + 0.5f) * BOT_NAV_STEP}};
+  return (v3){{-map_half() + ((float)(cell % BOT_NAV_SIDE) + 0.5f) * BOT_NAV_STEP,
+                0, -map_half() + ((float)(cell / BOT_NAV_SIDE) + 0.5f) * BOT_NAV_STEP}};
 }
 static int bot_nav_axis(float coordinate) {
-  return (int)f_clamp(floorf((coordinate + ARENA_HALF) / BOT_NAV_STEP),
+  return (int)f_clamp(floorf((coordinate + map_half()) / BOT_NAV_STEP),
                        0, BOT_NAV_SIDE - 1);
 }
 static const unsigned char *bot_nav_prepare(void) {
@@ -997,6 +997,7 @@ static const unsigned char *bot_nav_prepare(void) {
   float margin = PLAYER_RADIUS + BOT_NAV_STEP * 0.5f + 0.02f;
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *solid = &g_solids[i];
+    if (solid->mat == SOLID_BANK) continue;
     if (solid->max.y <= 0.20f || solid->min.y >= HEIGHT_STAND) continue;
     int x0 = bot_nav_axis(solid->min.x - margin);
     int x1 = bot_nav_axis(solid->max.x + margin);
@@ -1004,6 +1005,11 @@ static const unsigned char *bot_nav_prepare(void) {
     int z1 = bot_nav_axis(solid->max.z + margin);
     for (int z = z0; z <= z1; z++)
       for (int x = x0; x <= x1; x++) cache->blocked[z * BOT_NAV_SIDE + x] = 1;
+  }
+  if (map_has_banks()) for (int cell = 0; cell < BOT_NAV_CELLS; cell++) {
+    v3 point = bot_nav_point(cell);
+    for (int i = 0; i < map_perim_count(); i++)
+      if (bank_distance(&g_solids[i], point, margin) > 0) { cache->blocked[cell] = 1; break; }
   }
   for (int i = 0; i < BOT_NAV_SIDE; i++) {
     cache->blocked[i] = cache->blocked[BOT_NAV_CELLS - 1 - i] = 1;
@@ -1015,6 +1021,8 @@ static const unsigned char *bot_nav_prepare(void) {
 // Swept body clearance, shared by navigation, tactical anchors and escape. This
 // is a movement test; bullet penetration flags never make a wall walkable.
 static int bot_walk_clear(v3 from, v3 to) {
+  if (map_has_banks() && (!aabb_fits(from, PLAYER_RADIUS + 0.02f, HEIGHT_STAND) ||
+      !aabb_fits(to, PLAYER_RADIUS + 0.02f, HEIGHT_STAND))) return 0;
   v3 delta = v3_sub(to, from);
   float distance = v3_len(delta);
   if (distance < 0.01f) return aabb_fits(to, PLAYER_RADIUS, HEIGHT_STAND);
@@ -1022,6 +1030,7 @@ static int bot_walk_clear(v3 from, v3 to) {
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *solid = &g_solids[i];
     if (solid->max.y <= fminf(from.y, to.y) + 0.20f) continue;
+    if (solid->mat == SOLID_BANK) continue;
     v3 lo = v3_sub(solid->min, (v3){{PLAYER_RADIUS + 0.02f, HEIGHT_STAND, PLAYER_RADIUS + 0.02f}});
     v3 hi = v3_add(solid->max, (v3){{PLAYER_RADIUS + 0.02f, 0, PLAYER_RADIUS + 0.02f}});
     v3 normal;
@@ -1127,7 +1136,7 @@ static int bot_cover_spot_point(const bot_t *b, v3 threat_point, v3 *out) {
       // The ring STARTS at cov_phase, which the stuck escape advances.
       float a = (float)((k + b->cov_phase) & 7) * F_PI_4;
       v3 c = {{b->pos.x + sinf(a) * rad, b->pos.y, b->pos.z + cosf(a) * rad}};
-      if (fabsf(c.x) > ARENA_HALF - 1.0f || fabsf(c.z) > ARENA_HALF - 1.0f) continue;
+      if (fabsf(c.x) > map_half() - 1.0f || fabsf(c.z) > map_half() - 1.0f) continue;
       if (!aabb_fits(c, PLAYER_RADIUS, HEIGHT_STAND)) continue;
       v3 eo = {{c.x, c.y + EYE_STAND, c.z}};
       if (v3_len(v3_sub(threat_point, eo)) <= 0.5f) continue;
@@ -1186,6 +1195,7 @@ static int bot_suppress_path(v3 from, v3 to) {
   for (int i = 0; i < g_num_solids; i++) {
     const solid_t *solid = &g_solids[i];
     if (solid->max.y <= from.y + 0.20f) continue;
+    if (solid->mat == SOLID_BANK) continue;
     v3 lo = v3_sub(solid->min, (v3){{PLAYER_RADIUS, HEIGHT_STAND, PLAYER_RADIUS}});
     v3 hi = v3_add(solid->max, (v3){{PLAYER_RADIUS, 0, PLAYER_RADIUS}});
     v3 normal;
@@ -1216,7 +1226,7 @@ static void bot_suppress_plan(bot_t *b, int bi) {
     v3 goal = {{b->pos.x + sinf(angle) * radius, b->pos.y,
                 b->pos.z + cosf(angle) * radius}};
     g_match.suppress_candidates++;
-    if (fabsf(goal.x) > ARENA_HALF - 1.0f || fabsf(goal.z) > ARENA_HALF - 1.0f) continue;
+    if (fabsf(goal.x) > map_half() - 1.0f || fabsf(goal.z) > map_half() - 1.0f) continue;
     v3 chest = {{goal.x, goal.y + EYE_STAND - ENT_CHEST_OFF, goal.z}};
     if (bot_suppress_clear(chest, s->point) || !bot_suppress_path(b->pos, goal)) continue;
     s->goal = goal;
@@ -1234,7 +1244,7 @@ static void bot_suppress_plan(bot_t *b, int bi) {
     float side = ((bi + attempt) & 1) ? -1.0f : 1.0f;
     v3 goal = {{b->pos.x - away.z * 1.8f * side, b->pos.y,
                 b->pos.z + away.x * 1.8f * side}};
-    if (fabsf(goal.x) > ARENA_HALF - 1.0f || fabsf(goal.z) > ARENA_HALF - 1.0f) continue;
+    if (fabsf(goal.x) > map_half() - 1.0f || fabsf(goal.z) > map_half() - 1.0f) continue;
     if (bot_suppress_path(b->pos, goal)) { s->goal = goal; return; }
   }
 }
@@ -1280,7 +1290,7 @@ static int bot_flank_spot(const bot_t *b, v3 tpos, int side, v3 *out) {
     float cs = cosf(PHI[k]), sn = sinf(PHI[k]) * (float)side;
     v3 c = {{tpos.x + (ux * cs - uz * sn) * rad, 0.0f,
              tpos.z + (ux * sn + uz * cs) * rad}};
-    if (fabsf(c.x) > ARENA_HALF - 1.0f || fabsf(c.z) > ARENA_HALF - 1.0f) continue;
+    if (fabsf(c.x) > map_half() - 1.0f || fabsf(c.z) > map_half() - 1.0f) continue;
     if (!aabb_fits(c, PLAYER_RADIUS, HEIGHT_STAND)) continue;
     v3 ce = {{c.x, c.y + EYE_STAND, c.z}};
     float score = los_clear(ce, te) ? 0.0f : 100.0f;
@@ -1403,8 +1413,9 @@ static v3 bot_belief_aimpoint(const bot_t *b) {
 
 static v3 bot_search_clamped(v3 p) {
   p.y = 0.0f;
-  p.x = f_clamp(p.x, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
-  p.z = f_clamp(p.z, -ARENA_HALF + PLAYER_RADIUS, ARENA_HALF - PLAYER_RADIUS);
+  p.x = f_clamp(p.x, -map_half() + PLAYER_RADIUS, map_half() - PLAYER_RADIUS);
+  p.z = f_clamp(p.z, -map_half() + PLAYER_RADIUS, map_half() - PLAYER_RADIUS);
+  if (map_has_banks()) { v3 velocity = {{0,0,0}}; bank_resolve(&p, &velocity); }
   return p;
 }
 

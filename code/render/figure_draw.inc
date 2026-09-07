@@ -1286,7 +1286,7 @@ static float dust_phase(float mu) {
 static float dust_sunlit(v3 p) {
   for (int i = 0; i < g_num_solids; i++) {
     v3 n;
-    if (ray_aabb(p, g_sun.dir, g_solids[i].min, g_solids[i].max, &n) > 0.0f)
+    if (ray_solid(p, g_sun.dir, i, &n) > 0.0f)
       return 0.13f;
   }
   return 1.0f;
