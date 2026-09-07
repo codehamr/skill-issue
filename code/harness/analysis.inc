@@ -260,6 +260,7 @@ static void usage(void) {
        "  warp X Y Z         teleport the player (peek/camera framing tests)\n"
        "  pos                print tick/position/velocity/eye/grounded/lean/shots\n"
        "  lean               print lean command/clearance/eye+head offset/exposure\n"
+       "  leanmove           held/new lean through run, slide, jump, walls and release\n"
        "  wpn                print ammo/barrel recoil/ads/reload + cosmetic VM state\n"
        "  bot                print every bot: position/hp/state/target + belief\n"
        "  aimbot             snap yaw/pitch onto the nearest bot's head\n"

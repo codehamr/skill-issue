@@ -29,6 +29,7 @@ static void cmd_botflank(sim_ctx_t *s)         { (void)s; botflank_proof(); }
 static void cmd_botmemory(sim_ctx_t *s)        { (void)s; botmemory_proof(); }
 static void cmd_botmemoryobserve(sim_ctx_t *s) { (void)s; botmemoryobserve_proof(); }
 static void cmd_leanstep(sim_ctx_t *s)         { (void)s; leanstep_proof(); }
+static void cmd_leanmove(sim_ctx_t *s)         { (void)s; leanmove_proof(); }
 static void cmd_padbackend(sim_ctx_t *s)       { (void)s; padbackend_proof(); }
 static void cmd_padsync(sim_ctx_t *s)          { (void)s; pad_sync(TICK_DT); }
 static void cmd_netfuzz(sim_ctx_t *s)          { (void)s; netfuzz_proof(); }
@@ -4902,7 +4903,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"aim", cmd_aim}, {"warp", cmd_warp}, {"aimbot", cmd_aimbot}, {"filmtrack", cmd_filmtrack}, {"filmtrackproof", cmd_filmtrackproof}, {"filmcueproof", cmd_filmcueproof},
   {"botfreeze", cmd_botfreeze}, {"puppet", cmd_puppet},
   {"wpn", cmd_wpn}, {"bot", cmd_bot}, {"match", cmd_match}, {"map", cmd_map},
-  {"lean", cmd_lean}, {"cfg", cmd_cfg}, {"budget", cmd_budget},
+  {"lean", cmd_lean}, {"leanmove", cmd_leanmove}, {"cfg", cmd_cfg}, {"budget", cmd_budget},
   {"netstat", cmd_netstat}, {"updinfo", cmd_updinfo}, {"updcheck", cmd_updcheck},
   {"sun", cmd_sun}, {"biome", cmd_biome}, {"environment", cmd_environment}, {"environmentcheck", cmd_environmentcheck}, {"mood", cmd_mood}, {"scat", cmd_scat}, {"uistat", cmd_uistat},
   {"vmsight", cmd_vmsight}, {"vmscope", cmd_vmscope}, {"parity", cmd_parity},

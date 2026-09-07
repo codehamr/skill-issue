@@ -72,6 +72,9 @@
 #define LEAN_STEP_HIP_DROP_M  0.030f
 #define LEAN_STEP_HIP_FOLLOW_M 0.032f
 #define LEAN_STEP_CROUCH_K    0.52f
+// Only the planted support step fades at running speed; torso lean stays available.
+#define LEAN_STEP_SPD_LO      0.55f
+#define LEAN_STEP_SPD_HI      0.90f
 // The toe-out boot needs 72 mm of radial clearance at its widest projected edge. This
 // module owns the 80 mm Lean-only floor; the renderer applies no second correction.
 #define LEAN_STEP_MARGIN_M    0.080f
@@ -2579,8 +2582,8 @@ static void anim_tick(anim_t *a, v3 base, v3 vel, float yaw, float pitch,
     v3 old_off = a->lean_step_off;
     float run = g_sim_mv[MV_RUN] > 0.1f ? g_sim_mv[MV_RUN] : 0.1f;
     float raw_spd = sqrtf(vel.x * vel.x + vel.z * vel.z);
-    float speed_k = 1.0f - f_clamp((raw_spd / run - LEAN_SPD_LO) /
-                                    (LEAN_SPD_HI - LEAN_SPD_LO), 0.0f, 1.0f);
+    float speed_k = 1.0f - f_clamp((raw_spd / run - LEAN_STEP_SPD_LO) /
+                                    (LEAN_STEP_SPD_HI - LEAN_STEP_SPD_LO), 0.0f, 1.0f);
     int hard_clear = !grounded || slide;
     int active = !hard_clear && want_side >= 0 && speed_k > 1e-4f;
 

@@ -199,7 +199,7 @@ static void vm_tick(player_t *p) {
 static void player_lean_tick(player_t *p, const int held[IN_COUNT]) {
   p->prev_lean = p->lean;
   float want = (held[IN_LEAN_R] ? 1.0f : 0.0f) - (held[IN_LEAN_L] ? 1.0f : 0.0f);
-  p->lean = mv_lean(player_eye_base(p), p->vel, p->yaw, !p->sliding && p->alive,
+  p->lean = mv_lean(player_eye_base(p), p->vel, p->yaw, p->alive,
                     want, &p->lean_in, &p->lean_clr);
 }
 

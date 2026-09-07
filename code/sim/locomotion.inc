@@ -1,7 +1,7 @@
 // =============================================================================
 // sim/locomotion.inc  —  mv_*: the one set of movement primitives (walk,
 // steer, air, slide, jump) for player, bots and puppet alike.
-// Proof: parity (24 rows through shared code), trace. One TU: included once
+// Proof: parity (24 rows through shared code), trace, leanmove. One TU: included once
 // by game.c, in definition order — moving a definition out is a semantic
 // change.
 // Contract: difficulty carries no movement numbers. Any second copy of a
@@ -98,14 +98,10 @@ static void mv_air(v3 *vel, float wx, float wz, float wlen, float sp2d) {
   }
 }
 
-// Shared physical lean: speed attenuation, anticipatory clearance and the hard
-// wall clamp are identical for a player and an AI-controlled body.
+// Shared physical lean in every movement state: anticipatory clearance and the
+// hard wall clamp are identical for a player and an AI-controlled body.
 static float mv_lean(v3 origin, v3 velocity, float yaw, int enabled, float want,
                       float *input, float *clearance) {
-  float sp = sqrtf(velocity.x * velocity.x + velocity.z * velocity.z);
-  float run = g_sim_mv[MV_RUN] > 0.1f ? g_sim_mv[MV_RUN] : 0.1f;
-  want *= 1.0f - f_clamp((sp / run - LEAN_SPD_LO) / (LEAN_SPD_HI - LEAN_SPD_LO),
-                         0.0f, 1.0f);
   if (!enabled) want = 0.0f;
   float rate = fabsf(want) > fabsf(*input) ? LEAN_IN_RATE : LEAN_OUT_RATE;
   *input += (want - *input) * ease_k(rate);

@@ -2941,9 +2941,9 @@ static void leanstep_proof(void) {
   ls_case[ls_n++] = leanstep_case("crouch-R", LS_OPEN, 1, 1.0f, 1,
                                   (v3){{0, 0, 0}}, 1, 0, 0, 1.25f);
   float ls_run = g_sim_mv[MV_RUN];
-  float ls_slow = ls_run * LEAN_SPD_LO * 0.75f;
-  float ls_mid = ls_run * (LEAN_SPD_LO + LEAN_SPD_HI) * 0.5f;
-  float ls_fast = ls_run * LEAN_SPD_HI;
+  float ls_slow = ls_run * LEAN_STEP_SPD_LO * 0.75f;
+  float ls_mid = ls_run * (LEAN_STEP_SPD_LO + LEAN_STEP_SPD_HI) * 0.5f;
+  float ls_fast = ls_run * LEAN_STEP_SPD_HI;
   ls_case[ls_n++] = leanstep_case("slow-L", LS_OPEN, 0, 1.0f, 0,
                                   (v3){{ls_slow, 0, 0}}, 1, 0, 0, 1.25f);
   ls_case[ls_n++] = leanstep_case("slow-R", LS_OPEN, 1, 1.0f, 0,
@@ -3601,7 +3601,7 @@ static void bottactics_proof(void) {
   b->vel = (v3){{g_sim_mv[MV_RUN], 0, 0}};
   for (int i = 0; i < 90; i++)
     b->lean = mv_lean(bot_eye_pos(b), b->vel, b->yaw, 1, 1, &b->lean_in, &b->lean_clr);
-  bt_expect(fabsf(b->lean) < 0.01f, "sprint-denies-lean");
+  bt_expect(b->lean > 0.99f, "sprint-keeps-lean");
   bt_expect(BOT_SKILL[0].react_ms > BOT_SKILL[1].react_ms &&
       BOT_SKILL[1].react_ms > BOT_SKILL[2].react_ms &&
       BOT_SKILL[0].err1 > BOT_SKILL[1].err1 && BOT_SKILL[1].err1 > BOT_SKILL[2].err1 &&
@@ -3819,6 +3819,107 @@ static void naturalcheck_tick(player_t *p, const int held[IN_COUNT]) {
   g_tick++;
   player_move_tick(p, 0, held, 0, 0);
   player_present_tick(p, 0);
+}
+
+// Hold or first press lean during real run/slide/jump transitions. An upright
+// control receives identical movement input and must retain the same trajectory.
+static void leanmove_proof(void) {
+  static naturalcheck_save_t saved, restored;
+  memset(&saved, 0, sizeof saved);
+  naturalcheck_save(&saved);
+  g_online = 0; g_local_ent = 0; g_score_held = 0;
+  g_predicting = 1; g_prediction_replay = 0;
+  g_num_solids = g_num_events = 0;
+  memset(&g_match, 0, sizeof g_match);
+  memset(g_humans_on, 0, sizeof g_humans_on); g_humans_on[0] = 1;
+  const int press[] = {0, 100, 181, 221};
+  const int directions[][2] = {{0, 1}, {1, 1}, {1, 0}, {1, -1},
+                                {0, -1}, {-1, -1}, {-1, 0}, {-1, 1}};
+  int cases = 0, failures = 0;
+  for (int wi = 0; wi < WPN_COUNT; wi++)
+    for (int side = 0; side < 2; side++)
+      for (unsigned dir = 0; dir < sizeof directions / sizeof *directions; dir++)
+        for (unsigned start = 0; start < sizeof press / sizeof *press; start++) {
+          player_t *p = &g_players[0];
+          player_spawn(p); p->wp.cur = wi;
+          p->pos = p->prev_pos = (v3){{-directions[dir][0] * 18.0f, 0,
+                                       directions[dir][1] * 18.0f}};
+          anim_reset(&g_player_anim[0], p->pos, p->yaw, wi);
+          player_t control = *p;
+          int key = side ? IN_LEAN_R : IN_LEAN_L;
+          int other = side ? IN_LEAN_L : IN_LEAN_R;
+          float sign = side ? 1.0f : -1.0f;
+          int bad = 0, slid = 0, jumped = 0, landed = 0;
+          for (int tick = 0; tick < 550; tick++) {
+            int held[IN_COUNT] = {0};
+            held[IN_FWD] = tick >= 90 && directions[dir][1] > 0;
+            held[IN_BACK] = tick >= 90 && directions[dir][1] < 0;
+            held[IN_RIGHT] = tick >= 90 && directions[dir][0] > 0;
+            held[IN_LEFT] = tick >= 90 && directions[dir][0] < 0;
+            held[IN_CROUCH] = tick >= 180 && tick < 340;
+            held[IN_JUMP] = tick == 220;
+            player_move_tick(&control, ent_of_human(1), held, 0, 0);
+            held[key] = tick >= press[start] && tick < 430;
+            held[other] = tick >= 400 && tick < 490;
+            naturalcheck_tick(p, held);
+            slid |= p->sliding;
+            jumped |= tick == 220 && !p->grounded && p->vel.y > 0;
+            landed |= tick > 220 && jumped && p->grounded;
+            bad |= v3_len(v3_sub(p->pos, control.pos)) > 1e-6f ||
+                   v3_len(v3_sub(p->vel, control.vel)) > 1e-6f ||
+                   p->grounded != control.grounded || p->sliding != control.sliding;
+            if (tick >= press[start] + 30 && tick < 400)
+              bad |= p->lean * sign < 0.93f;
+            if ((tick >= 425 && tick < 430) || tick >= 530)
+              bad |= fabsf(p->lean) > 0.05f;
+            if (tick >= 470 && tick < 490) bad |= p->lean * sign > -0.93f;
+            const anim_t *a = &g_player_anim[0];
+            bad |= fabsf(a->lean_s - p->lean) > 1e-6f;
+            float pose[sizeof a->pose / sizeof(float)];
+            memcpy(pose, &a->pose, sizeof pose);
+            for (unsigned i = 0; i < sizeof pose / sizeof *pose; i++)
+              bad |= f_is_nonfinite(pose[i]);
+            net_ent_t wire; net_ent_from_live(&wire, 0);
+            bad |= fabsf(net_dq_wish(wire.lean) - p->lean) > 1.0f / 127.0f;
+          }
+          bad |= !slid || !jumped || !landed;
+          cases++; failures += !!bad;
+          if (bad) printf("leanmove FAIL weapon=%d side=%d dir=%u press=%d slide=%d jump=%d land=%d\n",
+                          wi, side, dir, press[start], slid, jumped, landed);
+        }
+  // Running beside a wall keeps the physical eye clearance. Dead input still
+  // releases lean, even if its button stays held.
+  for (int side = 0; side < 2; side++) {
+    player_t *p = &g_players[0];
+    player_spawn(p); p->pos = (v3){{0, 0, 18}};
+    anim_reset(&g_player_anim[0], p->pos, p->yaw, p->wp.cur);
+    g_num_solids = 1;
+    g_solids[0] = (solid_t){.min = {{side ? 0.4f : -2.0f, 0, -40}},
+                            .max = {{side ? 2.0f : -0.4f, 6, 40}}};
+    int held[IN_COUNT] = {[IN_FWD] = 1};
+    held[side ? IN_LEAN_R : IN_LEAN_L] = 1;
+    int bad = 0;
+    for (int tick = 0; tick < 150; tick++) {
+      held[IN_CROUCH] = tick >= 90;
+      held[IN_JUMP] = tick == 125;
+      naturalcheck_tick(p, held);
+      bad |= fabsf(player_eye_pos(p).x) > 0.4f - LEAN_MARGIN + 0.015f;
+    }
+    bad |= fabsf(p->lean) < 0.1f || fabsf(p->lean) > 0.9f;
+    p->alive = 0; p->respawn_t = 120;
+    for (int tick = 0; tick < 60; tick++) naturalcheck_tick(p, held);
+    bad |= fabsf(p->lean) > 0.001f;
+    cases++; failures += !!bad;
+    if (bad) printf("leanmove FAIL wall/dead side=%d\n", side);
+  }
+  naturalcheck_restore(&saved);
+  memset(&restored, 0, sizeof restored);
+  naturalcheck_save(&restored);
+  int restore = memcmp(&saved, &restored, sizeof saved) == 0;
+  failures += !restore;
+  printf("leanmove summary cases=%d restore=%d failures=%d %s\n",
+         cases, restore, failures, failures ? "FAIL" : "ok");
+  if (failures) exit(1);
 }
 
 static void naturalcheck_proof(void) {

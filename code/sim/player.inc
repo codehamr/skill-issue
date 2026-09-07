@@ -63,9 +63,6 @@
 #define LEAN_MARGIN  0.20f    // m of air the eye keeps between itself and a wall
 #define LEAN_LOOK    0.15f    // s of velocity the clearance probe looks ahead
 #define LEAN_LOOK_MAX 0.60f   // ...capped, so speed cannot anticipate a wall a room early
-// Leaning is a stationary/walking move.
-#define LEAN_SPD_LO  0.55f
-#define LEAN_SPD_HI  0.90f
 
 // Eye travel and drop at lean amount l, both DERIVED from the bend above so the camera
 // and the skeleton can never disagree: 0.28 m out and 0.09 m down at full lean.

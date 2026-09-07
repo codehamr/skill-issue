@@ -849,7 +849,7 @@ static void bot_tick(int bi) {
   }
 
   b->lean = mv_lean((v3){{b->pos.x, b->pos.y + bot_eye(b), b->pos.z}},
-                    b->vel, b->yaw, !b->sliding && b->grounded,
+                    b->vel, b->yaw, b->alive,
                     b->lean_want, &b->lean_in, &b->lean_clr);
 
   // Trigger discipline: shots leave only once the imperfect aim has settled onto the

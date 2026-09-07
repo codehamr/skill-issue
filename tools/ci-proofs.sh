@@ -30,6 +30,8 @@
 #   naturalcheck: real human jumps, air tuck/recovery, landing and buffered re-jump
 #             retain authored timing, bounded joints and pure pose restaging;
 #             AR/SR carry distinguishes relaxed air from spatial action gates
+#   leanmove: held/new lean through run, slide and jump retains movement, physical
+#             wall clearance, pose/network agreement and release/death behavior
 #   fighit : 280 weapon/pose/yaw/profile cases retain analytic/history agreement,
 #             the reviewed hit-covered sample census, and identical visible/hit
 #             witnesses when the actor and ray grid rotate together
@@ -732,6 +734,7 @@ fi
 gate_command figmotion "figmotion" '^figmotion summary rows=16 reload_boundary_mm=[0-9.]+ brace_boundary_mm=[0-9.]+ cancellations=4680 errors=0/0/0/0/0 ok$'
 gate_command gaitcheck "gaitcheck" '^gaitcheck summary cases=7 plants=[0-9]+ onset_mm=[0-9.]+ planted_mm=0.000000 limb_mm=[0-9.]+ finite=0 state=0 failed=0 ok$'
 gate_command naturalcheck "naturalcheck" '^naturalcheck summary jumps=12 carry=16 finite=0 pose_mutations=0 restore=1 failures=0 ok$'
+gate_command leanmove "leanmove" '^leanmove summary cases=130 restore=1 failures=0 ok$'
 # The sleeve root covers 45 additional body-grid samples against the preserved
 # closed-face reference. All head rows, visible miss counts and outside-distance
 # extrema are unchanged; the ray grid and history reconstruction are exact.
