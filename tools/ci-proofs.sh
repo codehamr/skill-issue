@@ -41,8 +41,9 @@
 #   homeui  : at four required resolutions the open readout fits, has zero
 #             hover/click pixels outside the cursor mask, preserves root/focus/
 #             uistat state, and does not exceed its secured state-matched peak
-#   decorcheck: actual crown containment, authored support, grounded free pieces,
-#             finite nondegenerate meshes, overflow and unchanged sim ownership
+#   decorcheck: actual crown containment, rounded bent stems within 75 mm of
+#             collision, attached forks, smooth outward bark normals, mirrored stem geometry,
+#             authored support, grounded free pieces, mesh capacity and sim ownership
 #   weatherproof: seed distribution, deterministic bounded samples, rain roof
 #             exclusion, unchanged gameplay RNGs and delayed thunder with map resets
 #   boundarycheck: five square biomes, low shot surfaces, full circuits, jumps and mesh capacity
@@ -782,7 +783,15 @@ gate_command feedbackproof "feedbackproof" '^feedbackproof cases=212 failed=0 ok
 gate_command filmtrackproof "filmtrackproof" '^filmtrackproof summary cases=13 speed=180 accel=1200 face_mm=100x70 ok$'
 gate_command filmcueproof "filmcueproof" '^filmcueproof summary cases=22 ok$'
 
-gate_command decorcheck "decorcheck" '^decorcheck trees=2560 tips=14792 buildings=240 controls=10 peak=720 state=same fail=0 ok$'
+gate_command decorcheck "decorcheck" '^decorcheck trees=2560 tips=14792 buildings=240 controls=17 peak=[0-9]+ state=same fail=0 ok$'
+decor_fork_rows="$(grep -Ec '^decorcheck forks=1536 detached=0$' "$TMPD/decorcheck.log" || true)"
+[ "$decor_fork_rows" = 1 ] || {
+  say "GATE decorcheck missing attached branch census"; fail=1;
+}
+decor_trunk_rows="$(grep -Ec '^decorcheck trunks=256 rays=36864 envelope_mm=[0-9]+[.][0-9]+ bend_mm=[0-9]+[.][0-9]+[.][.][0-9]+[.][0-9]+ peak=[0-9]+ fail=0$' "$TMPD/decorcheck.log" || true)"
+[ "$decor_trunk_rows" = 1 ] || {
+  say "GATE decorcheck missing rounded collision-trunk census"; fail=1;
+}
 # 128 maps x 4 walls x 9 positions x 2 ray heights; four contact modes.
 # Tangents exercise both directions on each wall, circuits retain all six modes.
 gate_command boundarycheck "boundarycheck 128" '^boundarycheck maps=128 rays=9216 routes=768 contacts=18432 tangents=1024 meshes=128 peak_verts=[0-9]+ fail=0 ok$'

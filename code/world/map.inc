@@ -5,7 +5,7 @@
 // definition order — moving a definition out is a semantic change.
 // Contract: the sun and the mood are MAP STATE, hashed off the seed and
 // never drawn from g_rng; mapcheck must read 0 coplanar same-facing faces
-// at N=2000.
+// and 0 isolated center posts at N=2000.
 // =============================================================================
 // ---------------------------------------------------------------------------
 // Procedural map — seeded square arenas. The same low wall boxes own
@@ -1026,7 +1026,7 @@ static void map_gen_shell(void) {
 }
 
 static void map_gen_landmark(void) {
-  // Mid landmark, self-symmetric: the map's one saturated color anchor.
+  // The center alternates open ground and broad cover, always self-symmetric.
   if (g_meta.sig == SIG_FALLEN) {
     // THE FALLEN MONOLITH — the signature that replaces the mid roll: the
     // anchor toppled into a lying slab (0.9 m: mountable cover, a completely
@@ -1063,11 +1063,10 @@ static void map_gen_landmark(void) {
       map_add((v3){{-mx_, 0, -mz}}, (v3){{mx_, mh, mz}}, g_theme.mid);
       gx0 = mx_; gz0 = mz;
     } break;
-    case 1: {  // plaza: mountable low platform, pillar marks the center
+    case 1: {  // plaza: an unobstructed, mountable low platform
       float pw = rng_range(3.4f, 4.4f);
       map_add((v3){{-pw, 0, -pw}}, (v3){{pw, 0.55f, pw}},
               col_tint(g_theme.crate_b, 0.97f, 1.03f));
-      map_add((v3){{-0.7f, 0.55f, -0.7f}}, (v3){{0.7f, 3.0f, 0.7f}}, g_theme.mid);
       gx0 = pw; gz0 = pw;
     } break;
     case 2: {  // gate: two parallel walls, a fought-over corridor through mid
@@ -1077,11 +1076,9 @@ static void map_gen_landmark(void) {
       meta_edge((v3){{gx + 0.35f, 0, -gl * 0.5f}}, (v3){{gx + 0.35f, 0, gl * 0.5f}},
                 ME_FOOT, 0);
     } break;
-    default: {  // four pillars: porous mid, peek duels
-      float d = rng_range(2.6f, 3.8f), r = rng_range(0.45f, 0.6f);
-      float h = rng_range(2.4f, 2.8f);
-      map_add_sym((v3){{d - r, 0, d - r}},  (v3){{d + r, h, d + r}},  g_theme.mid);
-      map_add_sym((v3){{d - r, 0, -d - r}}, (v3){{d + r, h, -d + r}}, g_theme.mid);
+    default: {  // open center: uninterrupted movement and sightlines
+      // Reserve the layout's parameter slots in the surrounding cover stream.
+      for (int i = 0; i < 3; i++) (void)rng_u32();
     } break;
     }
     // THE LANDMARK STOPS FLOATING (the grounding rule): the two big-mass

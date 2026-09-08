@@ -4821,6 +4821,16 @@ static void cmd_environmentcheck(sim_ctx_t *s) {
   if (fail) exit(1);
 }
 
+static int mapcheck_central_post(const solid_t *s) {
+  v3 extent = v3_sub(s->max, s->min);
+  v3 center = v3_scale(v3_add(s->min, s->max), 0.5f);
+  v3 tint = v3_sub(s->color, g_theme.mid);
+  // Distinguish isolated center posts from broad cover, broken wall pieces
+  // and the naturally narrow trunks placed outside the central arena.
+  return v3_dot(tint, tint) < 0.000001f && center.x * center.x + center.z * center.z < 36.0f &&
+         extent.x <= 1.5f && extent.z <= 1.5f && extent.y >= 2.0f;
+}
+
 static void cmd_mapcheck(sim_ctx_t *s) {
   (void)s;
   // The world's version of figcheck, and nothing covered it before: two solids
@@ -4830,6 +4840,22 @@ static void cmd_mapcheck(sim_ctx_t *s) {
   if (n < 1) n = 1;
   long worst = 0, total = 0, solid_peak = 0, solid_full = 0, edge_peak = 0;
   long open_probes = 0, open_blocked = 0, void_peak = 0, void_full = 0;
+  long center_posts = 0, center_unpaired = 0;
+  int center_control_fail = 0;
+  // Mutations exercise both removed post arrangements while retaining real
+  // center cover and excluding the peripheral trees from this check.
+  solid_t center_controls[] = {
+    {.min = {{2.5f,0,2.5f}}, .max = {{3.5f,2.6f,3.5f}}},
+    {.min = {{-0.7f,0.55f,-0.7f}}, .max = {{0.7f,3.0f,0.7f}}},
+    {.min = {{2.5f,0,2.5f}}, .max = {{3.5f,0.55f,3.5f}}},
+    {.min = {{-2.5f,0,-2.5f}}, .max = {{2.5f,2.6f,2.5f}}},
+    {.min = {{2.5f,0,-4.0f}}, .max = {{3.2f,2.2f,4.0f}}},
+    {.min = {{9.5f,0,2.5f}}, .max = {{10.5f,2.6f,3.5f}}}
+  };
+  for (int i = 0; i < 6; i++) {
+    center_controls[i].color = g_theme.mid;
+    center_control_fail += mapcheck_central_post(&center_controls[i]) != (i < 2);
+  }
   // The check is a property of the GENERATOR, so it walks the seed chain
   // (map_seed_next, the same chain `restart` advances) and must put it back:
   // leaving the seed N steps on desynchronises every later `restart`, and leaving
@@ -4844,6 +4870,23 @@ static void cmd_mapcheck(sim_ctx_t *s) {
     if (g_meta.nedge > edge_peak) edge_peak = g_meta.nedge;
     if (g_meta.nvoid > void_peak) void_peak = g_meta.nvoid;
     if (g_meta.nvoid == META_VOID_MAX) void_full++;
+    for (int i = map_perim_count(); i < g_num_solids; i++) {
+      const solid_t *a = &g_solids[i];
+      center_posts += mapcheck_central_post(a);
+      v3 tint = v3_sub(a->color, g_theme.mid);
+      if (v3_dot(tint, tint) >= 0.000001f) continue;
+      v3 mn = {{-a->max.x,a->min.y,-a->max.z}};
+      v3 mx = {{-a->min.x,a->max.y,-a->min.z}};
+      int paired = 0;
+      for (int j = map_perim_count(); j < g_num_solids && !paired; j++) {
+        const solid_t *b = &g_solids[j];
+        v3 low = v3_sub(mn, b->min), high = v3_sub(mx, b->max);
+        v3 color = v3_sub(a->color, b->color);
+        paired = v3_dot(low, low) < 0.000001f && v3_dot(high, high) < 0.000001f &&
+                 v3_dot(color, color) < 0.000001f && a->pen == b->pen && a->mat == b->mat;
+      }
+      center_unpaired += !paired;
+    }
     for (int q = 0; q < g_meta.nvoid; q++) {
       const mvoid_t *v = &g_meta.voids[q];
       v3 d = v->ax ? (v3){{0.0f, 0.0f, 1.0f}}
@@ -4894,11 +4937,13 @@ static void cmd_mapcheck(sim_ctx_t *s) {
   g_world_dirty = 1;
   printf("mapcheck maps=%ld coplanar_total=%ld worst=%ld worst_seed=%u "
          "solid_peak=%ld/%d solid_full=%ld edge_peak=%ld/%d "
-         "open_probes=%ld blocked=%ld void_peak=%ld/%d void_full=%ld\n",
+         "open_probes=%ld blocked=%ld void_peak=%ld/%d void_full=%ld "
+         "center_posts=%ld center_unpaired=%ld center_controls=6 control_fail=%d\n",
          n, total, worst, bad_seed, solid_peak, MAX_SOLIDS, solid_full,
          edge_peak, META_EDGE_MAX, open_probes, open_blocked,
-         void_peak, META_VOID_MAX, void_full);
-  if (total || solid_full || open_blocked || void_full) exit(1);
+         void_peak, META_VOID_MAX, void_full, center_posts, center_unpaired, center_control_fail);
+  if (total || solid_full || open_blocked || void_full || center_posts ||
+      center_unpaired || center_control_fail) exit(1);
 }
 
 static void cmd_feedbackproof(sim_ctx_t *s) { (void)s; feedbackproof(); }

@@ -650,19 +650,100 @@ static void scat_emit(void) {
   }
 }
 
-// ONE STICK — a thin oriented prism from a to b. The dead tree's branches,
-// the shrub's stems and the tumbleweed all speak this one construction (P6:
-// a second stick vocabulary would be a second plant kingdom).
+// Woody sweeps share rounded sections and smooth radial normals. The small
+// longitudinal radius variation catches bark light without a square silhouette.
+#define DEC_WOOD_N 12
+#define DEC_WOOD_RINGS 5
+static long g_decor_invalid;
+
+static void dec_wood_emit(const v3 *axis, const float *radius, int rings, int sides,
+                          v3 col, float sg, const char *role, int terminal) {
+  if (rings < 2 || rings > DEC_WOOD_RINGS || sides < 6 || sides > DEC_WOOD_N) {
+    g_decor_invalid++; return;
+  }
+  v3 pos[DEC_WOOD_RINGS][DEC_WOOD_N], normal[DEC_WOOD_RINGS][DEC_WOOD_N];
+  v3 tangent[DEC_WOOD_RINGS];
+  v3 overall = v3_norm(v3_sub(axis[rings-1],axis[0]));
+  v3 guide = fabsf(overall.y) > .90f ? (v3){{1,0,0}} : (v3){{0,1,0}};
+  for (int k = 0; k < rings; k++) {
+    if (f_is_nonfinite(radius[k]) || radius[k] <= .000001f ||
+        f_is_nonfinite(axis[k].x) || f_is_nonfinite(axis[k].y) || f_is_nonfinite(axis[k].z)) {
+      g_decor_invalid++; return;
+    }
+    int lo = k ? k - 1 : k, hi = k + 1 < rings ? k + 1 : k;
+    v3 delta = v3_sub(axis[hi], axis[lo]);
+    float length = v3_len(delta);
+    if (length < .00001f || f_is_nonfinite(length)) { g_decor_invalid++; return; }
+    tangent[k] = v3_scale(delta, 1.0f / length);
+    v3 x = v3_norm(v3_cross(tangent[k], guide)), z = v3_cross(tangent[k], x);
+    float taper = (radius[hi] - radius[lo]) / length;
+    for (int i = 0; i < sides; i++) {
+      float a = (float)i * (F_TAU / (float)sides);
+      v3 radial = v3_add(v3_scale(x, cosf(a)), v3_scale(z, sinf(a)));
+      float ridge = 1.0f + .018f * sinf(a * 3.0f + .7f) + .009f * cosf(a * 5.0f);
+      pos[k][i] = v3_add(axis[k], v3_scale(radial, radius[k] * ridge));
+      normal[k][i] = v3_norm(v3_sub(radial, v3_scale(tangent[k], taper)));
+    }
+  }
+  float rough = g_mat_rough, metal = g_mat_metal;
+  mat_set(WORLD_WOOD_TAG, 0);
+  probe(role);
+  for (int k = 0; k < rings - 1; k++) for (int i = 0; i < sides; i++) {
+    int j = (i + 1) % sides;
+    v3 tint = v3_scale(col, .96f + .04f * cosf((float)i * 2.3f));
+    scene_push(dec_rot(pos[k][i],sg), dec_rot(normal[k][i],sg), tint);
+    scene_push(dec_rot(pos[k][j],sg), dec_rot(normal[k][j],sg), tint);
+    scene_push(dec_rot(pos[k+1][j],sg), dec_rot(normal[k+1][j],sg), tint);
+    scene_push(dec_rot(pos[k][i],sg), dec_rot(normal[k][i],sg), tint);
+    scene_push(dec_rot(pos[k+1][j],sg), dec_rot(normal[k+1][j],sg), tint);
+    scene_push(dec_rot(pos[k+1][i],sg), dec_rot(normal[k+1][i],sg), tint);
+  }
+  for (int i = 0; i < sides; i++) {
+    int j = (i + 1) % sides;
+    scene_poly3(dec_rot(axis[0],sg), dec_rot(pos[0][j],sg), dec_rot(pos[0][i],sg),
+                dec_rot(v3_scale(tangent[0],-1),sg), col);
+  }
+  if (terminal) probe("decor.tip");
+  for (int i = 0; i < sides; i++) {
+    int j = (i + 1) % sides, k = rings - 1;
+    scene_poly3(dec_rot(axis[k],sg), dec_rot(pos[k][i],sg), dec_rot(pos[k][j],sg),
+                dec_rot(tangent[k],sg), v3_scale(col,1.10f));
+  }
+  probe(NULL);
+  mat_set(rough, metal);
+}
+
+// A branch bows away from the parent before tapering into its tip. Ground
+// sticks use the same profile; their placement pass owns ground contact.
 static void dec_stick(v3 a, v3 b, float r, v3 col, float sg) {
-  v3 d = v3_sub(b, a);
-  float l = sqrtf(v3_dot(d, d));
-  if (l < 1e-5f) return;
-  d = v3_scale(d, 1.0f / l);
-  v3 up = fabsf(d.y) > 0.9f ? (v3){{1, 0, 0}} : (v3){{0, 1, 0}};
-  v3 s1 = v3_norm(v3_cross(d, up)), s2 = v3_cross(d, s1);
-  v3 c = v3_scale(v3_add(a, b), 0.5f);
-  scene_box(dec_rot(c, sg), v3_scale(dec_rot(d, sg), l * 0.5f),
-            v3_scale(dec_rot(s1, sg), r), v3_scale(dec_rot(s2, sg), r), col);
+  v3 d = v3_sub(b,a);
+  float length = v3_len(d);
+  if (length < .0001f) return;
+  v3 bend = v3_cross(v3_scale(d,1.0f/length),(v3){{.41f,.83f,.37f}});
+  v3 axis[3] = {a, v3_add(v3_lerp(a,b,.48f),v3_scale(bend,length*.075f)), b};
+  float radius[3] = {r, r*.73f, r*.24f};
+  dec_wood_emit(axis,radius,3,8,col,sg,"decor.wood",0);
+}
+
+static v3 dec_trunk_point(const solid_t *s, float yaw, float t) {
+  float half = fminf(s->max.x-s->min.x,s->max.z-s->min.z)*.5f;
+  float bow = sinf(F_PI*t)*half*.08f, twist = sinf(F_TAU*t)*half*.02f;
+  return (v3){{(s->min.x+s->max.x)*.5f + cosf(yaw)*bow-sinf(yaw)*twist,
+               s->min.y-.025f+(s->max.y-s->min.y+.025f)*t,
+               (s->min.z+s->max.z)*.5f + sinf(yaw)*bow+cosf(yaw)*twist}};
+}
+
+// Playable stems stay within 75 mm of their existing collision envelope,
+// including diagonal corners. Branches above head height carry the wider bends.
+static void dec_trunk(const solid_t *s, float yaw, float sg) {
+  static const float height[5] = {0,.16f,.43f,.73f,1};
+  static const float width[5] = {1.22f,1.12f,1.09f,1.10f,1.10f};
+  v3 axis[5]; float radius[5];
+  float half = fminf(s->max.x-s->min.x,s->max.z-s->min.z)*.5f;
+  for (int i = 0; i < 5; i++) {
+    axis[i] = dec_trunk_point(s,yaw,height[i]); radius[i] = half*width[i];
+  }
+  dec_wood_emit(axis,radius,5,12,s->color,sg,"decor.trunk",0);
 }
 
 // The closed crown profile owns both the emitted facets and woody termination.
@@ -674,7 +755,6 @@ typedef struct {
   float radius, height, yaw;
   int valid;
 } dec_crown_t;
-static long g_decor_invalid;
 
 static dec_crown_t dec_crown_make(v3 at, float radius, float h, float yaw, int pine) {
   dec_crown_t c = {.at = at, .radius = radius, .height = h, .yaw = yaw};
@@ -744,52 +824,37 @@ static v3 dec_crown_fit(const dec_crown_t *c, v3 wanted) {
   return v3_add(c->core, v3_scale(delta, limit));
 }
 
-// Exposed roots retain their authored width. Four tapered sides end in a
-// cap with positive clearance from every actual crown facet. Thirty-six
-// vertices preserve the old prism's world/shadow budget.
-static void dec_terminal(v3 a, v3 wanted, float r, const dec_crown_t *c, v3 col, float sg) {
-  if (!c->valid || f_is_nonfinite(r) || !(r > 0.0001f) ||
+// Terminal caps fit inside the actual closed crown. A bowed, tapered stem
+// reaches that cap with rounded sides; the foliage never hides a square prism.
+static int dec_terminal_shape(v3 a, v3 wanted, float r, const dec_crown_t *c,
+                               v3 axis[3], float radius[3]) {
+  if (!c->valid || f_is_nonfinite(r) || !(r > .0001f) ||
       f_is_nonfinite(a.x) || f_is_nonfinite(a.y) || f_is_nonfinite(a.z) ||
       f_is_nonfinite(wanted.x) || f_is_nonfinite(wanted.y) || f_is_nonfinite(wanted.z)) {
-    g_decor_invalid++; return;
+    g_decor_invalid++; return 0;
   }
-  v3 b = dec_crown_fit(c, wanted);
-  if (v3_len(v3_sub(b, a)) < r * 0.25f) b = c->core;
-  v3 d = v3_sub(b, a);
-  float length = v3_len(d);
-  if (!(length > 0.0001f) || f_is_nonfinite(length)) { g_decor_invalid++; return; }
-  d = v3_scale(d, 1.0f / length);
-  v3 up = fabsf(d.y) > 0.9f ? (v3){{1, 0, 0}} : (v3){{0, 1, 0}};
-  v3 x = v3_norm(v3_cross(d, up)), z = v3_cross(d, x);
-  float end_r = r * 0.45f;
+  v3 b = dec_crown_fit(c,wanted);
+  if (v3_len(v3_sub(b,a)) < r*.25f) b = c->core;
+  v3 delta = v3_sub(b,a);
+  float length = v3_len(delta);
+  if (length < .0001f || f_is_nonfinite(length)) { g_decor_invalid++; return 0; }
+  // Spherical clearance bounds every possible orientation of the round cap.
+  float end_r = r*.28f;
   for (int i = 0; i <= DEC_CROWN_N; i++) {
-    v3 point, n = dec_crown_plane(c, i, &point);
-    float extent = fabsf(v3_dot(n, x)) + fabsf(v3_dot(n, z));
-    float margin = -v3_dot(n, v3_sub(b, point)) * 0.85f;
-    if (extent > 0.000001f) end_r = fminf(end_r, margin / extent);
+    v3 point, n = dec_crown_plane(c,i,&point);
+    end_r = fminf(end_r,-v3_dot(n,v3_sub(b,point))*.80f);
   }
-  if (!(end_r > 0.000001f)) { g_decor_invalid++; return; }
-  v3 bottom[4], top[4];
-  static const int sx[4] = {-1, 1, 1, -1}, sz[4] = {-1, -1, 1, 1};
-  for (int i = 0; i < 4; i++) {
-    v3 off = v3_add(v3_scale(x, (float)sx[i]), v3_scale(z, (float)sz[i]));
-    bottom[i] = v3_add(a, v3_scale(off, r));
-    top[i] = v3_add(b, v3_scale(off, end_r));
-  }
-  probe("decor.wood");
-  for (int i = 0; i < 4; i++) {
-    int j = (i + 1) % 4;
-    v3 n = v3_norm(v3_cross(v3_sub(bottom[j], bottom[i]), v3_sub(top[i], bottom[i])));
-    if (v3_dot(n, v3_sub(bottom[i], a)) < 0.0f) n = v3_scale(n, -1.0f);
-    scene_poly4(dec_rot(bottom[i], sg), dec_rot(bottom[j], sg), dec_rot(top[j], sg),
-                dec_rot(top[i], sg), dec_rot(n, sg), col);
-  }
-  scene_poly4(dec_rot(bottom[0], sg), dec_rot(bottom[1], sg), dec_rot(bottom[2], sg),
-              dec_rot(bottom[3], sg), dec_rot(v3_scale(d, -1.0f), sg), col);
-  probe("decor.tip");
-  scene_poly4(dec_rot(top[0], sg), dec_rot(top[1], sg), dec_rot(top[2], sg),
-              dec_rot(top[3], sg), dec_rot(d, sg), col);
-  probe(NULL);
+  if (end_r <= .000001f) { g_decor_invalid++; return 0; }
+  v3 bend = v3_cross(v3_scale(delta,1.0f/length),(v3){{.41f,.83f,.37f}});
+  axis[0] = a; axis[1] = v3_add(v3_lerp(a,b,.48f),v3_scale(bend,length*.095f)); axis[2] = b;
+  radius[0] = r; radius[1] = r*.68f; radius[2] = end_r;
+  return 1;
+}
+
+static void dec_terminal(v3 a, v3 wanted, float r, const dec_crown_t *c, v3 col, float sg) {
+  v3 axis[3]; float radius[3];
+  if (dec_terminal_shape(a,wanted,r,c,axis,radius))
+    dec_wood_emit(axis,radius,3,8,col,sg,"decor.wood",1);
 }
 
 // Large vegetation belongs beyond the boundary. Its solid foliage never
@@ -822,9 +887,12 @@ static void dec_backdrop_tree(v3 at, float h, int pine, uint64_t st, float sg) {
       v3 q = v3_add(at, (v3){{cosf(a) * rad, h * (0.55f + (float)j * 0.08f), sinf(a) * rad}});
       crowns[j] = dec_crown_make(q, h * rng_rangef(&st, 0.23f, 0.29f), h * 0.28f, a, 0);
     }
-    dec_terminal(at, tip, h * 0.023f, &crowns[2], wood, sg);
+    v3 axis[3]; float radius[3];
+    if (!dec_terminal_shape(at,tip,h*.023f,&crowns[2],axis,radius)) return;
+    dec_wood_emit(axis,radius,3,8,wood,sg,"decor.wood",1);
+    // Forks grow from the emitted bend, so the bowed stem cannot detach them.
     for (int j = 0; j < 3; j++) {
-      dec_terminal(v3_add(at, (v3){{0, h * 0.42f, 0}}), crowns[j].core,
+      dec_terminal(axis[1], crowns[j].core,
                     h * 0.015f, &crowns[j], wood, sg);
       dec_crown_emit(&crowns[j], v3_scale(leaf, 0.95f + 0.06f * (float)j), 0.0f, sg);
     }
@@ -844,6 +912,7 @@ static void dec_signature_tree(const solid_t *s, v3 w, float sg) {
   // KRUMMHOLZ: the crown leans DOWNWIND — a dead tree in this arena's
   // one climate wears the same wind the drifts, tufts and clouds do.
   float wyaw = atan2f(w2.z, w2.x);
+  dec_trunk(s, wyaw, sg);
   int np = 3;
   uint64_t st = (uint64_t)scat_h(0x72EEu, 1, 2, 3) * 2654435761u + 1;
   // One low dead stub halfway up the trunk: the gnarl that keeps a
@@ -852,7 +921,7 @@ static void dec_signature_tree(const solid_t *s, v3 w, float sg) {
     float sya = wyaw + rng_rangef(&st, 1.8f, 4.4f);
     float sel = rng_rangef(&st, 0.10f, 0.35f);
     v3 sd = {{cosf(sya) * cosf(sel), sinf(sel), sinf(sya) * cosf(sel)}};
-    v3 sa = {{base.x, s->max.y * rng_rangef(&st, 0.45f, 0.62f), base.z}};
+    v3 sa = dec_trunk_point(s,wyaw,rng_rangef(&st,.45f,.62f));
     dec_stick(sa, v3_add(sa, v3_scale(sd, rng_rangef(&st, 0.35f, 0.60f))),
               0.040f, v3_scale(wood, 0.92f), sg);
   }
@@ -862,7 +931,8 @@ static void dec_signature_tree(const solid_t *s, v3 w, float sg) {
     float el = rng_rangef(&st, 0.62f, 1.05f);
     float ln = rng_rangef(&st, 0.85f, 1.35f);
     v3 dir = {{cosf(ya) * cosf(el), sinf(el), sinf(ya) * cosf(el)}};
-    v3 a = v3_add(base, (v3){{0.0f, rng_rangef(&st, -0.28f, -0.05f), 0.0f}});
+    float root_y = base.y + rng_rangef(&st,-.28f,-.05f);
+    v3 a = dec_trunk_point(s,wyaw,(root_y-s->min.y)/(s->max.y-s->min.y));
     v3 b2 = v3_add(a, v3_scale(dir, ln));
     int foliated = g_biome.forest > 0.5f || g_biome.snow > 0.5f;
     dec_crown_t canopy = {0};
@@ -897,6 +967,12 @@ static void dec_grove_tree(const solid_t *s, int pair, float sg) {
                           (s->min.z + s->max.z) * 0.5f}}, sg);
   uint64_t st = (uint64_t)scat_h(0xCA90u, (uint32_t)pair, 2, 7) * 2654435761u + 1;
   float yaw = rng_rangef(&st, 0.0f, 6.2832f);
+  solid_t local = *s;
+  local.min.x = base.x-(s->max.x-s->min.x)*.5f;
+  local.max.x = base.x+(s->max.x-s->min.x)*.5f;
+  local.min.z = base.z-(s->max.z-s->min.z)*.5f;
+  local.max.z = base.z+(s->max.z-s->min.z)*.5f;
+  dec_trunk(&local,yaw,sg);
   for (int branch = 0; branch < 3; branch++) {
     float a = yaw + (float)branch * 2.3f;
     float reach = rng_rangef(&st, 0.35f, 0.55f);
@@ -911,7 +987,9 @@ static void dec_grove_tree(const solid_t *s, int pair, float sg) {
     float height = rng_rangef(&st, 0.92f, 1.10f);
     float radius = rng_rangef(&st, 0.84f, 1.08f);
     dec_crown_t canopy = dec_crown_make(crown, radius, height, a, 0);
-    dec_terminal(base, tip, 0.045f, &canopy, s->color, sg);
+    float join = .65f + .085f*(float)branch;
+    v3 root = dec_trunk_point(&local,yaw,join);
+    dec_terminal(root,tip,.072f-(float)branch*.009f,&canopy,s->color,sg);
     dec_crown_emit(&canopy, v3_scale((v3){{0.25f, 0.34f, 0.19f}}, tint), 0.0f, sg);
   }
 
@@ -1051,7 +1129,14 @@ static void dec_backdrop_building(v3 c, v3 radial, v3 tangent, float h,
       v3 b = v3_add(c, v3_add(v3_scale(tangent, x * 1.45f), v3_scale(radial, z * 1.45f)));
       a.y = -8.0f; b.y = h;
       probe("decor.leg");
-      dec_stick(a, b, 0.22f, trim, sg);
+      v3 delta = v3_sub(b,a);
+      float length = v3_len(delta);
+      v3 direction = v3_scale(delta,1.0f/length);
+      v3 side = v3_norm(v3_cross(direction,(v3){{1,0,0}}));
+      v3 cross = v3_cross(direction,side);
+      scene_box(dec_rot(v3_lerp(a,b,.5f),sg),
+                v3_scale(dec_rot(direction,sg),length*.5f),
+                v3_scale(dec_rot(side,sg),.22f),v3_scale(dec_rot(cross,sg),.22f),trim);
     }
     probe("decor.tank");
     dec_tank(c, h - 0.4f, h + 4.3f, wx * 0.51f, 0.18f, col, sg);

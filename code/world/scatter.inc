@@ -937,6 +937,10 @@ static void mesh_build(void) {
     // six-quad emit would fight the chamfered copy, so it is skipped here
     // and mesh_cast_extra owns the draw.
     if (i == g_meta.bould[0] || i == g_meta.bould[1]) continue;
+    // Trunks have rounded bark meshes in the same shadow-casting prefix.
+    int trunk = i == g_meta.tree[0] || i == g_meta.tree[1];
+    for (int j = 0; j < g_meta.ngrove; j++) trunk |= i == g_meta.grove[j];
+    if (trunk) continue;
     // The roughness sign is render metadata, not negative physics: WORLD_FS
     // takes abs() for the BRDF and uses the sign for the quiet plaster finish
     // on generated wall pieces. The vertex layout stays at 12 floats and

@@ -10145,10 +10145,9 @@ static int decor_triangle_ray(v3 p, double dx, double dy, double dz,
   *distance = (vx*qx+vy*qy+vz*qz)/det;
   return *distance > 1e-8;
 }
-static int decor_inside_ray(v3 p, int part, double dx, double dy, double dz) {
-  const probe_t *span = &g_probe[part];
+static int decor_inside_range_ray(v3 p, int lo, int hi, double dx, double dy, double dz) {
   double hits[128]; int count = 0;
-  for (int i = span->v0; i + 3*VERT_FLOATS <= span->v1; i += 3*VERT_FLOATS) {
+  for (int i = lo; i + 3*VERT_FLOATS <= hi; i += 3*VERT_FLOATS) {
     double distance;
     if (!decor_triangle_ray(p, dx, dy, dz, decor_vertex(i), decor_vertex(i+VERT_FLOATS),
                             decor_vertex(i+2*VERT_FLOATS), &distance)) continue;
@@ -10161,11 +10160,14 @@ static int decor_inside_ray(v3 p, int part, double dx, double dy, double dz) {
   }
   return count & 1;
 }
-static int decor_inside(v3 p, int part) {
-  int a = decor_inside_ray(p, part, .72313571, .39178193, .56917123);
-  int b = decor_inside_ray(p, part, -.41971829, .81613671, -.26351391);
-  int c = decor_inside_ray(p, part, .13972631, -.67191319, .74163187);
+static int decor_inside_range(v3 p, int lo, int hi) {
+  int a = decor_inside_range_ray(p, lo, hi, .72313571, .39178193, .56917123);
+  int b = decor_inside_range_ray(p, lo, hi, -.41971829, .81613671, -.26351391);
+  int c = decor_inside_range_ray(p, lo, hi, .13972631, -.67191319, .74163187);
   return a == b && a == c ? a : -1;
+}
+static int decor_inside(v3 p, int part) {
+  return decor_inside_range(p,g_probe[part].v0,g_probe[part].v1);
 }
 static int decor_covered(v3 p) {
   for (int i = 0; i < g_nprobe; i++)
@@ -10188,12 +10190,127 @@ static int decor_bad_tips(void) {
   int count = 0;
   for (int i = 0; i < g_nprobe; i++) if (!strcmp(g_probe[i].name, "decor.tip")) {
     const probe_t *p = &g_probe[i];
-    if (p->v1-p->v0 != 6*VERT_FLOATS) return 1;
+    if (p->v1-p->v0 < 9*VERT_FLOATS || (p->v1-p->v0) % (3*VERT_FLOATS)) return 1;
     for (int j = p->v0; j < p->v1; j += VERT_FLOATS)
       if (!decor_covered(decor_vertex(j))) return 1;
     count++;
   }
   return !count;
+}
+static int decor_bad_bark(void) {
+  int smooth = 0, vertices = 0;
+  for (int part = 0; part < g_nprobe; part++) {
+    if (strcmp(g_probe[part].name,"decor.wood") && strcmp(g_probe[part].name,"decor.trunk")) continue;
+    const probe_t *p = &g_probe[part];
+    if (decor_bad_mesh(p->v0,p->v1)) return 1;
+    for (int i = p->v0; i < p->v1; i += 3*VERT_FLOATS) {
+      v3 a = decor_vertex(i), b = decor_vertex(i+VERT_FLOATS), c = decor_vertex(i+2*VERT_FLOATS);
+      v3 face = v3_norm(v3_cross(v3_sub(b,a),v3_sub(c,a))), normal[3];
+      for (int j = 0; j < 3; j++) {
+        int at = i+j*VERT_FLOATS+3;
+        normal[j] = (v3){{g_scene[at],g_scene[at+1],g_scene[at+2]}};
+        if (fabsf(v3_dot(normal[j],normal[j])-1.0f) > .002f || v3_dot(face,normal[j]) < .45f) return 1;
+        vertices++;
+      }
+      smooth += v3_dot(normal[0],normal[1]) < .999f || v3_dot(normal[0],normal[2]) < .999f;
+    }
+  }
+  return !vertices || !smooth;
+}
+// A backdrop broadleaf emits its main stem before its three forks. Its wood
+// span and adjacent tip together form the actual closed parent surface. The
+// flat triangles in each child's wood span are its emitted basal cap; their
+// centroids must have positive overlap with that parent, even after bending.
+static int decor_bad_forks(int *count) {
+  int parent_lo = -1, parent_hi = -1;
+  *count = 0;
+  for (int part = 0; part < g_nprobe; part++) {
+    if (strcmp(g_probe[part].name,"decor.wood")) continue;
+    const probe_t *wood = &g_probe[part];
+    if (part+1 >= g_nprobe || strcmp(g_probe[part+1].name,"decor.tip") ||
+        wood->v1 != g_probe[part+1].v0) return 1;
+    if (parent_lo < 0) {
+      parent_lo = wood->v0; parent_hi = g_probe[part+1].v1; continue;
+    }
+    int cap_triangles = 0;
+    for (int i = wood->v0; i < wood->v1; i += 3*VERT_FLOATS) {
+      v3 normal[3];
+      for (int j = 0; j < 3; j++) {
+        int at = i+j*VERT_FLOATS+3;
+        normal[j] = (v3){{g_scene[at],g_scene[at+1],g_scene[at+2]}};
+      }
+      if (v3_dot(normal[0],normal[1]) < .99999f || v3_dot(normal[0],normal[2]) < .99999f) continue;
+      v3 centre = v3_scale(v3_add(v3_add(decor_vertex(i),decor_vertex(i+VERT_FLOATS)),
+                                  decor_vertex(i+2*VERT_FLOATS)),1.0f/3.0f);
+      if (decor_inside_range(centre,parent_lo,parent_hi) != 1) return 1;
+      cap_triangles++;
+    }
+    if (cap_triangles < 3) return 1;
+    (*count)++;
+  }
+  return *count != 3;
+}
+// Sample the emitted closed stem, not its ring construction. Radial surface
+// distances bound both visible bark outside collision and collision outside
+// bark; opposite rays locate the section centre independently of its taper.
+static int decor_bad_trunk(const solid_t *s, float sg, float *worst, float *bend) {
+  int part = -1;
+  for (int i = 0; i < g_nprobe; i++) if (!strcmp(g_probe[i].name,"decor.trunk")) {
+    if (part >= 0) return 1;
+    part = i;
+  }
+  if (part < 0) return 1;
+  const probe_t *p = &g_probe[part];
+  if (decor_bad_mesh(p->v0,p->v1)) return 1;
+  v3 centre = dec_rot(v3_scale(v3_add(s->min,s->max),.5f),sg);
+  float hx = (s->max.x-s->min.x)*.5f, hz = (s->max.z-s->min.z)*.5f;
+  float bottom = 1e30f, top = -1e30f;
+  for (int i = p->v0; i < p->v1; i += VERT_FLOATS) {
+    v3 q = decor_vertex(i);
+    bottom = fminf(bottom,q.y); top = fmaxf(top,q.y);
+    if (fabsf(q.x-centre.x) > hx+.075f || fabsf(q.z-centre.z) > hz+.075f) return 1;
+  }
+  // The end sections follow the stem tangent: their closed planes may tilt
+  // by a few millimetres around the authored endpoint on the collision axis.
+  if (bottom > s->min.y+.0001f || bottom < s->min.y-.030f || fabsf(top-s->max.y) > .004f) return 1;
+  for (int end = 0; end < 2; end++) {
+    double nearest = 1e30, dy = end ? 1.0 : -1.0;
+    for (int i = p->v0; i < p->v1; i += 3*VERT_FLOATS) {
+      double distance;
+      if (decor_triangle_ray(centre,0,dy,0,decor_vertex(i),decor_vertex(i+VERT_FLOATS),
+                             decor_vertex(i+2*VERT_FLOATS),&distance)) nearest = fmin(nearest,distance);
+    }
+    double endpoint = end ? s->max.y-centre.y : centre.y-(s->min.y-.025f);
+    if (fabs(nearest-endpoint) > .0001) return 1;
+  }
+  static const float levels[] = {.015f,.125f,.250f,.375f,.500f,.625f,.750f,.875f,.985f};
+  v3 first = {{0}};
+  *bend = 0;
+  for (int level = 0; level < (int)(sizeof levels/sizeof levels[0]); level++) {
+    v3 at = centre; at.y = s->min.y+(s->max.y-s->min.y)*levels[level];
+    if (decor_inside(at,part) != 1) return 1;
+    float radius[16];
+    for (int ray = 0; ray < 16; ray++) {
+      double angle = (double)ray*6.283185307179586/16.0;
+      double dx = cos(angle), dz = sin(angle), nearest = 1e30;
+      for (int i = p->v0; i < p->v1; i += 3*VERT_FLOATS) {
+        double distance;
+        if (decor_triangle_ray(at,dx,0,dz,decor_vertex(i),decor_vertex(i+VERT_FLOATS),
+                               decor_vertex(i+2*VERT_FLOATS),&distance)) nearest = fmin(nearest,distance);
+      }
+      double box = fmin((double)hx/fmax(fabs(dx),1e-12),(double)hz/fmax(fabs(dz),1e-12));
+      float error = (float)fabs(nearest-box);
+      if (nearest < .001 || nearest > 1.0 || error > .075f) return 1;
+      *worst = fmaxf(*worst,error); radius[ray] = (float)nearest;
+    }
+    float axes = radius[0]+radius[4]+radius[8]+radius[12];
+    float diagonals = radius[2]+radius[6]+radius[10]+radius[14];
+    if (diagonals > axes*1.25f || diagonals < axes*.80f) return 1;
+    v3 section = {{(radius[0]-radius[8])*.5f,0,(radius[4]-radius[12])*.5f}};
+    if (!level) first = section;
+    *bend = fmaxf(*bend,v3_len(v3_sub(section,first)));
+  }
+  return *bend < fminf(hx,hz)*.025f;
 }
 static void decor_capture_begin(void) {
   g_scene_floats = 0; g_scene_want = 0; g_scene_peak = 0; g_scene_drops = 0;
@@ -10278,6 +10395,7 @@ static void decorcheck_proof(void) {
   if (!old_scene) fatal("decorcheck: snapshot allocation failed");
   memcpy(old_scene,g_scene,(size_t)old_floats*sizeof(float));
   int fail = 0, trees = 0, buildings = 0, controls = 0, tips = 0, peak = 0;
+  int forks = 0, detached = 0;
   g_decor_invalid = 0;
   g_theme = THEMES[0];
   // Three unrelated private seed sequences, short/tall forms, both mirrors,
@@ -10300,21 +10418,66 @@ static void decorcheck_proof(void) {
           dec_signature_tree(&trunk,(v3){{cosf((float)seed*.137f),0,sinf((float)seed*.137f)}},sg);
         } else dec_grove_tree(&trunk,seed%3,sg);
         probe(NULL);
-        int bad = decor_bad_mesh(0,g_scene_floats) || decor_bad_tips() || g_scene_drops || g_nprobe >= PROBE_MAX;
+        int bad = decor_bad_mesh(0,g_scene_floats) || decor_bad_tips() || decor_bad_bark() ||
+                  g_scene_drops || g_nprobe >= PROBE_MAX || g_scene_floats/VERT_FLOATS > 6144;
+        if (family == 0) {
+          int count = 0, disconnected = decor_bad_forks(&count);
+          bad |= disconnected;
+          if (!repeat) { forks += count; detached += disconnected; }
+        }
         if (family == 4) for (int corner = 0; corner < 4; corner++) {
           v3 p = {{corner & 1 ? trunk.max.x : trunk.min.x,trunk.max.y,corner & 2 ? trunk.max.z : trunk.min.z}};
           if (!decor_covered(dec_rot(p,sg))) bad = 1;
         }
         for (int i = 0; i < g_nprobe; i++) if (!repeat && !strcmp(g_probe[i].name,"decor.tip")) tips++;
         if (g_scene_floats/VERT_FLOATS > peak) peak = g_scene_floats/VERT_FLOATS;
-        if (bad && fail < 8) printf("decorcheck witness family=%d seed=%d tall=%d mirror=%d mesh=%d tips=%d invalid=%ld\n",
-                                    family,seed,tall,mirror,decor_bad_mesh(0,g_scene_floats),decor_bad_tips(),g_decor_invalid);
+        if (bad && fail < 8) printf("decorcheck witness family=%d seed=%d tall=%d mirror=%d mesh=%d tips=%d bark=%d invalid=%ld\n",
+          family,seed,tall,mirror,decor_bad_mesh(0,g_scene_floats),decor_bad_tips(),decor_bad_bark(),g_decor_invalid);
         uint64_t hash = decor_bytes_hash(g_scene,(size_t)g_scene_floats*sizeof(float));
-        if (repeat) fail += repeated != hash;
+        if (repeat) {
+          if (repeated != hash && fail < 8) printf("decorcheck repeat family=%d seed=%d tall=%d mirror=%d\n",family,seed,tall,mirror);
+          fail += repeated != hash;
+        }
         else repeated = hash;
         fail += bad; if (!repeat) trees++;
       }
     }
+  printf("decorcheck forks=%d detached=%d\n",forks,detached);
+  {
+    int trunks = 0, trunk_fail = 0, trunk_peak = 0;
+    float worst = 0, min_bend = 1e30f, max_bend = 0;
+    float mirrored[512*VERT_FLOATS]; int mirror_floats = 0;
+    for (int width = 0; width < 2; width++) for (int tall = 0; tall < 2; tall++)
+      for (int angle = 0; angle < 32; angle++) for (int mirror = 0; mirror < 2; mirror++) {
+        float radius = width ? .16f : .08f;
+        solid_t stem = {.min={{3.25f-radius,0,-7.5f-radius}},
+                        .max={{3.25f+radius,tall ? 3.2f : 2.2f,-7.5f+radius}},.color={{.3f,.25f,.2f}}};
+        decor_capture_begin();
+        dec_trunk(&stem,(float)angle*.19634954f,mirror ? -1.0f : 1.0f); probe(NULL);
+        float bend = 0;
+        int bad = decor_bad_mesh(0,g_scene_floats) || decor_bad_bark() ||
+                  decor_bad_trunk(&stem,mirror ? -1.0f : 1.0f,&worst,&bend) ||
+                  g_scene_drops || g_nprobe >= PROBE_MAX || g_scene_floats/VERT_FLOATS > 512;
+        if (g_scene_floats <= (int)(sizeof mirrored/sizeof mirrored[0])) {
+          if (!mirror) { mirror_floats = g_scene_floats; memcpy(mirrored,g_scene,(size_t)mirror_floats*sizeof(float)); }
+          else if (mirror_floats != g_scene_floats) bad = 1;
+          else for (int i = 0; i < g_scene_floats; i++) {
+            int field = i%VERT_FLOATS;
+            float expected = mirrored[i]*(field == 0 || field == 2 || field == 3 || field == 5 ? -1.0f : 1.0f);
+            if (fabsf(g_scene[i]-expected) > .000001f) bad = 1;
+          }
+        } else bad = 1;
+        if (bad && trunk_fail < 8) printf("decorcheck trunk width=%d tall=%d angle=%d mirror=%d mesh=%d bark=%d surface=%d\n",
+          width,tall,angle,mirror,decor_bad_mesh(0,g_scene_floats),decor_bad_bark(),
+          decor_bad_trunk(&stem,mirror ? -1.0f : 1.0f,&worst,&bend));
+        min_bend = fminf(min_bend,bend); max_bend = fmaxf(max_bend,bend);
+        if (g_scene_floats/VERT_FLOATS > trunk_peak) trunk_peak = g_scene_floats/VERT_FLOATS;
+        trunk_fail += bad; trunks++;
+      }
+    printf("decorcheck trunks=%d rays=%d envelope_mm=%.3f bend_mm=%.3f..%.3f peak=%d fail=%d\n",
+           trunks,trunks*9*16,(double)(worst*1000),(double)(min_bend*1000),(double)(max_bend*1000),trunk_peak,trunk_fail);
+    fail += trunk_fail;
+  }
   for (int family = 0; family < 5; family++) for (int dim = 0; dim < 8; dim++)
     for (int mirror = 0; mirror < 2; mirror++) for (int angle = 0; angle < 3; angle++) {
       decor_capture_begin();
@@ -10401,6 +10564,73 @@ static void decorcheck_proof(void) {
   baseline_ok = !decor_bad_support(4);
   for (int i = 0; i < g_scene_floats; i += VERT_FLOATS) g_scene[i+1] += 30.0f;
   fail += !baseline_ok || !decor_bad_support(4); controls++;
+  {
+    decor_capture_begin();
+    dec_backdrop_tree((v3){{0,-.4f,0}},19,0,UINT64_C(4)*2654435761u+1,1); probe(NULL);
+    int count = 0, branch = 0;
+    baseline_ok = !decor_bad_forks(&count);
+    for (int i = 0; i+1 < g_nprobe; i++) if (!strcmp(g_probe[i].name,"decor.wood") && ++branch == 2) {
+      for (int j = g_probe[i].v0; j < g_probe[i+1].v1; j += VERT_FLOATS) g_scene[j] += 2.0f;
+      break;
+    }
+    fail += !baseline_ok || !decor_bad_forks(&count); controls++;
+  }
+  for (int control = 0; control < 6; control++) {
+    solid_t stem = {.min={{-.16f,0,-.16f}},.max={{.16f,3.2f,.16f}},.color={{.3f,.25f,.2f}}};
+    decor_capture_begin(); dec_trunk(&stem,.37f,1); probe(NULL);
+    float error = 0, bend = 0;
+    baseline_ok = !decor_bad_bark() && !decor_bad_trunk(&stem,1,&error,&bend);
+    if (control == 0) {
+      for (int axis = 3; axis < 6; axis++) g_scene[axis] = -g_scene[axis];
+    } else if (control == 1) {
+      for (int i = 0; i < g_scene_floats; i += 3*VERT_FLOATS) {
+        v3 a = decor_vertex(i), b = decor_vertex(i+VERT_FLOATS), c = decor_vertex(i+2*VERT_FLOATS);
+        v3 normal = v3_norm(v3_cross(v3_sub(b,a),v3_sub(c,a)));
+        for (int j = 0; j < 3; j++) memcpy(g_scene+i+j*VERT_FLOATS+3,normal.e,3*sizeof(float));
+      }
+    } else if (control == 2) {
+      for (int i = 0; i < g_scene_floats; i += VERT_FLOATS) g_scene[i] += .20f;
+    } else if (control == 3) {
+      // Remove measured section displacement while preserving each section's
+      // taper and round perimeter. A straight tube must fail the bend witness.
+      float levels[64]; v3 centres[64]; int count = 0;
+      for (int i = 0; i < g_scene_floats; i += VERT_FLOATS) {
+        float y = g_scene[i+1]; int found = 0;
+        for (int j = 0; j < count; j++) if (fabsf(levels[j]-y) < .04f) found = 1;
+        if (found) continue;
+        if (count >= 64) { fail++; break; }
+        float lx = 1e30f, hx = -1e30f, lz = 1e30f, hz = -1e30f;
+        for (int j = 0; j < g_scene_floats; j += VERT_FLOATS) if (fabsf(g_scene[j+1]-y) < .04f) {
+          lx = fminf(lx,g_scene[j]); hx = fmaxf(hx,g_scene[j]);
+          lz = fminf(lz,g_scene[j+2]); hz = fmaxf(hz,g_scene[j+2]);
+        }
+        levels[count] = y; centres[count++] = (v3){{(lx+hx)*.5f,0,(lz+hz)*.5f}};
+      }
+      for (int i = 0; i < g_scene_floats; i += VERT_FLOATS)
+        for (int j = 0; j < count; j++) if (fabsf(g_scene[i+1]-levels[j]) < .04f) {
+          g_scene[i] -= centres[j].x; g_scene[i+2] -= centres[j].z; break;
+        }
+    } else if (control == 4) {
+      for (int i = 0; i < g_scene_floats; i += VERT_FLOATS) {
+        float r = fmaxf(fabsf(g_scene[i]),fabsf(g_scene[i+2]));
+        if (r > .03f) { g_scene[i] *= .16f/r; g_scene[i+2] *= .16f/r; }
+      }
+    } else {
+      int out = 0, removed = 0;
+      for (int i = 0; i < g_scene_floats; i += 3*VERT_FLOATS) {
+        int cap = 1;
+        for (int j = 0; j < 3; j++) if (fabsf(g_scene[i+j*VERT_FLOATS+1]-stem.max.y) > .004f) cap = 0;
+        if (cap) { removed++; continue; }
+        memmove(g_scene+out,g_scene+i,3*VERT_FLOATS*sizeof(float)); out += 3*VERT_FLOATS;
+      }
+      g_scene_floats = out;
+      if (g_nprobe == 1) g_probe[0].v1 = out;
+      fail += !removed;
+    }
+    int rejected = control < 2 ? decor_bad_bark() : decor_bad_trunk(&stem,1,&error,&bend);
+    if (!baseline_ok || !rejected) printf("decorcheck trunk control=%d baseline=%d rejected=%d\n",control,baseline_ok,rejected);
+    fail += !baseline_ok || !rejected; controls++;
+  }
   int unchanged = g_num_solids == old_num_solids && solids_hash == decor_bytes_hash(g_solids,sizeof g_solids) &&
                   meta_hash == decor_bytes_hash(&g_meta,sizeof g_meta) && g_rng == old_rng &&
                   g_rng_bot == old_bot_rng && !memcmp(g_rng_gun,old_gun_rng,sizeof old_gun_rng);

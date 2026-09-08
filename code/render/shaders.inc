@@ -43,6 +43,7 @@
 // signed offset from this value, and the granular floor field reads it back to decide
 // where loose sand exists at all.
 #define WORLD_GROUND_R 0.86f   // dry dusty floor: a wide, weak sheen at grazing
+#define WORLD_WOOD_TAG -3.25f  // rounded woody stems and branches
 #define WORLD_ROCK_TAG -2.25f  // bedrock finish; separate from foliage and gloves
 #define GLSL_ENV \
   /* Smooth value noise, SHARED. It lives here rather than in WORLD_FS because
@@ -827,6 +828,7 @@ static const char *WORLD_FS =
   // generated ruins. The BRDF always sees its magnitude.
   "  bool wall_finish = vMat.x < 0.0 && vMat.x > -1.0;\n"
   "  bool rock_finish = abs(vMat.x - (" GLSL_NUM(WORLD_ROCK_TAG) ")) < 0.01;\n"
+  "  bool wood_finish = abs(vMat.x - (" GLSL_NUM(WORLD_WOOD_TAG) ")) < 0.01;\n"
   "  bool glove = vMat.x < -1.5 && vMat.x > -2.0;\n"
   "  float base_rough = glove ? 0.72 : (vMat.x < -1.0 ? 0.88 : abs(vMat.x));\n"
   "  float rough, surf_h = 0.5;\n"
@@ -864,6 +866,18 @@ static const char *WORLD_FS =
   "    surf_h = mix(surf_h, grain, 0.45);\n"
   "    rough = 0.91;\n"
   "  }\n"
+  // Elongated bark fissures are stable world-space material detail. Broad
+  // grooves survive distance filtering; surface derivatives supply the relief.
+  "  if (wood_finish && uDetail > 0.0) {\n"
+  "    vec2 bark_uv = vec2(vWorld.x * 0.79 + vWorld.z * 0.61, vWorld.y);\n"
+  "    float warp = vnoise2(bark_uv * vec2(4.0, 1.4));\n"
+  "    float grain = vnoise2(bark_uv * vec2(38.0, 2.2) + vec2(warp * 1.8, 0.0));\n"
+  "    float fissure = smoothstep(0.30, 0.53, grain);\n"
+  "    float detail = det * (1.0 - smoothstep(0.04, 0.14, length(fwidth(bark_uv))));\n"
+  "    alb *= mix(1.0, 0.66 + fissure * 0.48 + warp * 0.12, detail);\n"
+  "    surf_h = mix(surf_h, fissure, detail * 0.75);\n"
+  "    rough = 0.92;\n"
+  "  }\n"
   // PROCEDURAL RELIEF FROM THE MATERIAL FIELD ALREADY IN REGISTERS. The broad
   // concrete variation above is not only pigment: aggregate and worn render leave
   // shallow height changes that catch a grazing sun. Screen derivatives turn that
@@ -876,7 +890,7 @@ static const char *WORLD_FS =
   "    float hd = dot(dpdx, r1);\n"
   "    if (abs(hd) > 1.0e-8) {\n"
   "      vec3 sg = sign(hd) * (dFdx(surf_h) * r1 + dFdy(surf_h) * r2);\n"
-  "      float relief = wall_finish ? 0.035 : 0.070;\n"
+  "      float relief = wood_finish ? 0.014 : (wall_finish ? 0.035 : 0.070);\n"
   "      n = normalize(abs(hd) * n - sg * (relief * det));\n"
   "    }\n"
   "  }\n"
@@ -964,7 +978,7 @@ static const char *WORLD_FS =
   "    alb *= 1.0 + (gh - 0.5) * 0.085 + br * 0.040 * bore;\n"
   "  }\n"
   // Geometric specular antialiasing.
-  "  if (uDetail > 0.0 && !wall_finish && !rock_finish && abs(n.y) < 0.5) {\n"  // vertical faces: panel seams
+  "  if (uDetail > 0.0 && !wall_finish && !rock_finish && !wood_finish && abs(n.y) < 0.5) {\n"  // vertical faces: panel seams
   "    float sc = abs(n.x) > 0.5 ? vWorld.z : vWorld.x;\n"
   "    float sf = abs(fract(sc / 3.0) - 0.5) * 3.0;\n"
   "    float sm = 1.0 - smoothstep(0.02, 0.05, sf);\n"
