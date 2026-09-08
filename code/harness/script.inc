@@ -594,6 +594,18 @@ static int weatherproof_audio(void) {
         t->source_tick - flash_tick[thunders] != 90);
     thunders++;
   }
+  const int beds[] = {SFX_RAIN, SFX_WIND};
+  for (int bed = 0; bed < 2; bed++) {
+    long last = -1; int joins = 0;
+    int hop = (sfx_loop_hop_frames(beds[bed]) * TICK_HZ + SFX_HZ - 1) / SFX_HZ;
+    for (int i = 0; i < g_audio_trace_n; i++) {
+      const audio_trace_t *t = &g_audio_trace[i];
+      if (t->id != beds[bed]) continue;
+      if (last >= 0) { fail |= t->source_tick - last != hop; joins++; }
+      last = t->source_tick;
+    }
+    fail |= joins < 2;
+  }
   fail |= flashes != 2 || thunders != 2 || g_audio_invalid || g_audio_trace_overflow;
   // A new map with the same weather at the same tick must restart both
   // ambient lanes. A repeated call within that map must admit nothing twice.
@@ -604,9 +616,16 @@ static int weatherproof_audio(void) {
   fail |= g_audio_trace_n != count + 2 || g_weather_audio.seed != g_map_seed;
   weather_audio_tick();
   fail |= g_audio_trace_n != count + 2;
+  // An audio session reset also restarts each bed immediately, even when the
+  // map, weather and producer tick have not changed.
+  audio_session_reset(); weather_audio_tick();
+  fail |= g_audio_trace_n != count + 4;
+  g_tick++; weather_audio_tick();
+  fail |= g_audio_trace_n != count + 4;
   audio_trace_end();
   g_tick = tick0; g_map_seed = seed0; g_weather_audio = state0;
-  printf("weatherproof audio flashes=%d thunder=%d delay_ticks=90 dedup=1 map_reset=1 %s\n",
+  printf("weatherproof audio flashes=%d thunder=%d delay_ticks=90 dedup=1 map_reset=1 "
+         "bed_hop_ticks=600 epoch=1 %s\n",
          flashes, thunders, fail ? "FAIL" : "ok");
   return fail;
 }
@@ -4370,7 +4389,7 @@ static void cmd_audiocheck(sim_ctx_t *s) {
   else if (part && !strcmp(part, "catalogue")) mix = 0;
   else if (part) g_tok_pushback = part;
   int fail = catalogue ? audiocheck_catalogue() : 0;
-  if (mix) fail |= audiocheck_lifecycle(audiocheck_routes);
+  if (mix) fail |= audiocheck_lifecycle(audiocheck_presentation);
   printf("audiocheck summary catalogue=%d lifecycle=%d %s\n", catalogue ? SFX_COUNT : 0,
          mix ? 13 : 0, fail ? "FAIL" : "ok");
   if (fail) exit(1);

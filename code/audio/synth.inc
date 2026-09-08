@@ -1,31 +1,21 @@
 // =============================================================================
-// audio/synth.inc  —  procedural synthesis, the Confirmation Matrix (hit/
-// kill x body/head), sfx_build_all.
-// Proof: sfx DIR, audiocheck. One TU: included once by game.c, in definition order —
-// moving a definition out is a semantic change.
-// Contract: everything is generated at startup from a seeded stream;
-// sfx_alloc reseeds g_rng_sfx from the SOUND ID alone, so sounds are
-// byte-identical across map seeds.
-// sfx_build_weather appends bounded thunder/rain/wind buffers after the weapon
-// catalogue; independent SOUND ID streams preserve every existing sound.
+// audio/synth.inc — runtime procedural palette and startup source metadata.
+// Proof: sfx DIR, audiocheck. Included once by game.c in definition order.
+// Every sound is generated in C from a sound-ID seed, filters and envelopes.
+// Recipes preserve the selected sound directions; no recordings or generated
+// sample bank are build inputs. Playback only reads the resulting float buffers.
 // =============================================================================
-// ---------------------------------------------------------------------------
-// Procedural audio — every sound is synthesized at startup into a 48 kHz
-// interleaved STEREO float buffer (layered noise/sine partials through one-pole filters
-// and exponential envelopes; seeded, so the WAV dump is reproducible).
-// ---------------------------------------------------------------------------
-
 [[maybe_unused]] static const char *SFX_NAME[SFX_COUNT] = {  // harness WAV dump
   "fire_ar", "fire_sr", "far_ar", "far_sr", "hit", "hit_head",
   "kill", "kill_head", "hurt", "impact", "whizz", "step", "dryfire",
   "reload_ar", "reload_sr", "flesh", "reload_ar_tac",
-  "thunder", "rain", "wind",
+  "thunder", "rain", "wind", "slide",
 };
 
 #define SFX_HZ 48000
 #define SFX_CH 2            // every buffer is interleaved stereo
 
-// Buffers are STEREO now.
+// Generated buffers live for the process lifetime.
 static float *g_sfx_buf[SFX_COUNT];   // interleaved L,R
 static int    g_sfx_len[SFX_COUNT];   // FRAMES, not samples
 static uint64_t g_rng_sfx;
@@ -33,16 +23,19 @@ static uint64_t g_rng_sfx;
 #define SFX_SCRATCH (SFX_HZ * 2)
 static float g_scr[SFX_SCRATCH];      // one mono layer at a time
 
-static float *sfx_alloc(int id, float seconds) {
-  // One noise stream PER SOUND. g_rng_sfx used to be a single stream consumed in build
-  // order, which means changing the NUMBER or the LENGTH of the noise layers in any one
-  // sound re-rolls the noise in every sound built after it.
+static float *sfx_alloc_frames(int id, int frames) {
+  if ((unsigned)id >= SFX_COUNT || frames <= 0 || frames > 10 * SFX_HZ || g_sfx_buf[id])
+    fatal("invalid procedural audio allocation");
+  // Sound-ID streams isolate recipes from map seeds and catalogue build order.
   g_rng_sfx = 0x5F31Aull + 0x9E3779B97F4A7C15ull * (uint64_t)(id + 1);
-  int n = (int)(seconds * SFX_HZ);
-  g_sfx_len[id] = n;
-  g_sfx_buf[id] = calloc((size_t)n * SFX_CH, sizeof(float));
-  if (!g_sfx_buf[id]) fatal("out of memory");
+  g_sfx_len[id] = frames;
+  g_sfx_buf[id] = calloc((size_t)frames * SFX_CH, sizeof(float));
+  if (!g_sfx_buf[id]) fatal("procedural audio out of memory");
   return g_sfx_buf[id];
+}
+
+static float *sfx_alloc(int id, float seconds) {
+  return sfx_alloc_frames(id, (int)(seconds * SFX_HZ));
 }
 
 // --- filters -----------------------------------------------------------
@@ -123,22 +116,6 @@ static int sfx_burst(float sec, float hz, float q, float atk, float dec,
   return scr_norm(n, amp);
 }
 
-// A pitched body: a sine that sweeps down, which is what a pressure wave
-// expanding away from a muzzle actually does.
-static int sfx_sweep(float sec, float f0, float f1_, float ftau,
-                     float dec, float shape, float amp) {
-  int n = (int)(sec * SFX_HZ);
-  if (n > SFX_SCRATCH) n = SFX_SCRATCH;
-  float ph = 0;
-  for (int i = 0; i < n; i++) {
-    float t = (float)i / SFX_HZ;
-    float f = f1_ + (f0 - f1_) * expf(-t / ftau);
-    ph += F_TAU * f / SFX_HZ;
-    g_scr[i] = sinf(ph) * sfx_env(t, 0.0002f, dec, shape);
-  }
-  return scr_norm(n, amp);
-}
-
 // The transient.
 static int sfx_click(float sec, float dec, float hp_hz, float amp) {
   int n = (int)(sec * SFX_HZ);
@@ -185,30 +162,6 @@ static void sfx_tail(int id, int at, float sec, float hz, float q,
     for (int i = 0; i < n; i++) {
       int fr = at + i;
       if (fr >= 0 && fr < len) b[fr * SFX_CH + c] += g_scr[i];
-    }
-  }
-}
-
-// Early reflections: a handful of delayed, filtered, alternately-panned copies of what
-// has been written so far.
-static void sfx_reflect(int id, int upto, const float *dly, const float *gn,
-                        int nref, float lp_hz) {
-  float *b = g_sfx_buf[id];
-  int len = g_sfx_len[id];
-  // The source region is SNAPSHOT first, and that is a fix, not a tidy-up: writing
-  // `b[i+d]` while reading `b[i]` over the same range fed the generator on its own
-  // output once `upto` exceeded the shortest delay, so the tap at d reappeared at 2d,
-  // 3d, 4d... — an IIR comb, not a handful of delayed copies.
-  int ns = upto;
-  if (ns > SFX_SCRATCH / SFX_CH) ns = SFX_SCRATCH / SFX_CH;
-  for (int i = 0; i < ns * SFX_CH; i++) g_scr[i] = b[i];
-  for (int r = 0; r < nref; r++) {
-    int d = (int)(dly[r] * SFX_HZ);
-    for (int c = 0; c < SFX_CH; c++) {
-      op_t lp = {0};
-      float g = gn[r] * (c == (r & 1) ? 1.0f : 0.66f);   // alternate the side
-      for (int i = 0; i < ns && i + d < len; i++)
-        b[(i + d) * SFX_CH + c] += op_lp(&lp, g_scr[i * SFX_CH + c], lp_hz) * g;
     }
   }
 }
@@ -374,67 +327,53 @@ static void sfx_clack(int id, int at, float tone_hz, float amp) {
   sfx_lay(id, n, at, 0.0f, 0);
 }
 
-// ONE mechanical event, with mass and a space around it — the reload's counterpart to
-// `sfx_head_sig`: one authored signature that every moving metal part is an instance
-// of, so a magazine seating and a bolt going home differ in two frequencies and a
-// weight rather than in two invented layer stacks.
-//   knack     the transient. Sub-millisecond and high, and it must stay the loudest
-//             SAMPLE of the event.
-//   metal     the band that says what the part is made of (`tone_hz`)
-//   spring    spring, detent, gear rattle — the connective tissue that makes it a
-//             mechanism rather than isolated clicks
-//   mass      `mass_hz`, at +6 ms. Laid at frame 0 a slow low excursion adds to the
-//             transient's peak, the composite crest forces the limiter down, and the
-//             knack is what gets eaten. Metal-then-weight is what an impact IS.
-//   room      two dark early taps at +11/+19 ms: a reload is heard at 30 cm, so what
-//             returns per event is your own gear and the wall a metre away, not a hall.
-// THE HOLES BETWEEN THE EVENTS: the reloads are above threshold for only ~30% of their
-// length, with gaps of 70-276 ms. What fills a hole is NOT another struck event — a
-// sixth clack would fight `eng`, which is a contract on this buffer (atk and eng must
-// both land on the LAST event, or the sound announces a live weapon early). It is the
-// CONTINUOUS noise a mechanism makes between its events: broadband, quiet, no
-// transient. Deliberately 12-18 dB under the events it bridges, and `width` gives each
-// bed its own channel offset so the bridge is wider than the clacks it sits between.
+// Dry hand/rail friction connects authored mechanical landmarks. The edges
+// fade gently so movement cannot be mistaken for another seating impact.
 static void sfx_bed(int id, int at, float dur, float hz, float amp, int width) {
-  int n = sfx_burst(dur, hz, 0.85f, 0.020f, dur * 0.55f, 1.0f, amp);
+  int n = (int)(dur * SFX_HZ);
+  if (n > SFX_SCRATCH) n = SFX_SCRATCH;
+  op_t low = {0}, high = {0}, motion = {0};
+  for (int i = 0; i < n; i++) {
+    float t = (float)i / SFX_HZ;
+    float noise = rng_rangef(&g_rng_sfx, -1, 1);
+    float grain = 0.75f + 0.25f * tanhf(op_lp(&motion, noise, 85.0f) * 9.0f);
+    float edge = f_clamp((dur - t) / 0.025f, 0.0f, 1.0f);
+    g_scr[i] = op_hp(&high, op_lp(&low, noise, hz * 1.4f), hz * 0.18f)
+             * sfx_env(t, 0.015f, dur * 0.8f, 1.0f) * edge * edge * grain;
+  }
+  scr_norm(n, amp);
   sfx_lay(id, n, at, 0.0f, width);
 }
 
+// The transient, broad material knock and brief friction share one event
+// onset. Small seeded material differences preserve every animation landmark;
+// the final seat/bolt remains the loudest event of its reload.
 static void sfx_mech(int id, int at, float tone_hz, float mass_hz, float amp,
                      float spring) {
   int n, d6 = (int)(0.006f * SFX_HZ);
-  n = sfx_click(0.0025f, 0.00016f, tone_hz * 1.8f, 1.45f * amp);
-  sfx_lay(id, n, at, 0.0f, 0);                              // knack
-  n = sfx_burst(0.065f, tone_hz, 1.15f, 0.00004f, 0.0110f, 1.3f, 2.70f * amp);
-  sfx_lay(id, n, at, 0.0f, 1);                              // metal
+  tone_hz *= rng_rangef(&g_rng_sfx, 0.96f, 1.04f);
+  n = sfx_click(0.0025f, 0.00020f, tone_hz * 1.6f, 1.15f * amp);
+  sfx_lay(id, n, at, 0.0f, 0);                              // contact
+  n = sfx_burst(0.060f, tone_hz, 0.72f, 0.00010f, 0.0095f, 1.3f, 2.50f * amp);
+  sfx_lay(id, n, at, 0.0f, 1);                              // material
   if (spring > 0.0f) {
-    n = sfx_burst(0.09f, 3100.0f, 1.6f, 0.00006f, 0.026f, 1.5f, spring * amp);
-    sfx_lay(id, n, at + (int)(0.003f * SFX_HZ), 0.0f, 2);    // spring
+    n = sfx_burst(0.070f, tone_hz * 1.35f, 0.8f, 0.001f, 0.019f, 1.3f, spring * amp);
+    sfx_lay(id, n, at + (int)(0.003f * SFX_HZ), 0.0f, 2);    // detent/rail
   }
-  // 0.13, not 0.62. `amp` is a PEAK, and a two-partial ring carries roughly 15 dB more
-  // ENERGY than a band-passed noise burst at the same peak, so a mass ring set by eye
-  // against the metal burst's number buries it.
   float lk = f_clamp(150.0f / mass_hz, 1.0f, 1.60f);
-  float low = 0.17f * lk * lk;
-  n = sfx_ring(0.115f, mass_hz, mass_hz * 1.52f, 0.030f * (low / 0.17f),
+  float low = 0.10f * lk * lk;
+  n = sfx_ring(0.105f, mass_hz, mass_hz * 1.52f, 0.022f,
                low * amp);
   sfx_lay(id, n, at + d6, 0.0f, 0);                         // mass
-  n = sfx_burst(0.075f, mass_hz * 1.35f, 0.95f, 0.00012f, 0.017f, 1.1f,
-                0.55f * amp);
+  n = sfx_burst(0.080f, mass_hz * 1.35f, 0.70f, 0.0005f, 0.018f, 1.2f,
+                0.72f * amp);
   sfx_lay(id, n, at + d6, 0.0f, 3);                         // the weight
-  // THE MEAT, and it was simply not here: every AR reload event came back with 0-3%
-  // below 120 Hz and 68-70% in 500 Hz-2 kHz — all tone and knack with nothing in the
-  // 200-800 Hz band where weight actually lives.
   float meat = 0.95f * f_clamp(175.0f / mass_hz, 0.42f, 1.45f);
-  n = sfx_burst(0.085f, mass_hz * 3.40f, 1.05f, 0.00010f, 0.021f, 1.15f,
+  n = sfx_burst(0.085f, mass_hz * 3.40f, 0.75f, 0.0004f, 0.021f, 1.15f,
                 meat * amp);
   sfx_lay(id, n, at + (int)(0.008f * SFX_HZ), 0.0f, 2);     // 200-800 Hz
-  n = sfx_burst(0.07f, tone_hz * 0.55f, 1.0f, 0.00006f, 0.014f, 1.2f,
-                0.30f * amp);
-  sfx_lay(id, n, at + (int)(0.011f * SFX_HZ), -0.18f, 2);    // near tap
-  n = sfx_burst(0.09f, tone_hz * 0.40f, 0.9f, 0.00008f, 0.020f, 1.1f,
-                0.19f * amp);
-  sfx_lay(id, n, at + (int)(0.019f * SFX_HZ), 0.22f, 4);     // far tap
+  sfx_bed(id, at + (int)(0.004f * SFX_HZ), 0.070f, tone_hz * 0.8f,
+          amp * 0.24f, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -585,112 +524,11 @@ static void sfx_kill_base(int id, float g) {
 }
 
 // ---------------------------------------------------------------------------
-// Every sound is built the same way: a sub-millisecond TRANSIENT, then a
-// CRACK (the band that carries the "rifle"), then a BODY, then a SUB, then mechanical
-// detail, then early REFLECTIONS, then a decorrelated TAIL. The old shots had the body
-// and the sub and almost nothing else: measured, 94% of the AR's energy sat below 250
-// Hz and only 2.9% above 2 kHz, which is a thud, not a report.
+// A short broadband edge, noisy body and restrained low pressure partial make
+// one report. Dry shots contain no delayed report copies or fixed room reverb;
+// world geometry supplies the live reflections and diffuse decay.
 // ---------------------------------------------------------------------------
-static void sfx_build_shots(void) {
-  int n;  // sfx_alloc reseeds g_rng_sfx per sound id — no global seed here
-
-  // ---- AR: sharp, mid-forward, short room -------------------------------
-  // Short report texture leaves distant room response to the live wet bus.
-  sfx_alloc(SFX_FIRE_AR, 0.40f);
-  n = sfx_click(0.004f, 0.00055f, 1800.0f, 1.75f);
-  sfx_lay(SFX_FIRE_AR, n, 0, 0.0f, 0);                 // transient
-  n = sfx_burst(0.08f, 4300.0f, 1.7f, 0.00002f, 0.011f, 1.7f, 0.88f);
-  sfx_lay(SFX_FIRE_AR, n, 0, 0.0f, 0);                 // snap
-  n = sfx_burst(0.10f, 2500.0f, 1.4f, 0.00003f, 0.022f, 1.5f, 1.30f);
-  sfx_lay(SFX_FIRE_AR, n, 0, 0.0f, 0);                 // crack
-  n = sfx_burst(0.12f, 1150.0f, 1.2f, 0.00006f, 0.034f, 1.2f, 0.95f);
-  sfx_lay(SFX_FIRE_AR, n, 1, -0.06f, 2);               // upper body
-  n = sfx_burst(0.16f, 240.0f, 1.0f, 0.00010f, 0.045f, 1.0f, 0.58f);
-  sfx_lay(SFX_FIRE_AR, n, 2, 0.05f, 3);                // body
-  n = sfx_sweep(0.20f, 190.0f, 62.0f, 0.026f, 0.050f, 1.0f, 0.46f);
-  sfx_lay(SFX_FIRE_AR, n, 0, 0.0f, 0);                 // sub punch
-  sfx_clack(SFX_FIRE_AR, (int)(0.006f * SFX_HZ), 3400.0f, 0.20f);  // bolt
-  {   // Compact stereo texture within the dry report
-    static const float D[3] = {0.011f, 0.021f, 0.034f};
-    static const float G[3] = {0.09f, 0.06f, 0.035f};
-    sfx_reflect(SFX_FIRE_AR, (int)(0.09f * SFX_HZ), D, G, 3, 3200.0f);
-  }
-  sfx_verb(SFX_FIRE_AR, (int)(0.12f * SFX_HZ), 0.006f, 0.017f, 0.20f, 2600.0f,
-           0.08f);
-  sfx_tail(SFX_FIRE_AR, (int)(0.006f * SFX_HZ), 0.22f, 2600.0f, 0.9f,
-           0.005f, 0.055f, 0.13f);   // short air layer
-  sfx_finish(SFX_FIRE_AR, 0.97f, 0.1748f, 0.30f);
-
-  // ---- SR: hard crack, descending body and separated dark echoes ----------
-  sfx_alloc(SFX_FIRE_SR, 1.65f);
-  n = sfx_click(0.004f, 0.00045f, 1600.0f, 3.50f);
-  sfx_lay(SFX_FIRE_SR, n, 0, 0.0f, 0);
-  n = sfx_burst(0.045f, 6100.0f, 1.6f, 0.00002f, 0.0058f, 1.7f, 5.20f);
-  sfx_lay(SFX_FIRE_SR, n, 0, 0.0f, 0);
-  n = sfx_burst(0.105f, 3600.0f, 1.7f, 0.00002f, 0.019f, 1.8f, 4.40f);
-  sfx_lay(SFX_FIRE_SR, n, 0, 0.0f, 0);
-  n = sfx_burst(0.19f, 2500.0f, 1.35f, 0.00004f, 0.052f, 1.4f, 3.30f);
-  sfx_lay(SFX_FIRE_SR, n, 0, 0.0f, 0);
-  // The midrange fall starts after the edge; the lower layer follows later.
-  n = sfx_sweep(0.24f, 1700.0f, 260.0f, 0.040f, 0.085f, 1.2f, 1.75f);
-  sfx_lay(SFX_FIRE_SR, n, (int)(0.003f * SFX_HZ), 0.0f, 0);
-  n = sfx_burst(0.34f, 440.0f, 1.1f, 0.00008f, 0.083f, 1.1f, 1.95f);
-  sfx_lay(SFX_FIRE_SR, n, 1, -0.07f, 3);
-  n = sfx_burst(0.40f, 150.0f, 1.0f, 0.00012f, 0.105f, 1.0f, 0.95f);
-  sfx_lay(SFX_FIRE_SR, n, 2, 0.06f, 4);
-  n = sfx_sweep(0.40f, 310.0f, 88.0f, 0.042f, 0.095f, 1.0f, 1.20f);
-  sfx_lay(SFX_FIRE_SR, n, (int)(0.008f * SFX_HZ), 0.0f, 0);
-  {
-    static const float D[5] = {0.085f, 0.165f, 0.275f, 0.430f, 0.640f};
-    static const float G[5] = {0.26f, 0.20f, 0.15f, 0.11f, 0.075f};
-    sfx_reflect(SFX_FIRE_SR, (int)(0.17f * SFX_HZ), D, G, 5, 1900.0f);
-  }
-  // This bounded report texture supplements the live geometry-dependent wet
-  // bus. Neither layer schedules another shot or an independent bolt cycle.
-  sfx_verb(SFX_FIRE_SR, (int)(0.20f * SFX_HZ), 0.012f, 0.043f, 0.80f, 1700.0f,
-           0.19f);
-  sfx_finish(SFX_FIRE_SR, 0.99f, 0.2680f, 0.30f);
-
-  // ---- The same two shots heard from across the arena --------------------
-  // Distant reports retain less high-frequency energy and a compact wide body.
-  // The live wet path owns the surrounding geometry.
-  for (int fr = 0; fr < 2; fr++) {
-    int id = fr ? SFX_FAR_SR : SFX_FAR_AR;
-    sfx_alloc(id, fr ? 1.25f : 0.46f);
-    // No sharp click: at 40 m the wavefront has been smeared by the air and by
-    // everything it reflected off on the way.
-    n = sfx_burst(0.05f, 1100.0f, 0.8f, 0.0010f, 0.010f, 1.1f, 0.40f);
-    sfx_lay(id, n, 0, 0.0f, 0);
-    n = sfx_burst(0.10f, fr ? 900.0f : 1250.0f, 1.1f, 0.00008f,
-                  fr ? 0.020f : 0.014f, 1.3f, 0.55f);
-    sfx_lay(id, n, 0, 0.0f, 0);                        // thinned crack
-    n = sfx_burst(0.26f, fr ? 150.0f : 210.0f, 0.9f, 0.0004f,
-                  fr ? 0.075f : 0.055f, 1.0f, 0.52f);
-    sfx_lay(id, n, 2, 0.0f, 2);                        // the "thump"
-    if (fr) {
-      n = sfx_sweep(0.34f, 410.0f, 115.0f, 0.050f, 0.090f, 1.15f, 0.42f);
-      sfx_lay(id, n, (int)(0.006f * SFX_HZ), -0.04f, 5);
-      static const float D[5] = {0.065f, 0.135f, 0.235f, 0.370f, 0.550f};
-      static const float G[5] = {0.24f, 0.18f, 0.13f, 0.09f, 0.055f};
-      sfx_reflect(id, (int)(0.16f * SFX_HZ), D, G, 5, 1100.0f);
-    } else {
-      static const float D[4] = {0.024f, 0.043f, 0.068f, 0.099f};
-      static const float G[4] = {0.12f, 0.09f, 0.055f, 0.035f};
-      sfx_reflect(id, (int)(0.12f * SFX_HZ), D, G, 4, 1400.0f);
-    }
-    // SR echoes share its falling body while the distance layer stays dark.
-    sfx_tail(id, (int)(0.018f * SFX_HZ), fr ? 0.90f : 0.30f,
-             fr ? 320.0f : 380.0f, 0.7f, 0.008f, fr ? 0.160f : 0.060f, 0.20f);
-    sfx_tail(id, (int)(0.026f * SFX_HZ), fr ? 0.65f : 0.25f,
-             fr ? 900.0f : 1150.0f, 0.8f, 0.010f, fr ? 0.095f : 0.040f, 0.18f);
-    if (fr) sfx_verb(id, (int)(0.18f * SFX_HZ), 0.026f, 0.056f, 0.62f,
-                     1100.0f, 0.10f);
-    sfx_finish(id, 0.92f, 0.0876f, 0.30f);
-  }
-}
-
 static void sfx_build_confirms(void) {
-  int n;  // sfx_alloc reseeds g_rng_sfx per sound id — no global seed here
 
   // ---- The four confirmations --------------------------------------------
   // Two axes, three recipes, four buffers. See THE CONFIRMATION MATRIX above
@@ -729,150 +567,181 @@ static void sfx_build_confirms(void) {
   sfx_room_kill(SFX_KILL_HEAD);
   sfx_finish(SFX_KILL_HEAD, 0.96f, 0.3120f, 0.30f);
 
-  // ---- Taking a round ----------------------------------------------------
-  // Deliberately dark and dull: it must never be mistaken for your own hitmarker, which
-  // is the mistake the old build made by replaying the hit tick at 0.62x rate.
-  sfx_alloc(SFX_HURT, 0.30f);
-  n = sfx_click(0.004f, 0.00060f, 300.0f, 0.60f);
-  sfx_lay(SFX_HURT, n, 0, 0.0f, 0);
-  n = sfx_burst(0.16f, 380.0f, 0.9f, 0.00020f, 0.055f, 1.2f, 1.05f);
-  sfx_lay(SFX_HURT, n, 0, 0.0f, 3);
-  n = sfx_burst(0.12f, 900.0f, 1.1f, 0.00008f, 0.028f, 1.3f, 0.55f);
-  sfx_lay(SFX_HURT, n, 0, 0.0f, 2);   // enough edge to survive a laptop
-  n = sfx_sweep(0.26f, 145.0f, 52.0f, 0.030f, 0.075f, 1.0f, 0.62f);
-  sfx_lay(SFX_HURT, n, 0, 0.0f, 0);
-  sfx_tail(SFX_HURT, (int)(0.006f * SFX_HZ), 0.26f, 260.0f, 0.7f,
-           0.012f, 0.075f, 0.30f);
-  sfx_finish(SFX_HURT, 0.90f, 0.0663f, 0.30f);
 }
 
-static void sfx_build_world(void) {
-  int n;  // sfx_alloc reseeds g_rng_sfx per sound id — no global seed here
-
-  // ---- A round arriving in the world -------------------------------------
-  sfx_alloc(SFX_IMPACT, 0.26f);
-  n = sfx_click(0.003f, 0.00035f, 2800.0f, 0.80f);
-  sfx_lay(SFX_IMPACT, n, 0, 0.0f, 0);
-  n = sfx_burst(0.09f, 3100.0f, 1.3f, 0.00004f, 0.014f, 1.6f, 0.70f);
-  sfx_lay(SFX_IMPACT, n, 0, 0.0f, 1);                  // stone chip
-  n = sfx_burst(0.14f, 520.0f, 1.0f, 0.00012f, 0.038f, 1.2f, 0.60f);
-  sfx_lay(SFX_IMPACT, n, 1, 0.0f, 2);
-  n = sfx_burst(0.20f, 130.0f, 0.9f, 0.00030f, 0.055f, 1.0f, 0.45f);
-  sfx_lay(SFX_IMPACT, n, 2, 0.0f, 3);                  // dust thump
-  sfx_tail(SFX_IMPACT, (int)(0.005f * SFX_HZ), 0.12f, 900.0f, 0.8f,
-           0.004f, 0.025f, 0.14f);
-  sfx_finish(SFX_IMPACT, 0.85f, 0.0940f, 0.30f);
-
-  // ---- ...and a round arriving in a MAN -----------------------------------
-  // A ROUND LANDING IN A BODY WAS SILENT IN THE WORLD WHILE A ROUND LANDING IN A WALL
-  // WAS NOT: aimed at a bot, sfxlog routed the shot and the player's own screen-space
-  // confirmation and nothing else, so a bot shooting another bot five metres in front
-  // of you produced a muzzle report and silence at the target.
-  sfx_alloc(SFX_FLESH, 0.22f);
-  n = sfx_click(0.0025f, 0.00030f, 1400.0f, 1.10f);
-  sfx_lay(SFX_FLESH, n, 0, 0.0f, 0);                   // the arrival
-  n = sfx_burst(0.075f, 1900.0f, 1.2f, 0.00004f, 0.016f, 1.4f, 2.20f);
-  sfx_lay(SFX_FLESH, n, 0, 0.0f, 1);                   // the slap
-  n = sfx_burst(0.13f, 620.0f, 1.0f, 0.00010f, 0.034f, 1.2f, 1.55f);
-  sfx_lay(SFX_FLESH, n, (int)(0.002f * SFX_HZ), 0.0f, 2);  // the meat
-  n = sfx_burst(0.17f, 190.0f, 0.9f, 0.00025f, 0.050f, 1.0f, 0.80f);
-  sfx_lay(SFX_FLESH, n, (int)(0.008f * SFX_HZ), 0.0f, 3);  // the thump
-  // Per-event reflections, in the reload's idiom rather than a global verb: what
-  // comes back off a body hit at 8 m is the nearest wall, not the whole arena.
-  {
-    static const float D[2] = {0.032f, 0.086f};
-    static const float G[2] = {0.06f, 0.03f};
-    sfx_reflect(SFX_FLESH, (int)(0.07f * SFX_HZ), D, G, 2, 1100.0f);
+// Broad pressure bands and irregular material clouds define the chosen weapon
+// family. Every excitation comes from the sound-ID stream at startup.
+static int sfx_weapon_noise(float sec, float lo, float hi, float atk,
+                            float decay, float amp, float rough) {
+  int n = (int)(sec * SFX_HZ);
+  if (n > SFX_SCRATCH) n = SFX_SCRATCH;
+  op_t low = {0}, upper = {0}, high = {0}, color = {0};
+  double energy = 0;
+  for (int i = -4096; i < n; i++) {
+    float noise = rng_rangef(&g_rng_sfx, -1.0f, 1.0f);
+    float x = op_hp(&high, op_lp(&upper, op_lp(&low, noise, hi), hi), lo);
+    if (rough > 0.0f)
+      x = op_lp(&color, tanhf(x * rough + 0.24f) - tanhf(0.24f), hi);
+    if (i >= 0) { g_scr[i] = x; energy += (double)x * x; }
   }
-  sfx_finish(SFX_FLESH, 0.86f, 0.0700f, 0.30f);
-
-  // ---- One going past your head -------------------------------------------
-  // A supersonic round's bow wave: a very short, very bright band that sweeps DOWN as
-  // it passes and pans across.
-  sfx_alloc(SFX_WHIZZ, 0.22f);
-  n = sfx_click(0.0025f, 0.00022f, 3600.0f, 3.40f);
-  sfx_lay(SFX_WHIZZ, n, 0, 0.0f, 0);                   // the pressure step
-  // AN N-WAVE HAS TWO SHOCKS. The bow and the tail of the pressure profile are
-  // ~1.3 ms apart at rifle calibre, and the ear fuses the pair into one snap
-  // that is distinctly NASTIER than either click alone — the double-shock is
-  // most of why a real near miss sounds like a whip and a synthetic one like a
-  // camera flash.
-  n = sfx_click(0.0022f, 0.00020f, 2900.0f, 2.10f);
-  sfx_lay(SFX_WHIZZ, n, (int)(0.0013f * SFX_HZ), 0.0f, 0);   // the tail shock
-  // ...and the AIR ITSELF gets punched: a short 175 Hz thump under the snap.
-  // Threat lives down here, not in the treble — and it is deliberately small,
-  // because sfx_finish charges the whole buffer for every dB of low end.
-  n = sfx_burst(0.050f, 175.0f, 1.0f, 0.00010f, 0.016f, 1.1f, 0.80f);
-  sfx_lay(SFX_WHIZZ, n, (int)(0.002f * SFX_HZ), 0.0f, 1);    // the air punch
-  // KNOWN EXCEPTION to "every generator ends in scr_norm": this wake sweep writes
-  // filtered noise straight into the buffer at a hard 3.0, so its level rides the
-  // filter's response instead of a normalised peak.
-  for (int c = 0; c < 2; c++) {
-    int m = (int)(0.16f * SFX_HZ);
-    svf_t f1 = {0, 0};
-    float *b = g_sfx_buf[SFX_WHIZZ];
-    for (int i = 0; i < m; i++) {
-      float t = (float)i / SFX_HZ;
-      float hz = 5200.0f * expf(-t / 0.018f) + 700.0f;
-      float x = svf(&f1, rng_rangef(&g_rng_sfx, -1, 1), hz, 2.2f);
-      b[i * SFX_CH + c] += x * sfx_env(t, 0.0006f, 0.024f, 1.3f) * 3.0f;
-    }
+  float gain = amp / ((float)sqrt(energy / n) + 1e-9f);
+  for (int i = 0; i < n; i++) {
+    float t = (float)i / SFX_HZ;
+    g_scr[i] *= gain * (1.0f - expf(-t / atk)) * expf(-t / decay);
   }
-  // 1.50, and the number is a sweep rather than the 1.7-2.3 rule of thumb this file
-  // quotes for a mid burst that has to be heard UNDER something else.
-  n = sfx_burst(0.055f, 640.0f, 1.2f, 0.00004f, 0.014f, 1.3f, 1.50f);
-  sfx_lay(SFX_WHIZZ, n, (int)(0.005f * SFX_HZ), 0.0f, 2);   // the body
-  // THE ZIP: turbulence in the wake, darker and longer than the bow sweep — the
-  // angry-bee tail that says the round kept going somewhere behind you. 12-15 dB
-  // under the crack it follows, or the whole event turns into a cartoon ricochet.
-  {
-    int m = (int)(0.14f * SFX_HZ);
-    for (int c = 0; c < 2; c++) {
-      svf_t f2 = {0, 0};
-      float *b = g_sfx_buf[SFX_WHIZZ];
-      for (int i = 0; i < m; i++) {
-        float t = (float)i / SFX_HZ;
-        float hz = 980.0f * expf(-t / 0.075f) + 430.0f;
-        float x = svf(&f2, rng_rangef(&g_rng_sfx, -1, 1), hz, 1.6f);
-        b[(i + (int)(0.008f * SFX_HZ)) * SFX_CH + c] +=
-            x * sfx_env(t, 0.004f, 0.055f, 1.2f) * 0.55f;
-      }
-    }
-  }
-  sfx_finish(SFX_WHIZZ, 0.86f, 0.0896f, 0.30f);
-
-  // ---- a boot landing ------------------------------------------------------
-  // Short, dry and quiet.
-  sfx_alloc(SFX_STEP, 0.16f);
-  // The two bright layers are generated PER CHANNEL from independent noise, not laid
-  // once and offset by a sample or two.
-  for (int c = 0; c < 2; c++) {
-    float *b = g_sfx_buf[SFX_STEP];
-    n = sfx_burst(0.05f, 2400.0f, 0.9f, 0.00008f, 0.016f, 1.5f, 2.20f);
-    for (int i = 0; i < n; i++) b[i * SFX_CH + c] += g_scr[i];
-    n = sfx_burst(0.04f, 5200.0f, 1.4f, 0.00005f, 0.006f, 1.6f, 1.40f);
-    for (int i = 0; i < n; i++) b[(i + 1) * SFX_CH + c] += g_scr[i];
-  }
-  n = sfx_burst(0.10f, 620.0f, 0.8f, 0.00020f, 0.022f, 1.3f, 0.75f);
-  sfx_lay(SFX_STEP, n, 0, 0.0f, 2);                    // sole
-  n = sfx_burst(0.13f, 135.0f, 0.9f, 0.00040f, 0.034f, 1.1f, 0.62f);
-  sfx_lay(SFX_STEP, n, 1, 0.0f, 3);                    // weight
-  // Low short texture follows the boot body without a long fixed room.
-  {
-    static const float D[2] = {0.022f, 0.062f};
-    static const float G[2] = {0.07f, 0.035f};
-    sfx_reflect(SFX_STEP, (int)(0.05f * SFX_HZ), D, G, 2, 1400.0f);
-  }
-  sfx_finish(SFX_STEP, 0.70f, 0.0477f, 0.30f);
+  return n;
 }
 
+static void sfx_weapon_front(int id, float width, float gain) {
+  op_t high = {0}, low = {0};
+  int n = (int)(0.070f * SFX_HZ);
+  for (int i = 0; i < n; i++) {
+    float t = (float)i / SFX_HZ;
+    float x = (expf(-t / width) - 0.28f * expf(-t / (3.8f * width)))
+            * (1.0f - expf(-t / 0.000025f));
+    g_scr[i] = op_hp(&high, op_lp(&low, x, 9500.0f), 24.0f) * gain;
+  }
+  sfx_lay(id, n, 0, 0.0f, 0);
+}
+
+// Source level and runtime bus gain are separate. This stage sets the authored
+// source energy, with a peak ceiling and short silent boundaries for cancellation.
+static void sfx_weapon_finish(int id, float target, float window, float peak) {
+  float *buf = g_sfx_buf[id];
+  int n = g_sfx_len[id], count = n;
+  if (window > 0.0f && window * SFX_HZ < n) count = (int)(window * SFX_HZ);
+  double energy = 0;
+  op_t dc[SFX_CH] = {0}, top[SFX_CH] = {0}, upper[SFX_CH] = {0};
+  bool distant = id == SFX_FAR_AR || id == SFX_FAR_SR;
+  for (int i = 0; i < n; i++) {
+    float edge = f_clamp((float)i / 16.0f, 0.0f, 1.0f)
+               * f_clamp((float)(n - 1 - i) / 480.0f, 0.0f, 1.0f);
+    for (int c = 0; c < SFX_CH; c++) {
+      int at = i * SFX_CH + c;
+      float x = op_hp(&dc[c], buf[at], 24.0f);
+      if (distant) x = op_lp(&upper[c], op_lp(&top[c], x, 2900.0f), 2900.0f);
+      buf[at] = x * edge;
+      if (i < count) energy += (double)buf[at] * buf[at];
+    }
+  }
+  float gain = target / ((float)sqrt(energy / (count * SFX_CH)) + 1e-9f);
+  float max_sample = 1e-9f;
+  for (int i = 0; i < n * SFX_CH; i++) {
+    buf[i] *= gain;
+    max_sample = fmaxf(max_sample, fabsf(buf[i]));
+  }
+  if (max_sample > peak)
+    for (int i = 0; i < n * SFX_CH; i++) buf[i] *= peak / max_sample;
+}
+
+static void sfx_build_shots(void) {
+  // Kontur: compact fracture over the rolling Donnerkino body. Clouds overlap
+  // continuously; none replays the muzzle attack as a second report.
+  int id = SFX_FIRE_AR, n;
+  sfx_alloc_frames(id, 33600);
+  sfx_weapon_front(id, 0.0010f, 2.4f);
+  n = sfx_weapon_noise(0.10f, 1800, 7800, 0.000035f, 0.0052f, 1.65f, 0);
+  sfx_lay(id, n, 0, 0, 0);
+  n = sfx_weapon_noise(0.34f, 160, 2200, 0.0006f, 0.056f, 1.45f, 3.2f);
+  sfx_lay(id, n, 0, 0, 2);
+  n = sfx_weapon_noise(0.45f, 48, 330, 0.0013f, 0.079f, 0.87f, 1.8f);
+  sfx_lay(id, n, 0, 0, 0);
+  n = sfx_weapon_noise(0.46f, 430, 3400, 0.011f, 0.073f, 0.42f, 0);
+  sfx_lay(id, n, (int)(0.007f * SFX_HZ), 0, 3);
+  n = sfx_weapon_noise(0.55f, 120, 1350, 0.011f, 0.126f, 0.46f, 2.0f);
+  sfx_lay(id, n, (int)(0.018f * SFX_HZ), 0, 4);
+  sfx_tail(id, (int)(0.028f * SFX_HZ), 0.60f, 490, 0.65f, 0.016f, 0.13f, 0.31f);
+  sfx_verb(id, (int)(0.20f * SFX_HZ), 0.009f, 0.019f, 0.48f, 1900, 0.12f);
+  sfx_weapon_finish(id, 0.1074f, 0.30f, 0.90f);
+
+  // Klare Entladung: a clear broadband tear and sustained middle pressure,
+  // with the low diffuse shape of the selected Tiefdruck/Raum ancestry.
+  id = SFX_FIRE_SR;
+  sfx_alloc_frames(id, 49440);
+  sfx_weapon_front(id, 0.00207f, 2.8f);
+  n = sfx_weapon_noise(0.12f, 1450, 7900, 0.000035f, 0.0082f, 2.20f, 0);
+  sfx_lay(id, n, 0, 0, 0);
+  n = sfx_weapon_noise(0.52f, 180, 1800, 0.0009f, 0.115f, 1.20f, 5.0f);
+  sfx_lay(id, n, 0, 0, 1);
+  n = sfx_weapon_noise(0.33f, 800, 3600, 0.0007f, 0.058f, 0.78f, 1.3f);
+  sfx_lay(id, n, 0, 0, 0);
+  n = sfx_weapon_noise(0.58f, 36, 260, 0.0020f, 0.126f, 0.77f, 2.0f);
+  sfx_lay(id, n, (int)(0.003f * SFX_HZ), 0, 0);
+  n = sfx_weapon_noise(0.48f, 150, 950, 0.018f, 0.077f, 0.38f, 1.8f);
+  sfx_lay(id, n, (int)(0.027f * SFX_HZ), 0, 3);
+  sfx_tail(id, (int)(0.038f * SFX_HZ), 0.90f, 710, 0.70f, 0.023f, 0.105f, 0.32f);
+  sfx_verb(id, (int)(0.28f * SFX_HZ), 0.014f, 0.024f, 0.55f, 1450, 0.14f);
+  sfx_weapon_finish(id, 0.0899f, 0.30f, 0.90f);
+
+  // Offener Kern: distance softens the fracture, while an open 450–2600 Hz
+  // pressure band keeps the automatic rhythm distinct through the mix.
+  id = SFX_FAR_AR;
+  sfx_alloc_frames(id, 26698);
+  sfx_weapon_front(id, 0.0014f, 1.4f);
+  n = sfx_weapon_noise(0.09f, 850, 4300, 0.0001f, 0.008f, 0.78f, 0);
+  sfx_lay(id, n, 0, 0, 0);
+  n = sfx_weapon_noise(0.44f, 180, 1550, 0.0009f, 0.095f, 1.12f, 4.5f);
+  sfx_lay(id, n, 0, 0, 2);
+  n = sfx_weapon_noise(0.48f, 47, 330, 0.0012f, 0.094f, 1.55f, 2.2f);
+  sfx_lay(id, n, 0, 0, 1);
+  sfx_tail(id, (int)(0.019f * SFX_HZ), 0.50f, 730, 0.70f, 0.018f, 0.090f, 1.60f);
+  sfx_verb(id, (int)(0.23f * SFX_HZ), 0.012f, 0.025f, 0.46f, 1250, 0.20f);
+  sfx_weapon_finish(id, 0.1422f, 0.30f, 0.88f);
+
+  // Donnerkino: the distant sniper unfolds into several independently excited
+  // low clouds and a diffuse, dark tail instead of a pitched descending sweep.
+  id = SFX_FAR_SR;
+  sfx_alloc_frames(id, 72182);
+  sfx_weapon_front(id, 0.00163f, 2.4f);
+  n = sfx_weapon_noise(0.15f, 650, 3000, 0.00012f, 0.0130f, 1.10f, 0);
+  sfx_lay(id, n, 0, 0, 1);
+  n = sfx_weapon_noise(0.55f, 180, 1250, 0.0006f, 0.0848f, 1.30f, 0);
+  sfx_lay(id, n, 0, 0, 2);
+  n = sfx_weapon_noise(0.72f, 29, 310, 0.0013f, 0.143f, 0.79f, 0);
+  sfx_lay(id, n, 0, 0, 2);
+  static const float cloud[][5] = {
+    {0.0114f, 430, 2900, 0.119f, 0.504f},
+    {0.0293f, 120, 1350, 0.205f, 0.552f},
+    {0.0717f, 53, 720, 0.277f, 0.52f},
+    {0.1483f, 75, 440, 0.334f, 0.40f},
+  };
+  for (int i = 0; i < 4; i++) {
+    n = sfx_weapon_noise(1.34f, cloud[i][1], cloud[i][2], 0.018f,
+                         cloud[i][3], cloud[i][4], 1.8f);
+    sfx_lay(id, n, (int)(cloud[i][0] * SFX_HZ), 0, 4 + 3 * i);
+  }
+  sfx_tail(id, (int)(0.035f * SFX_HZ), 1.42f, 510, 0.70f, 0.045f, 0.36f, 0.95f);
+  sfx_verb(id, (int)(0.45f * SFX_HZ), 0.021f, 0.036f, 1.05f, 1250, 0.38f);
+  sfx_weapon_finish(id, 0.1453f, 0.30f, 0.88f);
+}
+
+// Existing synthesized contact material supplies the added weight. A short
+// low-mid band and gentle saturation fill each part without introducing a ring.
+static void sfx_mech_material(int id, const float *events, int count, float target) {
+  float *buf = g_sfx_buf[id];
+  int frames = g_sfx_len[id];
+  op_t low[SFX_CH] = {0}, high[SFX_CH] = {0};
+  for (int i = 0; i < frames; i++) {
+    float t = (float)i / SFX_HZ, gate = 0;
+    for (int e = 0; e < count; e++) {
+      float age = t - events[e];
+      if (age >= 0.0f) gate += (1.0f - expf(-age / 0.00012f)) * expf(-age / 0.024f);
+    }
+    for (int c = 0; c < SFX_CH; c++) {
+      int at = i * SFX_CH + c;
+      float source = buf[at];
+      float body = op_hp(&high[c], op_lp(&low[c], source, 1450.0f), 85.0f);
+      buf[at] = source + (tanhf(body * 7.0f + 0.24f) - tanhf(0.24f)) * gate * 0.23f;
+    }
+  }
+  sfx_weapon_finish(id, target, 0, id == SFX_DRY ? 0.72f : 0.88f);
+}
+
+// Mechanical landmarks share the animation timing. The selected original
+// sniper reload retains its complete procedural generator sequence.
 static void sfx_build_mech(void) {
-  int n;  // sfx_alloc reseeds g_rng_sfx per sound id — no global seed here
+  int n;
 
-  // ---- dry fire and reload -------------------------------------------------
-  // A hammer falling on an empty chamber is a CLACK WITH WEIGHT. The rewrite turned it
-  // into nearly pure click — the 80-250 Hz share fell from 82% to 5% — which reads as a
-  // UI tick rather than as a mechanism.
   sfx_alloc(SFX_DRY, 0.12f);
   sfx_clack(SFX_DRY, 0, 2600.0f, 0.55f);
   n = sfx_burst(0.05f, 4200.0f, 1.6f, 0.00003f, 0.006f, 1.5f, 0.30f);
@@ -883,93 +752,69 @@ static void sfx_build_mech(void) {
   sfx_lay(SFX_DRY, n, 1, 0.0f, 1);
   sfx_finish(SFX_DRY, 0.62f, 0.0374f, 0.30f);
 
-  // RELOADS ARE PER WEAPON AND TIMED FROM reload_ticks.
   {
     const float hz = (float)TICK_HZ;
     float t_ar = (float)wpn_reload_ticks(WPN_AR, 0) / hz;
-    // FIVE events, not four.
+
     sfx_alloc(SFX_RELOAD_AR, t_ar + 0.22f);
     sfx_mech(SFX_RELOAD_AR, (int)(0.055f * t_ar * SFX_HZ), 1900.0f, 240.0f,
-             0.42f, 0.10f);                              // mag release button
-    // ...and the catch snapping back 14 ms later: a button is TWO clicks — in
-    // and out — and one click reads as UI where a click-clack reads as a part.
+             0.42f, 0.10f);
+
     n = sfx_click(0.0030f, 0.00020f, 3300.0f, 0.30f);
     sfx_lay(SFX_RELOAD_AR, n, (int)(0.055f * t_ar * SFX_HZ + 0.014f * SFX_HZ),
             0.0f, 0);
     sfx_mech(SFX_RELOAD_AR, (int)(0.175f * t_ar * SFX_HZ), 950.0f, 190.0f,
-             0.54f, 0.55f);                              // magazine falls free
+             0.54f, 0.55f);
     sfx_mech(SFX_RELOAD_AR, (int)(0.360f * t_ar * SFX_HZ), 760.0f, 150.0f,
-             0.34f, 0.30f);                              // fresh mag to the well
-    // 820, not 1150: a magazine body going into an alloy well is not a 1.1 kHz
-    // ping, and at 1150 the event's LOUDEST band was 700 Hz-2 kHz with the meat
-    // 3.3 dB under it. 98, not 122: the ring's fundamental has to land INSIDE
-    // the 20-120 Hz band rather than 2 Hz above it — this file's own note says
-    // a ~104 Hz ring at amp 0.30 is enough to be FELT, and the whole reload
-    // measured -43.5 dB at 20-120 Hz against the gunshot's -22.3.
+             0.34f, 0.30f);
+
     sfx_mech(SFX_RELOAD_AR, (int)(RELOAD_BEAT[WPN_AR][0] * t_ar * SFX_HZ), 820.0f, 98.0f,
-             0.94f, 0.22f);                              // THE SEAT
-    // ...WITH REAL SUB UNDER IT. The whole buffer measured 0% share below
-    // 120 Hz — the 98 Hz mass ring inside sfx_mech is one partial at 0.13 of
-    // the event and it vanishes against the mid. A 63 Hz ring at +7 ms is the
-    // slam FELT in the wrists; deliberately moderate, because sfx_finish's
-    // A-weighted gain stage charges the whole buffer for every dB spent here.
+             0.94f, 0.22f);
+
     n = sfx_ring(0.110f, 63.0f, 96.0f, 0.026f, 0.20f);
     sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][0] * t_ar * SFX_HZ
                                     + 0.007f * SFX_HZ), 0.0f, 0);
-    n = sfx_click(0.0025f, 0.00018f, 2100.0f, 0.36f);    // ...and the SNAP on top
+    n = sfx_click(0.0025f, 0.00018f, 2100.0f, 0.36f);
     sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][0] * t_ar * SFX_HZ),
             0.0f, 0);
-    // The bolt has to STAY the loudest event, and that is a contract rather than a
-    // preference: `eng` — the energy peak — is the moment the sound says A LIVE WEAPON,
-    // and it is the one thing in this sound the player acts on.
+
     sfx_mech(SFX_RELOAD_AR, (int)(RELOAD_BEAT[WPN_AR][1] * t_ar * SFX_HZ), 2100.0f, 235.0f,
-             1.82f, 0.14f);                              // bolt release
-    // The bolt slamming into battery is the heaviest metal-on-metal contact in
-    // the whole mechanism, so it gets MORE weight than the seat (which also
-    // keeps `eng` on this event, the buffer's contract): a 116 Hz chunk at
-    // +6 ms and the buffer/spring SHRING of the carrier running its rails.
+             2.12f, 0.14f);
+
     n = sfx_ring(0.135f, 116.0f, 176.0f, 0.030f, 0.52f);
     sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][1] * t_ar * SFX_HZ
                                     + 0.006f * SFX_HZ), 0.0f, 0);
     n = sfx_burst(0.070f, 3600.0f, 1.6f, 0.00005f, 0.020f, 1.5f, 0.40f);
     sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][1] * t_ar * SFX_HZ
                                     + 0.003f * SFX_HZ), 0.06f, 1);
-    // A SIXTH EVENT, and it fills the largest hole in the sound: between the magazine
-    // seating and the bolt going home there were 386 ms of sample-exact silence in one
-    // block — the mechanism stopped existing for a third of a second, in exactly the
-    // window where the ANIMATION also goes static.
+
     sfx_bed(SFX_RELOAD_AR, (int)(0.235f * t_ar * SFX_HZ), 0.130f, 2600.0f, 0.14f, 7);
     sfx_bed(SFX_RELOAD_AR, (int)(0.400f * t_ar * SFX_HZ), 0.150f, 2300.0f, 0.16f, 5);
     sfx_bed(SFX_RELOAD_AR, (int)(0.600f * t_ar * SFX_HZ), 0.140f, 1750.0f, 0.13f, 9);
     sfx_bed(SFX_RELOAD_AR, (int)(0.680f * t_ar * SFX_HZ), 0.110f, 2900.0f, 0.10f, 3);
     sfx_mech(SFX_RELOAD_AR, (int)(0.760f * t_ar * SFX_HZ), 620.0f, 165.0f,
-             0.30f, 0.0f);                               // hand to the handle
+             0.30f, 0.0f);
     n = sfx_burst(0.10f, 2600.0f, 1.4f, 0.00004f, 0.012f, 1.4f, 0.66f);
     sfx_lay(SFX_RELOAD_AR, n, (int)(RELOAD_BEAT[WPN_AR][1] * t_ar * SFX_HZ), 0.10f, 2);
-    // ...AND THE TACTICAL VARIANT, which is the same mechanism with the one event that
-    // cannot have happened removed.
+
     {
       float t_tac = (float)wpn_reload_ticks(WPN_AR, 1) / hz;
       sfx_alloc(SFX_RELOAD_AR_TAC, t_tac + 0.22f);
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(0.055f * t_tac * SFX_HZ), 1900.0f, 240.0f,
-               0.42f, 0.10f);                            // mag release button
-      n = sfx_click(0.0030f, 0.00020f, 3300.0f, 0.30f);  // the catch, see above
+               0.42f, 0.10f);
+      n = sfx_click(0.0030f, 0.00020f, 3300.0f, 0.30f);
       sfx_lay(SFX_RELOAD_AR_TAC, n, (int)(0.055f * t_tac * SFX_HZ
                                           + 0.014f * SFX_HZ), 0.0f, 0);
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(0.185f * t_tac * SFX_HZ), 950.0f, 190.0f,
-               0.54f, 0.55f);                            // magazine falls free
+               0.54f, 0.55f);
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(0.400f * t_tac * SFX_HZ), 760.0f, 150.0f,
-               0.34f, 0.30f);                            // fresh mag to the well
+               0.34f, 0.30f);
       sfx_bed(SFX_RELOAD_AR_TAC, (int)(0.260f * t_tac * SFX_HZ), 0.130f, 2600.0f, 0.14f, 7);
       sfx_bed(SFX_RELOAD_AR_TAC, (int)(0.450f * t_tac * SFX_HZ), 0.150f, 2300.0f, 0.16f, 5);
-      // THE SEAT IS THE LAST EVENT HERE, so it is also the one `atk`/`eng` must land on
-      // — the same contract the empty reload puts on its bolt, moved to whichever event
-      // actually ends the mechanism.
+
       sfx_mech(SFX_RELOAD_AR_TAC, (int)(RELOAD_SEAT_TAC * t_tac * SFX_HZ), 820.0f, 98.0f,
-               1.55f, 0.22f);                            // THE SEAT
-      // The last event of THIS reload, so it carries the bolt-class weight the
-      // empty reload spends on its bolt: sub chunk plus snap, sized a notch
-      // above the empty seat's.
+               1.55f, 0.22f);
+
       n = sfx_ring(0.150f, 63.0f, 96.0f, 0.034f, 0.38f);
       sfx_lay(SFX_RELOAD_AR_TAC, n, (int)(RELOAD_SEAT_TAC * t_tac * SFX_HZ
                                           + 0.007f * SFX_HZ), 0.0f, 0);
@@ -979,51 +824,40 @@ static void sfx_build_mech(void) {
                0.12f, 3000.0f, 0.06f);
       sfx_finish(SFX_RELOAD_AR_TAC, 0.93f, 0.1050f, 0.30f);
     }
-  // Quiet short texture leaves gaps between the shared mechanical milestones.
+
   sfx_verb(SFX_RELOAD_AR, g_sfx_len[SFX_RELOAD_AR], 0.006f, 0.022f, 0.12f,
            3000.0f, 0.06f);
   sfx_finish(SFX_RELOAD_AR, 0.88f, 0.1320f, 0.0f);
 
-    // THE SNIPER CHANGES A MAGAZINE TOO. This used to be a five-round stripper load —
-    // bolt lift, five rounds pressed in one at a time, bolt forward and down — and the
-    // whole of it was audio for an animation that did not exist: the viewmodel just
-    // rolled the rifle over for 1.8 seconds with nothing moving on it.
     float t_sr = (float)wpn_reload_ticks(WPN_SR, 0) / hz;
     sfx_alloc(SFX_RELOAD_SR, t_sr + 0.22f);
     sfx_mech(SFX_RELOAD_SR, (int)(0.050f * t_sr * SFX_HZ), 1620.0f, 210.0f,
-             0.46f, 0.10f);                              // paddle release
+             0.46f, 0.10f);
     sfx_mech(SFX_RELOAD_SR, (int)(0.185f * t_sr * SFX_HZ), 840.0f, 160.0f,
-             0.60f, 0.55f);                              // the box falls free
+             0.60f, 0.55f);
     sfx_mech(SFX_RELOAD_SR, (int)(0.380f * t_sr * SFX_HZ), 700.0f, 132.0f,
-             0.36f, 0.30f);                              // fresh box to the well
-    // THE SEAT. 92 Hz rather than the AR's 98: a ten-round .308 box is heavier
-    // than a STANAG and it lands in a chassis rather than in an alloy lower.
+             0.36f, 0.30f);
+
     sfx_mech(SFX_RELOAD_SR, (int)(RELOAD_BEAT[WPN_SR][0] * t_sr * SFX_HZ), 760.0f, 92.0f,
              0.84f, 0.24f);
-    // Sub under the seat, the AR's argument at the SR's own pitch: a ten-round
-    // .308 box is the heavier magazine, so the ring sits at 58 Hz.
+
     n = sfx_ring(0.160f, 58.0f, 90.0f, 0.036f, 0.34f);
     sfx_lay(SFX_RELOAD_SR, n, (int)(RELOAD_BEAT[WPN_SR][0] * t_sr * SFX_HZ
                                     + 0.007f * SFX_HZ), 0.0f, 0);
-    // The hand leaving the grip for the knob, in the window where the animation is
-    // travel rather than a struck part — the same hole the AR's sixth event fills, at
-    // the same level relative to the seat.
+
     sfx_bed(SFX_RELOAD_SR, (int)(0.250f * t_sr * SFX_HZ), 0.190f, 2100.0f, 0.17f, 6);
     sfx_bed(SFX_RELOAD_SR, (int)(0.450f * t_sr * SFX_HZ), 0.150f, 1600.0f, 0.14f, 11);
     sfx_bed(SFX_RELOAD_SR, (int)(0.620f * t_sr * SFX_HZ), 0.130f, 2600.0f, 0.11f, 4);
     sfx_mech(SFX_RELOAD_SR, (int)(0.700f * t_sr * SFX_HZ), 600.0f, 150.0f,
-             0.30f, 0.0f);                               // hand to the bolt
+             0.30f, 0.0f);
     sfx_mech(SFX_RELOAD_SR, (int)(0.790f * t_sr * SFX_HZ), 1150.0f, 176.0f,
-             0.52f, 0.20f);                              // bolt lift + draw
-    // BOLT DOWN AND LOCKED stays the loudest event in the buffer, because `eng`
-    // — the energy peak — is the moment the sound says A LIVE WEAPON, and on
-    // this weapon that moment is the bolt handle, not the magazine.
+             0.52f, 0.20f);
+
     sfx_mech(SFX_RELOAD_SR, (int)(RELOAD_BEAT[WPN_SR][1] * t_sr * SFX_HZ), 1900.0f, 205.0f,
              1.78f, 0.15f);
     n = sfx_burst(0.10f, 2300.0f, 1.4f, 0.00004f, 0.013f, 1.4f, 0.62f);
     sfx_lay(SFX_RELOAD_SR, n, (int)(RELOAD_BEAT[WPN_SR][1] * t_sr * SFX_HZ), -0.08f, 2);
-    // Bolt down and LOCKED gets the heaviest chunk in the buffer — camming a
-    // .338 action shut is a bank-vault move, and `eng` lives here anyway.
+
     n = sfx_ring(0.145f, 108.0f, 168.0f, 0.032f, 0.44f);
     sfx_lay(SFX_RELOAD_SR, n, (int)(RELOAD_BEAT[WPN_SR][1] * t_sr * SFX_HZ
                                     + 0.006f * SFX_HZ), 0.0f, 0);
@@ -1034,53 +868,345 @@ static void sfx_build_mech(void) {
            3000.0f, 0.06f);
   sfx_finish(SFX_RELOAD_SR, 0.88f, 0.1210f, 0.0f);
   }
+
+  float t_ar = (float)wpn_reload_ticks(WPN_AR, 0) / TICK_HZ;
+  float t_tac = (float)wpn_reload_ticks(WPN_AR, 1) / TICK_HZ;
+  const float ar_events[] = {0.055f * t_ar, 0.175f * t_ar, 0.360f * t_ar,
+    RELOAD_BEAT[WPN_AR][0] * t_ar, 0.760f * t_ar, RELOAD_BEAT[WPN_AR][1] * t_ar};
+  const float tac_events[] = {0.055f * t_tac, 0.185f * t_tac,
+    0.400f * t_tac, RELOAD_SEAT_TAC * t_tac};
+  const float hammer[] = {0.0f};
+  sfx_mech_material(SFX_RELOAD_AR, ar_events, 6, 0.0592f);
+  sfx_mech_material(SFX_RELOAD_AR_TAC, tac_events, 4, 0.0980f);
+  sfx_mech_material(SFX_DRY, hammer, 1, 0.1380f);
 }
 
-// Weather buffers use their own sound-ID streams. Broad stereo rain and
-// gusts have overlapping fades; thunder has a distant crack and several
-// slower arrivals through a low-pass air path.
+// Broad stochastic contact: two low-pass poles round the edge without a
+// resonant pitch. Each layer consumes only its sound's private noise stream.
+static int sfx_contact(float seconds, float lo, float hi, float attack,
+                       float decay, float amp) {
+  int n = (int)(seconds * SFX_HZ);
+  if (n > SFX_SCRATCH) n = SFX_SCRATCH;
+  op_t high = {0}, low = {0}, round = {0};
+  for (int i = 0; i < n; i++) {
+    float t = (float)i / SFX_HZ;
+    float x = op_hp(&high, rng_rangef(&g_rng_sfx, -1, 1), lo);
+    x = op_lp(&round, op_lp(&low, x, hi), hi);
+    g_scr[i] = x * sfx_env(t, attack, decay, 1.0f);
+  }
+  return scr_norm(n, amp);
+}
+
+// Source level is independent of its route in the live mix. The eight-frame
+// entrance and ten-millisecond exit keep direct and repeated contacts quiet
+// at their buffer boundaries; only a linear safety gain limits the peak.
+static void sfx_world_finish(int id, float target, float peak, float window) {
+  float *dst = g_sfx_buf[id];
+  int frames = g_sfx_len[id];
+  int count = window > 0 ? (int)(window * SFX_HZ) : frames;
+  if (count > frames) count = frames;
+  int silence = id == SFX_IMPACT || id == SFX_FLESH || id == SFX_HURT
+             || id == SFX_WHIZZ || id == SFX_STEP ? 1024 : 0;
+  op_t dc[2] = {{0}};
+  double sum = 0;
+  float largest = 0;
+  for (int i = 0; i < frames; i++) {
+    float entry = f_clamp((float)i / 8.0f, 0, 1);
+    float exit = f_clamp((float)(frames - silence - 1 - i) / 480.0f, 0, 1);
+    for (int c = 0; c < SFX_CH; c++) {
+      float x = op_hp(&dc[c], dst[i * SFX_CH + c], 22.0f) * entry * exit;
+      dst[i * SFX_CH + c] = x;
+      if (i < count) sum += (double)x * (double)x;
+      largest = fmaxf(largest, fabsf(x));
+    }
+  }
+  float gain = target / ((float)sqrt(sum / (count * SFX_CH)) + 1e-9f);
+  gain = fminf(gain, peak / (largest + 1e-9f));
+  for (int i = 0; i < frames * SFX_CH; i++) dst[i] *= gain;
+}
+
+static void sfx_build_world(void) {
+  int n;
+
+  // Stone fracture, a broad compressed body, then scattered material settling.
+  sfx_alloc_frames(SFX_IMPACT, 16320);
+  n = sfx_contact(.030f, 900, 4300, .00025f, .004f, .54f);
+  sfx_lay(SFX_IMPACT, n, 0, 0, 1);
+  n = sfx_contact(.19f, 65, 770, .0007f, .036f, .75f);
+  sfx_lay(SFX_IMPACT, n, 144, 0, 2);
+  n = sfx_contact(.13f, 160, 1400, .001f, .023f, .29f);
+  sfx_lay(SFX_IMPACT, n, 528, 0, 1);
+  for (int k = 0; k < 18; k++) {
+    int at = (int)(rng_rangef(&g_rng_sfx, .018f, .11f) * SFX_HZ);
+    float gain = rng_rangef(&g_rng_sfx, .025f, .070f);
+    float pan = rng_rangef(&g_rng_sfx, -.24f, .24f);
+    n = sfx_contact(.027f, 650, 3300, .0015f, .006f, gain);
+    sfx_lay(SFX_IMPACT, n, at, pan, 3);
+  }
+  sfx_world_finish(SFX_IMPACT, .101f, .88f, .30f);
+
+  // A rounded cloth/slap edge and dense low-middle compression distinguish
+  // a body contact from the short, brighter screen-space confirmation.
+  sfx_alloc_frames(SFX_FLESH, 13440);
+  n = sfx_contact(.043f, 750, 3500, .0002f, .006f, .42f);
+  sfx_lay(SFX_FLESH, n, 0, 0, 0);
+  n = sfx_contact(.16f, 140, 1200, .0007f, .045f, .86f);
+  sfx_lay(SFX_FLESH, n, 48, 0, 0);
+  n = sfx_contact(.19f, 80, 430, .003f, .046f, .34f);
+  sfx_lay(SFX_FLESH, n, 240, 0, 0);
+  n = sfx_contact(.10f, 270, 1900, .009f, .024f, .18f);
+  sfx_lay(SFX_FLESH, n, 960, 0, 0);
+  sfx_world_finish(SFX_FLESH, .081f, .88f, .30f);
+
+  // Close incoming damage: a short dull contact followed by compressed cloth
+  // and body pressure. No confirmation pitch or additional room signature.
+  sfx_alloc_frames(SFX_HURT, 18720);
+  n = sfx_contact(.032f, 500, 2800, .0006f, .007f, .44f);
+  sfx_lay(SFX_HURT, n, 0, 0, 0);
+  n = sfx_contact(.23f, 65, 750, .0015f, .047f, .94f);
+  sfx_lay(SFX_HURT, n, 192, 0, 0);
+  n = sfx_contact(.15f, 320, 1600, .002f, .027f, .38f);
+  sfx_lay(SFX_HURT, n, 528, 0, 0);
+  n = sfx_contact(.25f, 75, 310, .008f, .052f, .28f);
+  sfx_lay(SFX_HURT, n, 960, 0, 0);
+  sfx_world_finish(SFX_HURT, .099f, .88f, .30f);
+
+  // The selected passage has a short approach and its hard shock at 48 ms.
+  // Dense middle-frequency pressure follows the crack; the wake clears fast.
+  sfx_alloc_frames(SFX_WHIZZ, 12000);
+  n = sfx_contact(.048f, 850, 3300, .035f, .09f, .028f);
+  sfx_lay(SFX_WHIZZ, n, 0, 0, 0);
+  n = sfx_contact(.022f, 1150, 6500, .00008f, .0021f, 1.0f);
+  sfx_lay(SFX_WHIZZ, n, 2304, 0, 0);
+  n = sfx_contact(.026f, 550, 3300, .0004f, .0047f, .75f);
+  sfx_lay(SFX_WHIZZ, n, 2352, 0, 0);
+  n = sfx_contact(.060f, 230, 1500, .001f, .010f, .30f);
+  sfx_lay(SFX_WHIZZ, n, 2496, 0, 0);
+  n = sfx_contact(.12f, 650, 2700, .003f, .016f, .11f);
+  sfx_lay(SFX_WHIZZ, n, 2688, 0, 0);
+  sfx_world_finish(SFX_WHIZZ, .057f, .89f, .30f);
+
+  // Soft heel compression and a separate forefoot load make the two contacts
+  // readable. The late rub is short and quiet, without a bright click layer.
+  sfx_alloc_frames(SFX_STEP, 20160);
+  n = sfx_contact(.11f, 170, 1350, .0014f, .018f, .49f);
+  sfx_lay(SFX_STEP, n, 0, 0, 2);
+  n = sfx_contact(.18f, 65, 740, .003f, .029f, .66f);
+  sfx_lay(SFX_STEP, n, 240, 0, 2);
+  n = sfx_contact(.12f, 140, 1050, .003f, .036f, .90f);
+  sfx_lay(SFX_STEP, n, 1296, 0, 2);
+  n = sfx_contact(.14f, 300, 1900, .012f, .030f, .095f);
+  sfx_lay(SFX_STEP, n, 2352, 0, 3);
+  sfx_world_finish(SFX_STEP, .117f, .82f, .30f);
+
+  // Loaded cloth/sole friction, with a shared random motion envelope and a
+  // small independent side field. The mixer owns the 250 ms segment overlap.
+  float *slide = sfx_alloc_frames(SFX_SLIDE, 60000);
+  op_t low = {0}, high = {0}, bass = {0}, motion = {0};
+  op_t sides[2] = {{0}};
+  for (int i = 0; i < g_sfx_len[SFX_SLIDE]; i++) {
+    float t = (float)i / SFX_HZ;
+    float end = (float)(g_sfx_len[SFX_SLIDE] - 1 - i) / SFX_HZ;
+    float x = rng_rangef(&g_rng_sfx, -1, 1);
+    float load = .78f + .22f * tanhf(op_lp(&motion, x, 17.0f) * 13.0f);
+    float body = op_hp(&high, op_lp(&low, x, 1450.0f), 65.0f);
+    float weight = op_lp(&bass, x, 340.0f);
+    float envelope = f_clamp(t / .025f, 0, 1) * f_clamp(end / .025f, 0, 1);
+    for (int c = 0; c < SFX_CH; c++) {
+      float side = op_lp(&sides[c], rng_rangef(&g_rng_sfx, -1, 1), 1900.0f);
+      slide[i * SFX_CH + c] = (body + .60f * weight + .08f * side) * load * envelope;
+    }
+  }
+  sfx_world_finish(SFX_SLIDE, .18f, .84f, .30f);
+}
+
 static void sfx_build_weather(void) {
-  const int ids[] = {SFX_THUNDER, SFX_RAIN, SFX_WIND};
-  const float durations[] = {4.8f, 3.2f, 4.2f};
-  for (int k = 0; k < 3; k++) {
-    int id = ids[k];
-    float *dst = sfx_alloc(id, durations[k]);
-    op_t low[2] = {{0}}, high[2] = {{0}}, bass[2] = {{0}};
-    for (int i = 0; i < g_sfx_len[id]; i++) {
+  // Independent, overlapping broadband pressure cells yield irregular thunder
+  // rolls. Their low/mid/high envelopes decay separately without tonal modes.
+  float *thunder = sfx_alloc_frames(SFX_THUNDER, 384000);
+  static const float cells[][3] = {
+    {0, 2.05f, .58f}, {.58f, 2.60f, .48f}, {1.70f, 2.65f, .38f},
+    {3.16f, 2.75f, .27f}, {4.78f, 2.60f, .15f},
+  };
+  for (int k = 0; k < 5; k++) {
+    op_t low[2] = {{0}}, high[2] = {{0}}, middle[2] = {{0}}, contour[2] = {{0}};
+    op_t movement = {0};
+    int offset = (int)(cells[k][0] * SFX_HZ);
+    int frames = (int)(cells[k][1] * SFX_HZ);
+    for (int i = 0; i < frames && offset + i < g_sfx_len[SFX_THUNDER]; i++) {
       float t = (float)i / SFX_HZ;
-      float fade = f_clamp(t / 0.20f, 0.0f, 1.0f)
-                 * f_clamp((durations[k] - t) / 0.20f, 0.0f, 1.0f);
-      fade *= fade;
-      for (int c = 0; c < 2; c++) {
-        float noise = rng_rangef(&g_rng_sfx, -1.0f, 1.0f), x;
-        if (k == 0) {
-          float crack = sfx_env(t, 0.008f, 0.16f, 1.0f);
-          float roll = sfx_env(t, 0.20f, 1.45f, 1.0f)
-                     + sfx_env(t - 0.65f, 0.15f, 0.85f, 1.0f) * 0.48f
-                     + sfx_env(t - 1.55f, 0.28f, 0.7f, 1.0f) * 0.30f;
-          x = op_lp(&low[c], noise, 140.0f) * roll * 2.8f
-            + op_lp(&bass[c], noise, 1250.0f) * crack * 0.62f;
-          float tail = f_clamp((durations[k] - t) / 0.40f, 0.0f, 1.0f);
-          x *= tail * tail;
-        } else if (k == 1) {
-          x = op_hp(&high[c], op_lp(&low[c], noise, 6400.0f), 740.0f);
-          float drops = powf(fabsf(noise), 12.0f) * noise * 0.24f;
-          x = (x * 0.22f + drops) * fade;
-        } else {
-          float swell = 0.64f + 0.23f * sinf(t * 1.3f) + 0.13f * sinf(t * 3.1f);
-          x = op_hp(&high[c], op_lp(&low[c], noise, 520.0f), 75.0f) * fade * swell;
-        }
-        dst[i * SFX_CH + c] = x;
+      float left = (float)(frames - 1 - i) / SFX_HZ;
+      float shared = rng_rangef(&g_rng_sfx, -1, 1);
+      float motion = .70f + .30f * tanhf(op_lp(&movement, shared, 7.0f) * 23.0f);
+      float envelope = sfx_env(t, k == 0 ? .008f : .10f, cells[k][1] * .36f, 1.0f);
+      envelope *= f_clamp(left / .30f, 0, 1) * motion * cells[k][2];
+      for (int c = 0; c < SFX_CH; c++) {
+        float x = .70f * shared + .30f * rng_rangef(&g_rng_sfx, -1, 1);
+        float bottom = op_hp(&high[c], op_lp(&low[c], x, 115.0f), 28.0f);
+        float mid = op_lp(&middle[c], x, 360.0f) - op_lp(&contour[c], x, 90.0f);
+        thunder[(offset + i) * SFX_CH + c] += (bottom * 5.0f + mid * 3.0f) * envelope;
       }
     }
-    sfx_finish(id, k == 0 ? 0.68f : 0.32f, k == 2 ? 0.028f : 0.035f, 0.0f);
   }
+  for (int k = 0; k < 3; k++) {
+    const int starts[] = {0, 864, 2640};
+    int n = sfx_contact(.31f, 240, k == 0 ? 4200 : 2350,
+                        .00035f + .0003f * k, .028f + .012f * k,
+                        .23f * expf(-.48f * k));
+    sfx_lay(SFX_THUNDER, n, starts[k], 0, 3 + k * 2);
+  }
+  // Broad pressure compression adds correlated texture inside the roll.
+  for (int i = 0; i < g_sfx_len[SFX_THUNDER] * SFX_CH; i++)
+    thunder[i] = tanhf(thunder[i] * 5.0f) * .2f;
+  sfx_world_finish(SFX_THUNDER, .25f, .91f, .30f);
+
+  // Rain remains a continuous sheet with dense stochastic surface contacts.
+  // No discrete plinks or periodic modulation compete with gameplay cues.
+  float *rain = sfx_alloc_frames(SFX_RAIN, 288000);
+  op_t rain_low[2] = {{0}}, rain_high[2] = {{0}}, rain_body[2] = {{0}};
+  op_t rain_motion[2] = {{0}};
+  for (int i = 0; i < g_sfx_len[SFX_RAIN]; i++) {
+    float t = (float)i / SFX_HZ;
+    float left = (float)(g_sfx_len[SFX_RAIN] - 1 - i) / SFX_HZ;
+    float envelope = f_clamp(t / .04f, 0, 1) * f_clamp(left / .04f, 0, 1);
+    for (int c = 0; c < SFX_CH; c++) {
+      float x = rng_rangef(&g_rng_sfx, -1, 1);
+      float sheet = op_hp(&rain_high[c], op_lp(&rain_low[c], x, 5600.0f), 600.0f);
+      float surface = op_lp(&rain_body[c], x, 1900.0f);
+      float density = .94f + .06f * tanhf(op_lp(&rain_motion[c], x, 22.0f) * 12.0f);
+      rain[i * SFX_CH + c] = (sheet + .22f * surface) * density * envelope;
+    }
+  }
+  sfx_world_finish(SFX_RAIN, .15f, .76f, 0);
+
+  // A shared slow gust carries open low-middle air while independently moving
+  // side turbulence supplies space. It contains no whistling oscillator.
+  float *wind = sfx_alloc_frames(SFX_WIND, 288000);
+  op_t wind_low[2] = {{0}}, wind_high[2] = {{0}}, wind_air[2] = {{0}}, wind_mid[2] = {{0}};
+  op_t wind_motion = {0};
+  for (int i = 0; i < g_sfx_len[SFX_WIND]; i++) {
+    float t = (float)i / SFX_HZ;
+    float left = (float)(g_sfx_len[SFX_WIND] - 1 - i) / SFX_HZ;
+    float shared = rng_rangef(&g_rng_sfx, -1, 1);
+    float gust = .82f + .18f * tanhf(op_lp(&wind_motion, shared, .75f) * 80.0f);
+    float envelope = f_clamp(t / .06f, 0, 1) * f_clamp(left / .06f, 0, 1);
+    for (int c = 0; c < SFX_CH; c++) {
+      float x = .60f * shared + .40f * rng_rangef(&g_rng_sfx, -1, 1);
+      float body = op_hp(&wind_high[c], op_lp(&wind_low[c], x, 750.0f), 70.0f);
+      float air = op_lp(&wind_air[c], x, 2450.0f) - op_lp(&wind_mid[c], x, 550.0f);
+      wind[i * SFX_CH + c] = (body + .37f * air) * gust * envelope;
+    }
+  }
+  sfx_world_finish(SFX_WIND, .11f, .76f, 0);
+}
+
+// Canonical sources and conservative remaining-peak bounds are captured once
+// after synthesis. Harness replacement buffers use their own full extent.
+static float *g_sfx_source[SFX_COUNT];
+static int g_sfx_source_len[SFX_COUNT], g_sfx_play_len[SFX_COUNT];
+static uint32_t g_sfx_source_hash[SFX_COUNT];
+#define SFX_PEAK_BLOCK (SFX_HZ / 100)
+static float *g_sfx_peak_storage, *g_sfx_peak[SFX_COUNT];
+
+// Linear staging preserves the chosen timbre and envelopes. Weather/friction
+// are aligned with the existing quiet world bed; reports retain transient
+// headroom and the established hit/kill cues keep their mix hierarchy.
+// Audition comparison gains are not a cross-family game mix.
+static const float SFX_GAME_GAIN[SFX_COUNT] = {
+  [SFX_FIRE_AR] = 1.15f, [SFX_FIRE_SR] = 1.20f,
+  [SFX_FAR_AR] = .81f, [SFX_FAR_SR] = .84f,
+  [SFX_HIT] = 1, [SFX_HIT_HEAD] = 1, [SFX_KILL] = 1, [SFX_KILL_HEAD] = 1,
+  [SFX_HURT] = 1, [SFX_IMPACT] = 1, [SFX_WHIZZ] = 1.05f,
+  [SFX_STEP] = .44f, [SFX_DRY] = .63f,
+  [SFX_RELOAD_AR] = 1.15f, [SFX_RELOAD_SR] = .95f,
+  [SFX_FLESH] = .84f, [SFX_RELOAD_AR_TAC] = 1.01f,
+  [SFX_THUNDER] = .72f, [SFX_RAIN] = .223f, [SFX_WIND] = .20f,
+  [SFX_SLIDE] = .258f,
+};
+
+// Repeating beds overlap at most two source windows. Their equal-power
+// playback envelopes are owned by the mixer, leaving generated buffers unchanged.
+static int sfx_loop_hop_frames(int id) {
+  if (id == SFX_RAIN || id == SFX_WIND) return 5 * SFX_HZ;
+  if (id == SFX_SLIDE) return SFX_HZ;
+  return 0;
+}
+static int sfx_loop_fade_frames(int id) {
+  if (id == SFX_RAIN || id == SFX_WIND) return SFX_HZ;
+  if (id == SFX_SLIDE) return SFX_HZ / 4;
+  return 0;
+}
+
+// Only exact zero suffixes can release a voice early. Full generated lengths
+// remain authoritative for cadence and admission priority.
+static int sfx_play_frames(int id) {
+  if (g_sfx_buf[id] != g_sfx_source[id] || g_sfx_len[id] != g_sfx_source_len[id])
+    return g_sfx_len[id];
+  return g_sfx_play_len[id];
+}
+
+// The entire remaining source contributes to this conservative bound. A quiet
+// reload gap cannot hide its future bolt. Lookups occur only under pool pressure.
+static float sfx_remaining_peak(int id, const float *buf, int frames, float pos) {
+  if ((unsigned)id >= SFX_COUNT || !g_sfx_peak[id] ||
+      buf != g_sfx_source[id] || frames != g_sfx_source_len[id]) return 1;
+  int block = (int)pos / SFX_PEAK_BLOCK;
+  if (block < 0) block = 0;
+  if (block >= (frames + SFX_PEAK_BLOCK - 1) / SFX_PEAK_BLOCK) return 0;
+  return g_sfx_peak[id][block];
 }
 
 static void sfx_build_all(void) {
+  if (g_sfx_peak_storage) return;
   sfx_build_shots();
   sfx_build_confirms();
   sfx_build_world();
   sfx_build_mech();
   sfx_build_weather();
+  size_t peak_count = 0;
+  for (int id = 0; id < SFX_COUNT; id++) {
+    if (!g_sfx_buf[id] || g_sfx_len[id] <= 0 || g_sfx_len[id] > 10 * SFX_HZ)
+      fatal("missing procedural audio source");
+    peak_count += (size_t)(g_sfx_len[id] + SFX_PEAK_BLOCK - 1) / SFX_PEAK_BLOCK;
+  }
+  g_sfx_peak_storage = malloc(peak_count * sizeof *g_sfx_peak_storage);
+  if (!g_sfx_peak_storage) fatal("audio peak metadata out of memory");
+  float *next_peak = g_sfx_peak_storage;
+  for (int id = 0; id < SFX_COUNT; id++) {
+    g_sfx_source[id] = g_sfx_buf[id];
+    g_sfx_source_len[id] = g_sfx_len[id];
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < g_sfx_len[id] * SFX_CH; i++) {
+      if (f_is_nonfinite(g_sfx_buf[id][i])) fatal("nonfinite procedural audio source");
+      uint32_t bits;
+      memcpy(&bits, &g_sfx_buf[id][i], sizeof bits);
+      for (int byte = 0; byte < 4; byte++) {
+        hash ^= (bits >> (byte * 8)) & 255u;
+        hash *= 16777619u;
+      }
+    }
+    g_sfx_source_hash[id] = hash;
+    int end = g_sfx_len[id];
+    if (!sfx_loop_hop_frames(id)) {
+      while (end > 0 && g_sfx_buf[id][(end - 1) * SFX_CH] == 0 &&
+             g_sfx_buf[id][(end - 1) * SFX_CH + 1] == 0) end--;
+      // Retain a zero frame after the last nonzero pair for interpolation.
+      if (end < g_sfx_len[id]) end++;
+    }
+    g_sfx_play_len[id] = end;
+    int blocks = (g_sfx_len[id] + SFX_PEAK_BLOCK - 1) / SFX_PEAK_BLOCK;
+    size_t used_peaks = (size_t)(next_peak - g_sfx_peak_storage);
+    if (used_peaks > peak_count || (size_t)blocks > peak_count - used_peaks)
+      fatal("invalid audio peak metadata extent");
+    g_sfx_peak[id] = next_peak; next_peak += blocks;
+    float peak = 0;
+    for (int block = blocks - 1; block >= 0; block--) {
+      int hi = (block + 1) * SFX_PEAK_BLOCK;
+      if (hi > g_sfx_len[id]) hi = g_sfx_len[id];
+      for (int frame = hi - 1; frame >= block * SFX_PEAK_BLOCK; frame--)
+        for (int channel = 0; channel < SFX_CH; channel++)
+          peak = fmaxf(peak, fabsf(g_sfx_buf[id][frame * SFX_CH + channel]));
+      g_sfx_peak[id][block] = peak;
+    }
+  }
 }

@@ -773,7 +773,7 @@ fi
 gate_command botsuppress "botsuppress" '^botsuppress summary cases=46 failed=0 authority=gun_shoot body=completed-tick ok$'
 gate_command recoil "recoil" '^recoil ok$'
 gate_command spstart "spstart" '^spstart summary cases=18 result=1 late_accept=3 audio_races=2 ok$'
-gate_command audiocheck "audiocheck" '^audiocheck summary catalogue=20 lifecycle=13 ok$'
+gate_command audiocheck "audiocheck" '^audiocheck summary catalogue=21 lifecycle=13 ok$'
 # Five biomes x three times x seven weather kinds; wire enums include RANDOM.
 gate_command environmentcheck "environmentcheck" '^environmentcheck combinations=105 wire=192 widgets=21 deferred=1 arenas=3 authority=join-rematch-leave fail=0 ok$'
 gate_command weatherproof "weatherproof" '^weatherproof modes=7 samples=33600 roof_cases=27 checked_vertices=[0-9]+ neutral=1 ok$'

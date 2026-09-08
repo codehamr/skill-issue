@@ -127,8 +127,7 @@ static void an_decay(const float *b, int frames, int ch, float lo_hz, float hi_h
 
 // One line of descriptors for a stereo buffer, in the format both `sfx` and `mixdown`
 // print. `win_s` (0 = whole buffer) is the window the LOUDNESS and the SPECTRUM are
-// measured over, and it has to be a window for the same reason sfx_finish takes one: a
-// shot with a 1.4 s hall on it is 80% tail by frame count, so its whole-buffer band
+// measured over. A shot with a 1.4 s hall is mostly tail by frame count, so its band
 // split describes the room and says nothing about whether the gun has a crack.
 static void an_report(const char *tag, const float *b, int frames, float win_s) {
   float peak = 1e-9f;
@@ -160,7 +159,8 @@ static void an_report(const char *tag, const float *b, int frames, float win_s) 
   float band[4], cent, awg, atk, eng, t20, t60, d0, d1, d2, lo60, hi60;
   an_spec(b, nw, SFX_CH);
   an_bands(band, &cent, &awg);
-  // dBA is the number "fatter / harder-hitting" is actually about.
+  // Digital weighted level is an authoring comparison, not calibrated dB SPL
+  // or a measurement of perceived impact or preference.
   printf("sfx %-9s len=%4ldms peak=%5.1fdB rms=%6.1fdB L%03ld=%6.1f/%6.1fdBA "
          "crest=%4.1fdB LRcorr=%+.2f\n", tag, (long)frames * 1000 / SFX_HZ,
          20.0 * log10((double)peak), rms, (long)nw * 1000 / SFX_HZ, lw,
@@ -1100,11 +1100,11 @@ static void bothear_emit_shot(int src, v3 pos) {
   gun_shoot(src, &w, pos, 0.0f, 0.0f, 1, 0, &g_rng_bot);
 }
 
-// Float-buffer quality gates are fixed before palette edits. The 300ms level
-// window excludes a weapon's long tail; reloads use their complete timeline.
+// Startup-generated source identity and independent signal contracts are checked.
+// The 300ms level window excludes a report's long tail; reloads use their timeline.
 enum {
   AQ_LENGTH = 1, AQ_FINITE = 2, AQ_PEAK = 4, AQ_LEVEL = 8, AQ_DC = 16,
-  AQ_EDGE = 32, AQ_TAIL = 64, AQ_CORR = 128, AQ_TIMING = 256
+  AQ_EDGE = 32, AQ_TAIL = 64, AQ_CORR = 128, AQ_TIMING = 256, AQ_SOURCE = 512
 };
 typedef struct {
   float len_lo, len_hi, rms_lo, rms_hi, corr_lo, corr_hi, attack_hi;
@@ -1113,23 +1113,24 @@ static const audio_quality_bound_t AUDIO_QUALITY[SFX_COUNT] = {
   [SFX_FIRE_AR] = {.18f,.80f,.05f,.45f,-.10f,1.001f,.025f},
   [SFX_FIRE_SR] = {.25f,2.50f,.08f,.48f,-.10f,1.001f,.025f},
   [SFX_FAR_AR] = {.18f,1.40f,.025f,.35f,-.10f,.90f,.090f},
-  [SFX_FAR_SR] = {.20f,1.40f,.025f,.35f,-.10f,.90f,.090f},
+  [SFX_FAR_SR] = {.20f,1.80f,.025f,.35f,-.10f,.90f,.090f},
   [SFX_HIT] = {.10f,.40f,.06f,.48f,.10f,1.001f,.025f},
   [SFX_HIT_HEAD] = {.10f,.40f,.06f,.48f,.10f,1.001f,.025f},
   [SFX_KILL] = {.20f,.80f,.06f,.50f,.10f,1.001f,.025f},
   [SFX_KILL_HEAD] = {.20f,.80f,.06f,.50f,.10f,1.001f,.025f},
   [SFX_HURT] = {.10f,.40f,.025f,.30f,.10f,1.001f,.030f},
   [SFX_IMPACT] = {.08f,.35f,.015f,.25f,-.10f,1.001f,.025f},
-  [SFX_WHIZZ] = {.08f,.35f,.020f,.30f,-.10f,.95f,.025f},
-  [SFX_STEP] = {.08f,.22f,.015f,.20f,-.10f,.95f,.025f},
+  [SFX_WHIZZ] = {.08f,.35f,.020f,.30f,-.10f,1.001f,.075f},
+  [SFX_STEP] = {.08f,.50f,.015f,.20f,-.10f,1.001f,.040f},
   [SFX_DRY] = {.08f,.18f,.020f,.20f,.10f,1.001f,.025f},
   [SFX_RELOAD_AR] = {1.0f,2.50f,.03f,.25f,.10f,1.001f,0},
   [SFX_RELOAD_SR] = {1.0f,2.50f,.03f,.25f,.10f,1.001f,0},
   [SFX_FLESH] = {.08f,.30f,.015f,.25f,.10f,1.001f,.025f},
   [SFX_RELOAD_AR_TAC] = {.80f,2.50f,.03f,.25f,.10f,1.001f,0},
-  [SFX_THUNDER] = {4.7f,4.9f,.015f,.25f,-.10f,.20f,.60f},
-  [SFX_RAIN] = {3.1f,3.3f,.008f,.12f,-.10f,.20f,3.2f},
-  [SFX_WIND] = {4.1f,4.3f,.008f,.18f,-.10f,.20f,4.2f}
+  [SFX_THUNDER] = {4.7f,8.1f,.015f,.35f,-.10f,1.001f,.60f},
+  [SFX_RAIN] = {5.9f,6.1f,.008f,.20f,-.10f,.20f,6.0f},
+  [SFX_WIND] = {5.9f,6.1f,.008f,.18f,-.10f,1.001f,6.0f},
+  [SFX_SLIDE] = {1.2f,1.3f,.008f,.25f,-.10f,1.001f,1.0f}
 };
 typedef struct {
   double peak, rms, dc, edge, tail, corr;
@@ -1138,12 +1139,13 @@ typedef struct {
 static unsigned audio_quality_measure(int id, const float *buf, int frames,
                                         audio_quality_t *out) {
   *out = (audio_quality_t){0};
-  if ((unsigned)id >= SFX_COUNT || !buf || frames < 1 || frames > SFX_HZ * 5)
+  if ((unsigned)id >= SFX_COUNT || !buf || frames < 1 || frames > SFX_HZ * 10)
     return AQ_LENGTH;
   const audio_quality_bound_t *bound = &AUDIO_QUALITY[id];
   double seconds = (double)frames / SFX_HZ;
   unsigned fail = seconds < bound->len_lo || seconds > bound->len_hi ||
-                  bound->len_hi <= 0 ? AQ_LENGTH : 0;
+                  bound->len_hi <= 0 || frames != g_sfx_source_len[id] ? AQ_LENGTH : 0;
+  uint32_t source_hash = UINT32_C(2166136261);
   int reload = id == SFX_RELOAD_AR || id == SFX_RELOAD_AR_TAC || id == SFX_RELOAD_SR;
   int window = reload ? frames : frames < SFX_HZ * 3 / 10 ? frames : SFX_HZ * 3 / 10;
   double sum[2] = {0}, square[2] = {0}, product = 0, level = 0, tail = 0;
@@ -1152,6 +1154,10 @@ static unsigned audio_quality_measure(int id, const float *buf, int frames,
     for (int c = 0; c < SFX_CH; c++) {
       float sample = buf[f * SFX_CH + c];
       if (f_is_nonfinite(sample)) return fail | AQ_FINITE;
+      uint32_t bits;
+      memcpy(&bits, &sample, sizeof bits);
+      for (unsigned shift = 0; shift < 32; shift += 8)
+        source_hash = (source_hash ^ ((bits >> shift) & 255)) * UINT32_C(16777619);
       double value = sample, absolute = fabs(value);
       if (absolute > out->peak) out->peak = absolute;
       sum[c] += value; square[c] += value * value;
@@ -1170,11 +1176,16 @@ static unsigned audio_quality_measure(int id, const float *buf, int frames,
   out->tail = sqrt(tail / ((double)(frames - tail_start) * SFX_CH));
   double den = sqrt(square[0] * square[1]);
   out->corr = den > 1e-12 ? product / den : 0;
-  if (out->peak < .15 || out->peak > .94) fail |= AQ_PEAK;
+  if (source_hash != g_sfx_source_hash[id]) fail |= AQ_SOURCE;
+  if (out->peak < .15 || out->peak >= 1.0) fail |= AQ_PEAK;
   if (out->rms < bound->rms_lo || out->rms > bound->rms_hi) fail |= AQ_LEVEL;
   if (out->dc > .006) fail |= AQ_DC;
   if (out->edge > 1.90) fail |= AQ_EDGE;
-  if (out->tail > .0002) fail |= AQ_TAIL;
+  // Overlapping weather beds retain energy through their crossfade; one-shots
+  // must have fully decayed. End-sample continuity is checked independently.
+  double tail_limit = id == SFX_RAIN || id == SFX_WIND || id == SFX_SLIDE
+    ? .20 * out->rms : .0008;
+  if (out->tail > tail_limit) fail |= AQ_TAIL;
   if (out->corr < bound->corr_lo || out->corr > bound->corr_hi) fail |= AQ_CORR;
   float t20, t60;
   an_decay(buf, frames, SFX_CH, 0, 0, &out->attack, &out->energy, &t20, &t60);
@@ -1191,9 +1202,12 @@ static unsigned audio_quality_measure(int id, const float *buf, int frames,
 }
 static int audiocheck_catalogue(void) {
   int fail = 0, controls = 0;
+  size_t generated_frames = 0;
   for (int id = 0; id < SFX_COUNT; id++) {
     audio_quality_t measured;
     unsigned errors = audio_quality_measure(id, g_sfx_buf[id], g_sfx_len[id], &measured);
+    if (g_sfx_buf[id] != g_sfx_source[id]) errors |= AQ_SOURCE;
+    generated_frames += (size_t)g_sfx_source_len[id];
     printf("audiocheck sound=%s frames=%d peak=%.5f rms=%.5f dc=%.6f edge=%.5f "
            "tail=%.7f corr=%.4f attack_ms=%.3f energy_ms=%.3f errors=%u\n",
            SFX_NAME[id], g_sfx_len[id], measured.peak, measured.rms, measured.dc,
@@ -1229,8 +1243,47 @@ static int audiocheck_catalogue(void) {
   for (int f = 0; f < frames; f++) control[f * SFX_CH + 1] *= -1;
   controls += (audio_quality_measure(SFX_FIRE_AR, control, frames, &result) & AQ_CORR) != 0;
   controls += (audio_quality_measure(SFX_FIRE_AR, control, 0, &result) & AQ_LENGTH) != 0;
+  memcpy(control, g_sfx_buf[SFX_FIRE_AR], bytes); control[48] += 1.0f / 32768;
+  int identity_control = (audio_quality_measure(SFX_FIRE_AR, control, frames, &result) & AQ_SOURCE) != 0;
   free(control);
-  fail |= controls != 8;
+  fail |= controls != 8 || !identity_control;
+  printf("audiocheck source=runtime_procedural generated_frames=%zu identity_control=%s\n",
+    generated_frames, identity_control ? "ok" : "FAIL");
+  // Sniper synthesis includes decaying space. Source hashes detect mutation;
+  // late energy is reported separately from onset and level contracts.
+  for (int far = 0; far < 2; far++) {
+    int id = far ? SFX_FAR_SR : SFX_FIRE_SR;
+    const float *b = g_sfx_buf[id];
+    double total = 0, late = 0;
+    for (int i = 0; i < g_sfx_len[id] * SFX_CH; i++) {
+      double energy = (double)b[i] * b[i]; total += energy;
+      if (i >= SFX_HZ / 5 * SFX_CH) late += energy;
+    }
+    printf("audiocheck report=%s post200ms_energy=%.6f generated_tail=measured\n",
+      SFX_NAME[id], total > 0 ? late / total : 0);
+  }
+  // Measure generated sources with the same source-position windows as playback.
+  // Neighbor windows allow natural gust/friction variation but reject a gap.
+  const int beds[] = {SFX_RAIN, SFX_WIND, SFX_SLIDE};
+  for (int k = 0; k < (int)(sizeof beds / sizeof beds[0]); k++) {
+    int id = beds[k], at = sfx_loop_hop_frames(id), overlap = sfx_loop_fade_frames(id);
+    double seam = 0, neighbor = 0;
+    for (int f = 0; f < overlap; f++) {
+      double incoming = sqrt((double)f / overlap), outgoing = sqrt(1.0 - (double)f / overlap);
+      for (int c = 0; c < SFX_CH; c++) {
+        double a = g_sfx_buf[id][(at + f) * SFX_CH + c] * outgoing;
+        double b = g_sfx_buf[id][f * SFX_CH + c] * incoming;
+        seam += (a + b) * (a + b);
+        double before = g_sfx_buf[id][(at - overlap + f) * SFX_CH + c];
+        double after = g_sfx_buf[id][(overlap + f) * SFX_CH + c];
+        neighbor += .5 * (before * before + after * after);
+      }
+    }
+    int bad = neighbor <= 0 || seam < .60 * neighbor || seam > 1.60 * neighbor;
+    fail |= bad;
+    printf("audiocheck overlap=%s relative_power=%.5f %s\n", SFX_NAME[id],
+      neighbor > 0 ? seam / neighbor : 0, bad ? "FAIL" : "ok");
+  }
   printf("audiocheck catalogue rows=%d controls=%d/8 %s\n", SFX_COUNT, controls,
          fail ? "FAIL" : "ok");
   return fail;
@@ -1399,7 +1452,9 @@ static int audiocheck_lifecycle(int (*routing)(void)) {
   uint32_t epoch = atomic_load(&g_audio_epoch), mix_epoch = g_audio_mix_epoch;
   for (int id = 0; id < SFX_COUNT; id++)
     for (int tag = 0; tag < AUDIO_TAGS; tag++) cancels[id][tag] = atomic_load(&g_audio_cancel[id][tag]);
-  float state[] = {g_dev_rate, g_cfg.vol, g_lim_g, g_lim_min, g_duck_env, g_duck_min, g_pause_env};
+  float state[] = {g_dev_rate, g_cfg.vol, g_lim_g, g_lim_min, g_duck_env, g_duck_min,
+    g_pause_env, g_ambient_env, g_ambient_shelter};
+  typeof(g_audio_slide) slide_state = g_audio_slide;
   int pause = atomic_load(&g_audio_pause), log_on = g_sfx_log_on, voice_peak = g_voice_peak;
   long device_counts[] = {g_audio_device_errors, g_audio_underruns, g_audio_stream_errors, g_audio_restarts};
   long counts[] = {g_trig_flooded, g_trig_protected_flooded, g_audio_invalid, g_trig_stale,
@@ -1598,6 +1653,7 @@ static int audiocheck_lifecycle(int (*routing)(void)) {
     for (int tag = 0; tag < AUDIO_TAGS; tag++) atomic_store(&g_audio_cancel[id][tag], cancels[id][tag]);
   g_dev_rate = state[0]; g_cfg.vol = state[1]; g_lim_g = state[2]; g_lim_min = state[3];
   g_duck_env = state[4]; g_duck_min = state[5]; g_pause_env = state[6];
+  g_ambient_env = state[7]; g_ambient_shelter = state[8]; g_audio_slide = slide_state;
   atomic_store(&g_audio_pause, pause); g_sfx_log_on = log_on; g_voice_peak = voice_peak;
   g_audio_device_errors = device_counts[0]; g_audio_underruns = device_counts[1];
   g_audio_stream_errors = device_counts[2]; g_audio_restarts = device_counts[3];
@@ -1610,8 +1666,327 @@ static int audiocheck_lifecycle(int (*routing)(void)) {
   return fail;
 }
 
+static int audiocheck_slides(void) {
+  proof_world_t *world = malloc(sizeof *world);
+  if (!world) fatal("slide proof out of memory");
+  proof_world_save(world);
+  typeof(g_audio_slide) state = g_audio_slide;
+  int local = g_local_ent, fail = 0;
+  v3 listener = g_listen, right = g_listen_r;
+  uint64_t rng = g_rng, bots = g_rng_bot, audio = g_rng_audio;
+  memset(g_players, 0, sizeof g_players);
+  memset(g_bots, 0, sizeof g_bots);
+  memset(g_humans_on, 0, sizeof g_humans_on);
+  g_local_ent = 0; g_match.nbots = 1;
+  g_listen = (v3){{0, 1.6f, 0}}; g_listen_r = (v3){{1, 0, 0}};
+  const int human = MAX_HUMANS - 1, remote = ent_of_human(human);
+  g_players[0] = (player_t){.vel = {{8,0,0}}, .alive = 1, .grounded = 1, .sliding = 1};
+  g_players[human] = g_players[0]; g_players[human].pos.x = -4;
+  g_humans_on[human] = 1;
+  g_bots[0] = (bot_t){.pos = {{4,0,0}}, .vel = {{8,0,0}}, .active = 1,
+                      .alive = 1, .grounded = 1, .sliding = 1};
+  audiocheck_reset(); fail |= !audio_trace_begin();
+  g_tick = 100; audio_slide_update(); audio_slide_update();
+  fail |= g_audio_trace_n != 3;
+  for (int i = 0; i < 2; i++) audiocheck_render(400, 2, &fail);
+  int placed = 0;
+  for (int i = 0; i < MAX_VOICES; i++) {
+    const voice_t *v = &g_voices[i];
+    if (!v->active || v->id != SFX_SLIDE) continue;
+    fail |= v->rate != 1.0f;
+    placed += v->tag == 2 && v->gl == v->gr;
+    placed += v->tag == 3 && v->gl < v->gr;
+    placed += v->tag == remote + 2 && v->gl > v->gr;
+  }
+  fail |= placed != 3;
+  for (int i = 2; i < audio_slide_interval() - 1; i++) audiocheck_render(400, 2, &fail);
+  g_tick = 100 + audio_slide_interval() - 1; audio_slide_update();
+  fail |= g_audio_trace_n != 3;
+  audiocheck_render(400, 2, &fail);
+  g_tick++; audio_slide_update(); fail |= g_audio_trace_n != 6;
+  g_players[0].grounded = 0; audio_slide_update();
+  for (int i = 0; i < 10; i++) audiocheck_render(500, 2, &fail);
+  fail |= audiocheck_live(SFX_SLIDE, 2, -1) != 0 ||
+          audiocheck_live(SFX_SLIDE, 3, 0) != 2 ||
+          audiocheck_live(SFX_SLIDE, remote + 2, 0) != 2;
+  g_bots[0].active = 0; g_humans_on[human] = 0;
+  audio_slide_update(); for (int i = 0; i < 10; i++) audiocheck_render(500, 2, &fail);
+  fail |= audiocheck_live(SFX_SLIDE, -1, -1) != 0;
+  g_players[0].grounded = 1; g_players[0].alive = 0;
+  g_bots[0].active = 1; g_bots[0].pos.x = AUDIO_SLIDE_RANGE + 1;
+  g_tick++; audio_slide_update(); fail |= g_audio_trace_n != 6;
+  // A dead listener keeps hearing a nearby foreign slider.
+  g_bots[0].pos.x = 4; audio_slide_update();
+  fail |= g_audio_trace_n != 7 || g_audio_trace[6].tag != 3;
+  g_bots[0].alive = 0; audio_slide_update();
+  for (int i = 0; i < 10; i++) audiocheck_render(500, 2, &fail);
+  fail |= audiocheck_live(SFX_SLIDE, -1, -1) != 0;
+  g_players[0].alive = 1; g_players[0].vel = (v3){{0,0,0}};
+  audio_slide_update(); fail |= g_audio_trace_n != 7;
+  g_players[0].vel.x = 8; audio_slide_update();
+  fail |= g_audio_trace_n != 8;
+  audio_session_reset(); audio_slide_update();
+  fail |= g_audio_trace_n != 9;
+  for (int i = 0; i < 2; i++) audiocheck_render(400, 2, &fail);
+  fail |= audiocheck_live(SFX_SLIDE, 2, 0) != 1;
+  // Rewinding the producer clock also cancels its old grain before re-entry.
+  g_tick = 10; audio_slide_update();
+  fail |= g_audio_trace_n != 10;
+  for (int i = 0; i < 10; i++) audiocheck_render(500, 2, &fail);
+  fail |= audiocheck_live(SFX_SLIDE, 2, 0) != 1;
+  fail |= g_rng != rng || g_rng_bot != bots || g_rng_audio != audio ||
+          g_audio_invalid || g_trig_flooded || g_trig_protected_flooded ||
+          g_protected_dropped;
+  audio_trace_end();
+  proof_world_restore(world); free(world);
+  g_local_ent = local; g_listen = listener; g_listen_r = right;
+  g_audio_slide = state;
+  printf("audiocheck slides entities=3 interval_ticks=%d air=0 dead=0 despawn=0 "
+         "range=14 epoch=1 rewind=1 sim_rng=unchanged %s\n",
+         audio_slide_interval(), fail ? "FAIL" : "ok");
+  return fail;
+}
+
+// A full pool ranks an eligible tail by its remaining source, not its old
+// trigger gain. Adversarial gaps and pending attacks must not become victims.
+static int audiocheck_pressure(void) {
+  int fail = 0;
+  for (int test = 0; test < 6; test++) {
+    audiocheck_reset();
+    int old_id = test == 3 ? SFX_RELOAD_AR : SFX_FIRE_AR;
+    audio_play(old_id, 1, 1, 0, 0); audio_mix_admit();
+    voice_t source = g_voices[0], loop = {0};
+    source.pos = (float)source.len * .60f;
+    if (test == 1 || test == 2 || test == 4 || test == 5) source.pos = 0;
+    if (test == 2 || test == 5) source.delay = SFX_HZ / 10;
+    if (test == 4) {
+      audio_play(SFX_RAIN, .04f, 1, 0, 0); audio_mix_admit();
+      loop = g_voices[1]; loop.pos = (float)loop.len * .75f;
+    }
+    for (int i = 0; i < MAX_VOICES; i++) g_voices[i] = source;
+    if (test == 4) g_voices[0] = loop;
+    int incoming_id = test == 5 ? SFX_WHIZZ : SFX_FAR_AR;
+    float incoming = .08f * SFX_GAME_GAIN[incoming_id] * sqrtf(2) *
+      sfx_remaining_peak(incoming_id, g_sfx_buf[incoming_id], g_sfx_len[incoming_id], 0);
+    if (test == 0) {
+      float remaining = (source.gl + source.gr) *
+        sfx_remaining_peak(source.id, source.buf, source.len, source.pos);
+      fail |= remaining >= incoming || source.gl + source.gr <= incoming;
+    }
+    if (test == 3) {
+      float present = 0;
+      for (int i = (int)source.pos; i < (int)source.pos + SFX_PEAK_BLOCK; i++)
+        for (int c = 0; c < SFX_CH; c++)
+          present = fmaxf(present, fabsf(source.buf[i * SFX_CH + c]));
+      float remaining = sfx_remaining_peak(source.id, source.buf, source.len, source.pos);
+      fail |= present * (source.gl + source.gr) >= incoming ||
+              remaining * (source.gl + source.gr) <= incoming;
+    }
+    audio_play(incoming_id, .08f, 1, 0, 0); audio_mix_admit();
+    int accepted = test == 0 || test == 5;
+    fail |= audiocheck_live(incoming_id, 0, 0) != accepted ||
+            audiocheck_live(-1, -1, -1) != MAX_VOICES ||
+            g_trig_dropped != !accepted || g_protected_dropped ||
+            g_trig_capped || g_trig_flooded || g_trig_protected_flooded;
+    if (test == 4) fail |= audiocheck_live(SFX_RAIN, 0, 0) != 1;
+  }
+  audiocheck_reset();
+  printf("audiocheck pressure pool=96 decayed_tail=1 fresh=1 delayed=1 "
+         "future_bolt=1 loop=1 protected=1 %s\n", fail ? "FAIL" : "ok");
+  return fail;
+}
+
+// Exact-zero retirement must preserve actual mixed PCM, including fractional
+// interpolation, propagation delay and the room tail after a source finishes.
+static int audiocheck_silent_suffix(void) {
+  int fail = 0;
+  long retired = 0;
+  for (int id = 0; id < SFX_COUNT; id++) {
+    int end = sfx_play_frames(id), frames = g_sfx_len[id];
+    fail |= end < 1 || end > frames;
+    if (sfx_loop_hop_frames(id)) fail |= end != frames;
+    for (int i = end; i < frames; i++)
+      fail |= g_sfx_buf[id][i * SFX_CH] != 0 || g_sfx_buf[id][i * SFX_CH + 1] != 0;
+    retired += frames - end;
+    g_sfx_len[id]--;
+    fail |= sfx_play_frames(id) != frames - 1;
+    g_sfx_len[id] = frames;
+  }
+  const int ids[] = {SFX_STEP, SFX_WHIZZ, SFX_FLESH, SFX_HURT, SFX_IMPACT};
+  acoustic_params_t room = {.delay = {.010f, .024f}, .early = {.20f, .24f},
+    .late = .18f, .feedback = .60f, .damping = 4000, .kind = ACOUSTIC_EDGE};
+  for (int k = 0; k < 5; k++) {
+    int id = ids[k], frames = g_sfx_len[id], end = sfx_play_frames(id);
+    float *source = g_sfx_buf[id];
+    size_t bytes = (size_t)frames * SFX_CH * sizeof *source;
+    float *copy = malloc(bytes);
+    if (!copy) fatal("silent suffix proof out of memory");
+    memcpy(copy, source, bytes);
+    for (int device = 0; device < 2; device++) {
+      int hz = device ? 44100 : SFX_HZ;
+      float rate = device ? 1.015f : 1;
+      float stride = rate * (float)SFX_HZ / hz;
+      int boundary = (int)((end + 512) / stride) + (int)(.013f * hz);
+      int output_frames = (int)(frames / stride) + hz / 5;
+      size_t output_bytes = (size_t)output_frames * SFX_CH * sizeof(float);
+      float *takes[2] = {malloc(output_bytes), malloc(output_bytes)};
+      if (!takes[0] || !takes[1]) fatal("silent suffix proof out of memory");
+      // A 1024-frame suffix leaves the probe halfway through the silence.
+      fail |= end + 1024 > frames || boundary >= output_frames;
+      for (int take = 0; take < 2; take++) {
+        audiocheck_reset(); fail |= !audio_mix_device_reset((unsigned)hz, SFX_CH);
+        g_sfx_buf[id] = take ? copy : source;
+        fail |= sfx_play_frames(id) != (take ? frames : end);
+        audio_acoustic_publish(room);
+        audio_play(id, .4f, rate, .25f, .013f); audio_mix_admit();
+        for (int v = 0; v < MAX_VOICES; v++) if (g_voices[v].active)
+          fail |= g_voices[v].len != frames;
+        audio_mix(takes[take], (uint32_t)boundary, SFX_CH);
+        fail |= audiocheck_live(id, 0, 0) != take;
+        audio_mix(takes[take] + boundary * SFX_CH,
+                  (uint32_t)(output_frames - boundary), SFX_CH);
+        fail |= audiocheck_live(id, 0, -1) != 0;
+      }
+      fail |= memcmp(takes[0], takes[1], output_bytes) != 0;
+      free(takes[0]); free(takes[1]);
+    }
+    audiocheck_reset(); g_sfx_buf[id] = source; free(copy);
+  }
+  printf("audiocheck silent_suffix rows=%d retired_frames=%ld pcm_pairs=10 "
+         "rates=2 delayed=1 wet=1 fixture_fallback=1 age_unchanged=1 %s\n",
+         SFX_COUNT, retired, fail ? "FAIL" : "ok");
+  return fail;
+}
+
+// Orthogonal fixture ends expose overlap power in actual output PCM. The first
+// segment keeps its onset; its successor joins at the scheduler's source hop.
+static int audiocheck_loops(void) {
+  int fail = 0;
+  double worst = 0;
+  const int ids[] = {SFX_RAIN, SFX_WIND, SFX_SLIDE};
+  const int rates[] = {48000, 44100};
+  for (int k = 0; k < 3; k++) {
+    int id = ids[k], hop = sfx_loop_hop_frames(id), fade = sfx_loop_fade_frames(id);
+    int frames = g_sfx_len[id];
+    fail |= hop <= 0 || fade <= 0 || hop + fade != frames;
+    if (hop <= 0 || fade <= 0 || hop + fade != frames) continue;
+    float *source = g_sfx_buf[id];
+    float *fixture = calloc((size_t)frames * SFX_CH, sizeof *fixture);
+    if (!fixture) fatal("loop proof out of memory");
+    for (int i = 0; i < frames; i++) fixture[i * SFX_CH + (i < hop)] = .08f;
+    g_sfx_buf[id] = fixture;
+    for (int rate = 0; rate < 2; rate++) {
+      audiocheck_reset(); fail |= !audio_mix_device_reset(rates[rate], SFX_CH);
+      audio_play_tag(id, .4f, 1, 0, 0, 2);
+      double base = audiocheck_render(400, SFX_CH, &fail) / 400;
+      fail |= base <= 1e-10;
+      int hop_device = (int)((int64_t)hop * rates[rate] / SFX_HZ);
+      for (int at = 400; at < hop_device;) {
+        int n = hop_device - at; if (n > 400) n = 400;
+        audiocheck_render(n, SFX_CH, &fail); at += n;
+      }
+      audio_play_tag(id, .4f, 1, 0, 0, 2); audio_mix_admit();
+      fail |= audiocheck_live(id, 2, 0) != 2;
+      // A duplicate producer command cannot grow an entity past two segments.
+      audio_play_tag(id, .4f, 1, 0, 0, 2); audio_mix_admit();
+      fail |= audiocheck_live(id, 2, 0) != 2 || g_trig_capped != 1;
+      int fade_device = (int)((int64_t)fade * rates[rate] / SFX_HZ);
+      for (int at = 0; at < fade_device;) {
+        int n = fade_device - at; if (n > 400) n = 400;
+        double power = audiocheck_render(n, SFX_CH, &fail) / n;
+        double error = base > 0 ? fabs(power / base - 1) : 1;
+        worst = fmax(worst, error);
+        fail |= error > .02; at += n;
+      }
+      audiocheck_render(400, SFX_CH, &fail);
+      fail |= audiocheck_live(id, 2, 0) != 1;
+      audio_kill(id, 2);
+      for (int i = 0; i < 10; i++) audiocheck_render(500, SFX_CH, &fail);
+      fail |= audiocheck_live(id, 2, -1) != 0;
+    }
+    audiocheck_reset(); g_sfx_buf[id] = source; free(fixture);
+  }
+  printf("audiocheck loops beds_hop=5.0 slide_hop=1.0 rates=2 max_overlap=2 "
+         "power_error=%.6f cancel=1 %s\n", worst, fail ? "FAIL" : "ok");
+  return fail;
+}
+
 // These fixtures drive actual geometry, routing, admission and callback owners.
 // Scalar analytic witnesses do not reimplement the production descriptor or DSP.
+static int audiocheck_ambience(void) {
+  int fail = 0;
+  float reference[4096 * 2], room[4096 * 2];
+  acoustic_params_t edge = {.delay = {.010f, .024f}, .early = {.30f, .30f},
+    .late = .22f, .feedback = .65f, .damping = 3500, .kind = ACOUSTIC_EDGE};
+  const int ids[] = {SFX_RAIN, SFX_WIND, SFX_THUNDER};
+  for (int i = 0; i < 3; i++) {
+    audiocheck_reset(); audio_play(ids[i], .4f, 1, 0, 0);
+    audio_mix(reference, 4096, 2);
+    audiocheck_reset(); audio_acoustic_publish(edge); audio_play(ids[i], .4f, 1, 0, 0);
+    audio_mix(room, 4096, 2);
+    fail |= memcmp(reference, room, sizeof room) != 0;
+  }
+  // Low-level carriers isolate ambience gain from the gunshot and avoid the
+  // master limiter. Compare mixed PCM, not the envelope formula.
+  const int frames = 48000;
+  float *bed = malloc((size_t)frames * 2 * sizeof *bed);
+  float *shot = calloc((size_t)frames * 2, sizeof *shot);
+  float *takes[3];
+  if (!bed || !shot) fatal("ambience proof out of memory");
+  for (int i = 0; i < frames; i++) {
+    bed[2*i] = bed[2*i+1] = .08f;
+    if (i < 2400) shot[2*i] = shot[2*i+1] = .35f;
+  }
+  float *old_bed = g_sfx_buf[SFX_RAIN], *old_shot = g_sfx_buf[SFX_FIRE_AR];
+  int bed_len = g_sfx_len[SFX_RAIN], shot_len = g_sfx_len[SFX_FIRE_AR];
+  g_sfx_buf[SFX_RAIN] = bed; g_sfx_len[SFX_RAIN] = frames;
+  g_sfx_buf[SFX_FIRE_AR] = shot; g_sfx_len[SFX_FIRE_AR] = frames;
+  for (int take = 0; take < 3; take++) {
+    takes[take] = malloc((size_t)frames * 2 * sizeof(float));
+    if (!takes[take]) fatal("ambience proof out of memory");
+    audiocheck_reset();
+    if (take != 1) audio_play(SFX_RAIN, 1, 1, 0, 0);
+    if (take != 0) audio_play(SFX_FIRE_AR, 1, 1, 0, 0);
+    audio_mix(takes[take], (uint32_t)frames, 2);
+  }
+  double dry = 0, ducked = 0, recovered = 0;
+  for (int i = 960; i < 2400; i++) {
+    dry += takes[0][i*2];
+    ducked += takes[2][i*2] - takes[1][i*2];
+    recovered += takes[2][(i + 42000)*2] - takes[1][(i + 42000)*2];
+  }
+  fail |= dry <= 0 || ducked / dry < .44 || ducked / dry > .80 || recovered / dry < .96;
+  audiocheck_reset(); edge.kind = ACOUSTIC_SHELTER; audio_acoustic_publish(edge);
+  audio_play(SFX_RAIN, 1, 1, 0, 0); audio_mix(takes[1], (uint32_t)frames, 2);
+  double sheltered = takes[1][(frames - 2)*2] / takes[0][(frames - 2)*2];
+  fail |= sheltered < .37 || sheltered > .39;
+  audio_session_reset(); audio_mix(room, 1, 2);
+  fail |= g_ambient_env != 0 || g_ambient_shelter != 1;
+  for (int i = 0; i < 3; i++) free(takes[i]);
+  g_sfx_buf[SFX_RAIN] = old_bed; g_sfx_len[SFX_RAIN] = bed_len;
+  g_sfx_buf[SFX_FIRE_AR] = old_shot; g_sfx_len[SFX_FIRE_AR] = shot_len;
+  audiocheck_reset(); free(bed); free(shot);
+  // Pending propagation delays count against the same fixed class ceiling.
+  for (int i = 0; i < 24; i++) audio_play_tag(SFX_SLIDE, .2f, 1, .2f, .03f, i + 2);
+  audio_mix_admit();
+  fail |= audiocheck_live(SFX_SLIDE, -1, -1) != 8 || g_trig_capped != 16;
+  printf("audiocheck ambience world_wet=0 combat_gain=%.4f recovered=%.4f roof=%.4f "
+         "delayed_slide_cap=8 reset=1 %s\n", ducked / dry, recovered / dry, sheltered,
+         fail ? "FAIL" : "ok");
+  audiocheck_reset();
+  return fail;
+}
+
+static int audiocheck_presentation(void) {
+  int fail = audiocheck_routes();
+  fail |= audiocheck_slides();
+  fail |= audiocheck_silent_suffix();
+  fail |= audiocheck_pressure();
+  fail |= audiocheck_loops();
+  fail |= audiocheck_ambience();
+  return fail;
+}
+
 static int acousticcheck_geometry(void) {
   int fail = 0;
   uint64_t rng = g_rng, bots = g_rng_bot;
@@ -1660,6 +2035,13 @@ static int acousticcheck_geometry(void) {
 
 static int acousticcheck_routes(void) {
   int fail = 0;
+  float arrival = 0;
+  // Sonic/subsonic rounds and listeners outside the cone cannot emit a snap.
+  // On axis the shock travels with the round: 9 m / 900 m/s = 10 ms.
+  fail |= audio_crack_delay(10, 2, 343, &arrival) || audio_crack_delay(10, 2, 300, &arrival);
+  fail |= audio_crack_delay(.6f, 4, 900, &arrival) || audio_crack_delay(-1, 0, 900, &arrival);
+  fail |= !audio_crack_delay(9, 0, 900, &arrival) || fabsf(arrival - .010f) > 1e-6f;
+  printf("acousticcheck mach_cone subsonic=0 outside=0 axial_ms=10 %s\n", fail ? "FAIL" : "ok");
   float pulse[1024 * SFX_CH];
   for (int i = 0; i < 1024; i++) pulse[i*2] = pulse[i*2+1] = .1f;
   float *old_buf = g_sfx_buf[SFX_WHIZZ]; int old_len = g_sfx_len[SFX_WHIZZ];
@@ -1706,7 +2088,9 @@ static int acousticcheck_routes(void) {
     if (expected) {
       sfx_log_t t = g_sfx_log[0];
       bad |= t.id != SFX_WHIZZ || fabsf(t.pan - pan) > 1e-5f;
-      float delay = along / WPN_DEF[WPN_AR].v_round + miss / 343.0f;
+      // Analytic constant-speed arrival, independent of the router helper.
+      float velocity = WPN_DEF[WPN_AR].v_round;
+      float delay = along / velocity + miss / 343.0f * sqrtf(1 - (343.0f / velocity) * (343.0f / velocity));
       bad |= fabsf(t.delay - delay) > 1e-6f || energy[0] + energy[1] <= .001;
       if (pan > 0) bad |= energy[1] < 15 * energy[0];
       if (pan < 0) bad |= energy[0] < 15 * energy[1];

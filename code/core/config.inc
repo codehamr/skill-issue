@@ -120,11 +120,11 @@ enum {
   SFX_WHIZZ,                         // one going past your head
   SFX_STEP,                          // a boot landing
   SFX_DRY, SFX_RELOAD_AR, SFX_RELOAD_SR,
-  // A NEW ID GOES AT THE END, ALWAYS: sfx_alloc reseeds the noise stream FROM
-  // THE ID, so inserting one re-rolls every sound after it.
+  // Append sound IDs to preserve event/proof identities and procedural seeds.
   SFX_FLESH,                         // a round arriving in a MAN
   SFX_RELOAD_AR_TAC,                 // ...and the AR's tactical reload
   SFX_THUNDER, SFX_RAIN, SFX_WIND,
+  SFX_SLIDE,                        // quiet, cancellable ground friction
   SFX_COUNT
 };
 

@@ -914,41 +914,55 @@ static void part_census(void) {
   if (res > g_part_res_peak) g_part_res_peak = res;
 }
 
-static struct { int mode; long tick; uint32_t seed; } g_weather_audio = {.mode = -1, .tick = -1};
+static struct {
+  int mode;
+  long tick, next_rain, next_wind;
+  uint32_t seed, epoch;
+} g_weather_audio = {.mode = -1, .tick = -1};
 static void weather_audio_tick(void) {
   int mode = weather_kind();
+  uint32_t epoch = atomic_load_explicit(&g_audio_epoch, memory_order_relaxed);
   if (g_weather_audio.tick == g_tick && g_weather_audio.mode == mode &&
-      g_weather_audio.seed == g_map_seed) return;
+      g_weather_audio.seed == g_map_seed && g_weather_audio.epoch == epoch) return;
   int changed = g_weather_audio.mode != mode || g_tick < g_weather_audio.tick ||
-                g_weather_audio.seed != g_map_seed;
+                g_weather_audio.seed != g_map_seed || g_weather_audio.epoch != epoch;
   g_weather_audio.tick = g_tick;
   if (changed) {
     audio_kill(SFX_RAIN, 0); audio_kill(SFX_WIND, 0); audio_kill(SFX_THUNDER, 0);
     g_weather_audio.mode = mode;
     g_weather_audio.seed = g_map_seed;
+    g_weather_audio.epoch = epoch;
+    g_weather_audio.next_rain = g_weather_audio.next_wind = g_tick;
   }
   if (!g_weather_audio.mode) return;
-  int rain_due = mode >= WEATHER_RAIN && (changed || g_tick % 360 == 1);
-  int wind_due = changed || g_tick % 480 == 1;
+  int rain_due = mode >= WEATHER_RAIN && g_tick >= g_weather_audio.next_rain;
+  int wind_due = g_tick >= g_weather_audio.next_wind;
   int thunder_due = mode == WEATHER_STORM &&
                     weather_phase() == WEATHER_STRIKE + WEATHER_THUNDER_DELAY;
   if (!rain_due && !wind_due && !thunder_due) return;
-  // Ambient sheltering is sampled only when a new ambient voice is due.
-  // The thunder lane needs neither a roof trace nor a weather sample.
+  // Relative scheduling cannot crowd two long beds immediately after a map
+  // change. The mixer owns their overlap and follows the shared shelter probes.
   if (rain_due || wind_due) {
     weather_t w = weather_sample();
-    v3 n;
-    float roof = trace_world(g_listen, (v3){{0.0f, 1.0f, 0.0f}}, &n, NULL);
-    float shelter = roof < 20.0f ? 0.32f : 1.0f;
+    if (rain_due)
+      g_weather_audio.next_rain = g_tick +
+        (sfx_loop_hop_frames(SFX_RAIN) * TICK_HZ + SFX_HZ - 1) / SFX_HZ;
+    if (wind_due)
+      g_weather_audio.next_wind = g_tick +
+        (sfx_loop_hop_frames(SFX_WIND) * TICK_HZ + SFX_HZ - 1) / SFX_HZ;
     if (rain_due && w.rain > 0.0f)
-      audio_play(SFX_RAIN, w.rain * 0.72f * shelter, 1.0f, 0.0f, 0.0f);
+      audio_play(SFX_RAIN, w.rain * 0.72f, 1.0f, 0.0f, 0.0f);
     if (wind_due && w.wind > 0.1f)
-      audio_play(SFX_WIND, f_clamp(w.wind * 0.10f, 0.04f, 0.42f) * shelter,
+      audio_play(SFX_WIND, f_clamp(w.wind * 0.10f, 0.04f, 0.42f),
                  1.0f, v3_dot(wind_dir(), g_listen_r) * 0.24f, 0.0f);
   }
-  if (thunder_due)
-    audio_play(SFX_THUNDER, 0.66f, 1.0f,
+  if (thunder_due) {
+    // Per-strike variation cannot change later weapon/footstep random choices.
+    uint64_t rng = ((uint64_t)g_map_seed << 32) ^ (uint64_t)g_tick ^ UINT64_C(0x7468756e646572);
+    audio_play(SFX_THUNDER, rng_rangef(&rng, .63f, .69f),
+               rng_rangef(&rng, .97f, 1.03f),
                v3_dot(wind_dir(), g_listen_r) * 0.42f, 0.0f);
+  }
 }
 
 static void vfx_tick(void) {

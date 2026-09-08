@@ -15,8 +15,11 @@
 // shot from behind-left becomes information rather than noise, and the delay is how the
 // hit confirmation gets heard at all — see audio_on_event.
 typedef struct {
-  int active; const float *buf; int len;
+  int active; const float *buf; int len, play_end;
   float pos, rate, gl, gr; int delay;
+  float wet, shelter;
+  int loop_hop, loop_fade, loop_join;
+  int ambient, foreground;
   int prio;                  // SFX_P_* — who ducks whom
   int dying;                 // fading out after a kill trigger — see audio_kill
   uint64_t trace;             // optional harness census identity
@@ -30,11 +33,9 @@ typedef struct {
 // otherwise take 6.7 dB off the two cues a player cannot afford to miss.
 //   LEAD   local hit/kill confirmation. Ducks the ordinary bus and is not
 //          stolen; bounded protected admission and pool pressure are counted.
-//   KEEP   taking a round, and a round cracking past your head. Neither ducks
-//          nor is ducked: this is the audio that tells you you are being shot
-//          and from where, and trading it for your own hitmarker is a bad trade
-//          however satisfying the hitmarker is. They barely overlap in spectrum
-//          anyway — `hurt` is 72% under 120 Hz, a confirmation's fat is 200-800.
+//   KEEP   taking a round and a round cracking past your head. Bypasses
+//          confirmation ducking and only lowers the ambience, preserving
+//          incoming-fire direction and other world cues under a hitmarker.
 //   NORM   everything else.
 // Derived from the sound id rather than passed in, so it cannot be forgotten at
 // a call site and cannot be handed to something that is not a confirmation —
@@ -47,6 +48,7 @@ static int sfx_class_cap(int id) {
   // 52 and 12, measured rather than guessed.
   if (id == SFX_FAR_AR || id == SFX_FAR_SR) return 52;
   if (id == SFX_STEP) return 12;
+  if (id == SFX_SLIDE) return 8;
   if (id == SFX_THUNDER || id == SFX_RAIN || id == SFX_WIND) return 2;
   return 0;
 }
@@ -57,6 +59,23 @@ static int sfx_prio(int id) {
       || id == SFX_KILL_HEAD) return SFX_P_LEAD;
   if (id == SFX_HURT || id == SFX_WHIZZ) return SFX_P_KEEP;
   return SFX_P_NORM;
+}
+
+static int sfx_ambient(int id) {
+  return id == SFX_RAIN || id == SFX_WIND || id == SFX_THUNDER;
+}
+
+// Local mechanical detail stays close; weather already represents an extended
+// outdoor field. Only world sources excite the listener's bounded room response.
+static float sfx_wet_send(int id) {
+  if (sfx_ambient(id) || sfx_prio(id) == SFX_P_LEAD) return 0;
+  if (id == SFX_FIRE_AR || id == SFX_FIRE_SR) return .65f;
+  if (id == SFX_FAR_AR || id == SFX_FAR_SR) return .30f;
+  if (id == SFX_WHIZZ || id == SFX_HURT) return .10f;
+  if (id == SFX_STEP || id == SFX_SLIDE) return .20f;
+  if (id == SFX_DRY || id == SFX_RELOAD_AR || id == SFX_RELOAD_AR_TAC ||
+      id == SFX_RELOAD_SR) return .18f;
+  return 1;
 }
 
 // The pool is a CEILING, not a target: sfx_prio's classes decide what goes when the
@@ -505,7 +524,9 @@ static void audio_acoustic_update(void) {
 static void audio_on_event(const event_t *e) {
   switch (e->type) {
   case EV_FIRE: {
-    float rate = rng_rangef(&g_rng_audio, 0.97f, 1.03f);
+    if ((unsigned)e->wpn >= WPN_COUNT) break;
+    float variation = e->wpn == WPN_SR ? .010f : .018f;
+    float rate = rng_rangef(&g_rng_audio, 1 - variation, 1 + variation);
     if (e->src == g_local_ent) {  // your own weapon: dead centre, full level
       g_last_wpn = e->wpn;
       // PER WEAPON, because both buffers are PEAK-normalised and both were routed at
@@ -514,7 +535,7 @@ static void audio_on_event(const event_t *e) {
       // of it.
       float lvl = e->wpn == WPN_SR ? 1.12f : 1.0f;
       audio_play(WPN_DEF[e->wpn].sfx_fire,
-                 lvl * rng_rangef(&g_rng_audio, 0.92f, 1.0f), rate, 0.0f, 0.0f);
+                 lvl * rng_rangef(&g_rng_audio, 0.96f, 1.0f), rate, 0.0f, 0.0f);
       break;
     }
     // Someone else's, placed where the round started — the shooter's eye, close
@@ -596,7 +617,8 @@ static void audio_on_event(const event_t *e) {
             * f_clamp(1.0f / (1.0f + dist * dist * 0.020f), 0.0f, 1.0f);
     // A FLOOR, not a fade to nothing.
     if (e->src != g_local_ent && g < 0.10f) break;
-    audio_play(SFX_STEP, g, rng_rangef(&g_rng_audio, 0.86f, 1.16f),
+    audio_play(SFX_STEP, g * rng_rangef(&g_rng_audio, .94f, 1.0f),
+               rng_rangef(&g_rng_audio, .985f, 1.015f),
                e->src == g_local_ent ? 0.0f : pan, dist / 343.0f);
     break;
   }
@@ -702,6 +724,19 @@ static void audio_on_event(const event_t *e) {
 // 4.2 m, not 3.0.
 #define WHIZZ_MISS 4.2f
 
+// Retarded arrival from a constant-speed supersonic trajectory. The shock is
+// emitted before closest approach; a listener outside the muzzle's Mach cone
+// hears the muzzle report, without an invented near-miss crack.
+static int audio_crack_delay(float along, float miss, float velocity, float *delay) {
+  if (f_is_nonfinite(along) || f_is_nonfinite(miss) || f_is_nonfinite(velocity) ||
+      along <= 0 || miss < 0 || velocity <= 343.0f) return 0;
+  float mach = velocity / 343.0f;
+  float cone = sqrtf(mach * mach - 1);
+  if (along <= miss / cone) return 0;
+  *delay = along / velocity + miss * cone / velocity;
+  return 1;
+}
+
 static void audio_shot_world(const event_t *e) {
   if (e->type != EV_FIRE || (unsigned)e->wpn >= WPN_COUNT || f_is_nonfinite(e->f) || e->f <= 1) return;
   // EXCLUDE ONLY ROUNDS THAT HIT THE LISTENER. The old guard rejected `k == 2 || k ==
@@ -717,6 +752,8 @@ static void audio_shot_world(const event_t *e) {
     float t = nearest.along, miss = nearest.miss;
     v3 perp = nearest.offset;
     if (t > 0.5f && t < nearest.length - 0.5f && miss < WHIZZ_MISS) {
+      float delay;
+      if (!audio_crack_delay(t, miss, WPN_DEF[e->wpn].v_round, &delay)) return;
       // Penetrated material is part of the event span, but not an air pass.
       for (int i = 0; i < g_num_solids; i++) {
         g_acoustic_whizz_solids++;
@@ -737,24 +774,15 @@ static void audio_shot_world(const event_t *e) {
       // A CONCAVE LEVEL LAW, because a linear one cannot say "that was CLOSE".
       float k = f_clamp(1.0f - miss / WHIZZ_MISS, 0.0f, 1.0f);
       float g = powf(k, 3.3f) * 0.92f;
-      // THE CRACK ARRIVES BEFORE THE BANG. The round covers `t` metres at its muzzle
-      // velocity and its bow wave then travels `miss` metres of air to the ear; the
-      // report covers the whole `t` at 343 m/s.
-      float v = WPN_DEF[e->wpn].v_round;
-      float delay = t / (v > 1.0f ? v : 343.0f) + miss / 343.0f;
       // One crack per 90 ms unless the new one is closer, so a burst is a crack and a
       // rattle.
       if (g_tick - g_whizz_t < WHIZZ_HOLD && g <= g_whizz_g) return;
       g_whizz_t = g_tick;
       g_whizz_g = g;
-      // A near pass is SHARPER as well as louder: the rate rides the same curve,
-      // so the bow wave's whole spectrum shifts up as it gets closer instead of
-      // only its level. And a .338 is not a 5.56: the heavier round plays the
-      // same buffer a fifth lower, which reads as MASS without a second buffer
-      // — the same trick fx_flash uses for the weapon-differentiated star.
-      audio_play(SFX_WHIZZ, g, (e->wpn == WPN_SR ? 0.81f : 1.0f)
-                 * rng_rangef(&g_rng_audio, 0.92f, 1.10f)
-                 * (0.90f + 0.22f * k), pan, delay);
+      // Small variation preserves the identity and bearing of one ballistic snap.
+      audio_play(SFX_WHIZZ, g, (e->wpn == WPN_SR ? .96f : 1.0f)
+                 * rng_rangef(&g_rng_audio, .98f, 1.02f)
+                 * (.97f + .06f * k), pan, delay);
     }
   }
 }
@@ -781,6 +809,7 @@ static long  g_trig_dropped;     // triggers the pool refused
 static long  g_trig_capped;
 static float g_duck_env;         // lead-voice envelope driving the sidechain
 static float g_duck_min = 1.0f;  // deepest duck applied to the non-lead bus
+static float g_ambient_env, g_ambient_shelter = 1.0f;
 
 // The menu-pause reaches the AUDIO TIMELINE too: freezing only the tick accumulator
 // lets every in-flight voice run ahead of the frozen sim — a paused mid-reload played
@@ -877,6 +906,7 @@ static void audio_mix_reset_state(void) {
   memset(g_voices, 0, sizeof g_voices);
   audio_wet_reset();
   g_duck_env = 0.0f;
+  g_ambient_env = 0.0f; g_ambient_shelter = 1.0f;
   g_lim_g = g_pause_env = 1.0f;
 }
 static int audio_device_format_valid(unsigned hz, int channels) {
@@ -920,14 +950,28 @@ static void audio_mix_admit_trigger(sfx_trig_t t) {
   if (t.epoch != g_audio_mix_epoch) { g_trig_stale++; audio_trace_status(t.trace, ATR_STALE); return; }
   uint32_t cancel = atomic_load_explicit(&g_audio_cancel[t.id][t.tag], memory_order_acquire);
   if (cancel != t.cancel) { g_trig_cancelled++; audio_trace_status(t.trace, ATR_CANCELLED); return; }
+  int loop_hop = sfx_loop_hop_frames(t.id), loop_fade = sfx_loop_fade_frames(t.id);
+  // Source PCM stays intact. Only a continuing segment fades in; the first
+  // retains its authored onset. Per-entity overlap is bounded independently
+  // of the global class ceiling, including voices waiting for propagation.
+  if (loop_hop <= 0 || loop_fade <= 0 ||
+      loop_hop + loop_fade != g_sfx_len[t.id]) loop_hop = loop_fade = 0;
+  int loop_join = 0;
+  if (loop_fade)
+    for (int i = 0; i < MAX_VOICES; i++) {
+      const voice_t *v = &g_voices[i];
+      if (v->active && !v->dying && v->id == t.id && v->tag == t.tag) loop_join++;
+    }
+  if (loop_join >= 2) { g_trig_capped++; audio_trace_status(t.trace, ATR_CAPPED); return; }
   int cap = sfx_class_cap(t.id);
   if (cap > 0) {
     int live = 0;
     for (int i = 0; i < MAX_VOICES; i++)
-      if (g_voices[i].active && !g_voices[i].dying && g_voices[i].delay == 0 &&
+      if (g_voices[i].active && !g_voices[i].dying &&
           g_voices[i].buf == g_sfx_buf[t.id]) live++;
     if (live >= cap) { g_trig_capped++; audio_trace_status(t.trace, ATR_CAPPED); return; }
   }
+  t.gain *= SFX_GAME_GAIN[t.id];
   float gl = t.gain * sqrtf(0.5f * (1.0f - t.pan));
   float gr = t.gain * sqrtf(0.5f * (1.0f + t.pan));
   int slot = -1;
@@ -936,17 +980,21 @@ static void audio_mix_admit_trigger(sfx_trig_t t) {
   int prio = sfx_prio(t.id);
   if (slot < 0) {
     float worst = 1e9f;
+    float incoming = (gl + gr) * sfx_remaining_peak(t.id, g_sfx_buf[t.id], g_sfx_len[t.id], 0);
     int worst_prio = SFX_P_LEAD;
     for (int i = 0; i < MAX_VOICES; i++) {
       const voice_t *v = &g_voices[i];
       if (v->prio == SFX_P_LEAD || v->prio > prio) continue;
-      if (v->prio == prio && v->pos < (float)v->len * 0.55f) continue;
+      if (v->prio == prio && (v->delay > 0 || v->loop_fade ||
+                             v->pos < (float)v->len * 0.55f)) continue;
       float gain = v->gl + v->gr;
+      if (v->prio == prio)
+        gain *= sfx_remaining_peak(v->id, v->buf, v->len, v->pos);
       if (v->prio < worst_prio || (v->prio == worst_prio && gain < worst)) {
         worst_prio = v->prio; worst = gain; slot = i;
       }
     }
-    if (slot < 0 || (worst_prio == prio && worst > gl + gr)) {
+    if (slot < 0 || (worst_prio == prio && worst > incoming)) {
       g_trig_dropped++;
       if (prio != SFX_P_NORM) g_protected_dropped++;
       audio_trace_status(t.trace, ATR_POOL_DROP);
@@ -955,7 +1003,12 @@ static void audio_mix_admit_trigger(sfx_trig_t t) {
   }
   if (g_voices[slot].active) audio_trace_status(g_voices[slot].trace, ATR_STOLEN);
   g_voices[slot] = (voice_t){.active = 1, .buf = g_sfx_buf[t.id], .len = g_sfx_len[t.id],
+    .play_end = sfx_play_frames(t.id),
     .rate = t.rate, .gl = gl, .gr = gr,
+    .loop_hop = loop_hop, .loop_fade = loop_fade, .loop_join = loop_join,
+    .wet = sfx_wet_send(t.id), .ambient = sfx_ambient(t.id),
+    .shelter = t.id == SFX_THUNDER ? .15f : t.id == SFX_WIND ? .65f : 1,
+    .foreground = prio == SFX_P_KEEP || (t.id >= SFX_FIRE_AR && t.id <= SFX_FAR_SR),
     .delay = (int)((float)t.delay / (g_dev_rate > 0.01f ? g_dev_rate : 1.0f)),
     .prio = prio, .id = t.id, .cancel = t.cancel, .tag = t.tag, .trace = t.trace};
   audio_trace_t *witness = audio_trace_find(t.trace);
@@ -1007,6 +1060,10 @@ static void audio_mix(float *out, uint32_t frames, int channels) {
   const float out_vol = g_cfg.vol / VOL_REF;
   int paused = atomic_load_explicit(&g_audio_pause, memory_order_relaxed);
   const float fade = g_dev_rate == 1.0f ? 0.9945f : powf(0.9945f, g_dev_rate);
+  const float ambient_attack = 1 - expf(-g_dev_rate / (.004f * SFX_HZ));
+  const float ambient_release = 1 - expf(-g_dev_rate / (.220f * SFX_HZ));
+  const float shelter_smooth = 1 - expf(-g_dev_rate / (.080f * SFX_HZ));
+  const float shelter_target = g_audio_wet.target.kind == ACOUSTIC_SHELTER ? .38f : 1;
   for (uint32_t f = 0; f < frames; f++) {
     // Pause envelope: fade to silence, then hold every voice in place.
     if (paused) {
@@ -1024,6 +1081,8 @@ static void audio_mix(float *out, uint32_t frames, int channels) {
     }
     if (g_audio_wet.paused_clear) { audio_wet_reset(); audio_wet_prepare(); }
     float sl = 0, sr = 0, ll = 0, lr = 0, kl = 0, kr = 0;
+    float al = 0, ar = 0, send_l = 0, send_r = 0, foreground = 0;
+    g_ambient_shelter += (shelter_target - g_ambient_shelter) * shelter_smooth;
     int live = 0;
     for (int i = 0; i < MAX_VOICES; i++) {
       voice_t *v = &g_voices[i];
@@ -1035,24 +1094,50 @@ static void audio_mix(float *out, uint32_t frames, int channels) {
         if (v->gl + v->gr < 1e-4f) { v->active = 0; continue; }
       }
       int ip = (int)v->pos;
-      if (ip + 1 >= v->len) { audio_trace_status(v->trace, ATR_FINISHED); v->active = 0; continue; }
+      int play_end = v->play_end > 0 ? v->play_end : v->len;
+      if (ip + 1 >= play_end) { audio_trace_status(v->trace, ATR_FINISHED); v->active = 0; continue; }
       float fr = v->pos - (float)ip;
       const float *b = v->buf + ip * SFX_CH;
       float xl = (b[0] * (1.0f - fr) + b[SFX_CH] * fr) * v->gl;
       float xr = (b[1] * (1.0f - fr) + b[SFX_CH + 1] * fr) * v->gr;
+      if (v->loop_fade) {
+        // Complementary power during the overlap, at the source clock even
+        // when a device uses another rate. No filter or buffer mutation.
+        float power = 1;
+        if (v->loop_join && v->pos < v->loop_fade)
+          power = v->pos / v->loop_fade;
+        if (v->pos > v->loop_hop)
+          power = fminf(power, (v->len - v->pos) / v->loop_fade);
+        if (power < 1) {
+          float envelope = sqrtf(f_clamp(power, 0, 1));
+          xl *= envelope; xr *= envelope;
+        }
+      }
       if (g_audio_trace_on && v->trace) audio_trace_sample(v->trace, g_audio_trace_frames + f, v->pos, xl, xr);
-      // KEEP voices bypass the duck by riding the lead bus WITHOUT feeding the
-      // sidechain: they are neither attenuated nor allowed to attenuate.
+      send_l += xl * v->wet; send_r += xr * v->wet;
+      if (v->foreground) foreground = fmaxf(foreground, fmaxf(fabsf(xl), fabsf(xr)));
+      // KEEP bypasses the confirmation sidechain. Its separate ambience
+      // detector above never attenuates world cues or confirmations.
       if (v->prio == SFX_P_LEAD)      { ll += xl; lr += xr; }
       else if (v->prio == SFX_P_KEEP) { kl += xl; kr += xr; }
+      else if (v->ambient) {
+        float shelter = 1 - v->shelter * (1 - g_ambient_shelter);
+        al += xl * shelter; ar += xr * shelter;
+      }
       else                            { sl += xl; sr += xr; }
       v->pos += v->rate * g_dev_rate;
       live++;
     }
     if (live > g_voice_peak) g_voice_peak = live;
     float wet_l, wet_r;
-    audio_wet_sample(sl + .10f * kl, sr + .10f * kr, &wet_l, &wet_r);
+    audio_wet_sample(send_l, send_r, &wet_l, &wet_r);
     sl += wet_l; sr += wet_r;
+    // Brief combat priority only lowers the ambience. It never suppresses
+    // footsteps or incoming fire, and its release follows the shot's body.
+    g_ambient_env += (foreground - g_ambient_env) *
+      (foreground > g_ambient_env ? ambient_attack : ambient_release);
+    float ambient_gain = f_clamp(1 - 3 * g_ambient_env, .45f, 1);
+    sl += al * ambient_gain; sr += ar * ambient_gain;
     // Sidechain duck — where the confirmation gets to be the loudest thing in the
     // game. Arithmetic, not taste: one shot already puts the bus at 0.68 against a
     // 0.92 limiter threshold, so a confirmation loud enough to dominate by LEVEL

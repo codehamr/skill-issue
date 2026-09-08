@@ -1,6 +1,6 @@
 // =============================================================================
 // core/frame.inc — application frame, native input, diagnostics and fixtures.
-// Proof: appframe, framepace, spstart, netleave. Included once in definition order.
+// Proof: appframe, framepace, spstart, netleave, audiocheck. One ordered inclusion.
 // Contract: app_pump joins native input to app_frame; the harness can drive
 // app_frame directly. pad_look owns pad-only aim friction. New-local-arena
 // intent is consumed before handshake polling at a frame boundary. Cleanup is
@@ -827,6 +827,71 @@ static void pad_look(player_t *p, float dt) {
   p->pitch = f_clamp(p->pitch + dp, -PITCH_MAX, PITCH_MAX);
 }
 
+// Slides are presentation state on both local and snapshot-driven entities.
+// Source-length overlap needs no new simulation event or network payload.
+static int audio_slide_interval(void) {
+  return (sfx_loop_hop_frames(SFX_SLIDE) * TICK_HZ + SFX_HZ - 1) / SFX_HZ;
+}
+#define AUDIO_SLIDE_RANGE 14.0f
+static struct {
+  uint32_t epoch;
+  long tick, next[MAX_ENTS];
+  unsigned char active[MAX_ENTS];
+} g_audio_slide;
+
+static void audio_slide_entity(int ent, int active, v3 pos, v3 velocity) {
+  if ((unsigned)ent >= MAX_ENTS) return;
+  float speed = sqrtf(velocity.x * velocity.x + velocity.z * velocity.z);
+  float dist = 0, pan = 0;
+  for (int axis = 0; axis < 3; axis++)
+    if (f_is_nonfinite(pos.e[axis])) active = 0;
+  if (f_is_nonfinite(speed) || speed < 1.0f) active = 0;
+  if (active && ent != g_local_ent) {
+    pan = audio_place(pos, &dist);
+    if (f_is_nonfinite(dist) || dist >= AUDIO_SLIDE_RANGE) active = 0;
+  }
+  int tag = ent + 2;
+  if (!active) {
+    if (g_audio_slide.active[ent]) audio_kill(SFX_SLIDE, tag);
+    g_audio_slide.active[ent] = 0;
+    return;
+  }
+  if (g_audio_slide.active[ent] && g_tick < g_audio_slide.next[ent]) return;
+  g_audio_slide.active[ent] = 1;
+  g_audio_slide.next[ent] = g_tick + audio_slide_interval();
+  float run = fmaxf(g_cfg.mv[MV_RUN], 1.0f);
+  float weight = .35f + .65f * f_clamp(speed / run, 0, 1);
+  float gain = (ent == g_local_ent ? .17f : .48f) * weight /
+               (1 + .030f * dist * dist);
+  audio_play_tag(SFX_SLIDE, gain, 1.0f, pan, dist / 343.0f, tag);
+}
+
+static void audio_slide_update(void) {
+  uint32_t epoch = atomic_load_explicit(&g_audio_epoch, memory_order_relaxed);
+  if (epoch != g_audio_slide.epoch || g_tick < g_audio_slide.tick) {
+    if (epoch == g_audio_slide.epoch)
+      for (int ent = 0; ent < MAX_ENTS; ent++)
+        if (g_audio_slide.active[ent]) audio_kill(SFX_SLIDE, ent + 2);
+    memset(&g_audio_slide, 0, sizeof g_audio_slide);
+    g_audio_slide.epoch = epoch;
+  }
+  g_audio_slide.tick = g_tick;
+  // Visit absent slots too, so a roster removal cancels its last grain.
+  for (int h = 0; h < MAX_HUMANS; h++) {
+    const player_t *p = &g_players[h];
+    int ent = ent_of_human(h);
+    int active = (ent == g_local_ent || g_humans_on[h]) &&
+                 p->alive && p->grounded && p->sliding;
+    audio_slide_entity(ent, active, p->pos, p->vel);
+  }
+  for (int b = 0; b < MAX_BOTS; b++) {
+    const bot_t *bot = &g_bots[b];
+    int active = b < g_match.nbots && bot->active && bot->alive &&
+                 bot->grounded && bot->sliding;
+    audio_slide_entity(b + 1, active, bot->pos, bot->vel);
+  }
+}
+
 // Listener update + event drain, once per frame: the ears travel with the peek, then
 // every event of the frame's ticks is routed into the mixer.
 static void audio_frame_drain(const player_t *p) {
@@ -850,6 +915,7 @@ static void audio_frame_drain(const player_t *p) {
   g_audio_event_age = 0;
   g_audio_event_cursor = -1;
   g_num_events = 0;
+  audio_slide_update();
 }
 
 // Advances the sim by `dt` seconds and renders one frame; the backend swaps.
