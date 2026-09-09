@@ -1217,8 +1217,156 @@ static int fig_hand_rings(const fnode_t *node, int n, int k, v3 hint, fring_t *r
   return 1;
 }
 
+// The first-person skin samples a bounded cubic loft between round profiles. Its normals
+// include the changing section radius, so wrists and rounded joints shade as
+// continuous surfaces instead of a stack of individually lit bands.
+#define FIG_SKIN_SIDES 32
+#define FIG_SKIN_STEPS 4
+#define FIG_SKIN_ROWS ((FIG_NMAX - 1) * FIG_SKIN_STEPS + 1)
+static int g_fig_view_skin;
+static float g_fig_view_ads;
+
+typedef struct {
+  int valid;
+  v3 p[FIG_SKIN_SIDES], normal[FIG_SKIN_SIDES];
+  v3 center, hint, dir, col;
+  float rx, rz, ao;
+} fig_skin_seam_t;
+static fig_skin_seam_t g_fig_skin_seam[FIG_HAND_COUNT];
+
+static float fig_skin_cubic(float a, float b, float c, float d, float t) {
+  float m0 = (c - a) * 0.5f, m1 = (d - b) * 0.5f;
+  float span = c - b;
+  if (m0 * span <= 0.0f) m0 = 0.0f;
+  if (m1 * span <= 0.0f) m1 = 0.0f;
+  float limit = 1.5f * fabsf(span);
+  m0 = f_clamp(m0, -limit, limit);
+  m1 = f_clamp(m1, -limit, limit);
+  return b + t * (m0 + t * (3.0f * (c - b) - 2.0f * m0 - m1 +
+                             t * (2.0f * (b - c) + m0 + m1)));
+}
+
+static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
+                            fig_skin_seam_t *seam, int join) {
+  if (n < 2 || n > FIG_NMAX) return;
+  v3 p[FIG_SKIN_ROWS][FIG_SKIN_SIDES];
+  v3 normal[FIG_SKIN_ROWS][FIG_SKIN_SIDES];
+  v3 control[FIG_NMAX][FIG_SKIN_SIDES];
+  fnode_t row[FIG_SKIN_ROWS];
+  // Finger and palm spans are shorter than sleeve spans; they retain three
+  // subdivisions while the forearm join and broad upper arm retain four.
+  int steps = join || node[1].rx > 0.060f ? FIG_SKIN_STEPS : 3;
+  int rows = (n - 1) * steps + 1;
+  v3 prev_x = hint;
+  for (int i = 0; i < n; i++) {
+    int lo = i ? i - 1 : i, hi = i + 1 < n ? i + 1 : i;
+    v3 ny = v3_norm(v3_sub(node[hi].p, node[lo].p));
+    // Sleeve rings transport their preceding frame through elbow and wrist
+    // bends; the fixed palm hint continues to define finger breadth.
+    v3 nx = fig_perp(ny, steps == FIG_SKIN_STEPS && i ? prev_x : hint);
+    if (v3_dot(nx, prev_x) < 0.0f) nx = v3_scale(nx, -1.0f);
+    prev_x = nx;
+    v3 nz = v3_cross(nx, ny);
+    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+      float ang = ((float)j + 0.5f) * F_TAU / FIG_SKIN_SIDES + node[i].roll;
+      control[i][j] = v3_add(node[i].p,
+          v3_add(v3_scale(nx, cosf(ang) * node[i].rx),
+                 v3_scale(nz, sinf(ang) * node[i].rz)));
+    }
+  }
+  int joined = seam && seam->valid && join && n > 2;
+  if (joined)
+    for (int j = 0; j < FIG_SKIN_SIDES; j++)
+      control[1][j] = v3_add(
+          v3_lerp(seam->center, seam->p[FIG_SKIN_SIDES - 1 - j], 0.994f),
+          v3_scale(seam->dir, 0.00025f));
+  for (int i = 0; i < rows; i++) {
+    int b = i / steps;
+    if (b >= n - 1) b = n - 2;
+    int a = b > 0 ? b - 1 : b, c = b + 1, d = c + 1 < n ? c + 1 : c;
+    float t = (float)(i - b * steps) / steps;
+    row[i] = node[b];
+    for (int j = 0; j < 3; j++)
+      row[i].p.e[j] = fig_skin_cubic(node[a].p.e[j], node[b].p.e[j],
+                                    node[c].p.e[j], node[d].p.e[j], t);
+    row[i].rx = fig_skin_cubic(node[a].rx, node[b].rx, node[c].rx, node[d].rx, t);
+    row[i].rz = fig_skin_cubic(node[a].rz, node[b].rz, node[c].rz, node[d].rz, t);
+    row[i].roll = node[b].roll + (node[c].roll - node[b].roll) * t;
+    row[i].col = v3_lerp(node[b].col, node[c].col, t);
+    float ao0 = node[b].ao > 0.0f ? node[b].ao : 1.0f;
+    float ao1 = node[c].ao > 0.0f ? node[c].ao : 1.0f;
+    row[i].ao = ao0 + (ao1 - ao0) * t;
+    for (int j = 0; j < FIG_SKIN_SIDES; j++)
+      for (int xyz = 0; xyz < 3; xyz++)
+        p[i][j].e[xyz] = fig_skin_cubic(control[a][j].e[xyz], control[b][j].e[xyz],
+                                       control[c][j].e[xyz], control[d][j].e[xyz], t);
+  }
+  for (int i = 0; i < rows; i++) {
+    int lo = i ? i - 1 : i, hi = i + 1 < rows ? i + 1 : i;
+    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+      int prev = (j + FIG_SKIN_SIDES - 1) % FIG_SKIN_SIDES;
+      int next = (j + 1) % FIG_SKIN_SIDES;
+      normal[i][j] = v3_norm(v3_cross(v3_sub(p[hi][j], p[lo][j]),
+                                      v3_sub(p[i][next], p[i][prev])));
+    }
+  }
+  if (joined) {
+    // The arm's closed root tucks a quarter millimetre inside the palm. Matching
+    // normals preserve the smooth join without coincident edges on two shells.
+    int shared = steps;
+    row[shared].p = seam->center;
+    row[shared].col = seam->col;
+    row[shared].ao = seam->ao;
+    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+      p[shared][j] = control[1][j];
+      normal[shared][j] = seam->normal[FIG_SKIN_SIDES - 1 - j];
+    }
+  } else if (seam && !join) {
+    seam->valid = 1;
+    seam->center = row[0].p;
+    seam->hint = hint;
+    seam->dir = v3_norm(v3_sub(node[1].p, node[0].p));
+    seam->col = row[0].col;
+    seam->rx = node[0].rx;
+    seam->rz = node[0].rz;
+    seam->ao = row[0].ao;
+    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+      seam->p[j] = p[0][j];
+      seam->normal[j] = normal[0][j];
+    }
+  }
+  for (int i = 1; i < rows; i++)
+    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+      int next = (j + 1) % FIG_SKIN_SIDES;
+      const int ri[6] = {i - 1, i, i, i - 1, i, i - 1};
+      const int rj[6] = {j, j, next, j, next, next};
+      for (int v = 0; v < 6; v++) {
+        int r = ri[v], s = rj[v];
+        g_ao_mul = row[r].ao;
+        scene_push(p[r][s], normal[r][s], row[r].col);
+      }
+    }
+  for (int end = 0; end < 2; end++) {
+    int i = end ? rows - 1 : 0;
+    v3 ny = end ? v3_norm(v3_sub(row[i].p, row[i - 1].p))
+                : v3_norm(v3_sub(row[0].p, row[1].p));
+    g_ao_mul = row[i].ao;
+    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+      int next = (j + 1) % FIG_SKIN_SIDES;
+      scene_push(row[i].p, ny, row[i].col);
+      scene_push(p[i][end ? next : j], normal[i][end ? next : j], row[i].col);
+      scene_push(p[i][end ? j : next], normal[i][end ? j : next], row[i].col);
+    }
+  }
+  g_ao_mul = 1.0f;
+}
+
 static void fig_hand_chain(const fnode_t *node, int n, int k, v3 hint,
                            v3 held_center, float dorsal) {
+  if (g_fig_view_skin) {
+    fig_skin_chain(node, n, hint, NULL, 0);
+    return;
+  }
   if (n < 2 || n > FIG_NMAX) return;
   if (k > g_fig_k) k = g_fig_k < 4 ? 4 : g_fig_k;
   fring_t ring[FIG_NMAX];
@@ -1344,11 +1492,9 @@ static void fig_hand_sweep_clear(fnode_t *node, int n, int k, v3 hint, float cle
 }
 
 // --- palm: wrist -> knuckle row, and the palm's own frame for the digits --
-// THE BACK OF A HAND IS FLAT — only the fingers curl — so the palm is a straight
-// tapered slab from the wrist to the knuckle row with a shallow cup in it, and the
-// whole wrap lives in the digits. Every digit below used to be placed purely in the
-// GRIP CYLINDER's polar frame — hand_pt(FAX[f], phi, rad) — while the palm is a chord
-// from the CALLER's wrist to pk, so this also builds the palm's OWN frame (pbx/pu/
+// The wrist-to-knuckle palm has a shallow cup around the held profile. First-person
+// skin rounds its heel, dorsum and distal edge; distant figures keep a compact sweep.
+// Digits root in the palm's frame (pbx/pu/
 // root_c/root_x) the digits root into. Outputs: pk/rk (the knuckle-row point and its
 // radius — also feeds the far-tier one-mass hand), p3/p4/prx3/prx4 (pm[3]/pm[4] and
 // their authored half-widths — also feeds the far-tier hand's own root), pbx/pu/
@@ -1448,7 +1594,25 @@ static void fig_hand_palm(v3 wrist, v3 gc, v3 ga, float gr, v3 col,
   bk = v3_norm(v3_sub(pm[1].p, pm[2].p));
   if (out_palm_dir) *out_palm_dir = v3_scale(bk, -1.0f);
   int patch_v0 = g_scene_floats;
-  if (g_fig_k >= FIG_HAND_DETAIL_K) {
+  if (g_fig_view_skin) {
+    fnode_t skin[7] = {pm[0], pm[1], pm[2], pm[3], pm[4], pm[4], pm[4]};
+    skin[1].rx = 0.0290f; skin[1].rz = 0.0188f;
+    skin[2].rx = 0.0380f; skin[2].rz = 0.0230f;
+    skin[3].p = v3_lerp(pm[3].p, pm[4].p, 0.15f);
+    skin[3].rx = 0.0445f; skin[3].rz = 0.0160f;
+    skin[4].p = v3_lerp(pm[3].p, pm[4].p, 0.45f);
+    skin[4].rx = 0.0420f;
+    skin[5].p = v3_lerp(pm[3].p, pm[4].p, 0.62f);
+    skin[5].rx *= 0.65f; skin[5].rz *= 0.70f;
+    skin[6].p = v3_lerp(pm[3].p, pm[4].p, 0.70f);
+    skin[6].rx *= 0.08f; skin[6].rz *= 0.18f;
+    for (int i = 1; i < 7; i++)
+      skin[i].p = fig_hand_hold_clear(skin[i].p, skin[i].rz, -0.0010f,
+                                      gc, ga, e1, e2, gr);
+    fig_skin_chain(skin, 7, ga, &g_fig_skin_seam[hand_slot], 0);
+    fig_contact_patch_add("palm", hand_slot, patch_v0, skin, 7,
+                          gc, ga, e1, e2, gr);
+  } else if (g_fig_k >= FIG_HAND_DETAIL_K) {
     fig_hand_chain(palm_mesh, 7, 12, ga, gc, 0.24f);   // hint = ga, so rx is the BREADTH
     fig_contact_patch_add("palm", hand_slot, patch_v0, palm_mesh, 7,
                           gc, ga, e1, e2, gr);
@@ -1523,6 +1687,11 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   float sweep = FSW[f], reach = 0.0f;
   if (heel > 0.0f) {
     float closed = f == 3 && g_fig_fp ? 0.42f : 0.52f;
+    if (g_fig_view_skin) {
+      static const float wrap[4] = {0.62f, 0.66f, 0.68f, 0.64f};
+      float sight = smooth01(f_clamp(g_fig_view_ads * 2.0f, 0.0f, 1.0f));
+      closed = wrap[f] + (0.52f - wrap[f]) * sight;
+    }
     sweep *= heel >= 1.0f ? closed : 1.0f + (closed - 1.0f) * heel;
   }
   int aimed = style == 1 && f == 3 && trig_pt != NULL && !slid;
@@ -1567,7 +1736,7 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
     // A 1.5 mm station bias keeps the exact k=12 facet on the authored
     // -0.5..-2.5 mm pad band while the neighbouring blade centreline remains at
     // the independent -4.5 mm limit.
-    const float PAD_FACET_SEAT = -0.001500f;
+    const float PAD_FACET_SEAT = -0.001500f + (g_fig_view_skin ? 0.00025f : 0.0f);
     tB = v3_add(*trig_pt,
                 v3_scale(g_gun_trig_n,
                          r * tip_rz - TRIG_PAD_SQUASH + PAD_FACET_SEAT));
@@ -1651,6 +1820,10 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
     float root_pad = fmaxf(fg[0].rx, fg[0].rz);
     fg[0].p = a;
     fg[0].p = fig_body_clear(fg[0].p, root_pad);
+    if (g_fig_view_skin && style == 2) {
+      fg[0].rx = r * 0.88f;
+      fg[0].rz = r * 0.82f;
+    }
   }
   if (!aimed) {
     // Exact critical stations on the authored polar curve, not chord lerps. They
@@ -1749,12 +1922,41 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   // The palm buries this short 3 mm feather from a proud attachment cap to the first
   // compressed pad station. It cannot traverse a neighbouring rail land axially.
   // Each articulated digit has a reinforced proximal knuckle, a darker flexion
-  // crease and a softer distal pad. Keep the proven grip surface and radii exact.
+  // crease and a softer distal pad. The close skin rounds these authored stations.
   for (int i = 0; i < chain_nodes; i++) {
     float t = (float)i / (float)(chain_nodes - 1);
     float knuckle = expf(-90.0f * (t - 0.22f) * (t - 0.22f));
     float fold = expf(-130.0f * (t - 0.53f) * (t - 0.53f));
     fg[i].col = fg[i].bcol = v3_scale(col, 0.94f + 0.20f * knuckle - 0.12f * fold);
+    if (g_fig_view_skin && !aimed && (i == 4 || i == 6)) {
+      float swelling = i == 4 ? 0.0009f : 0.0006f;
+      v3 radial = v3_sub(fg[i].p, gc);
+      radial = v3_norm(v3_sub(radial, v3_scale(ga, v3_dot(radial, ga))));
+      fg[i].p = v3_add(fg[i].p, v3_scale(radial, swelling));
+      fg[i].rx += swelling * 0.55f;
+      fg[i].rz += swelling;
+    }
+  }
+  if (g_fig_view_skin && !aimed)
+    for (int i = 1; i < chain_nodes; i++) {
+      // Reserve a small contact margin for the curved glove surface between
+      // authored stations while keeping the compressed pad visibly seated.
+      v3 radial = v3_sub(fg[i].p, gc);
+      radial = v3_sub(radial, v3_scale(ga, v3_dot(radial, ga)));
+      float length = v3_len(radial);
+      if (length > 1e-6f)
+        fg[i].p = v3_add(fg[i].p, v3_scale(radial, 0.0004f / length));
+      fg[i].p = fig_hand_exposed_clear(fg[i].p, fg[i].rz,
+          fmaxf(fg[i].rx, fg[i].rz), 1.0f, gc, ga, e1, e2, gr);
+    }
+  if (g_fig_view_skin && style == 2)
+    fig_hand_sweep_clear(fg, chain_nodes, 20, ga, 0.0008f);
+  if (g_fig_view_skin && aimed) {
+    // The smooth distal pad clears the blade's centreline while its contact
+    // surface remains seated. Apply the offset after the guard constraints.
+    v3 clearance = v3_scale(g_gun_trig_n, -0.0004f);
+    for (int i = 2; i < chain_nodes; i++)
+      fg[i].p = v3_add(fg[i].p, clearance);
   }
   fig_hand_chain(fg, chain_nodes, FIG_DIGIT_K, ga, gc, 0.22f);
   fig_contact_patch_add(aimed ? "trigger_digit" : "grip_digits",
@@ -1773,10 +1975,11 @@ static void fig_hand_thumb(v3 wrist, v3 pk, v3 gc, v3 ga, v3 e1, v3 e2,
   // of half-breadth put its outer extent 3.8 mm outside a palm that is 34.0 mm there,
   // so the thumb's proximal end sat ON the palm surface with a dark seam under it and
   // read as a rod glued to the hand.
-  float thumb_root0 = g_fig_fp ? 0.30f : 0.42f;
-  float thumb_root1 = g_fig_fp ? 0.52f : 0.62f;
-  float thumb_lift0 = g_fig_fp ? 0.0100f : 0.0150f;
-  float thumb_lift1 = g_fig_fp ? 0.0280f : 0.0382f;
+  int close_skin = g_fig_fp || g_fig_view_skin;
+  float thumb_root0 = close_skin ? 0.30f : 0.42f;
+  float thumb_root1 = close_skin ? 0.52f : 0.62f;
+  float thumb_lift0 = close_skin ? 0.0100f : 0.0150f;
+  float thumb_lift1 = close_skin ? 0.0280f : 0.0382f;
   v3 tb0 = v3_add(v3_lerp(wrist, pk, thumb_root0), v3_scale(ga, thumb_lift0));
   v3 tb1 = v3_add(v3_lerp(wrist, pk, thumb_root1), v3_scale(ga, thumb_lift1));
   v3 wrap_root = tb1;
@@ -2282,9 +2485,16 @@ void fig_upper_arm(v3 shoulder, v3 elbow, v3 into, v3 hint,
     {v3_add(shoulder, v3_scale(ua, 0.680f)), c4, c4,
      0.0590f, 0.0620f, 0, 0.0f},
     {elbow, c5, c5, 0.0425f, 0.0445f, 0, 0.0f}};
+  if (g_fig_view_skin) {
+    // Continue the hidden sleeve root along the first visible segment so the
+    // smooth shoulder loft keeps one tangent through its broadest section.
+    v3 root_axis = v3_norm(v3_sub(ar[2].p, ar[1].p));
+    ar[0].p = v3_sub(ar[1].p, v3_scale(root_axis, 0.045f));
+  }
   float saved_jit = g_fig_jit;
   g_fig_jit = 0.35f;
-  fig_chain(ar, 6, k, 1, 1, hint);
+  if (g_fig_view_skin) fig_skin_chain(ar, 6, hint, NULL, 0);
+  else fig_chain(ar, 6, k, 1, 1, hint);
   g_fig_jit = saved_jit;
 }
 
@@ -2382,7 +2592,36 @@ static void fig_forearm(v3 wrist, v3 back, v3 pd, v3 lat, float side,
     fn[7].col = fn[7].bcol = v3_scale(sleeve, 0.91f);
     float saved_jit = g_fig_jit;
     g_fig_jit = 0.35f;
-    if (g_fig_k >= 12) {
+    if (g_fig_view_skin) {
+      int hand_slot = side > 0.0f ? FIG_HAND_FIRE : FIG_HAND_SUPPORT;
+      fig_skin_seam_t *seam = &g_fig_skin_seam[hand_slot];
+      if (seam->valid) {
+        // The wrist follows the palm's root with a submillimetre overlap and
+        // matching normals. Its smaller closing ring remains buried in the hand.
+        fn[0].p = v3_add(seam->center, v3_scale(seam->dir, 0.010f));
+        fn[0].rx = seam->rx * 0.60f;
+        fn[0].rz = seam->rz * 0.60f;
+        fn[1].p = seam->center;
+        fn[1].rx = seam->rx;
+        fn[1].rz = seam->rz;
+        fn[2].p = v3_sub(seam->center, v3_scale(seam->dir, 0.015f));
+        fn[2].rx = seam->rx * 1.025f;
+        fn[2].rz = seam->rz * 1.040f;
+        fn[3].p = v3_lerp(
+            v3_sub(seam->center, v3_scale(seam->dir, 0.042f)),
+            v3_add(wrist, v3_scale(back, 0.038f * sc)), 0.50f);
+        for (int i = 0; i < 3; i++) {
+          fn[i].roll = 0.0f;
+          fn[i].col = fn[i].bcol = seam->col;
+          fn[i].ao = seam->ao;
+        }
+        fn[3].col = fn[3].bcol = v3_lerp(seam->col, sleeve, 0.18f);
+        fig_skin_chain(fn, 9, seam->hint, seam, 1);
+        seam->valid = 0;
+      } else {
+        fig_skin_chain(fn, 9, lat, NULL, 0);
+      }
+    } else if (g_fig_k >= 12) {
       fig_chain(fn, 9, k, 1, 1, lat);
     } else {
       fnode_t f5[5] = {fn[0], fn[2], fn[4], fn[7], fn[8]};

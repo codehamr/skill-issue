@@ -526,9 +526,18 @@ case "$ELF" in b700|3e00) WANT_SR_CROSS="205 205 185 133 104" ;; esac
 # values and reduce the current cross witness to134 in both complete sweeps.
 # Dorsal-only glove shaping retains every forbidden-contact and grip-interval
 # invariant in vmtrig; the 20-state shallow crossing census changes 134->142.
+# The dense first-person skin uses 32-sided smooth rings and transported sleeve
+# frames. Its reviewed x86_64 near/cross census is 196/220 across all 152 poses:
+# open/flip/dup/zfight/degen and vmtrig forbidden mesh/proxy crossings stay zero,
+# and all ten third-person figure summaries match the pre-change binary exactly.
+# AArch64 retains its last independently measured reference.
 WANT_VM_NEAR=198
-[ "$ELF" != b700 ] || WANT_VM_NEAR=194
-gate_command vmcheck "vmcheck" "^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=$WANT_VM_NEAR cross=142 degen=0 recoil_states=20$"
+WANT_VM_CROSS=142
+case "$ELF" in
+  3e00) WANT_VM_NEAR=196; WANT_VM_CROSS=220 ;;
+  b700) WANT_VM_NEAR=194 ;;
+esac
+gate_command vmcheck "vmcheck" "^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=$WANT_VM_NEAR cross=$WANT_VM_CROSS degen=0 recoil_states=20$"
 gate_command vmsight "vmsight" '^vmsight total=0 '
 gate_command vmscope "vmscope" '^vmscope scope_tris=[1-9][0-9]* open_at=0[.]55 baseline_err=.* recoil_min_ocular=.* recoil_axis=.* recoil_center=.* recoil_pip=.* recoil_radius_delta=.* ok$'
 gate_command vmframe "vmframe" '^vmframe ok$'

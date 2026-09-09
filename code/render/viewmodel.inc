@@ -521,17 +521,11 @@ static void vm_stage_hands(const vm_pose_t *ps, v3 org, v3 gx, v3 gy, v3 gz,
   gunanim_t ga_ = ps->ga;
   float mdrop = ga_.mag, mgv = ga_.hand;
   {
-    // FROM THE FIGURE'S ONE KIT, not restated. The one thing that may
-    // legitimately differ is a LIGHTING compensation.
-    // The viewmodel has its own hero rig and its own depth-cleared pass; the
-    // world sun and the shadow map do not reach it, and at equal albedo it
-    // measures a few percent darker than the same cloth on the body (measured:
-    // rendered mean luminance of the cloth pixels, 95 on the body against 75
-    // on the viewmodel before this was compensated at all). That factor lives
-    // here, once, instead of in a second set of colours that can drift.
+    // The sleeve uses the shared uniform under the viewmodel's light rig.
+    // Coyote leather distinguishes the close glove from the weapon's graphite.
     kit_t vkt = fig_kit(0.0f, (v3){{1, 1, 1}});
     v3 sleeve = v3_scale(vkt.sleeve, 1.055f);   // shared uniform, VM-lit
-    v3 glove  = v3_scale(vkt.glove, 1.055f);    // ...and his own gloves
+    v3 glove  = {{0.32f, 0.285f, 0.225f}};    // coyote leather, readable at arm's length
     // The cuff belongs to the GLOVE, not to the sleeve.
     v3 gnt    = v3_scale(glove, 0.88f);
     // BOTH hands are placed on the weapon's OWN published grip cylinders (`gun_hold`)
@@ -754,7 +748,11 @@ static void vm_build_prepared(v3 eye, v3 rgt, v3 upv, v3 fwd,
   // onto a pose the render never draws. render_frame's mesh-free pre-glow
   // plan, the one caller whose basis IS the camera, owns the publish.
 
+  g_fig_view_skin = 1;
+  g_fig_view_ads = ps.ads;
   vm_stage_hands(&ps, org, gx, gy, gz, eye, rgt, upv, fwd);
+  g_fig_view_skin = 0;
+  g_fig_view_ads = 0.0f;
 
   if (cur == WPN_SR) {
     g_gun_sight_p = plan->scope.ocular;

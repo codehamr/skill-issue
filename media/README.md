@@ -57,6 +57,7 @@ python3 media/media.py render frost_scope frost_impact
 python3 media/media.py all --skip-render
 python3 media/media.py review
 python3 media/gallery.py --before build/SESSION/game-before
+python3 tools/hand-captures.py --before build/SESSION/game-before
 ```
 
 `check` verifies the native build transaction, tools and recipes; it reports
@@ -79,6 +80,19 @@ The MP4 and cache are ignored by Git. Neither production nor review reads
 
 `gallery.py` retains raw before/after PNGs, recipes, logs and hashes in a unique
 `build/media-gallery-*` directory and exports only `screenshots/arenas.png`.
+`tools/hand-captures.py` exports separate `000-before.png`, `000-after.png`,
+`001-before-closeup.png` and `001-after-closeup.png` frames using the same seed,
+profile and pose. The closeup moves the actual viewmodel camera; use `--closeup`
+to supply a `vmorbit` or `vmbore` command. `--tag iteration-02` captures just that
+version. `--config-source PATH` pins an existing profile; otherwise the oldest
+binary supplies the shared defaults. `--captions` adds one caption band to each
+raw frame. Captures, recipes, logs and manifests stay in `build/hand-captures-*`.
+Every export validates the expected dimensions and a complete single PNG;
+exports are never inputs, so rerunning cannot stack frames or labels.
+The harness `shot` command renders once and writes one framebuffer. It does not
+add captions or construct contact sheets; those operations belong to export
+tools. The hand exporter keeps those individual frames separate, and its optional
+caption pass always starts from the raw PNG with exactly one `drawtext` operation.
 At the end of each prompt, keep `screenshots/` limited to a few final new results,
 preferably before/after collages. Archive needed raw/earlier evidence under
 `build/`, preserving other sessions' work.

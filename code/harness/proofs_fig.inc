@@ -1062,8 +1062,11 @@ typedef struct {
 // straddles a hard wall threshold. Patch membership and Bite area retain the
 // 0.25 mm source partition; this only tightens an otherwise inconclusive depth bound.
 #define VMTRIG_WALL_LEAF_RADIUS 0.00010f
-#define VMTRIG_HAND_LEAF_CAP 512
-#define VMTRIG_HAND_NODE_CAP 128
+// The first-person skin emits up to 1792 triangles per closed hand child. Its
+// contact partition also needs leaves for triangles split along patch borders;
+// the gate independently retains twenty percent headroom above measured peaks.
+#define VMTRIG_HAND_LEAF_CAP 4096
+#define VMTRIG_HAND_NODE_CAP 2048
 #define VMTRIG_WEAPON_LEAF_CAP 256
 #define VMTRIG_WEAPON_NODE_CAP 128
 enum { VMTRIG_PATCH_HAND, VMTRIG_PATCH_WEAPON, VMTRIG_SCRATCH_COUNT };

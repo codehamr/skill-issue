@@ -59,9 +59,10 @@ typedef struct { int tris, degen, open, flip, dup, zfight, near, cross; } fchk_r
 // edge, whatever the tessellation does.
 #define FCHK_CROSS_COS 0.9659f   // cos 15 deg
 #define FCHK_CROSS_SEG 0.0005f   // 0.5 mm of intersection segment
-// Triangles the crossing tier keeps a bounding radius for. The pair loop is
-// O(n^2) already; this is what lets a pair be rejected in one subtraction.
-#define FCHK_TMAX 32768
+// Dense first-person skins and ordinary figures share one bounded triangle
+// capacity for topology and crossing radii. The pair loop is O(n^2); radii
+// let a distant pair be rejected in one subtraction.
+#define FCHK_TMAX 65536
 
 // Do two triangles share a vertex, bit-exactly? Neighbours inside one chain do, and
 // their "intersection" is the edge they were built to share.
@@ -338,7 +339,12 @@ static fchk_res_t fchk_scene(void) {
   fchk_res_t r = {0};
   int nt = g_scene_floats / (VERT_FLOATS * 3);
   r.tris = nt;
-  static fchk_edge_t ed[65536];
+  if (nt > FCHK_TMAX) {
+    fprintf(stderr, "fchk: triangle capacity exceeded (%d > %d)\n",
+            nt, FCHK_TMAX);
+    exit(1);
+  }
+  static fchk_edge_t ed[FCHK_TMAX * 3];
   static float trad[FCHK_TMAX];   // circumradius about the centroid, for the
                                   // crossing tier's one-subtraction reject
   int ne = 0;
@@ -363,8 +369,7 @@ static fchk_res_t fchk_scene(void) {
                      fchk_vkey(&t[VERT_FLOATS * 2])};
     for (int e = 0; e < 3; e++) {
       uint64_t a = k[e], b = k[(e + 1) % 3];
-      if (ne < (int)(sizeof ed / sizeof *ed))
-        ed[ne++] = (fchk_edge_t){a < b ? a : b, a < b ? b : a, a < b ? 1 : -1, i};
+      ed[ne++] = (fchk_edge_t){a < b ? a : b, a < b ? b : a, a < b ? 1 : -1, i};
     }
   }
   qsort(ed, ne, sizeof *ed, fchk_cmp);
