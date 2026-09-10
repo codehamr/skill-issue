@@ -19,5 +19,22 @@ RUN apt-get update \
       imagemagick \
       openssh-client \
       libegl1-mesa-dev libgl1-mesa-dev libgl1-mesa-dri \
+      curl \
       ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# Native agents live in the image, outside the mounted runtime state.
+# Codex's standalone payload belongs in /opt so its config volume cannot hide it.
+# Remove Claude's installer scaffolding before Docker seeds fresh config volumes.
+# Rebuild without cache to fetch current releases.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN set -eu; \
+    curl -fsSL https://claude.ai/install.sh | bash; \
+    ln -s /root/.local/bin/claude /usr/local/bin/claude; \
+    curl -fsSL https://chatgpt.com/codex/install.sh \
+      | CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/opt/codex CODEX_NON_INTERACTIVE=1 sh; \
+    curl -fsSL https://codehamr.com/install.sh | TERM=xterm PREFIX=/usr/local bash; \
+    claude --version; \
+    codex --version; \
+    codehamr --version; \
+    rm -rf /root/.claude /root/.claude.json
