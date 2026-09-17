@@ -13,14 +13,15 @@
 
 // A point on the grip cylinder's frame: `ax` along the axis from `gc`, `ph` around it
 // measured from e1, at radius `rad`.
-static v3    g_gun_trig_p;    // world contact point on the blade's rear face
-static v3    g_gun_trig_n;    // unit REARWARD normal there (the pull direction)
+static v3    g_gun_trig_p;    // world contact point on the blade's forward face
+static v3    g_gun_trig_n;    // outward normal toward the contacting finger pad
 static v3    g_gun_guard[4];  // the guard bow's polyline, world space
 static float g_gun_guard_r;   // ...and the tube radius round it
 // The cross-section scale the rifle is being drawn at — 1.0 in first person,
 // GUN_GIRTH_3P on a figure.
 static float g_gun_girth;
 static v3    g_gun_blade[3];  // the trigger blade's polyline, world space
+static int   g_gun_blade_range[2];  // exact emitted blade mesh, excluding the guard
 static float g_gun_blade_r;   // ...and its tube radius. Published for the same
                               // reason the guard is: it is a THIN part in open air, and
                               // the proof has to be able to ask whether a fat finger
@@ -724,15 +725,14 @@ static v3 fig_trig_pt(v3 a, v3 c, v3 b, float t) {
 // is derived from it.
 #define FTIP_RX 0.798f
 #define FTIP_RZ 0.730f
-// A pad PRESSES on a trigger, it does not pass through it: the surface stops on the
-// steel and deforms about a millimetre and a half.
-#define TRIG_PAD_SQUASH 0.0015f
+// The pad rests in front of the blade with a small positive contact allowance.
+#define TRIG_PAD_CLEARANCE 0.0002f
 
-// How much air a digit keeps from the guard's wire, before the girth scale. 6.0 mm and
-// not 1.5, because the push moves NODES and the swept surface between two cleared nodes
-// is a chord where the arc is not — a margin sized for the nodes leaves the BAND
-// between them inside the tube.
+// Coarse fingers reserve room for long bevel bands. Close skin uses a smaller
+// margin plus segment witnesses, so the guard cannot force neighbouring joints
+// onto opposite faces of the bow.
 #define HAND_GUARD_CLR 0.0090f
+static int g_fig_view_skin;
 // The broad glove back sits half a millimetre proud of a hard surface.
 #define HAND_CLEAR_AIR 0.0005f
 
@@ -809,7 +809,8 @@ static v3 fig_guard_clear(v3 p, float r) {
   // radii do: the third-person rifle draws at GUN_GIRTH_3P and its digits are
   // fatter in proportion, so a fixed millimetre margin covers less of the
   // chord sag between two cleared nodes there than it does in first person.
-  float need = r + g_gun_guard_r + HAND_GUARD_CLR * g_gun_girth;
+  float need = r + g_gun_guard_r +
+                 (g_fig_view_skin ? 0.0015f : HAND_GUARD_CLR) * g_gun_girth;
   for (int e = 0; e + 1 < 4; e++) {
     v3 a = g_gun_guard[e], ab = v3_sub(g_gun_guard[e + 1], a);
     float l2 = v3_dot(ab, ab);
@@ -819,6 +820,26 @@ static v3 fig_guard_clear(v3 p, float r) {
     if (len < 1e-5f || len >= need) continue;
     p = v3_add(c, v3_scale(d, need / len));
   }
+  return p;
+}
+
+// Clear the curved blade with its elliptical section, independently of the guard.
+static v3 fig_blade_clear(v3 p, float radius) {
+  for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < 2; i++) {
+      v3 a = g_gun_blade[i], ab = v3_sub(g_gun_blade[i + 1], a);
+      float l2 = v3_dot(ab, ab);
+      if (l2 < 1e-10f) continue;
+      float t = f_clamp(v3_dot(v3_sub(p, a), ab) / l2, 0.0f, 1.0f);
+      v3 c = v3_add(a, v3_scale(ab, t)), d = v3_sub(p, c);
+      float len = v3_len(d);
+      if (len < 1e-7f) continue;
+      v3 normal = v3_scale(d, 1.0f / len);
+      float forward = v3_dot(normal, g_gun_trig_n);
+      float blade = g_gun_blade_r * sqrtf(1.0f - 0.55f * forward * forward);
+      float need = radius + blade + 0.0002f;
+      if (len < need) p = v3_add(c, v3_scale(normal, need));
+    }
   return p;
 }
 
@@ -1221,9 +1242,8 @@ static int fig_hand_rings(const fnode_t *node, int n, int k, v3 hint, fring_t *r
 // include the changing section radius, so wrists and rounded joints shade as
 // continuous surfaces instead of a stack of individually lit bands.
 #define FIG_SKIN_SIDES 32
-#define FIG_SKIN_STEPS 4
+#define FIG_SKIN_STEPS 3
 #define FIG_SKIN_ROWS ((FIG_NMAX - 1) * FIG_SKIN_STEPS + 1)
-static int g_fig_view_skin;
 static float g_fig_view_ads;
 
 typedef struct {
@@ -1233,6 +1253,48 @@ typedef struct {
   float rx, rz, ao;
 } fig_skin_seam_t;
 static fig_skin_seam_t g_fig_skin_seam[FIG_HAND_COUNT];
+static fnode_t g_fig_skin_palm[FIG_HAND_COUNT][7];
+static fnode_t g_fig_skin_thumb_anchor[FIG_HAND_COUNT];
+
+#define FIG_PALM_ROWS (6 * FIG_SKIN_STEPS + 1)
+typedef struct {
+  int rows;
+  v3 p[FIG_PALM_ROWS][FIG_SKIN_SIDES], normal[FIG_PALM_ROWS][FIG_SKIN_SIDES];
+  v3 center[FIG_PALM_ROWS], col[FIG_PALM_ROWS], du[FIG_PALM_ROWS], dv[FIG_PALM_ROWS];
+  v3 axis;
+  float along[FIG_PALM_ROWS], inv_span[FIG_PALM_ROWS];
+} fig_skin_patch_t;
+static fig_skin_patch_t g_fig_skin_palm_patch[FIG_HAND_COUNT];
+
+// Each proximal digit inherits the actual palm's local tangent and colour. A
+// cached longitudinal frame and one angular lookup select four shared vertices.
+static void fig_skin_palm_blend(v3 p, v3 *normal, v3 *col, float *ao, int hand, float fade) {
+  const fig_skin_patch_t *palm = &g_fig_skin_palm_patch[hand];
+  if (palm->rows < 2) return;
+  float along = v3_dot(v3_sub(p, palm->center[0]), palm->axis);
+  int row = 0;
+  while (row + 2 < palm->rows && along > palm->along[row + 1]) row++;
+  float t = f_clamp((along - palm->along[row]) * palm->inv_span[row], 0.0f, 1.0f);
+  v3 d = v3_sub(p, v3_lerp(palm->center[row], palm->center[row + 1], t));
+  float x = v3_dot(d, v3_lerp(palm->du[row], palm->du[row + 1], t));
+  float z = v3_dot(d, v3_lerp(palm->dv[row], palm->dv[row + 1], t));
+  float angle = atan2f(z, x) * (FIG_SKIN_SIDES / F_TAU) - 0.5f;
+  if (angle < 0.0f) angle += FIG_SKIN_SIDES;
+  int j = (int)angle;
+  float u = angle - (float)j;
+  j %= FIG_SKIN_SIDES;
+  int next = (j + 1) % FIG_SKIN_SIDES;
+  v3 surface = v3_lerp(v3_lerp(palm->p[row][j], palm->p[row + 1][j], t),
+                       v3_lerp(palm->p[row][next], palm->p[row + 1][next], t), u);
+  v3 pn = v3_norm(v3_lerp(
+      v3_lerp(palm->normal[row][j], palm->normal[row + 1][j], t),
+      v3_lerp(palm->normal[row][next], palm->normal[row + 1][next], t), u));
+  float gap = v3_dot(v3_sub(p, surface), pn);
+  float blend = 1.0f - smooth01(f_clamp(gap / fade, 0.0f, 1.0f));
+  *normal = v3_norm(v3_lerp(*normal, pn, blend));
+  *col = v3_lerp(*col, v3_lerp(palm->col[row], palm->col[row + 1], t), blend);
+  *ao += (1.0f - *ao) * blend;
+}
 
 static float fig_skin_cubic(float a, float b, float c, float d, float t) {
   float m0 = (c - a) * 0.5f, m1 = (d - b) * 0.5f;
@@ -1247,28 +1309,53 @@ static float fig_skin_cubic(float a, float b, float c, float d, float t) {
 }
 
 static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
-                            fig_skin_seam_t *seam, int join) {
+                            fig_skin_seam_t *seam, int join, int thumb_hand, int digit_hand) {
   if (n < 2 || n > FIG_NMAX) return;
   v3 p[FIG_SKIN_ROWS][FIG_SKIN_SIDES];
   v3 normal[FIG_SKIN_ROWS][FIG_SKIN_SIDES];
+  v3 root_col[FIG_SKIN_STEPS * 2 + 1][FIG_SKIN_SIDES];
+  float root_ao[FIG_SKIN_STEPS * 2 + 1][FIG_SKIN_SIDES];
   v3 control[FIG_NMAX][FIG_SKIN_SIDES];
+  v3 thumb_control[FIG_SKIN_SIDES], thumb_x = hint;
   fnode_t row[FIG_SKIN_ROWS];
-  // Finger and palm spans are shorter than sleeve spans; they retain three
-  // subdivisions while the forearm join and broad upper arm retain four.
-  int steps = join || node[1].rx > 0.060f ? FIG_SKIN_STEPS : 3;
+  // Palms and joined wrists retain 32 angular samples. Fingers use 16 sides
+  // and two longitudinal samples; broad upper arms use 16 sides and three.
+  int sleeve = join || node[1].rx > 0.060f;
+  int sides = (sleeve && !join) || digit_hand >= 0 ? FIG_SKIN_SIDES / 2 : FIG_SKIN_SIDES;
+  int stride = FIG_SKIN_SIDES / sides;
+  int steps = sleeve || thumb_hand >= 0 || seam ? FIG_SKIN_STEPS : 2;
   int rows = (n - 1) * steps + 1;
+  int root_hand = thumb_hand >= 0 ? thumb_hand : digit_hand;
+  if (thumb_hand == FIG_HAND_SUPPORT) {
+    const fnode_t *anchor = &g_fig_skin_thumb_anchor[thumb_hand];
+    v3 ny = v3_norm(v3_sub(node[2].p, anchor->p));
+    thumb_x = fig_perp(ny, hint);
+    v3 nz = v3_cross(thumb_x, ny);
+    for (int j = 0; j < sides; j++) {
+      float ang = ((float)j + 0.5f) * F_TAU / FIG_SKIN_SIDES + anchor->roll;
+      thumb_control[j] = v3_add(anchor->p,
+          v3_add(v3_scale(thumb_x, cosf(ang) * anchor->rx),
+                 v3_scale(nz, sinf(ang) * anchor->rz)));
+    }
+  }
   v3 prev_x = hint;
   for (int i = 0; i < n; i++) {
     int lo = i ? i - 1 : i, hi = i + 1 < n ? i + 1 : i;
     v3 ny = v3_norm(v3_sub(node[hi].p, node[lo].p));
+    if (thumb_hand == FIG_HAND_SUPPORT && i == 2) {
+      // The contact shoulder keeps its original frame and outgoing cubic
+      // tangent while the palm-buried root is reshaped independently.
+      ny = v3_norm(v3_sub(node[3].p, g_fig_skin_thumb_anchor[thumb_hand].p));
+      prev_x = thumb_x;
+    }
     // Sleeve rings transport their preceding frame through elbow and wrist
     // bends; the fixed palm hint continues to define finger breadth.
-    v3 nx = fig_perp(ny, steps == FIG_SKIN_STEPS && i ? prev_x : hint);
+    v3 nx = fig_perp(ny, sleeve && i ? prev_x : hint);
     if (v3_dot(nx, prev_x) < 0.0f) nx = v3_scale(nx, -1.0f);
     prev_x = nx;
     v3 nz = v3_cross(nx, ny);
-    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
-      float ang = ((float)j + 0.5f) * F_TAU / FIG_SKIN_SIDES + node[i].roll;
+    for (int j = 0; j < sides; j++) {
+      float ang = ((float)(j * stride) + 0.5f) * F_TAU / FIG_SKIN_SIDES + node[i].roll;
       control[i][j] = v3_add(node[i].p,
           v3_add(v3_scale(nx, cosf(ang) * node[i].rx),
                  v3_scale(nz, sinf(ang) * node[i].rz)));
@@ -1276,9 +1363,9 @@ static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
   }
   int joined = seam && seam->valid && join && n > 2;
   if (joined)
-    for (int j = 0; j < FIG_SKIN_SIDES; j++)
+    for (int j = 0; j < sides; j++)
       control[1][j] = v3_add(
-          v3_lerp(seam->center, seam->p[FIG_SKIN_SIDES - 1 - j], 0.994f),
+          v3_lerp(seam->center, seam->p[FIG_SKIN_SIDES - 1 - j * stride], 0.994f),
           v3_scale(seam->dir, 0.00025f));
   for (int i = 0; i < rows; i++) {
     int b = i / steps;
@@ -1296,18 +1383,26 @@ static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
     float ao0 = node[b].ao > 0.0f ? node[b].ao : 1.0f;
     float ao1 = node[c].ao > 0.0f ? node[c].ao : 1.0f;
     row[i].ao = ao0 + (ao1 - ao0) * t;
-    for (int j = 0; j < FIG_SKIN_SIDES; j++)
+    for (int j = 0; j < sides; j++)
       for (int xyz = 0; xyz < 3; xyz++)
-        p[i][j].e[xyz] = fig_skin_cubic(control[a][j].e[xyz], control[b][j].e[xyz],
+        p[i][j].e[xyz] = fig_skin_cubic(thumb_hand == FIG_HAND_SUPPORT && b == 2 ? thumb_control[j].e[xyz]
+                                       : control[a][j].e[xyz], control[b][j].e[xyz],
                                        control[c][j].e[xyz], control[d][j].e[xyz], t);
   }
   for (int i = 0; i < rows; i++) {
     int lo = i ? i - 1 : i, hi = i + 1 < rows ? i + 1 : i;
-    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
-      int prev = (j + FIG_SKIN_SIDES - 1) % FIG_SKIN_SIDES;
-      int next = (j + 1) % FIG_SKIN_SIDES;
+    for (int j = 0; j < sides; j++) {
+      int prev = (j + sides - 1) % sides;
+      int next = (j + 1) % sides;
       normal[i][j] = v3_norm(v3_cross(v3_sub(p[hi][j], p[lo][j]),
                                       v3_sub(p[i][next], p[i][prev])));
+      if (root_hand >= 0 && i <= steps * 2) {
+        root_col[i][j] = row[i].col;
+        root_ao[i][j] = row[i].ao;
+        fig_skin_palm_blend(p[i][j], &normal[i][j], &root_col[i][j],
+                         &root_ao[i][j], root_hand, digit_hand >= 0 ? 0.012f
+                         : root_hand == FIG_HAND_FIRE ? 0.035f : 0.016f);
+      }
     }
   }
   if (joined) {
@@ -1317,11 +1412,27 @@ static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
     row[shared].p = seam->center;
     row[shared].col = seam->col;
     row[shared].ao = seam->ao;
-    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+    for (int j = 0; j < sides; j++) {
       p[shared][j] = control[1][j];
-      normal[shared][j] = seam->normal[FIG_SKIN_SIDES - 1 - j];
+      normal[shared][j] = seam->normal[FIG_SKIN_SIDES - 1 - j * stride];
     }
   } else if (seam && !join) {
+    fig_skin_patch_t *patch = &g_fig_skin_palm_patch[seam - g_fig_skin_seam];
+    patch->rows = rows;
+    patch->axis = v3_norm(v3_sub(row[rows - 1].p, row[0].p));
+    for (int i = 0; i < rows; i++) {
+      patch->center[i] = row[i].p;
+      patch->col[i] = row[i].col;
+      patch->along[i] = v3_dot(v3_sub(row[i].p, row[0].p), patch->axis);
+      v3 ux = v3_sub(v3_scale(v3_add(p[i][0], p[i][FIG_SKIN_SIDES - 1]), 0.5f), row[i].p);
+      v3 uz = v3_sub(v3_scale(v3_add(p[i][FIG_SKIN_SIDES / 4 - 1],
+                                     p[i][FIG_SKIN_SIDES / 4]), 0.5f), row[i].p);
+      patch->du[i] = v3_scale(ux, 1.0f / fmaxf(v3_dot(ux, ux), 1e-10f));
+      patch->dv[i] = v3_scale(uz, 1.0f / fmaxf(v3_dot(uz, uz), 1e-10f));
+      if (i) patch->inv_span[i - 1] = 1.0f / fmaxf(patch->along[i] - patch->along[i - 1], 1e-6f);
+      memcpy(patch->p[i], p[i], sizeof p[i]);
+      memcpy(patch->normal[i], normal[i], sizeof normal[i]);
+    }
     seam->valid = 1;
     seam->center = row[0].p;
     seam->hint = hint;
@@ -1330,20 +1441,25 @@ static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
     seam->rx = node[0].rx;
     seam->rz = node[0].rz;
     seam->ao = row[0].ao;
-    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
+    for (int j = 0; j < sides; j++) {
       seam->p[j] = p[0][j];
       seam->normal[j] = normal[0][j];
     }
   }
   for (int i = 1; i < rows; i++)
-    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
-      int next = (j + 1) % FIG_SKIN_SIDES;
+    for (int j = 0; j < sides; j++) {
+      int next = (j + 1) % sides;
       const int ri[6] = {i - 1, i, i, i - 1, i, i - 1};
       const int rj[6] = {j, j, next, j, next, next};
       for (int v = 0; v < 6; v++) {
         int r = ri[v], s = rj[v];
         g_ao_mul = row[r].ao;
-        scene_push(p[r][s], normal[r][s], row[r].col);
+        v3 col = row[r].col;
+        if (root_hand >= 0 && r <= steps * 2) {
+          col = root_col[r][s];
+          g_ao_mul = root_ao[r][s];
+        }
+        scene_push(p[r][s], normal[r][s], col);
       }
     }
   for (int end = 0; end < 2; end++) {
@@ -1351,8 +1467,8 @@ static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
     v3 ny = end ? v3_norm(v3_sub(row[i].p, row[i - 1].p))
                 : v3_norm(v3_sub(row[0].p, row[1].p));
     g_ao_mul = row[i].ao;
-    for (int j = 0; j < FIG_SKIN_SIDES; j++) {
-      int next = (j + 1) % FIG_SKIN_SIDES;
+    for (int j = 0; j < sides; j++) {
+      int next = (j + 1) % sides;
       scene_push(row[i].p, ny, row[i].col);
       scene_push(p[i][end ? next : j], normal[i][end ? next : j], row[i].col);
       scene_push(p[i][end ? j : next], normal[i][end ? j : next], row[i].col);
@@ -1364,7 +1480,7 @@ static void fig_skin_chain(const fnode_t *node, int n, v3 hint,
 static void fig_hand_chain(const fnode_t *node, int n, int k, v3 hint,
                            v3 held_center, float dorsal) {
   if (g_fig_view_skin) {
-    fig_skin_chain(node, n, hint, NULL, 0);
+    fig_skin_chain(node, n, hint, NULL, 0, -1, -1);
     return;
   }
   if (n < 2 || n > FIG_NMAX) return;
@@ -1607,9 +1723,10 @@ static void fig_hand_palm(v3 wrist, v3 gc, v3 ga, float gr, v3 col,
     skin[6].p = v3_lerp(pm[3].p, pm[4].p, 0.70f);
     skin[6].rx *= 0.08f; skin[6].rz *= 0.18f;
     for (int i = 1; i < 7; i++)
-      skin[i].p = fig_hand_hold_clear(skin[i].p, skin[i].rz, -0.0010f,
+      skin[i].p = fig_hand_hold_clear(skin[i].p, skin[i].rz, -0.0024f,
                                       gc, ga, e1, e2, gr);
-    fig_skin_chain(skin, 7, ga, &g_fig_skin_seam[hand_slot], 0);
+    memcpy(g_fig_skin_palm[hand_slot], skin, sizeof skin);
+    fig_skin_chain(skin, 7, ga, &g_fig_skin_seam[hand_slot], 0, -1, -1);
     fig_contact_patch_add("palm", hand_slot, patch_v0, skin, 7,
                           gc, ga, e1, e2, gr);
   } else if (g_fig_k >= FIG_HAND_DETAIL_K) {
@@ -1659,6 +1776,7 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   // THE MIDDLE FINGER IS THE THICKEST, not the index.
   static const float FGR[4] = {0.0098f, 0.0110f, 0.0118f, 0.0111f};  // girth, x1.13
   float fax = FAX[f];
+  if (g_fig_view_skin && style == 1 && f == 2) fax -= 0.006f;
   // 6-8 degrees PAST THE CREST of the tube, measured on the player's own frame rather
   // than judged. Stopping at 12 o'clock put the whole finger row on the FAR side of
   // the fore-end, so the only digit the player ever saw was the thumb; going 13
@@ -1679,7 +1797,8 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   // closed-form as fig_hand's own copy, bit-identical by construction — kept
   // local to spare a parameter rather than piped through as one.
   const float KN_PH = side * 1.52f;
-  float r = FGR[f], rr = gr + r - 0.0034f + FLF[f];
+  float r = FGR[f] * (g_fig_view_skin ? 0.84f : 1.0f);
+  float rr = gr + r - 0.0034f + FLF[f];
   float ph0 = KN_PH + side * FKN[f];
   // THE TRIGGER FINGER. Four identical curled digits clamped on a pistol grip is a
   // clamp, not a firing grip: what says "about to shoot" is one finger doing
@@ -1687,11 +1806,7 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   float sweep = FSW[f], reach = 0.0f;
   if (heel > 0.0f) {
     float closed = f == 3 && g_fig_fp ? 0.42f : 0.52f;
-    if (g_fig_view_skin) {
-      static const float wrap[4] = {0.62f, 0.66f, 0.68f, 0.64f};
-      float sight = smooth01(f_clamp(g_fig_view_ads * 2.0f, 0.0f, 1.0f));
-      closed = wrap[f] + (0.52f - wrap[f]) * sight;
-    }
+    if (g_fig_view_skin) closed = 0.52f;
     sweep *= heel >= 1.0f ? closed : 1.0f + (closed - 1.0f) * heel;
   }
   int aimed = style == 1 && f == 3 && trig_pt != NULL && !slid;
@@ -1712,16 +1827,16 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   // the only landmark the back of a hand has and the thing whose absence made this
   // read as a spade from the one angle the player looks at it from.
   static const float FT5[5] = {-0.16f, 0.08f, 0.46f, 0.76f, 1.00f};
-  // 0.86 / 0.72 on the ROOT, not 1.16 / 0.90.
-  static const float FRX5[5] = {0.86f, 1.16f, 1.04f, 0.94f, 0.76f};
-  static const float FRZ5[5] = {0.72f, 1.11f, 0.94f, 0.84f, 0.64f};
+  // 0.86 / 0.72 on the ROOT, not 1.16 / 0.90. The three exposed stations are a
+  // JOINTED finger, not a cone: the PIP crease (t=0.76, the distal interphalangeal
+  // one sits between them) pinches below its neighbours so the middle and distal
+  // phalanges read as separate segments with a knuckle between them. A monotone
+  // taper is what made a hand read as five sausages.
+  static const float FRX5[5] = {0.86f, 1.16f, 1.06f, 0.93f, 0.77f};
+  static const float FRZ5[5] = {0.72f, 1.11f, 0.96f, 0.84f, 0.63f};
   int nnode = 5;
-  // The aimed index runs a Bezier instead of an arc: A = the metacarpal head, where
-  // the digit leaves the palm; B = the blade, pulled back along the guard's own
-  // axis by the finger's own radius so the PAD touches it rather than the tip's
-  // centre landing inside the steel; C = out in front of the knuckle, which is what
-  // bows the proximal phalanx away from the grip and takes the middle of the finger
-  // clear of the guard's rear upright.
+  // One Bezier runs from the metacarpal head to the forward blade face.
+  // The lateral control point gives the distal pad the trigger's pull direction.
   v3 tA = {{0, 0, 0}}, tB = tA, tC = tA;
   if (aimed) {
     // The METACARPAL joint carries the whole digit onto the blade, so the bearing
@@ -1729,28 +1844,14 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
     float aph = ph0 + side * 0.30f;
     float arad = rr + 0.0018f;
     tA = hand_pt(gc, ga, e1, e2, fax - 0.0050f, aph, arad);
-    // The tip's own half-thickness minus the squash: the pad's SURFACE
-    // lands on the steel and deforms into it by TRIG_PAD_SQUASH, which is
-    // what vmtrig's `pad` reads back (-0.8 mm at rest, -1.9 pressed).
-    // Seat the final supporting facet (rather than its ideal ellipse) on the blade;
-    // A 1.5 mm station bias keeps the exact k=12 facet on the authored
-    // -0.5..-2.5 mm pad band while the neighbouring blade centreline remains at
-    // the independent -4.5 mm limit.
-    const float PAD_FACET_SEAT = -0.001500f + (g_fig_view_skin ? 0.00025f : 0.0f);
     tB = v3_add(*trig_pt,
-                v3_scale(g_gun_trig_n,
-                         r * tip_rz - TRIG_PAD_SQUASH + PAD_FACET_SEAT));
-    // THE CONTROL POINT IS THE ARC'S OWN TANGENT, and that is a manifold
-    // requirement rather than a nicety.
-    v3 tg = v3_sub(hand_pt(gc, ga, e1, e2, fax - 0.0050f,
-                           aph + side * 0.08f, arad), tA);
-    tg = v3_dot(tg, tg) > 1e-12f ? v3_norm(tg) : v3_norm(v3_sub(tB, tA));
-            // 0.35, not 0.62, and the departure 0.30 rad rather than 0.60: with the
-            // Bezier leaving a third of a radian further round the grip and bowing
-            // out by two thirds of its own chord, the index left the knuckle, ran
-            // AROUND the grip and then turned back to the trigger — a hard V that
-            // read as a folded sausage from every angle behind the weapon.
-    tC = v3_add(tA, v3_scale(tg, 0.35f * v3_len(v3_sub(tB, tA))));
+                v3_scale(g_gun_trig_n, r * tip_rz + TRIG_PAD_CLEARANCE));
+    // The distal phalanx crosses the blade laterally. Its bend stays outside
+    // the guard while the pad faces rearward to pull the trigger.
+    v3 blade_axis = v3_norm(v3_sub(g_gun_blade[2], g_gun_blade[0]));
+    v3 lateral = v3_norm(v3_cross(blade_axis, g_gun_trig_n));
+    float sign = v3_dot(v3_sub(tA, tB), lateral) < 0.0f ? -1.0f : 1.0f;
+    tC = v3_add(tB, v3_scale(lateral, sign * 0.032f));
   }
   for (int i = 0; i < nnode; i++) {
     float t = FT5[i];
@@ -1775,15 +1876,11 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
               : i == 1 ? rr + 0.0016f : gr + node_rz - HAND_DIGIT_BITE;
     rad += reach * t * t;              // straightens off the grip's front
     fg[i].p = hand_pt(gc, ga, e1, e2, fax, ph0 + side * sweep * t, rad);
-    if (aimed && i >= 2) {
-      // THE PRESS SLIDES THE NODES ALONG THE CURVE, IT DOES NOT BOW IT. The tip is
-      // pinned to the blade and the two proximal nodes sit on the grip arc, so the
-      // only thing a press can shape is what happens between them — and shaping it
-      // with the CONTROL POINT was wrong: measured, pushing tC out by 0.30 took
-      // node 3's turn from 71.5 to 92.8 degrees on the SR, and fig_chain answers a
-      // corner it cannot fillet by collapsing the cross-section, so the fingertip
-      // pinched and then flared into a trumpet exactly when the trigger was pulled.
-      float u = (t - FT5[2]) / (1.0f - FT5[2]);
+    if (aimed && i >= 1) {
+      // One ordered curve runs from the knuckle through both finger joints.
+      // The proximal station is part of this curve rather than a grip-arc detour.
+      static const float INDEX_T[5] = {0.0f, 0.0f, 0.32f, 0.68f, 1.0f};
+      float u = INDEX_T[i];
       fg[i].p = fig_trig_pt(tA, tC, tB, u);
     }
     fg[i].col = fg[i].bcol = col;
@@ -1832,8 +1929,11 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
     // grip uses circular sections because its transported frame crosses successive
     // guard faces; pistol-grip fingers retain their anatomical oval section.
     static const float CT[4] = {0.27f, 0.365f, 0.61f, 0.92f};
-    static const float CX[4] = {1.10f, 1.07f, 0.99f, 0.82f};
-    static const float CZ[4] = {1.025f, 0.98f, 0.89f, 0.707f};
+    // Proximal-phalanx belly, PIP crease, middle-phalanx belly, distal pad: the
+    // crease stations sit BELOW the bellies on both axes, which is the only thing
+    // that makes the two joints of a curled digit visible at all.
+    static const float CX[4] = {1.10f, 1.06f, 1.01f, 0.83f};
+    static const float CZ[4] = {1.025f, 0.975f, 0.905f, 0.72f};
     static const int CI[4] = {2, 3, 5, 7};
     fnode_t base2 = fg[2], base3 = fg[3], tip = fg[4];
     for (int j = 0; j < 4; j++) {
@@ -1847,7 +1947,7 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
           rz += (pad - rz) * heel;
         }
       }
-      float rad = gr + rz - 0.0034f;
+      float rad = gr + rz - 0.0034f + reach * CT[j] * CT[j];
       mid.p = hand_pt(gc, ga, e1, e2, fax,
                       ph0 + side * sweep * CT[j], rad);
       mid.rx = rx; mid.rz = rz;
@@ -1912,7 +2012,7 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
                         : 0.58f;
     fg[dome_i].p = v3_add(fg[tip].p,
                           v3_scale(dir, fmaxf(fg[tip].rx, fg[tip].rz) * dome));
-    fg[dome_i].p = fig_hand_exposed_clear(
+    if (!aimed) fg[dome_i].p = fig_hand_exposed_clear(
         fg[dome_i].p, fg[dome_i].rz,
         fmaxf(fg[dome_i].rx, fg[dome_i].rz), !aimed,
         gc, ga, e1, e2, gr);
@@ -1954,11 +2054,64 @@ static void fig_hand_digit(v3 gc, v3 ga, v3 e1, v3 e2, float gr, float rk,
   if (g_fig_view_skin && aimed) {
     // The smooth distal pad clears the blade's centreline while its contact
     // surface remains seated. Apply the offset after the guard constraints.
-    v3 clearance = v3_scale(g_gun_trig_n, -0.0004f);
+    v3 clearance = v3_scale(g_gun_trig_n, 0.0003f);
     for (int i = 2; i < chain_nodes; i++)
       fg[i].p = v3_add(fg[i].p, clearance);
   }
-  fig_hand_chain(fg, chain_nodes, FIG_DIGIT_K, ga, gc, 0.22f);
+  if (rest_index > 0.0f) {
+    // During an action the index rests beside the receiver, outside the bow.
+    // Interpolate the whole digit so critical stations cannot alternate between
+    // a stretched endpoint and the old grip arc.
+    v3 axis = v3_norm(v3_sub(g_gun_blade[2], g_gun_blade[0]));
+    v3 lateral = v3_norm(v3_cross(axis, g_gun_trig_n));
+    float sign = v3_dot(v3_sub(fg[1].p, g_gun_trig_p), lateral) < 0.0f ? -1.0f : 1.0f;
+    v3 end = v3_add(g_gun_trig_p, v3_add(v3_scale(lateral, sign * 0.035f),
+                                         v3_scale(g_gun_trig_n, 0.030f)));
+    for (int i = 2; i < chain_nodes; i++) {
+      float t = (float)(i - 1) / (float)(chain_nodes - 2);
+      fg[i].p = v3_lerp(fg[i].p, v3_lerp(fg[1].p, end, t), rest_index);
+    }
+  }
+  if (g_fig_view_skin && !aimed) {
+    // Share a sharp constraint correction across adjacent joints instead of
+    // leaving a single displaced ring to fold back through its neighbours.
+    for (int pass = 0; pass < 4; pass++)
+      for (int i = 2; i + 1 < chain_nodes; i++) {
+        v3 a = v3_norm(v3_sub(fg[i].p, fg[i - 1].p));
+        v3 b = v3_norm(v3_sub(fg[i + 1].p, fg[i].p));
+        if (v3_dot(a, b) < 0.6f)
+          fg[i].p = v3_lerp(fg[i].p, v3_lerp(fg[i - 1].p, fg[i + 1].p, 0.5f), 0.5f);
+      }
+  }
+  if (style == 1 && f == 3) {
+    // Fixed segment witnesses bound clearance between authored joints as well.
+    for (int pass = 0; pass < 3; pass++)
+      for (int i = 1; i < chain_nodes; i++) {
+        fg[i].p = fig_body_clear(fg[i].p, fmaxf(fg[i].rx, fg[i].rz) + 0.0005f);
+        fg[i].p = fig_guard_clear(fg[i].p, fmaxf(fg[i].rx, fg[i].rz));
+        fg[i].p = fig_blade_clear(fg[i].p, aimed ? fg[i].rz : fmaxf(fg[i].rx, fg[i].rz));
+        if (i == 1) continue;
+        for (int j = 1; j < 4; j++) {
+          float t = (float)j * 0.25f, u = 1.0f - t;
+          float radius = aimed ? fg[i - 1].rz * u + fg[i].rz * t
+              : fmaxf(fg[i - 1].rx, fg[i - 1].rz) * u + fmaxf(fg[i].rx, fg[i].rz) * t;
+          v3 p = v3_lerp(fg[i - 1].p, fg[i].p, t);
+          v3 q = fig_body_clear(p, radius + 0.0005f);
+          q = fig_guard_clear(q, radius);
+          v3 d = v3_sub(fig_blade_clear(q, radius), p);
+          float den = u * u + t * t;
+          fg[i - 1].p = v3_add(fg[i - 1].p, v3_scale(d, u / den));
+          fg[i].p = v3_add(fg[i].p, v3_scale(d, t / den));
+        }
+      }
+  }
+  if (aimed) {
+    int tip = chain_nodes - 2;
+    v3 dir = v3_norm(v3_sub(fg[tip].p, fg[tip - 1].p));
+    fg[tip + 1].p = v3_add(fg[tip].p, v3_scale(dir, fg[tip].rx * 0.58f));
+  }
+  if (g_fig_view_skin) fig_skin_chain(fg, chain_nodes, ga, NULL, 0, -1, hand_slot);
+  else fig_hand_chain(fg, chain_nodes, FIG_DIGIT_K, ga, gc, 0.22f);
   fig_contact_patch_add(aimed ? "trigger_digit" : "grip_digits",
                         hand_slot, patch_v0, fg + 1, chain_nodes - 1,
                         gc, ga, e1, e2, gr);
@@ -2161,7 +2314,27 @@ static void fig_hand_thumb(v3 wrist, v3 pk, v3 gc, v3 ga, v3 e1, v3 e2,
       hint = v3_sub(rel, v3_scale(ga, v3_dot(rel, ga)));
     }
     if (style == 1) fig_hand_sweep_clear(th, nth, FIG_DIGIT_K, hint, HAND_CLEAR_AIR);
-    fig_hand_chain(th, nth, FIG_DIGIT_K, hint, gc, 0.0f);
+    if (g_fig_view_skin && nth < FIG_NMAX) {
+      // The thenar eminence fans into the palm before narrowing into the thumb.
+      // Its broad root is buried; the contact stations and distal pad stay fixed.
+      g_fig_skin_thumb_anchor[hand_slot] = th[0];
+      th[0].p = g_fig_skin_palm[hand_slot][2].p;
+      th[0].rx = 0.0240f;
+      th[0].rz = 0.0160f;
+      for (int i = nth; i > 1; i--) th[i] = th[i - 1];
+      th[1] = th[0];
+      th[1].p = v3_lerp(th[0].p, th[2].p, 0.40f);
+      th[1].rx = 0.0180f;
+      th[1].rz = style == 1 ? 0.0110f : 0.0140f;
+      th[1].ao = 0.96f;
+      if (style == 2) {
+        th[1].p = fig_hand_exposed_clear(th[1].p, th[1].rx, th[1].rx, 1.0f,
+                                         gc, ga, e1, e2, gr);
+      }
+      nth++;
+    }
+    if (g_fig_view_skin) fig_skin_chain(th, nth, hint, NULL, 0, hand_slot, -1);
+    else fig_hand_chain(th, nth, FIG_DIGIT_K, hint, gc, 0.0f);
     fig_contact_patch_add("thumb", hand_slot, patch_v0, th, nth,
                           gc, ga, e1, e2, gr);
   } else {
@@ -2493,7 +2666,7 @@ void fig_upper_arm(v3 shoulder, v3 elbow, v3 into, v3 hint,
   }
   float saved_jit = g_fig_jit;
   g_fig_jit = 0.35f;
-  if (g_fig_view_skin) fig_skin_chain(ar, 6, hint, NULL, 0);
+  if (g_fig_view_skin) fig_skin_chain(ar, 6, hint, NULL, 0, -1, -1);
   else fig_chain(ar, 6, k, 1, 1, hint);
   g_fig_jit = saved_jit;
 }
@@ -2616,10 +2789,10 @@ static void fig_forearm(v3 wrist, v3 back, v3 pd, v3 lat, float side,
           fn[i].ao = seam->ao;
         }
         fn[3].col = fn[3].bcol = v3_lerp(seam->col, sleeve, 0.18f);
-        fig_skin_chain(fn, 9, seam->hint, seam, 1);
+        fig_skin_chain(fn, 9, seam->hint, seam, 1, -1, -1);
         seam->valid = 0;
       } else {
-        fig_skin_chain(fn, 9, lat, NULL, 0);
+        fig_skin_chain(fn, 9, lat, NULL, 0, -1, -1);
       }
     } else if (g_fig_k >= 12) {
       fig_chain(fn, 9, k, 1, 1, lat);

@@ -58,6 +58,7 @@ python3 media/media.py all --skip-render
 python3 media/media.py review
 python3 media/gallery.py --before build/SESSION/game-before
 python3 tools/hand-captures.py --before build/SESSION/game-before
+python3 tools/hand-captures.py --suite --weapon both --before build/SESSION/game-before
 ```
 
 `check` verifies the native build transaction, tools and recipes; it reports
@@ -80,6 +81,31 @@ The MP4 and cache are ignored by Git. Neither production nor review reads
 
 `gallery.py` retains raw before/after PNGs, recipes, logs and hashes in a unique
 `build/media-gallery-*` directory and exports only `screenshots/arenas.png`.
+The hand capture `--suite` records finger attachments, both sides of the trigger
+contact and support fingers for either or both weapons. Thumb and normal gameplay
+views remain selectable through `--views`. Cameras use fixed weapon-space
+stations, so changing the wrist or hand mesh cannot move the comparison camera.
+Each weapon/pose starts in a fresh process with the same seed and copied profile;
+two independent takes must have identical PNG hashes before any export is published.
+`--poses hip ads reload`, `--views support trigger` and `--repeat 3` select the matrix.
+The default suite exports four labelled comparisons, with BEFORE/AFTER columns and
+AR/SR rows. Complete game frames are only arranged and captioned, never retouched.
+Executables, input profiles, recipes, budgets, raw frames, hashes and a JSON manifest
+remain in `build/hand-suite-*`. Existing same-name exports are archived there before
+replacement. Use `--output-dir build/SESSION/iteration-02` for intermediate reviews.
+For finger work, use `--views fingers trigger-contact trigger-reverse support-fingers`.
+These four fixed cameras expose the palm attachments, both sides of the index/trigger
+contact and all four support fingers. `--poses hip ads reload` repeats the same views
+in each action state. The `vmfinger` proof builds twelve canonical FP poses (both
+weapons, hip, ADS and four reload phases) and checks all 96 finger paths, real blade
+triangle crossings, blade containment, guard clearance and a surface contact gap
+of at most 1.5 mm. It is part of `tools/ci-proofs.sh`; the larger `vmtrig` matrix also
+rejects blade crossings independently of legacy contact-interval relaxations.
+
+`vmbench 1000` reports CPU time for building the frozen viewmodel and its total,
+hand and thumb triangle counts. It does not time simulation or GPU rendering;
+use matched build flags and several alternating before/after runs for comparisons.
+
 `tools/hand-captures.py` exports separate `000-before.png`, `000-after.png`,
 `001-before-closeup.png` and `001-after-closeup.png` frames using the same seed,
 profile and pose. The closeup moves the actual viewmodel camera; use `--closeup`
@@ -91,8 +117,8 @@ Every export validates the expected dimensions and a complete single PNG;
 exports are never inputs, so rerunning cannot stack frames or labels.
 The harness `shot` command renders once and writes one framebuffer. It does not
 add captions or construct contact sheets; those operations belong to export
-tools. The hand exporter keeps those individual frames separate, and its optional
-caption pass always starts from the raw PNG with exactly one `drawtext` operation.
+tools. The hand exporter retains those individual frames as evidence; each caption
+pass starts from the raw PNG with exactly one `drawtext` operation per frame.
 At the end of each prompt, keep `screenshots/` limited to a few final new results,
 preferably before/after collages. Archive needed raw/earlier evidence under
 `build/`, preserving other sessions' work.

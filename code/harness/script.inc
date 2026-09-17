@@ -2305,6 +2305,44 @@ static void cmd_vmhand(sim_ctx_t *s) {
   if (fail) exit(1);
 }
 
+// Frozen-pose CPU geometry cost. No simulation, GL draw or readback is timed.
+static void cmd_vmbench(sim_ctx_t *s) {
+  long n = next_n();
+  if (n < 1 || n > 100000) {
+    fprintf(stderr, "script: vmbench N must be 1..100000\n");
+    exit(1);
+  }
+  player_t saved = *s->p;
+  v3 eye = {{0, 0, 0}}, right = {{1, 0, 0}}, up = {{0, 1, 0}}, forward = {{0, 0, -1}};
+  int old_probe = g_probe_on;
+  g_probe_on = 1;
+  g_nprobe = 0;
+  vm_build(s->p, 1.0f, eye, right, up, forward, 1.0f);
+  probe(NULL);
+  int hand_tris = 0, thumb_tris = 0;
+  for (int i = 0; i < g_nprobe; i++) {
+    const char *name = g_probe[i].name;
+    if (!name) continue;
+    int tris = (g_probe[i].v1 - g_probe[i].v0) / (VERT_FLOATS * 3);
+    if (!strcmp(name, "thumb")) thumb_tris += tris;
+    if (!strcmp(name, "palm") || !strcmp(name, "thumb") ||
+        !strcmp(name, "grip_digits") || !strcmp(name, "trigger_digit")) hand_tris += tris;
+  }
+  g_probe_on = 0;
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (long i = 0; i < n; i++) vm_build(s->p, 1.0f, eye, right, up, forward, 1.0f);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double us = ((double)(t1.tv_sec - t0.tv_sec) * 1e6 +
+               (double)(t1.tv_nsec - t0.tv_nsec) * 1e-3) / (double)n;
+  int unchanged = !memcmp(s->p, &saved, sizeof saved);
+  printf("vmbench weapon=%s builds=%ld us/build=%.2f tris=%d hands=%d thumbs=%d state=%d renderer=%s\n",
+         WPN_DEF[s->p->wp.cur].prefix, n, us, g_scene_floats / (VERT_FLOATS * 3),
+         hand_tris, thumb_tris, unchanged, (const char *)glGetString(GL_RENDERER));
+  g_probe_on = old_probe;
+  if (!unchanged) exit(1);
+}
+
 static void cmd_vmorbit(sim_ctx_t *s) {
   (void)s;
   // Turntable on the VIEWMODEL's hands: the pose is the real one (springs, ADS
@@ -4975,7 +5013,7 @@ static const script_cmd_t SCRIPT_CMDS[] = {
   {"figv", cmd_figv}, {"figcheck", cmd_figcheck}, {"kine", cmd_kine},
   {"slidecheck", cmd_slidecheck}, {"armcheck", cmd_armcheck},
   {"naturalcheck", cmd_naturalcheck}, {"gaitcheck", cmd_gaitcheck}, {"animbench", cmd_animbench}, {"skel", cmd_skel}, {"vmhand", cmd_vmhand}, {"vmorbit", cmd_vmorbit},
-  {"vmbore", cmd_vmbore},
+  {"vmbore", cmd_vmbore}, {"vmbench", cmd_vmbench}, {"vmfinger", vmfinger_proof},
   {"hud", cmd_hud}, {"showfps", cmd_showfps}, {"trace", cmd_trace},
   {"shot", cmd_shot}, {"capture", cmd_capture}, {"cam", cmd_cam}, {"bench", cmd_bench},
   {"benchpass", cmd_benchpass},

@@ -1170,17 +1170,15 @@ static void gun_ar_gripmag(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       gun_contact_mesh_pause();
       int contact_v0 = g_scene_floats;
       fig_chain(tb, 3, 8, 1, 1, gz);
+      g_gun_blade_range[0] = contact_v0;
+      g_gun_blade_range[1] = g_scene_floats;
       gun_contact_mesh_add_active(contact_v0);
       gun_contact_mesh_resume();
       for (int q = 0; q < 3; q++) g_gun_blade[q] = tb[q].p;
       g_gun_blade_r = 0.0042f * gg;   // the chain's own widest rz
-      // THE PAD IS BEHIND THE BLADE, NOT IN FRONT OF IT. This used to publish the
-      // blade's MUZZLE-side face with a forward normal, on the reasoning that "a
-      // trigger finger hooks PAST the blade and pulls it back toward the palm" — which
-      // is not how a rifle trigger is pulled.
-      g_gun_trig_p = TRIGP(-0.0165f, -0.0073f);
-      g_gun_trig_n = v3_norm(v3_sub(TRIGP(-0.0165f, -0.0110f),
-                                    TRIGP(-0.0165f, -0.0073f)));
+      // The pad contacts the forward face and pulls the blade rearward.
+      g_gun_trig_p = TRIGP(-0.0165f, -0.0023f);
+      g_gun_trig_n = gz;
       #undef TRIGP
       // The no-go box for the trigger finger: the receiver FORWARD of the grip.
       g_gun_body_c   = GUNP(0, 0.0085f, 0.0700f);
@@ -1779,7 +1777,7 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
     gun_contact_mesh_resume();
     mat_lathe(MAT_STEEL_R, MAT_STEEL_M);
     {
-      v3 tpv = GUNP(0, -0.0010f, SRTRIG_Z);     // seat — rigid, see the AR's blade
+      v3 tpv = GUNP(0, -0.0010f, SRTRIG_Z - 0.0080f); // pad room behind the magwell
       #define TRIGP(VY, WZ) v3_add(tpv, v3_add(v3_scale(gy, (VY) * gg),   \
                                                v3_scale(gz, (WZ) * gg)))
       // Girth-scaled radii — same fix as the AR's blade above.
@@ -1790,15 +1788,15 @@ static void gun_sr_magwell(v3 org, v3 gx, v3 gy, v3 gz, float gg,
       gun_contact_mesh_pause();
       int contact_v0 = g_scene_floats;
       fig_chain(tb, 3, 8, 1, 1, gz);
+      g_gun_blade_range[0] = contact_v0;
+      g_gun_blade_range[1] = g_scene_floats;
       gun_contact_mesh_add_active(contact_v0);
       gun_contact_mesh_resume();
       for (int q = 0; q < 3; q++) g_gun_blade[q] = tb[q].p;
       g_gun_blade_r = 0.0038f * gg;   // the chain's own widest rz
-      // The SHOOTER-side face, exactly as on the AR — see the note there. The
-      // centreline is at WZ -0.0015 here with a 0.0027 half-thickness.
-      g_gun_trig_p = TRIGP(-0.0165f, -0.0042f);
-      g_gun_trig_n = v3_norm(v3_sub(TRIGP(-0.0165f, -0.0080f),
-                                    TRIGP(-0.0165f, -0.0042f)));
+      // Contact is on the forward face, matching the AR's pull direction.
+      g_gun_trig_p = TRIGP(-0.0165f, 0.0012f);
+      g_gun_trig_n = gz;
       #undef TRIGP
       // See the AR's box: the receiver forward of the grip only.
       g_gun_body_c   = GUNP(0, 0.0130f, 0.0575f);

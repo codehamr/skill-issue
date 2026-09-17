@@ -35,6 +35,8 @@
 #   fighit : 280 weapon/pose/yaw/profile cases retain analytic/history agreement,
 #             the reviewed hit-covered sample census, and identical visible/hit
 #             witnesses when the actor and ray grid rotate together
+#   vmfinger: 12 frozen FP poses, 96 ordered fingers, zero real blade crossings,
+#             positive blade/guard clearance and a pad within 1.5 mm of steel
 #   vmtrig  : complete 70-state FP/3P x AR/SR contact matrix, exact child/part
 #             census, no patch/pool/counter overflow, bounded work and scratch,
 #             and at most 13,000,000 bytes of static vmtrig scratch pools
@@ -164,6 +166,7 @@ for wpn in ar sr; do
   for d in 0 3 8 12 30; do spawn "figcheck-$wpn-$d" "figcheck 60 $d $wpn" "$FIG_SEED"; done
 done
 spawn vmtrig "vmtrig"
+spawn vmfinger "vmfinger"
 spawn vmcheck "vmcheck"
 wait
 
@@ -452,7 +455,13 @@ case "$ELF" in b700|3e00) WANT_AR_NEAR="70 70 73 71 63" ;; esac
 # over sixty ticks, with ankle/cuff host contacts redistributed. Both weapons
 # preserve exact upper-body family counts between model-only and integrated runs.
 WANT_AR_CROSS="160 160 155 130 79"
-case "$ELF" in b700|3e00) WANT_AR_CROSS="129 129 124 109 74" ;; esac
+# The current finger profiles measure 128 at both close x86_64 tiers before
+# and after the first-person thenar change. All ten matched third-person
+# summaries are identical; AArch64 keeps its independently measured reference.
+case "$ELF" in
+  b700) WANT_AR_CROSS="129 129 124 109 74" ;;
+  3e00) WANT_AR_CROSS="126 126 124 109 74" ;;
+esac
 [ "$AR_CROSS" = "$WANT_AR_CROSS" ] || {
   say "GATE AR cross '$AR_CROSS' != reviewed baseline '$WANT_AR_CROSS'"; fail=1;
 }
@@ -486,7 +495,7 @@ WANT_SR_NEAR="93 93 84 55 40"
 # Architecture-specific near counts are stable in each paired seed-2 control.
 case "$ELF" in
   b700) WANT_SR_NEAR="95 95 86 55 42" ;;
-  3e00) WANT_SR_NEAR="94 94 85 55 42" ;;
+  3e00) WANT_SR_NEAR="93 93 85 55 42" ;;
 esac
 # SR uses the same reviewed sleeve, pouch and gait changes, with its own
 # weapon-aware pose and independently retained sixty-tick family census.
@@ -526,15 +535,23 @@ case "$ELF" in b700|3e00) WANT_SR_CROSS="205 205 185 133 104" ;; esac
 # values and reduce the current cross witness to134 in both complete sweeps.
 # Dorsal-only glove shaping retains every forbidden-contact and grip-interval
 # invariant in vmtrig; the 20-state shallow crossing census changes 134->142.
-# The dense first-person skin uses 32-sided smooth rings and transported sleeve
-# frames. Its reviewed x86_64 near/cross census is 196/220 across all 152 poses:
-# open/flip/dup/zfight/degen and vmtrig forbidden mesh/proxy crossings stay zero,
-# and all ten third-person figure summaries match the pre-change binary exactly.
+# The first-person thenar root blends into the actual palm surface while its
+# support contact shoulder retains its frame and outgoing curve. Fingers use
+# two longitudinal samples, palms/thumbs/arms three; upper arms use 16 sides,
+# hands and joined wrists 32. The reviewed x86_64 near/cross census is 196/180
+# across all 152 poses, with 26,028 SR triangles. All five topology invariants
+# and all 70 vmtrig forbidden mesh/proxy crossings remain zero; all ten matched
+# third-person summaries are unchanged by this first-person geometry work.
 # AArch64 retains its last independently measured reference.
+# Native close fingers use 16-sided lofts, a continuous trigger path and a straight
+# released index. Their shallow overlap census is 158; all structural counts stay
+# zero. The independent vmfinger and 70-state vmtrig gates require zero real blade
+# traversals, and the 328-state figmotion contact proof keeps mesh/proxy crossings
+# at zero. The thumb/palm meshes retain their existing angular resolution.
 WANT_VM_NEAR=198
 WANT_VM_CROSS=142
 case "$ELF" in
-  3e00) WANT_VM_NEAR=196; WANT_VM_CROSS=220 ;;
+  3e00) WANT_VM_NEAR=196; WANT_VM_CROSS=158 ;;
   b700) WANT_VM_NEAR=194 ;;
 esac
 gate_command vmcheck "vmcheck" "^vmcheck tris=[1-9][0-9]* worst=\[.*\] open=0 flip=0 dup=0 zfight=0 near=$WANT_VM_NEAR cross=$WANT_VM_CROSS degen=0 recoil_states=20$"
@@ -569,6 +586,7 @@ grep -Eq '^vmframe fire sr T1 .*ready=0[.]000/0[.][12][0-9][0-9] .* ok$' \
   "$TMPD/vmframe.log" || {
     say "GATE vmframe missing partial T1 fire carry witness"; fail=1;
   }
+gate_command vmfinger "vmfinger" '^vmfinger summary rows=12 fingers=96 bend=[0-9.]+ blade_cross=0 axis=[+][0-9.]+mm ok$'
 gate_command vmtrig "vmtrig" '^vmtrig worst .* ok$'
 gate_command slidecheck "slidecheck" '^slidecheck dirs=8 clear=[0-9]+[.][0-9]mm@[0-7]/[0-9]+ side=[0-9]+[.][0-9]mm step=[0-9]+[.][0-9]mm@[0-7]/[0-9]+/[01] pole=[0-9]+[.][0-9]+deg@[0-7]/[0-9]+/[01] steady=[0-9]+[.][0-9]mm/[0-9]+[.][0-9]+deg contact=[0-9]+[.][0-9]@[0-7]/[0-9]+/[0-9]+[.][0-9]@[0-7]/[0-9]+mm exit_step=[0-9]+[.][0-9]mm@[0-7]/[0-9]+/[01] exit_pole=[0-9]+[.][0-9]+deg@[0-7]/[0-9]+/[01] exit_side=[0-9]+[.][0-9]mm handoff=[0-9]+[.][.][0-9]+ swing_lag=[0-9]+ bone=[0-9]+[.][0-9]+mm finite=1 ok$'
 gate_command armcheck "armcheck" '^armcheck weapons=2 max_step=[0-9]+[.][0-9]mm trigger=[0-9]+[.][0-9]mm gun=[0-9]+[.][0-9]mm/[0-9]+[.][0-9]+deg min_clear=[0-9]+[.][0-9]+ ok$'
@@ -637,6 +655,7 @@ if ! awk '
     need("amb", "0")
     need("state", "0")
     need("clamp", "0")
+    need("blade_cross", "0")
     if ($NF != "ok") bad = 1
   }
 

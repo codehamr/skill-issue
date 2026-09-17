@@ -9115,6 +9115,133 @@ static vmtrig_recoil_state_t vmtrig_recoil_sample(int view, int wpn, float ads,
   return (vmtrig_recoil_state_t){0};
 }
 
+// The real blade may touch a pad but may not traverse any hand surface.
+static int vmfinger_blade_cross(const vmtrig_hand_range_t *hand, int count,
+                                 vmtrig_work_t *work) {
+  int cross = 0;
+  vmtrig_aabb_t blade_box = vmtrig_range_aabb(g_gun_blade_range);
+  for (int i = 0; i < count; i++) {
+    if (!vmtrig_aabb_overlap(blade_box, vmtrig_range_aabb(hand[i].r))) continue;
+    int c = vmtrig_mesh_cross(g_gun_blade_range, hand[i].r, work);
+    if (c && g_fchk_v)
+      fprintf(stderr, "vmfinger blade hand=%d part=%s cross=%d\n", hand[i].hand, hand[i].name, c);
+    cross += c;
+  }
+  return cross;
+}
+
+// Closest sampled surface separation between the real blade and its contact pad.
+// Both vertex directions are required for a broad pad against a narrow steel face;
+// the independent edge-crossing test excludes interpenetration between samples.
+static float vmfinger_blade_gap(const vmtrig_hand_range_t *hand, int count,
+                                  vmtrig_work_t *work) {
+  float gap = 1e9f;
+  for (int i = 0; i < count; i++) {
+    if (strcmp(hand[i].name, "trigger_digit")) continue;
+    for (int f = g_gun_blade_range[0]; f < g_gun_blade_range[1]; f += VERT_FLOATS)
+      gap = fminf(gap, vmtrig_mesh_sd(SCENE_V(f), hand[i].r, work));
+    for (int f = hand[i].r[0]; f < hand[i].r[1]; f += VERT_FLOATS)
+      gap = fminf(gap, vmtrig_mesh_sd(SCENE_V(f), g_gun_blade_range, work));
+  }
+  return gap;
+}
+
+// Quick first-person finger regression: ordered joint paths, exact blade crossings,
+// blade containment and a seated pad. No relaxed SR contact branch applies here.
+static void vmfinger_proof(sim_ctx_t *s) {
+  static const float RELOAD[] = {0.0f, 0.0f, 0.15f, 0.55f, 0.75f, 0.90f};
+  static const char *const NAME[] = {"hip", "ads", "rl15", "rl55", "rl75", "rl90"};
+  player_t saved = *s->p;
+  int old_probe = g_probe_on, rows = 0, fingers = 0, bad = 0;
+  long old_tick = g_tick;
+  int cross_max = 0;
+  float turn_max = 0.0f, axis_min = 1e9f;
+  v3 eye = {{0, 0, 0}}, right = {{1, 0, 0}}, up = {{0, 1, 0}}, forward = {{0, 0, -1}};
+  vmtrig_work_t work = {0};
+  for (int wi = 0; wi < WPN_COUNT; wi++)
+    for (int pose = 0; pose < 6; pose++) {
+      g_tick = 1000;
+      player_t p;
+      player_spawn(&p);
+      p.pos = p.prev_pos = eye;
+      p.yaw = p.pitch = 0.0f;
+      memset(&p.vm, 0, sizeof p.vm);
+      memset(p.wp.cool, 0, sizeof p.wp.cool);
+      p.wp.cur = wi;
+      p.wp.reload_tac = 0;
+      p.wp.reload_t = RELOAD[pose] > 0.0f
+          ? (int)((1.0f - RELOAD[pose]) * WPN_DEF[wi].reload_ticks + 0.5f) : 0;
+      p.wp.switch_t = 0; p.wp.prev_switch = 0;
+      p.wp.ads_lin = p.wp.ads_s = p.wp.prev_ads_s = pose == 1 ? 1.0f : 0.0f;
+      fig_contact_patch_reset();
+      g_probe_on = 1; g_nprobe = 0;
+      vm_build_plan_t plan = vm_plan_make(&p, 1.0f, eye, right, up, forward, forward, 1.0f);
+      vm_build_prepared(eye, right, up, forward, &plan);
+      probe(NULL);
+      vmtrig_hand_range_t hand[PROBE_MAX];
+      int count = vmtrig_collect_hands(hand, 0), n = 0, aimed = 0;
+      float turn = 0;
+      int invalid_path = 0;
+      for (int i = 0; i < g_fig_contact_patch_n; i++) {
+        const fig_contact_patch_t *patch = &g_fig_contact_patch[i];
+        int trigger = !strcmp(patch->name, "trigger_digit");
+        if (!trigger && strcmp(patch->name, "grip_digits")) continue;
+        aimed += trigger;
+        n++;
+        for (int j = 1; j + 1 < patch->n; j++) {
+          v3 a = v3_sub(patch->center[j], patch->center[j - 1]);
+          v3 b = v3_sub(patch->center[j + 1], patch->center[j]);
+          float la = v3_len(a), lb = v3_len(b);
+          if (f_is_nonfinite(la) || f_is_nonfinite(lb) || la < 1e-6f || lb < 1e-6f) {
+            invalid_path = 1;
+            continue;
+          }
+          a = v3_scale(a, 1.0f / la); b = v3_scale(b, 1.0f / lb);
+          float angle = acosf(f_clamp(v3_dot(a, b), -1.0f, 1.0f)) / DEG2RAD;
+          turn = fmaxf(turn, angle);
+          if (g_fchk_v && angle > 70.0f)
+            fprintf(stderr, "vmfinger bend hand=%d part=%d node=%d angle=%.1f\n",
+                    patch->hand, i, j, (double)angle);
+        }
+      }
+      int cross = vmfinger_blade_cross(hand, count, &work);
+      float axis = vmtrig_tube_parts(g_gun_blade, 3, 0.0f, hand, count, &work);
+      float pad = vmtrig_pad_parts(hand, count, &work);
+      float gap = vmfinger_blade_gap(hand, count, &work);
+      float guard = vmtrig_tube_parts(g_gun_guard, 4, g_gun_guard_r, hand, count, &work);
+      gunanim_t ga = plan.pose.ga;
+      uint32_t fire_allow = vmtrig_contact_mask(fig_hand_contact_pose(
+          FIG_HAND_FIRE, ga.hand, ga.bhand, 0));
+      uint32_t support_allow = vmtrig_contact_mask(fig_hand_contact_pose(
+          FIG_HAND_SUPPORT, ga.hand, ga.bhand, 0));
+      float hi, wi_in, phi, pwi;
+      int mx, px, detail[9], pairs, missing, overflow, unclassified;
+      vmtrig_forbidden(wi, fire_allow, support_allow, hand, count,
+          &hi, &wi_in, &mx, &phi, &pwi, &px,
+          &detail[0], &detail[1], &detail[2], &detail[3], &detail[4],
+          &detail[5], &detail[6], &detail[7], &detail[8], &work,
+          &pairs, &missing, &overflow, &unclassified);
+      int fail = invalid_path || n != 8 || turn > 70.0f || cross || axis < -0.00001f || guard < 0.0f ||
+                 (aimed && (gap < -0.00001f || gap > 0.0015f)) || work.overflow ||
+                 g_fig_contact_patch_overflow ||
+                 fmaxf(hi, wi_in) > 0.0005f || mx || fmaxf(phi, pwi) > 0.0005f || px ||
+                 missing || overflow || unclassified;
+      printf("vmfinger %s %s fingers=%d bend=%.1f blade_cross=%d axis=%+.3fmm pad=%+.3fmm gap=%+.3fmm guard=%+.3fmm body=%+.3fmm mx=%d px=%d %s\n",
+             WPN_DEF[wi].prefix, NAME[pose], n, (double)turn, cross,
+             (double)(axis * 1000.0f), (double)(aimed ? pad * 1000.0f : 999.0f),
+             (double)(aimed ? gap * 1000.0f : 999.0f), (double)(guard * 1000.0f), (double)(fmaxf(hi, wi_in) * 1000.0f), mx, px, fail ? "FAIL" : "ok");
+      bad |= fail; fingers += n; rows++;
+      turn_max = fmaxf(turn_max, turn); axis_min = fminf(axis_min, axis);
+      if (cross > cross_max) cross_max = cross;
+    }
+  g_probe_on = old_probe;
+  g_tick = old_tick;
+  bad |= rows != 12 || fingers != 96 || memcmp(s->p, &saved, sizeof saved) != 0;
+  printf("vmfinger summary rows=%d fingers=%d bend=%.1f blade_cross=%d axis=%+.3fmm %s\n",
+         rows, fingers, (double)turn_max, cross_max, (double)(axis_min * 1000.0f), bad ? "FAIL" : "ok");
+  if (bad) exit(1);
+}
+
 // The trigger/hand contract over FP and 3P Hip/ADS/action/recoil/death states.
 // Allowed bite is measured only against the closed grip/fore/mag primitive that owns
 // that contact. Receiver/scope/stock/chassis stay forbidden and are checked in both
@@ -9506,6 +9633,8 @@ static void vmtrig_proof(sim_ctx_t *s) {
         // Centreline clearance: the pad may close over the shoe, but the blade axis
         // may not sink beyond the plan's -4.5 mm allowance.
         float blade = vmtrig_tube_parts(g_gun_blade, 3, 0.0f, hr, nh, &work);
+        int blade_cross = vmfinger_blade_cross(hr, nh, &work);
+        float blade_gap = vmfinger_blade_gap(hr, nh, &work);
         if (g_fchk_v)
           fprintf(stderr, "vmtrig-blade exact=%.6f\n", (double)blade);
         // A third-person slide deliberately plants the support fist on the ground.
@@ -9595,7 +9724,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
                         (ga.bolt <= 0.0f || ga.bhand < 0.95f)) ||
                        (live && g_fig_clamped != 0);
         if (pad_contact) {
-          row_fail |= pad > -0.0005f || pad < -0.0025f;
+          row_fail |= blade_gap < -0.00001f || blade_gap > 0.0015f;
           if (pad < min_pad) min_pad = pad;
           if (pad > max_pad) max_pad = pad;
         }
@@ -9617,11 +9746,13 @@ static void vmtrig_proof(sim_ctx_t *s) {
           if (supp_mesh_bite < min_actual_bite) min_actual_bite = supp_mesh_bite;
           if (supp_mesh_bite > max_actual_bite) max_actual_bite = supp_mesh_bite;
         }
-        // 3P and SR contact intervals remain diagnostic until their conservative
-        // mesh bounds are tightened; hard forbidden geometry above stays fail-closed.
+        // Legacy 3P/SR contact intervals remain diagnostic. Exact blade crossings
+        // and the FP guard/contact contract are independent of that relaxation.
         if (soft_contact_relaxed) row_fail = 0;
+        row_fail |= blade_cross != 0 || (!view && guard < 0.0f) ||
+                    (!view && pad_contact && (blade_gap < -0.00001f || blade_gap > 0.0015f));
         uint64_t ambiguous_row = g_vmtrig_inside_ambiguous - ambiguous_before;
-        printf("vmtrig %s %s %-5s child=%d pad=%+.1f guard=%+.1f blade=%+.1f "
+        printf("vmtrig %s %s %-5s child=%d pad=%+.1f guard=%+.1f blade=%+.1f blade_cross=%d blade_gap=%+.2f "
                "bite=%.1f/%.1f actual=%.1f/%.1f "
                "opp=%.1f:%s%d/%.1f:%s%d:%.1f:%s%d/%.1f:%s%d "
                "oppi=%.1f..%.1f/%.1f..%.1f:%.1f..%.1f/%.1f..%.1f "
@@ -9643,7 +9774,7 @@ static void vmtrig_proof(sim_ctx_t *s) {
                "state=%d idle=%d ready=%.2f sw=%.2f clamp=%u %s\n",
                view ? "3p" : "fp", WPN_DEF[wi].prefix, cs->name, nh,
                (double)(pad > 1e8f ? 999.0f : pad * 1000.0f),
-               (double)(guard * 1000.0f), (double)(blade * 1000.0f),
+               (double)(guard * 1000.0f), (double)(blade * 1000.0f), blade_cross, (double)(pad_contact ? blade_gap * 1000.0f : 999.0f),
                (double)(grip_bite * 1000.0f), (double)(supp_bite * 1000.0f),
                (double)(grip_mesh_bite * 1000.0f),
                (double)(supp_mesh_bite * 1000.0f),
