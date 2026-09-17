@@ -758,6 +758,62 @@ static void recoil_wp_zero(int col_a, int col_b) {
   g_sim_wp = wp;
 }
 
+// Compare real press/hold and press/release paths through weapon_tick. Both must
+// recover the SR's physical bore identically, fire once, and accept a fresh press.
+static int recoil_hold_case(int ads) {
+  enum { TICKS = 240 };
+  float released[TICKS][2];
+  int ok = 1;
+  for (int hold = 0; hold <= 1; hold++) {
+    recoil_stage(1, WPN_SR, ads);
+    player_t *p = &g_players[0];
+    int ammo = p->wp.ammo[WPN_SR];
+    int held[IN_COUNT] = {[IN_ADS] = ads};
+    float peak = 0.0f, delta = 0.0f;
+    int settled = -1;
+    for (int t = 0; t < TICKS; t++) {
+      held[IN_FIRE] = hold || t == 0;
+      g_tick++;
+      weapon_tick(p, 0, held);
+      vm_tick(p);
+      memcpy(p->prev_held, held, sizeof p->prev_held);
+      if (t == 0) peak = p->wp.rec_p;
+      if (!hold) {
+        released[t][0] = p->wp.rec_p;
+        released[t][1] = p->wp.rec_y;
+      } else {
+        delta = fmaxf(delta, fabsf(p->wp.rec_p - released[t][0]));
+        delta = fmaxf(delta, fabsf(p->wp.rec_y - released[t][1]));
+      }
+      if (settled < 0 && p->wp.rec_p == 0.0f && p->wp.rec_y == 0.0f)
+        settled = t;
+    }
+    int shots = ammo - p->wp.ammo[WPN_SR];
+    int intent = p->wp.fire_want == hold && p->wp.ads_want == ads &&
+                 fabsf(p->wp.ads_s - (float)ads) < 1e-6f;
+    int calm = p->wp.rec_p == 0.0f && p->wp.rec_y == 0.0f &&
+               v3_len(v3_sub(gun_bore_dir(&p->wp, p->yaw, p->pitch),
+                             bore_axis(p->yaw, p->pitch))) < 1e-6f;
+    held[IN_FIRE] = 0;
+    g_tick++;
+    weapon_tick(p, 0, held);
+    memcpy(p->prev_held, held, sizeof p->prev_held);
+    held[IN_FIRE] = 1;
+    g_tick++;
+    weapon_tick(p, 0, held);
+    int rearmed = p->wp.ammo[WPN_SR] == ammo - 2 && p->wp.rec_p == peak;
+    int row = shots == 1 && peak > 0.0f && settled > 0 &&
+              delta < 1e-6f && intent && calm && rearmed;
+    printf("recoil sr_%s_%s shots=%d peak=%.3fdeg settled=%d/%.3fs "
+           "tap_delta=%.6fdeg intent=%d calm=%d rearm=%d %s\n",
+           ads ? "ads" : "hip", hold ? "hold" : "tap", shots,
+           (double)peak, settled, (double)(settled * TICK_DT),
+           (double)delta, intent, calm, rearmed, row ? "ok" : "FAIL");
+    ok &= row;
+  }
+  return ok;
+}
+
 // Compact contract proof for the intentionally compact gun model.
 static void recoil_proof(void) {
   recoil_save_globals();
@@ -796,9 +852,16 @@ static void recoil_proof(void) {
                  fabsf(alt.rec_y + side) < 1e-6f;
 
     float hold_p = p->wp.rec_p, hold_y = p->wp.rec_y;
-    gun_recoil_step(&p->wp, 1);
-    int held = p->wp.fire_want && p->wp.rec_p == hold_p && p->wp.rec_y == hold_y;
     float step = g_sim_gun[GP_RECENTER] * TICK_DT;
+    int hold_idx = p->wp.idx;
+    gun_recoil_step(&p->wp, 1);
+    float held_p = WPN_DEF[wi].full_auto ? hold_p : fmaxf(hold_p - step, 0.0f);
+    float held_y = WPN_DEF[wi].full_auto ? hold_y :
+        fabsf(hold_y) <= step ? 0.0f : hold_y - copysignf(step, hold_y);
+    int held = p->wp.fire_want && p->wp.idx == hold_idx &&
+               fabsf(p->wp.rec_p - held_p) < 1e-6f &&
+               fabsf(p->wp.rec_y - held_y) < 1e-6f;
+    hold_p = p->wp.rec_p; hold_y = p->wp.rec_y;
     gun_recoil_step(&p->wp, 0);
     float want_p = fmaxf(hold_p - step, 0.0f);
     float want_y = fabsf(hold_y) <= step ? 0.0f
@@ -838,6 +901,8 @@ static void recoil_proof(void) {
     ok &= row;
   }
 
+  ok &= recoil_hold_case(0);
+  ok &= recoil_hold_case(1);
   recoil_restore_globals();
   printf("recoil %s\n", ok ? "ok" : "FAIL");
   if (!ok) exit(1);
@@ -1854,7 +1919,7 @@ static size_t netrecoil_snapshot(unsigned char *buf, size_t cap, uint32_t st,
   return w.bad ? 0 : w.at;
 }
 
-static int netrecoil_case(int burst) {
+static int netrecoil_case(int wpn, int burst) {
   enum { LI = 100, END = 157, NREC = END - LI + 1 };
   static_assert(NREC == 58);
   memset(g_players, 0, sizeof g_players);
@@ -1899,7 +1964,7 @@ static int netrecoil_case(int burst) {
   p->vel = (v3){{0.0f, 0.0f, 0.0f}};
   p->grounded = p->prev_grounded = 0;
   p->yaw = p->pitch = 0.0f;
-  p->wp.cur = WPN_AR;
+  p->wp.cur = wpn;
   p->vm.last_eye = p->eye;
   anim_reset(&g_player_anim[0], p->pos, p->yaw, p->wp.cur);
   g_rng_gun[0] = rng_gun_seed(1337u, 0);
@@ -1916,21 +1981,21 @@ static int netrecoil_case(int burst) {
   netrecoil_ref_t ref;
   memset(&ref, 0, sizeof ref);
   ref.pred[0] = g_cl_pred[LI % NET_HIST];
-  int ammo0 = p->wp.ammo[WPN_AR];
+  int ammo0 = p->wp.ammo[wpn];
   for (int rel = 1; rel < NREC; rel++) {
     uint32_t rt = LI + (uint32_t)rel;
     int held[IN_COUNT] = {0};
-    held[IN_FIRE] = burst ? (rel >= 3 && rel <= 23) : rel == 3;
+    held[IN_FIRE] = burst ? (rel >= 3 && (wpn == WPN_SR || rel <= 23)) : rel == 3;
     uint16_t buttons = held[IN_FIRE] ? (uint16_t)(1u << IN_FIRE) : 0;
     g_cl.inlog[rt % NET_HIST] =
         (net_input_t){.tick = rt, .buttons = buttons,
                       .yaw = net_q_yaw(0.0f), .pitch = net_q_pitch(0.0f)};
-    int before = p->wp.ammo[WPN_AR];
+    int before = p->wp.ammo[wpn];
     g_tick = (long)rt;
     g_predicting = 1;
     player_move_tick(p, 0, held, 0.0f, 0.0f);
     g_predicting = 0;
-    if (p->wp.ammo[WPN_AR] != before) ref.last_shot_tick = rel;
+    if (p->wp.ammo[wpn] != before) ref.last_shot_tick = rel;
     g_cl.predpos[rt % NET_HIST] = p->pos;
     g_cl_pred[rt % NET_HIST] =
         (cl_pred_t){.wp = p->wp, .vm = p->vm, .rng = g_rng_gun[0], .yaw = p->yaw};
@@ -1938,7 +2003,7 @@ static int netrecoil_case(int burst) {
     float back = p->vm.kick_back;
     if (back > ref.peak) { ref.peak = back; ref.peak_tick = rel; }
   }
-  ref.shots = ammo0 - p->wp.ammo[WPN_AR];
+  ref.shots = ammo0 - p->wp.ammo[wpn];
   player_t endpoint = *p;
   uint64_t endpoint_rng = g_rng_gun[0];
   int forward_player_shots = p->shots;
@@ -1987,6 +2052,7 @@ static int netrecoil_case(int burst) {
   player_spawn(remote_p);
   remote_p->pos = remote_p->prev_pos = (v3){{3.0f, 0.0f, 6.0f}};
   remote_p->wp.cur = WPN_SR;
+  remote_p->wp.fire_want = (unsigned char)(wpn == WPN_SR && burst);
   remote_p->wp.ready_want = 1;
   anim_reset(&g_player_anim[rh], remote_p->pos, remote_p->yaw, remote_p->wp.cur);
   net_ent_t remote;
@@ -1995,7 +2061,7 @@ static int netrecoil_case(int burst) {
   v3 dir = {{0.0f, 0.0f, -1.0f}};
   event_t echo[2] = {
     {.type = EV_FIRE, .a = v3_add(endpoint.pos, v3_scale(dir, 20.0f)),
-     .b = dir, .f = 20.0f, .i = 0, .wpn = WPN_AR, .src = 0, .dst = -1},
+     .b = dir, .f = 20.0f, .i = 0, .wpn = wpn, .src = 0, .dst = -1},
     {.type = EV_FIRE, .a = v3_add(remote_p->pos, v3_scale(dir, 20.0f)),
      .b = dir, .f = 20.0f, .i = 4, .wpn = WPN_SR, .src = rent, .dst = -1},
   };
@@ -2024,8 +2090,7 @@ static int netrecoil_case(int burst) {
   g_tick++;
   net_cl_present_advance();
   client_anim_all();
-  // The remote snapshot says the trigger is up, so one presentation tick subtracts
-  // exactly one global recenter step while the cosmetic body spring starts moving.
+  // A remote SR recovers with either wire trigger intent while its body spring moves.
   float want_after = fmaxf(want_rec_p - g_sim_gun[GP_RECENTER] * TICK_DT, 0.0f);
   int body_moved = ra->recoil_back > 0.004f && ra->recoil_lift == 0.0f &&
                    fabsf(remote_p->wp.rec_p - want_after) < 1e-6f;
@@ -2034,22 +2099,24 @@ static int netrecoil_case(int burst) {
                              g_match.shots[0] == forward_match_shots &&
                              !memcmp(&g_match.noise[BOT_NOISE_SHOT][0],
                                      &forward_noise, sizeof forward_noise);
-  int expected_shots = burst ? 3 : 1;
+  int expected_shots = burst && WPN_DEF[wpn].full_auto ? 3 : 1;
+  int sr_return = wpn != WPN_SR || (p->wp.rec_p == 0.0f && p->wp.rec_y == 0.0f &&
+                                   p->wp.fire_want == burst);
   int ok = len > 0 && corrected && series_same && endpoint_same &&
            peak == ref.peak && peak_tick == ref.peak_tick &&
-           ref.shots == expected_shots && body_impulse && body_moved &&
+           ref.shots == expected_shots && body_impulse && body_moved && sr_return &&
            replay_anim_same && direct_sidefx_same && snapshot_sidefx_same &&
            forward_player_shots == expected_shots &&
            forward_match_shots == expected_shots &&
            g_cl_ev_applied == 2 && g_cl_ev_dupes == 0;
-  printf("netrecoil %s corr=%.1fmm peak=%.2f/%.2fmm@T%d/T%d "
+  printf("netrecoil %s_%s corr=%.1fmm peak=%.2f/%.2fmm@T%d/T%d "
          "end_vm=%d series=%d ammo=%d/%d rec=(%.6f %.6f) remote_rec=%.4f "
          "rng=%016llx echo_once=%d replay_body=%d remote3p=(%d %d) "
          "sidefx=%d/%d counts=%d/%d noise_t=%ld events=%d/%d %s\n",
-         burst ? "burst" : "single", (double)g_cl_worst_err_mm,
+         WPN_DEF[wpn].prefix, burst ? "hold" : "single", (double)g_cl_worst_err_mm,
          (double)(ref.peak * 1000.0f), (double)(peak * 1000.0f),
          ref.peak_tick, peak_tick, endpoint_same, series_same,
-         p->wp.ammo[WPN_AR], endpoint.wp.ammo[WPN_AR],
+         p->wp.ammo[wpn], endpoint.wp.ammo[wpn],
          (double)p->wp.rec_p, (double)p->wp.rec_y,
          (double)remote_p->wp.rec_p,
          (unsigned long long)g_rng_gun[0], endpoint_same, replay_anim_same,
@@ -2062,10 +2129,12 @@ static int netrecoil_case(int burst) {
 
 static void netrecoil_proof(void) {
   recoil_save_globals();
-  int single = netrecoil_case(0);
-  int burst = netrecoil_case(1);
+  int single = netrecoil_case(WPN_AR, 0);
+  int burst = netrecoil_case(WPN_AR, 1);
+  int sr_single = netrecoil_case(WPN_SR, 0);
+  int sr_hold = netrecoil_case(WPN_SR, 1);
   recoil_restore_globals();
-  int ok = single && burst;
+  int ok = single && burst && sr_single && sr_hold;
   printf("netrecoil cl_pred=%zuB ring=%zuB %s\n", sizeof(cl_pred_t),
          sizeof g_cl_pred, ok ? "ok" : "FAIL");
   if (!ok) exit(1);

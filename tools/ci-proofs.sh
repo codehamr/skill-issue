@@ -839,16 +839,23 @@ done
 gate_command botmemory-normal "skill normal; botmemory" '^botmemory .* proofrestore=1 lose_t=[0-9]+ hold=1/1 expiry=1/1 skill=1$'
 gate_command botmemory-hard "skill hard; botmemory" '^botmemory .* proofrestore=1 lose_t=[0-9]+ hold=1/1 expiry=1/1 skill=2$'
 gate_command netrecoil "netrecoil" '^netrecoil cl_pred=.* ok$'
-netrecoil_single_rows="$(grep -Ec '^netrecoil single .* replay_body=1 .* sidefx=1/1 counts=1/1 noise_t=[0-9]+ events=2/0 ok$' \
+netrecoil_single_rows="$(grep -Ec '^netrecoil ar_single .* replay_body=1 .* sidefx=1/1 counts=1/1 noise_t=[0-9]+ events=2/0 ok$' \
   "$TMPD/netrecoil.log" || true)"
 [ "$netrecoil_single_rows" = 1 ] || {
   say "GATE netrecoil single-shot witness rows=$netrecoil_single_rows (want 1)"; fail=1;
 }
-netrecoil_burst_rows="$(grep -Ec '^netrecoil burst .* replay_body=1 .* sidefx=1/1 counts=3/3 noise_t=[0-9]+ events=2/0 ok$' \
+netrecoil_burst_rows="$(grep -Ec '^netrecoil ar_hold .* replay_body=1 .* sidefx=1/1 counts=3/3 noise_t=[0-9]+ events=2/0 ok$' \
   "$TMPD/netrecoil.log" || true)"
 [ "$netrecoil_burst_rows" = 1 ] || {
   say "GATE netrecoil burst witness rows=$netrecoil_burst_rows (want 1)"; fail=1;
 }
+for mode in single hold; do
+  sr_rows="$(grep -Ec "^netrecoil sr_$mode .* rec=\\(0.000000 0.000000\\) .* replay_body=1 .* sidefx=1/1 counts=1/1 noise_t=[0-9]+ events=2/0 ok$" \
+    "$TMPD/netrecoil.log" || true)"
+  [ "$sr_rows" = 1 ] || {
+    say "GATE netrecoil SR $mode return witness rows=$sr_rows (want 1)"; fail=1;
+  }
+done
 gate_command netdeath "netdeath" '^netdeath death=1 recoil=1 respawn=1 ok$'
 netdeath_dead_rows="$(grep -Ec '^netdeath respawn motion=1 lean=1 life=1 wp=1 vm=1 buttons=1 rng=1 last_eye=[0-9]+[.][0-9]+$' \
   "$TMPD/netdeath.log" || true)"

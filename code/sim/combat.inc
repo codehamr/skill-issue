@@ -286,19 +286,19 @@ static float gun_recenter_axis(float v, float step) {
   return fabsf(v) <= step ? 0.0f : v - copysignf(step, v);
 }
 
-// Recoil is frozen while the trigger is held and returns at one linear angular speed
-// after release. Linear motion makes the DEV value literal: 12 means 12 degrees per
+// Full-auto recoil holds until trigger release; press-edge weapons recover between
+// shots even with the trigger held. The shared linear speed is literal degrees per
 // second, reaches exact zero, and has no hidden spring or weapon-specific recovery.
 static void gun_recoil_step(weapon_t *w, int held) {
   w->prev_rec_p = w->rec_p;
   w->prev_rec_y = w->rec_y;
   w->fire_want = (unsigned char)(held ? 1 : 0);
-  if (!held) {
+  if (!held || !WPN_DEF[w->cur].full_auto) {
     float step = g_sim_gun[GP_RECENTER] * TICK_DT;
     w->rec_p = gun_recenter_axis(w->rec_p, step);
     w->rec_y = gun_recenter_axis(w->rec_y, step);
-    w->idx = 0;
   }
+  if (!held) w->idx = 0;
 }
 
 // THE BORE. Base aim plus the visible recoil offset, clamped to the same pitch

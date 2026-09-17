@@ -380,7 +380,7 @@ static void usage(void) {
        "                     for an aimed round (cone 0) and inside HIP SPREAD's own\n"
        "                     angle over the path from the hip (hard gate)\n"
        "  recoil             compact gun contract: first-shot axis, fixed up + alternating\n"
-       "                     side steps, held-trigger freeze, linear exact recenter, and\n"
+       "                     side steps, AR held freeze, SR held return, exact recenter,\n"
        "                     identical jump/slide spread for AR/SR (hard gate)\n"
        "  vmtrig             hard hand contract over FP/3P Hip/ADS, reload\n"
        "                     15/35/55/75/90, SR bolt, recoil peaks, Low-Ready\n"
